@@ -376,8 +376,11 @@ async def find_dataset_item_traces(
             item_id = metadata.get("dataset_item_id")
             trace_id = row.get("id")
             if isinstance(item_id, str) and isinstance(trace_id, str):
-                # Rows stream oldest-first; the last write per case wins.
-                links[item_id] = trace_id
+                # Newest run per case wins. Trace ids are UUIDv7, so the
+                # largest id IS the newest — never trust the stream's order.
+                current = links.get(item_id)
+                if current is None or trace_id > current:
+                    links[item_id] = trace_id
     return links
 
 

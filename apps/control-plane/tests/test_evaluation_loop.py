@@ -108,3 +108,57 @@ async def test_dataset_items_carry_their_provenance(admin_client, engine):
 
     dataset = next(iter(engine.dataset_items.values()))
     assert dataset[0].get("source") == "manual"
+
+
+async def test_the_newest_run_per_case_is_the_one_that_judges(
+    admin_client, ingest_client, factory, workspace, engine
+):
+    """A case run twice links its newest trace, whatever order the stream uses."""
+    await factory.provisioned_agent(workspace, engine, name="Support Bot")
+    created = await admin_client.post(
+        "/api/v1/evaluations/datasets", json={"name": "rerun-set"}
+    )
+    assert created.status_code == 201, created.text
+    await admin_client.post(
+        "/api/v1/evaluations/datasets/rerun-set/items",
+        json={"items": [{"input": "only case"}]},
+    )
+    item_id = (await admin_client.get("/api/v1/evaluations/datasets/rerun-set/items")).json()[
+        "items"
+    ][0]["id"]
+
+    async def run_case(offset: int, scores):
+        body = {
+            "agent": "Support Bot",
+            "traces": [
+                {
+                    "name": "experiment:rerun-set",
+                    "start_time": iso(offset),
+                    "end_time": iso(offset + 1.0),
+                    "metadata": {"dataset_item_id": item_id},
+                }
+            ],
+        }
+        if scores:
+            body["traces"][0]["feedback_scores"] = scores
+        posted = await ingest_client.post("/api/v1/ingest/traces", json=body)
+        assert posted.json()["accepted"] == 1, posted.text
+
+    await run_case(0, None)  # the first run produced no verdicts
+    await run_case(5, [{"name": "answer_correctness", "value": 0.75}])
+
+    started = await admin_client.post(
+        "/api/v1/evaluations", json={"dataset": "rerun-set", "judge_model": "gpt-5"}
+    )
+    evaluation_id = started.json()["id"]
+    for _ in range(40):
+        progress = (
+            await admin_client.get(f"/api/v1/evaluations/{evaluation_id}/progress")
+        ).json()
+        if progress["is_terminal"]:
+            break
+        await asyncio.sleep(0.5)
+
+    detail = (await admin_client.get(f"/api/v1/evaluations/{evaluation_id}")).json()
+    assert detail["status"] == "Completed", detail.get("notes")
+    assert detail["correctness"] == 0.75, "the scored (newest) run judges the case"
