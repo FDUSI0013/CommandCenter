@@ -94,7 +94,15 @@
   }
 
   function navigate(){
-    const hash = location.hash.replace(/^#\/?/, '') || 'live-runs';
+    const raw = location.hash.replace(/^#\/?/, '') || 'live-runs';
+    // "#/replay?run=<id>" — the query rides on APP.query so outside links
+    // (the chat frontend, a pasted URL) can land on a specific entity.
+    const [hash, search] = raw.split('?');
+    APP.query = {};
+    if(search) for(const pair of search.split('&')){
+      const i = pair.indexOf('=');
+      if(i > 0) APP.query[decodeURIComponent(pair.slice(0,i))] = decodeURIComponent(pair.slice(i+1));
+    }
     const [route, param] = hash.split('/');
     const screen = SCREENS[route] || SCREENS['live-runs'];
     // cleanup previous screen (timers, open streams)

@@ -563,7 +563,9 @@
       // Agents come from the registry — every agent, whatever its status,
       // because history outlives activation. The rail then reads that agent's
       // complete run history from the telemetry store, page by page.
-      const requested = APP.replayRun;
+      // A run can be named internally (Live Runs hand-off) or from outside
+      // via #/replay?run=<id> — the chat frontend links each answer that way.
+      const requested = (APP.query && APP.query.run) || APP.replayRun;
       Promise.all([
         API.agents.list({ page_size: 200, sort: 'name' }),
         requested ? API.runs.get(requested).catch(() => null) : Promise.resolve(null),
