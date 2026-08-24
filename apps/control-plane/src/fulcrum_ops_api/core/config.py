@@ -107,6 +107,12 @@ class Settings(BaseSettings):
     rate_limit_read_per_minute: int = 1_200
     redis_url: str | None = None  # optional; in-process limiter when unset
 
+    # ---- inline content checker ------------------------------------------
+    # The guardrail scanner is its own service; unset means the engine's own
+    # base URL is assumed to front it (true for the test double, not for the
+    # compose stack, where the scanner has its own hostname and port).
+    engine_checker_url: str | None = None
+
     # ---- background scheduler --------------------------------------------
     # The platform's own clock: export schedules, test-suite cadences, SLA
     # expiry, mute expiry and secret-status recomputation all hang off it.

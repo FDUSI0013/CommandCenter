@@ -207,6 +207,19 @@ def _row_matches(row: dict[str, Any]) -> list[MatchedSpan]:
         if isinstance(value, list):
             raw = value
             break
+    if not raw:
+        # The scanner answers with validation_details.detected_entities: a map
+        # of entity label -> [{start, end, score, text}] rather than a flat
+        # list; flatten it, carrying the label onto each hit.
+        details = row.get("validation_details")
+        if isinstance(details, dict):
+            detected = details.get("detected_entities")
+            if isinstance(detected, dict):
+                for label, hits in detected.items():
+                    for hit in hits if isinstance(hits, list) else []:
+                        entry = dict(hit) if isinstance(hit, dict) else {}
+                        entry.setdefault("label", str(label))
+                        raw.append(entry)
 
     spans: list[MatchedSpan] = []
     for entry in raw:
@@ -292,23 +305,50 @@ def _pair_rows(
     return paired
 
 
+#: The validations the inline scanner actually implements. Anything else sent
+#: in the same request 400s the whole batch, so unsupported guardrails are
+#: excluded from the call and simply produce no verdict — never a simulated one.
+SUPPORTED_CHECKER_VALIDATIONS: Final[frozenset[str]] = frozenset(
+    {"PII", "TOPIC", "PROMPT_INJECTION", "CUSTOM_CLASSIFIER"}
+)
+
+
+def checker_supported(guardrail: GuardrailConfig) -> bool:
+    """Whether the inline scanner can answer for this guardrail at all."""
+    return (
+        validation_name(guardrail.guardrail_type, guardrail.config).upper()
+        in SUPPORTED_CHECKER_VALIDATIONS
+    )
+
+
+def _checker_request(guardrail: GuardrailConfig) -> dict[str, Any]:
+    """One validation entry in the scanner's own contract: {type, config}."""
+    config = {
+        "threshold": guardrail.threshold,
+        **{
+            key: value
+            for key, value in (guardrail.config or {}).items()
+            if key != "validation"
+        },
+    }
+    name = validation_name(guardrail.guardrail_type, guardrail.config).upper()
+    if name == "TOPIC":
+        # The scanner requires a mode for topic checks; a guardrail listing
+        # topics means those topics are restricted unless it says otherwise.
+        config.setdefault("mode", "restrict")
+    return {"type": name, "config": config}
+
+
 async def _run_checker(
     text: str, guardrails: Sequence[GuardrailConfig]
 ) -> tuple[dict[str, dict[str, Any]], int]:
-    """Run one real check covering every guardrail, and time it."""
+    """Run one real check covering every supported guardrail, and time it."""
     client = get_engine_client()
-    validations = [
-        {
-            "name": validation_name(guardrail.guardrail_type, guardrail.config),
-            "threshold": guardrail.threshold,
-            **{
-                key: value
-                for key, value in (guardrail.config or {}).items()
-                if key != "validation"
-            },
-        }
-        for guardrail in guardrails
-    ]
+    supported = [guardrail for guardrail in guardrails if checker_supported(guardrail)]
+    if not supported:
+        return {}, 0
+    guardrails = supported
+    validations = [_checker_request(guardrail) for guardrail in guardrails]
     started = time.perf_counter()
     try:
         payload = await client.evaluate_guardrails(text, validations)
@@ -1259,6 +1299,18 @@ async def test_guardrail(
     """
     principal.require(Role.OPERATOR)
     guardrail = await get_guardrail(session, principal, guardrail_id)
+
+    if not checker_supported(guardrail):
+        # Never simulate a verdict: a validation the scanner does not
+        # implement cannot be tested, and saying "Clear" would be a lie.
+        wanted = validation_name(guardrail.guardrail_type, guardrail.config)
+        raise PreconditionFailed(
+            f"The content checker on this deployment does not implement "
+            f"'{wanted}'. It answers for: "
+            + ", ".join(sorted(SUPPORTED_CHECKER_VALIDATIONS))
+            + ".",
+            details={"validation": wanted},
+        )
 
     paired, latency_ms = await _run_checker(text, [guardrail])
     triggered, score, matches = _hit_from(guardrail, paired.get(guardrail.id))

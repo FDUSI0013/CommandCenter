@@ -1273,7 +1273,7 @@ async def execute_prompt(
 
     await audit.record(
         session,
-        principal,
+        principal=principal,
         action="prompt.executed",
         entity_type=ENTITY_TYPE,
         entity_id=prompt_id,

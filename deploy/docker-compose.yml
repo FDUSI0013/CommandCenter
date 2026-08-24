@@ -255,6 +255,9 @@ services:
       FULCRUM_OPS_ENCRYPTION_KEY: ${APP_ENCRYPTION_KEY:?set in .env}
       FULCRUM_OPS_DATABASE_URL: postgresql+asyncpg://${APP_DB_USER:-fulcrum}:${APP_DB_PASSWORD}@app-db:5432/${APP_DB_NAME:-fulcrum_ops}
       FULCRUM_OPS_ENGINE_BASE_URL: http://telemetry-engine:8080
+      # The guardrail scanner answers on its own service, not through the
+      # engine gateway; without this, guardrail checks 404 and degrade open.
+      FULCRUM_OPS_ENGINE_CHECKER_URL: http://safety-scanner:5000
       FULCRUM_OPS_ENGINE_WORKSPACE: default
       FULCRUM_OPS_ENGINE_METRIC_LIBRARY: ${ENGINE_METRIC_LIBRARY:-}
       FULCRUM_OPS_REDIS_URL: redis://:${CACHE_PASSWORD}@cache:6379/1

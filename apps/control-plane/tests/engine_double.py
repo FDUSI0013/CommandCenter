@@ -304,6 +304,7 @@ class EngineDouble:
         self.path_failures: dict[str, int] = {}
         #: Guardrail verdicts the inline checker hands back, newest wins.
         self.checker_verdicts: list[JsonObject] = []
+        self.checker_requests: list[JsonObject] = []
         self.healthy = True
 
         self._routes = self._build_routes()
@@ -2027,6 +2028,7 @@ class EngineDouble:
     def _evaluate_guardrails(self, _match: re.Match, _query: dict, body: Any) -> JsonObject:
         """The inline checker: answers with whatever verdicts a test staged."""
         payload = body or {}
+        self.checker_requests.append(dict(payload))
         return {
             "text": payload.get("text"),
             "validations": [dict(row) for row in self.checker_verdicts],

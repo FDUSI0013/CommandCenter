@@ -65,6 +65,7 @@ async def lifespan(app: FastAPI):
         base_url=settings.engine_base_url,
         workspace=settings.engine_workspace,
         api_key=settings.engine_api_key,
+        checker_base_url=settings.engine_checker_url,
     )
     set_engine_client(client)
 
