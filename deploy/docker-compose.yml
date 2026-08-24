@@ -270,6 +270,10 @@ services:
       FULCRUM_OPS_PROMPT_STUDIO_API_KEY: ${PROMPT_STUDIO_API_KEY:-}
       FULCRUM_OPS_PROMPT_STUDIO_MODEL: ${PROMPT_STUDIO_MODEL:-gpt-4o-mini}
       FULCRUM_OPS_PROMPT_STUDIO_API_VERSION: ${PROMPT_STUDIO_API_VERSION:-2024-10-21}
+    volumes:
+      # Generated exports must outlive the container: without this every
+      # rebuild silently expires every downloadable file.
+      - export-spool:/app/var/exports
     ports:
       - "127.0.0.1:8080:8080"   # Caddy on the host is the only client
     depends_on:
@@ -310,3 +314,4 @@ volumes:
   cache:
   blob-store:
   app-db:
+  export-spool:

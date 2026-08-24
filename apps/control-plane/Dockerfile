@@ -44,6 +44,10 @@ COPY --chown=fulcrum:fulcrum apps/control-plane/alembic.ini /app/alembic.ini
 # this copy is what makes `docker run` alone enough for a smoke test.
 COPY --chown=fulcrum:fulcrum apps/web /app/web
 
+# The export spool mounts as a named volume; owning it here is what makes the
+# fresh volume writable by the non-root user on first use.
+RUN mkdir -p /app/var/exports && chown -R fulcrum:fulcrum /app/var
+
 WORKDIR /app
 USER fulcrum
 EXPOSE 8080
