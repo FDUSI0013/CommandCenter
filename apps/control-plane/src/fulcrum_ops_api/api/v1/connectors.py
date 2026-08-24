@@ -17,6 +17,7 @@ from fastapi.responses import StreamingResponse
 from ...schemas.connectors import (
     ConnectorBlockRequest,
     ConnectorCreate,
+    ConnectorGrantRequest,
     ConnectorRead,
     ConnectorSummary,
     ConnectorTestResult,
@@ -223,6 +224,59 @@ async def unblock_connector(
     )
     return ActionResult(
         message=f"{connector.name} restored.",
+        entity_id=connector.id,
+        data=connector.model_dump(mode="json"),
+    )
+
+
+@router.post(
+    "/{connector_id}/grants",
+    response_model=ActionResult,
+    status_code=201,
+    summary="Grant a connector to an agent",
+)
+async def grant_connector(
+    principal: CurrentPrincipal,
+    session: Db,
+    connector_id: str,
+    payload: ConnectorGrantRequest,
+    request: Request,
+) -> ActionResult:
+    """Grant this connector to one agent.
+
+    The grant is what connector-scoped policies and blocks act on: a policy
+    with Connector scope reaches the agent through it, and blocking the
+    connector then refuses the agent's telemetry at ingest until the block is
+    lifted or the grant revoked.
+    """
+    connector = await connectors_service.grant_connector(
+        session, principal, connector_id, payload, request=request
+    )
+    return ActionResult(
+        message=f"{connector.name} granted.",
+        entity_id=connector.id,
+        data=connector.model_dump(mode="json"),
+    )
+
+
+@router.delete(
+    "/{connector_id}/grants/{agent_id}",
+    response_model=ActionResult,
+    summary="Revoke a connector grant",
+)
+async def revoke_connector_grant(
+    principal: CurrentPrincipal,
+    session: Db,
+    connector_id: str,
+    agent_id: str,
+    request: Request,
+) -> ActionResult:
+    """Take this connector away from one agent."""
+    connector = await connectors_service.revoke_grant(
+        session, principal, connector_id, agent_id, request=request
+    )
+    return ActionResult(
+        message=f"{connector.name} grant revoked.",
         entity_id=connector.id,
         data=connector.model_dump(mode="json"),
     )

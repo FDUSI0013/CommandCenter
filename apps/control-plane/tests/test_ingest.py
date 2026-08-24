@@ -1367,3 +1367,327 @@ async def test_an_otlp_export_is_measured_against_the_same_quota(
     assert error_code(response) == "quota_exceeded"
     stored = await db.get(Quota, quota.id)
     assert stored.used_value == 1
+
+
+# ===========================================================================
+# Guardrails at ingest — the server-side checker, wired through the batch hook
+# ===========================================================================
+
+
+async def test_an_active_block_guardrail_refuses_the_item_at_ingest(
+    ingest_client, db, factory, workspace, engine
+):
+    """A Block guardrail is enforced before the store, not merely displayed."""
+    agent = await factory.provisioned_agent(workspace, engine, name="Support Bot")
+    guardrail = await factory.guardrail(workspace, name="PII shield")
+    engine.checker_verdicts = [
+        {"name": "PII", "triggered": True, "score": 0.97, "entities": ["EMAIL"]}
+    ]
+
+    posted = await ingest_client.post(
+        "/api/v1/ingest/traces",
+        json={
+            "agent": "Support Bot",
+            "traces": [trace(input={"question": "my email is dana@example.com"})],
+        },
+    )
+
+    assert posted.status_code == 200, posted.text
+    body = posted.json()
+    assert body["guardrails_evaluated"] is True
+    assert outcomes(posted) == [(0, "blocked", RejectionCode.GUARDRAIL_BLOCKED.value)]
+    assert body["results"][0]["guardrail_id"] == guardrail.id
+    assert engine.trace_count(agent.engine_project_name) == 0, "the blocked item never left"
+
+    events = await db.scalars(
+        select(GuardrailEvent).where(GuardrailEvent.guardrail_id == guardrail.id)
+    )
+    assert len(events) == 1
+    assert events[0].action_taken == "Block"
+
+    stored = await db.get(type(guardrail), guardrail.id)
+    assert stored.triggers_30d == 1
+    assert stored.last_triggered_at is not None
+
+
+async def test_a_tuning_guardrail_records_its_trial_without_enforcing(
+    ingest_client, db, factory, workspace, engine
+):
+    """Tuning runs in shadow: the event lands, the telemetry still flows."""
+    from fulcrum_ops_api.models.quality import GuardrailStatus
+
+    agent = await factory.provisioned_agent(workspace, engine, name="Support Bot")
+    guardrail = await factory.guardrail(
+        workspace, name="PII trial", status=GuardrailStatus.TUNING.value
+    )
+    engine.checker_verdicts = [{"name": "PII", "triggered": True, "score": 0.9}]
+
+    posted = await ingest_client.post(
+        "/api/v1/ingest/traces",
+        json={"agent": "Support Bot", "traces": [trace()]},
+    )
+
+    assert posted.status_code == 200, posted.text
+    assert outcomes(posted) == [(0, "accepted", None)]
+    assert engine.trace_count(agent.engine_project_name) == 1
+
+    events = await db.scalars(
+        select(GuardrailEvent).where(GuardrailEvent.guardrail_id == guardrail.id)
+    )
+    assert len(events) == 1
+    assert events[0].action_taken == "Log", "a shadow trial is recorded, never enforced"
+
+
+async def test_a_mask_guardrail_redacts_what_reaches_the_store(
+    ingest_client, factory, workspace, engine
+):
+    from fulcrum_ops_api.models.quality import GuardrailAction
+
+    agent = await factory.provisioned_agent(workspace, engine, name="Support Bot")
+    await factory.guardrail(workspace, name="PII mask", action=GuardrailAction.MASK.value)
+    engine.checker_verdicts = [{"name": "PII", "triggered": True, "score": 0.8}]
+
+    posted = await ingest_client.post(
+        "/api/v1/ingest/traces",
+        json={
+            "agent": "Support Bot",
+            "traces": [trace(input={"question": "card 4111 1111 1111 1111"})],
+        },
+    )
+
+    assert posted.status_code == 200, posted.text
+    assert posted.json()["results"][0]["masked"] is True
+    assert engine.trace_count(agent.engine_project_name) == 1
+    stored = next(iter(engine.traces.values()))
+    assert "4111" not in str(stored.get("input")), "the raw content never left"
+
+
+async def test_a_broken_checker_degrades_open_rather_than_losing_telemetry(
+    ingest_client, factory, workspace, engine, monkeypatch
+):
+    """The documented posture: a failing evaluator must not cost the batch."""
+    agent = await factory.provisioned_agent(workspace, engine, name="Support Bot")
+    await factory.guardrail(workspace, name="PII shield")
+
+    from fulcrum_ops_api.services import guardrails as guardrail_service
+
+    async def broken(*_args, **_kwargs):
+        raise RuntimeError("checker exploded")
+
+    monkeypatch.setattr(guardrail_service, "evaluate_ingest_batch", broken)
+
+    posted = await ingest_client.post(
+        "/api/v1/ingest/traces",
+        json={"agent": "Support Bot", "traces": [trace()]},
+    )
+
+    assert posted.status_code == 200, posted.text
+    assert posted.json()["guardrails_evaluated"] is False
+    assert outcomes(posted) == [(0, "accepted", None)]
+    assert engine.trace_count(agent.engine_project_name) == 1
+
+
+# ===========================================================================
+# Quota accounting regressions
+# ===========================================================================
+
+
+async def test_an_exceeded_quota_keeps_refusing_the_next_batch(
+    ingest_client, factory, workspace, engine
+):
+    """Filling up must not unenforce the quota: Exceeded still blocks."""
+    await factory.provisioned_agent(workspace, engine, name="Support Bot")
+    await factory.quota(
+        workspace,
+        name="Requests per month",
+        resource=QuotaResource.REQUESTS.value,
+        unit="requests",
+        limit_value=10,
+        used_value=12,
+        enforcement=QuotaEnforcement.BLOCK.value,
+        status=LimitStatus.EXCEEDED.value,
+    )
+
+    response = await ingest_client.post(
+        "/api/v1/ingest/traces",
+        json={"agent": "Support Bot", "traces": [trace()]},
+    )
+
+    assert response.status_code == 402, response.text
+    assert error_code(response) == "quota_exceeded"
+    assert engine.trace_count() == 0
+
+
+async def test_a_reported_token_total_is_charged_once_not_twice(
+    ingest_client, db, factory, workspace, engine
+):
+    """SDKs send prompt, completion and total; the quota charges the total."""
+    await factory.provisioned_agent(workspace, engine, name="Support Bot")
+    quota = await factory.quota(
+        workspace,
+        name="Tokens per month",
+        resource=QuotaResource.TOKENS.value,
+        limit_value=1_000,
+        used_value=0,
+        enforcement=QuotaEnforcement.WARN.value,
+    )
+
+    await ingest_client.post(
+        "/api/v1/ingest/traces",
+        json={
+            "agent": "Support Bot",
+            "traces": [
+                trace(
+                    spans=[
+                        {
+                            "name": "chat",
+                            "type": "llm",
+                            "start_time": iso(),
+                            "end_time": iso(1),
+                            "usage": {
+                                "prompt_tokens": 120,
+                                "completion_tokens": 30,
+                                "total_tokens": 150,
+                            },
+                        }
+                    ]
+                )
+            ],
+        },
+    )
+
+    stored = await db.get(Quota, quota.id)
+    assert stored.used_value == 150, "prompt+completion+total is one measurement, not two"
+
+
+# ===========================================================================
+# Connector blocks fail granted agents closed
+# ===========================================================================
+
+
+async def test_a_blocked_connector_fails_its_granted_agent_closed(
+    ingest_client, db, factory, workspace, engine
+):
+    from fulcrum_ops_api.models.registry import AgentConnector, ConnectorStatus
+
+    agent = await factory.provisioned_agent(workspace, engine, name="Support Bot")
+    connector = await factory.connector(
+        workspace, name="Order DB", status=ConnectorStatus.BLOCKED.value
+    )
+    await factory.add(
+        AgentConnector(workspace_id=workspace.id, agent_id=agent.id, connector_id=connector.id)
+    )
+
+    posted = await ingest_client.post(
+        "/api/v1/ingest/traces",
+        json={"agent": "Support Bot", "traces": [trace()]},
+    )
+
+    assert posted.status_code == 200, posted.text
+    assert outcomes(posted) == [(0, "blocked", RejectionCode.CONNECTOR_BLOCKED.value)]
+    assert "Order DB" in posted.json()["results"][0]["reason"]
+    assert engine.trace_count(agent.engine_project_name) == 0
+
+
+async def test_an_unrelated_agent_is_not_punished_for_the_blocked_connector(
+    ingest_client, factory, workspace, engine
+):
+    from fulcrum_ops_api.models.registry import ConnectorStatus
+
+    agent = await factory.provisioned_agent(workspace, engine, name="Sales Bot")
+    await factory.connector(workspace, name="Order DB", status=ConnectorStatus.BLOCKED.value)
+
+    posted = await ingest_client.post(
+        "/api/v1/ingest/traces",
+        json={"agent": "Sales Bot", "traces": [trace()]},
+    )
+
+    assert posted.status_code == 200, posted.text
+    assert outcomes(posted) == [(0, "accepted", None)]
+    assert engine.trace_count(agent.engine_project_name) == 1
+
+
+async def test_the_grant_lifecycle_governs_ingest_end_to_end(
+    ingest_client, admin_client, factory, workspace, engine
+):
+    """Grant on the governance screen, block, fail closed, unblock, flow again."""
+    agent = await factory.provisioned_agent(workspace, engine, name="Support Bot")
+    connector = await factory.connector(workspace, name="GitHub MCP")
+
+    granted = await admin_client.post(
+        f"/api/v1/connectors/{connector.id}/grants", json={"agent_id": agent.id}
+    )
+    assert granted.status_code == 201, granted.text
+
+    again = await admin_client.post(
+        f"/api/v1/connectors/{connector.id}/grants", json={"agent_id": agent.id}
+    )
+    assert again.status_code == 409, "the same grant cannot be made twice"
+
+    listed = await admin_client.get(f"/api/v1/connectors/{connector.id}")
+    assert listed.json()["used_by_agents"] == 1
+
+    blocked = await admin_client.post(
+        f"/api/v1/connectors/{connector.id}/block",
+        json={"reason": "Token scope under review"},
+    )
+    assert blocked.status_code == 200, blocked.text
+
+    refused = await ingest_client.post(
+        "/api/v1/ingest/traces",
+        json={"agent": "Support Bot", "traces": [trace()]},
+    )
+    assert outcomes(refused) == [(0, "blocked", RejectionCode.CONNECTOR_BLOCKED.value)]
+
+    regrant = await admin_client.post(
+        f"/api/v1/connectors/{connector.id}/grants", json={"agent_id": agent.id}
+    )
+    assert regrant.status_code == 412, "a blocked connector cannot take new grants"
+
+    unblocked = await admin_client.post(f"/api/v1/connectors/{connector.id}/unblock")
+    assert unblocked.status_code == 200, unblocked.text
+
+    flowing = await ingest_client.post(
+        "/api/v1/ingest/traces",
+        json={"agent": "Support Bot", "traces": [trace(name="after unblock")]},
+    )
+    assert outcomes(flowing) == [(0, "accepted", None)]
+
+    revoked = await admin_client.delete(
+        f"/api/v1/connectors/{connector.id}/grants/{agent.id}"
+    )
+    assert revoked.status_code == 200, revoked.text
+    twice = await admin_client.delete(
+        f"/api/v1/connectors/{connector.id}/grants/{agent.id}"
+    )
+    assert twice.status_code == 404, "a revoked grant is gone"
+
+
+async def test_a_pipeline_policy_hit_stamps_the_policy_last_triggered(
+    ingest_client, db, factory, workspace, engine
+):
+    from fulcrum_ops_api.models.governance import Policy
+
+    await factory.provisioned_agent(workspace, engine, name="Support Bot")
+    policy = await factory.policy(
+        workspace,
+        name="No card numbers",
+        enforcement=PolicyEnforcement.BLOCK.value,
+        rules={
+            "conditions": [
+                {"signal": "content", "operator": "contains", "value": "4111 1111"}
+            ]
+        },
+    )
+    assert policy.last_triggered_at is None
+
+    await ingest_client.post(
+        "/api/v1/ingest/traces",
+        json={
+            "agent": "Support Bot",
+            "traces": [trace(input={"question": "my card is 4111 1111 1111 1111"})],
+        },
+    )
+
+    stored = await db.get(Policy, policy.id)
+    assert stored.last_triggered_at is not None, "enforcement is a trigger too"

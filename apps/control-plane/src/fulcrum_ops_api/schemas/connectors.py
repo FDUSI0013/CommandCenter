@@ -232,6 +232,14 @@ class ConnectorBlockRequest(BaseModel):
     )
 
 
+class ConnectorGrantRequest(BaseModel):
+    """Grant of this connector to one agent — the edge the access graph draws."""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    agent_id: str = Field(min_length=1, max_length=36, description="Agent in this workspace.")
+
+
 class ConnectorTestResult(BaseModel):
     """Outcome of an unauthenticated reachability probe against the endpoint."""
 

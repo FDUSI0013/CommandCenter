@@ -44,6 +44,7 @@ from ..schemas.connectors import (
     ConnectorAgentRef,
     ConnectorBlockRequest,
     ConnectorCreate,
+    ConnectorGrantRequest,
     ConnectorRead,
     ConnectorSummary,
     ConnectorTestResult,
@@ -729,6 +730,123 @@ async def unblock_connector(
             "blocked_by": blocked_by,
             "blocked_reason": reason,
         },
+        request=request,
+    )
+    return await _read(session, principal, connector)
+
+
+async def grant_connector(
+    session: AsyncSession,
+    principal: Principal,
+    connector_id: str,
+    payload: ConnectorGrantRequest,
+    *,
+    request: Request | None = None,
+) -> ConnectorRead:
+    """Grant this connector to one agent.
+
+    The grant is the edge governance acts on: connector-scoped policies reach
+    the agent through it, and a block on the connector fails the agent closed
+    at ingest. A blocked connector cannot take new grants - unblock it first,
+    so the reach it regains is a deliberate decision.
+    """
+    principal.require(Role.OPERATOR)
+    connector = await _load(session, principal, connector_id)
+    if connector.status == ConnectorStatus.BLOCKED.value:
+        raise PreconditionFailed(
+            f"'{connector.name}' is blocked. Unblock it before granting it to an agent.",
+            details={"blocked_reason": connector.blocked_reason},
+        )
+
+    agent = (
+        await session.execute(
+            select(Agent).where(
+                Agent.workspace_id == principal.workspace_id, Agent.id == payload.agent_id
+            )
+        )
+    ).scalar_one_or_none()
+    if agent is None:
+        raise NotFound("No agent with that id exists in this workspace.")
+
+    existing = (
+        await session.execute(
+            select(AgentConnector).where(
+                AgentConnector.workspace_id == principal.workspace_id,
+                AgentConnector.connector_id == connector.id,
+                AgentConnector.agent_id == agent.id,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        raise Conflict(f"'{connector.name}' is already granted to '{agent.name}'.")
+
+    session.add(
+        AgentConnector(
+            workspace_id=principal.workspace_id,
+            agent_id=agent.id,
+            connector_id=connector.id,
+            granted_at=dt.datetime.now(dt.UTC),
+            granted_by=principal.actor,
+        )
+    )
+    await session.flush()
+
+    await audit.record(
+        session,
+        principal=principal,
+        action="connector.granted",
+        entity_type=ENTITY_TYPE,
+        entity_id=connector.id,
+        entity_label=connector.name,
+        source_screen=SOURCE_SCREEN,
+        detail=f"Granted '{connector.name}' to agent '{agent.name}'.",
+        metadata={"agent_id": agent.id, "agent_name": agent.name},
+        request=request,
+    )
+    return await _read(session, principal, connector)
+
+
+async def revoke_grant(
+    session: AsyncSession,
+    principal: Principal,
+    connector_id: str,
+    agent_id: str,
+    *,
+    request: Request | None = None,
+) -> ConnectorRead:
+    """Take a connector away from one agent."""
+    principal.require(Role.OPERATOR)
+    connector = await _load(session, principal, connector_id)
+
+    grant = (
+        await session.execute(
+            select(AgentConnector).where(
+                AgentConnector.workspace_id == principal.workspace_id,
+                AgentConnector.connector_id == connector.id,
+                AgentConnector.agent_id == agent_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if grant is None:
+        raise NotFound(f"'{connector.name}' is not granted to that agent.")
+
+    agent_name = (
+        await session.execute(select(Agent.name).where(Agent.id == agent_id))
+    ).scalar_one_or_none()
+
+    await session.delete(grant)
+    await session.flush()
+
+    await audit.record(
+        session,
+        principal=principal,
+        action="connector.grant_revoked",
+        entity_type=ENTITY_TYPE,
+        entity_id=connector.id,
+        entity_label=connector.name,
+        source_screen=SOURCE_SCREEN,
+        detail=f"Revoked '{connector.name}' from agent '{agent_name or agent_id}'.",
+        metadata={"agent_id": agent_id, "agent_name": agent_name},
         request=request,
     )
     return await _read(session, principal, connector)

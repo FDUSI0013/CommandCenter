@@ -115,6 +115,7 @@ class RejectionCode(enum.StrEnum):
     INVALID_ID = "invalid_id"
     POLICY_BLOCKED = "policy_blocked"
     GUARDRAIL_BLOCKED = "guardrail_blocked"
+    CONNECTOR_BLOCKED = "connector_blocked"
     TELEMETRY_REJECTED = "telemetry_rejected"
     UNSUPPORTED_EVENT = "unsupported_event"
     UNKNOWN_GUARDRAIL = "unknown_guardrail"

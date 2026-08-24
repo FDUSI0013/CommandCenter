@@ -55,6 +55,7 @@ from typing import Any, Final
 
 from fastapi import Request
 from sqlalchemy import Select, func, or_, select
+from sqlalchemy import update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..api.deps import Principal
@@ -102,6 +103,8 @@ from ..models.registry import (
     AgentConnector,
     AgentStatus,
     AgentType,
+    Connector,
+    ConnectorStatus,
     EnvironmentType,
     Platform,
     RiskLevel,
@@ -538,6 +541,56 @@ async def _resolve_agents(
     return resolved
 
 
+async def _connector_blocks(
+    session: AsyncSession, principal: Principal, agents: _Agents
+) -> dict[str, list[str]]:
+    """Agents that must fail closed, mapped to the blocked connectors they hold.
+
+    A block on a connector is a statement about every agent granted it: their
+    telemetry is refused until the block is lifted or the grant revoked. One
+    query per batch answers for every agent the batch touches.
+    """
+    agent_ids = [agent.id for agent in agents.touched]
+    if not agent_ids:
+        return {}
+    rows = (
+        await session.execute(
+            select(AgentConnector.agent_id, Connector.name)
+            .join(Connector, Connector.id == AgentConnector.connector_id)
+            .where(
+                AgentConnector.workspace_id == principal.workspace_id,
+                AgentConnector.agent_id.in_(agent_ids),
+                Connector.status == ConnectorStatus.BLOCKED.value,
+            )
+        )
+    ).all()
+    blocked: dict[str, list[str]] = {}
+    for agent_id, connector_name in rows:
+        blocked.setdefault(agent_id, []).append(connector_name)
+    return blocked
+
+
+def _block_for_connector(
+    results: list[IngestItemResult],
+    index: int,
+    *,
+    agent_id: str,
+    connector_names: Sequence[str],
+    spans: int = 0,
+) -> None:
+    names = ", ".join(sorted(connector_names))
+    results[index] = results[index].model_copy(
+        update={
+            "outcome": ItemOutcome.BLOCKED,
+            "code": RejectionCode.CONNECTOR_BLOCKED,
+            "reason": f"Connector '{names}' is blocked; this agent fails closed until "
+            "the block is lifted or the grant revoked.",
+            "agent_id": agent_id,
+            "spans": spans,
+        }
+    )
+
+
 # ---------------------------------------------------------------------------
 # Policy evaluation
 # ---------------------------------------------------------------------------
@@ -965,6 +1018,27 @@ def _quota_applies(quota: Quota, agents: Sequence[Agent]) -> bool:
     return False
 
 
+def _billable_tokens(usage: Mapping[str, Any] | None) -> int:
+    """The token count a quota is charged for one item.
+
+    Reporters usually send prompt, completion *and* total counters; summing the
+    raw dict would charge the tenant roughly double. An explicit total wins,
+    otherwise prompt+completion, and only a dict with neither falls back to the
+    sum of whatever counters it does carry.
+    """
+    counters = dict(usage or {})
+    if not counters:
+        return 0
+    prompt = counters.get("prompt_tokens", counters.get("input_tokens"))
+    completion = counters.get("completion_tokens", counters.get("output_tokens"))
+    total = counters.get("total_tokens")
+    if total is not None:
+        return int(total)
+    if prompt is not None or completion is not None:
+        return int(prompt or 0) + int(completion or 0)
+    return int(sum(value for value in counters.values() if isinstance(value, (int, float))))
+
+
 @dataclasses.dataclass
 class _Charge:
     quota: Quota
@@ -990,7 +1064,17 @@ async def _prepare_quotas(
             await session.execute(
                 select(Quota).where(
                     Quota.workspace_id == principal.workspace_id,
-                    Quota.status.in_((LimitStatus.ACTIVE.value, LimitStatus.WARNING.value)),
+                    # Exceeded quotas must stay loaded: a Block quota that
+                    # stopped being read the moment it filled up would refuse
+                    # exactly one batch and then wave everything through, and
+                    # its period could never roll from the ingest path.
+                    Quota.status.in_(
+                        (
+                            LimitStatus.ACTIVE.value,
+                            LimitStatus.WARNING.value,
+                            LimitStatus.EXCEEDED.value,
+                        )
+                    ),
                     Quota.resource.in_(
                         (QuotaResource.REQUESTS.value, QuotaResource.TOKENS.value)
                     ),
@@ -1251,6 +1335,7 @@ async def ingest_traces(
         request=request,
     )
     policies = await _load_policies(session, principal, [agent.id for agent in agents.touched])
+    connector_blocks = await _connector_blocks(session, principal, agents)
 
     accepted: list[_Accepted] = []
     candidates: list[GuardrailCandidate] = []
@@ -1259,6 +1344,16 @@ async def ingest_traces(
     for index, trace in parsed.valid:
         agent = _bind(agents, trace.agent or parsed.envelope.agent, results, index)
         if agent is None:
+            continue
+        blocked_connectors = connector_blocks.get(agent.id)
+        if blocked_connectors:
+            _block_for_connector(
+                results,
+                index,
+                agent_id=agent.id,
+                connector_names=blocked_connectors,
+                spans=len(trace.spans),
+            )
             continue
         try:
             trace_id = _telemetry_id(trace.id, field="trace id")
@@ -1302,7 +1397,7 @@ async def ingest_traces(
                 entity_id=trace_id,
                 trace_id=trace_id,
                 spans=len(trace.spans),
-                tokens=sum(usage.values()),
+                tokens=_billable_tokens(usage),
                 masked=masked,
             )
         )
@@ -1468,6 +1563,7 @@ async def ingest_spans(
         request=request,
     )
     policies = await _load_policies(session, principal, [agent.id for agent in agents.touched])
+    connector_blocks = await _connector_blocks(session, principal, agents)
 
     accepted: list[_Accepted] = []
     candidates: list[GuardrailCandidate] = []
@@ -1476,6 +1572,12 @@ async def ingest_spans(
     for index, span in parsed.valid:
         agent = _bind(agents, span.agent or parsed.envelope.agent, results, index)
         if agent is None:
+            continue
+        blocked_connectors = connector_blocks.get(agent.id)
+        if blocked_connectors:
+            _block_for_connector(
+                results, index, agent_id=agent.id, connector_names=blocked_connectors
+            )
             continue
         if not span.trace_id:
             _reject(
@@ -1527,7 +1629,7 @@ async def ingest_spans(
                 entity_id=span_id,
                 trace_id=trace_id,
                 spans=1,
-                tokens=sum((span.usage or {}).values()),
+                tokens=_billable_tokens(span.usage),
                 masked=masked,
             )
         )
@@ -2052,6 +2154,10 @@ async def sdk_config(session: AsyncSession, principal: Principal) -> IngestConfi
         .scalars()
         .all()
     )
+    # An unbound key may report as any agent in the workspace, so every
+    # guardrail could end up applying to what it sends; it receives them all so
+    # client-side masking works whichever agent a batch names. A bound key gets
+    # only its own agent's scope.
     applicable = [
         row
         for row in guardrail_rows
@@ -2378,8 +2484,8 @@ async def _record_evidence(
 
     guardrail_rows = 0
     for verdict in verdicts:
-        if verdict.action == GuardrailAction.LOG.value:
-            continue
+        # Log verdicts are recorded too: a Tuning guardrail's whole point is
+        # that its shadow trials show up on the Guardrails screen.
         if len(rows) >= MAX_EVIDENCE_ROWS:
             truncated = True
             break
@@ -2399,10 +2505,27 @@ async def _record_evidence(
         )
         guardrail_rows += 1
 
-    if not rows:
+    # Connector blocks carry no policy hit, so they are counted off the results
+    # directly; without this the audit trail would show nothing for a batch the
+    # platform refused wholesale.
+    connector_blocked = sum(
+        1 for row in results if row.code is RejectionCode.CONNECTOR_BLOCKED
+    )
+    blocked_count += connector_blocked
+
+    if not rows and not connector_blocked:
         return 0
 
     session.add_all(rows)
+    # The Policy Center's "last triggered" reads this column; a pipeline hit
+    # counts as a trigger just as much as an SDK-reported one does.
+    policy_ids = {row.policy_id for row in rows if isinstance(row, PolicyViolation)}
+    if policy_ids:
+        await session.execute(
+            sa_update(Policy)
+            .where(Policy.workspace_id == principal.workspace_id, Policy.id.in_(policy_ids))
+            .values(last_triggered_at=now)
+        )
     await session.flush()
     violations = sum(1 for row in rows if isinstance(row, PolicyViolation))
 
@@ -2423,6 +2546,7 @@ async def _record_evidence(
                 "source": source,
                 "received": parsed.received,
                 "blocked": blocked_count,
+                "connector_blocked": connector_blocked,
                 "violations": violations,
                 "guardrail_events": guardrail_rows,
                 "evidence_truncated": truncated,

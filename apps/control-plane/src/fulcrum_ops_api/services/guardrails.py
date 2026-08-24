@@ -3,9 +3,10 @@
 Guardrail definitions live here; enforcement runs in the telemetry engine's
 inline content checker. Everything the console can do to a guardrail — create,
 tune, enable, disable, test — goes through this module, and so does the runtime
-path: :func:`evaluate_content` is what the ingest endpoint calls on every piece
-of incoming or outgoing content, and it is the only writer of
-``GuardrailEvent``.
+path: :func:`evaluate_ingest_batch` is the hook the ingest pipeline calls on
+every trace/span batch (ingest applies the verdicts and writes the evidence
+rows), while :func:`evaluate_content` serves single-content callers and writes
+its own ``GuardrailEvent`` rows.
 
 The numbers the screen shows are counted, not remembered. Triggers, blocks and
 masks come from ``GROUP BY`` over the event table for the requested window, so
@@ -25,7 +26,7 @@ import datetime as dt
 import logging
 import time
 from collections.abc import Sequence
-from typing import Any, Final
+from typing import TYPE_CHECKING, Any, Final
 
 from fastapi import Request
 from sqlalchemy import Select, case, func, or_, select
@@ -64,6 +65,9 @@ from ..schemas.guardrails import (
 )
 from . import audit
 from .evaluations import owner_names, translate_engine_error
+
+if TYPE_CHECKING:
+    from ..schemas.ingest import GuardrailCandidate, GuardrailVerdict
 
 log = logging.getLogger(__name__)
 
@@ -1483,3 +1487,88 @@ async def evaluate_content(
             else f"{len(guardrails)} guardrail(s) cleared the content"
         ),
     )
+
+
+async def evaluate_ingest_batch(
+    session: AsyncSession,
+    principal: Principal,
+    candidates: Sequence[GuardrailCandidate],
+) -> list[GuardrailVerdict]:
+    """Judge a batch of ingested items against the guardrails in scope.
+
+    This is the hook :mod:`services.ingest` duck-types on every trace/span
+    batch. The split of responsibilities is ingest's: ingest extracts the
+    content, applies the verdicts (block, mask) and writes the evidence rows;
+    this side owns the checking and the per-guardrail counters. Tuning
+    guardrails run in shadow — their verdict is reported as ``Log`` so the
+    trial is visible in the evidence without being enforced.
+
+    An engine failure propagates: ingest treats any exception from this hook
+    as "not evaluated" and lets the telemetry through, which is the documented
+    degrade-open posture for a broken checker.
+    """
+    from ..schemas.ingest import MAX_SAMPLE_LENGTH, GuardrailVerdict
+
+    verdicts: list[GuardrailVerdict] = []
+    now = _now()
+    # One guardrail load per (agent, environment) pair: batches are almost
+    # always single-agent, so this is one query, not one per item.
+    scoped: dict[tuple[str | None, str | None], Sequence[GuardrailConfig]] = {}
+
+    for candidate in candidates:
+        text = candidate.text.strip()
+        if not text:
+            continue
+        key = (candidate.agent_id, candidate.environment)
+        if key not in scoped:
+            scoped[key] = await _runtime_guardrails(
+                session, principal.workspace_id, candidate.agent_id, candidate.environment
+            )
+        guardrails = scoped[key]
+        if not guardrails:
+            continue
+
+        paired, latency_ms = await _run_checker(text, guardrails)
+        per_guardrail_latency = max(1, latency_ms // max(1, len(guardrails)))
+
+        for guardrail in guardrails:
+            triggered, score, matches = _hit_from(guardrail, paired.get(guardrail.id))
+            guardrail.added_latency_ms = int(
+                round(
+                    guardrail.added_latency_ms * (1 - LATENCY_SMOOTHING)
+                    + per_guardrail_latency * LATENCY_SMOOTHING
+                )
+            )
+            if not triggered:
+                continue
+
+            enforced = guardrail.status == GuardrailStatus.ACTIVE.value
+            action_taken = GuardrailAction(guardrail.action) if enforced else GuardrailAction.LOG
+            guardrail.triggers_30d += 1
+            if action_taken is GuardrailAction.BLOCK:
+                guardrail.blocked_30d += 1
+            elif action_taken is GuardrailAction.MASK:
+                guardrail.masked_30d += len(matches) or 1
+            guardrail.last_triggered_at = now
+
+            verdicts.append(
+                GuardrailVerdict(
+                    index=candidate.index,
+                    guardrail_id=guardrail.id,
+                    guardrail_name=guardrail.name,
+                    action=action_taken.value,
+                    score=score,
+                    matched={
+                        "count": len(matches),
+                        "labels": sorted({span.label for span in matches}),
+                        "spans": [
+                            span.model_dump(exclude={"text"}, mode="json") for span in matches
+                        ],
+                        "enforced": enforced,
+                    },
+                    sample=text[:MAX_SAMPLE_LENGTH],
+                )
+            )
+
+    await session.flush()
+    return verdicts
