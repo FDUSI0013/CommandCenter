@@ -104,3 +104,36 @@ async def test_testing_an_unsupported_guardrail_refuses_rather_than_simulating(
     assert tested.status_code == 412, tested.text
     assert error_code(tested) == "precondition_failed"
     assert "does not implement" in tested.text
+
+
+async def test_an_unknown_score_source_is_folded_not_fatal(
+    ingest_client, factory, workspace, engine
+):
+    """One invalid source enum must not cost the whole score batch."""
+    agent = await factory.provisioned_agent(workspace, engine, name="Support Bot")
+
+    posted = await ingest_client.post(
+        "/api/v1/ingest/traces",
+        json={
+            "agent": "Support Bot",
+            "traces": [
+                {
+                    "name": "experiment case",
+                    "start_time": "2026-08-24T12:00:00Z",
+                    "end_time": "2026-08-24T12:00:02Z",
+                    "feedback_scores": [
+                        {"name": "answer_correctness", "value": 0.9, "source": "experiment"}
+                    ],
+                }
+            ],
+        },
+    )
+
+    assert posted.status_code == 200, posted.text
+    body = posted.json()
+    assert body["accepted"] == 1
+    assert body["scores_accepted"] == 1, "the score must land, source folded to sdk"
+    stored = next(iter(engine.traces.values()))
+    scores = stored.get("feedback_scores") or []
+    assert scores and scores[0]["source"] == "sdk"
+    assert agent.engine_project_name

@@ -1393,6 +1393,14 @@ class EngineDouble:
     @staticmethod
     def _merge_score(row: JsonObject, score: Mapping[str, Any]) -> None:
         """Scores are keyed by name: a second write of the same name replaces it."""
+        source = str(score.get("source") or "sdk").lower()
+        if source not in ("ui", "sdk", "online_scoring"):
+            # The engine's ScoreSource enum; an unknown value 400s the whole
+            # batch (seen in production with "experiment" on 2026-08-24).
+            raise EngineFailure(
+                400,
+                {"message": f"{source} was not one of [UI, SDK, ONLINE_SCORING]"},
+            )
         scores = [
             existing
             for existing in (row.get("feedback_scores") or [])

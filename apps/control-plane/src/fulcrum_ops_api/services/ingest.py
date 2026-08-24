@@ -1257,6 +1257,12 @@ def _engine_span(
     return {key: value for key, value in payload.items() if value is not None}
 
 
+#: The only provenances the engine's score enum accepts. Anything else —
+#: "experiment", "judge", whatever an SDK invents — 400s the WHOLE score batch,
+#: so unknown values are folded to "sdk" rather than costing their neighbours.
+_ENGINE_SCORE_SOURCES: Final[frozenset[str]] = frozenset({"ui", "sdk", "online_scoring"})
+
+
 def _engine_score(
     name: str,
     value: float,
@@ -1268,6 +1274,8 @@ def _engine_score(
     reason: str | None = None,
     source: str = "sdk",
 ) -> dict[str, Any]:
+    if source.lower() not in _ENGINE_SCORE_SOURCES:
+        source = "sdk"
     payload: dict[str, Any] = {
         "project_name": _project(agent),
         "name": name,
@@ -1503,9 +1511,12 @@ async def ingest_traces(
                 spans_sent = len(spans_payload)
             else:
                 logger.warning("spans refused after their traces were stored: %s", span_refusal)
-            await _push(client.score_traces_batch, trace_scores)
-            await _push(client.score_spans_batch, span_scores)
-            scores_sent = len(trace_scores) + len(span_scores)
+            trace_score_refusal = await _push(client.score_traces_batch, trace_scores)
+            span_score_refusal = await _push(client.score_spans_batch, span_scores)
+            # scores_accepted must report what the store took, not what we sent.
+            scores_sent = (len(trace_scores) if trace_score_refusal is None else 0) + (
+                len(span_scores) if span_score_refusal is None else 0
+            )
             quotas = _commit_quotas(charges)
 
     violations = await _record_evidence(
@@ -1699,9 +1710,9 @@ async def ingest_spans(
                 _reject(results, entry.index, RejectionCode.TELEMETRY_REJECTED, refusal)
             accepted = []
         else:
-            await _push(client.score_spans_batch, score_payload)
+            score_refusal = await _push(client.score_spans_batch, score_payload)
             spans_sent = len(payload)
-            scores_sent = len(score_payload)
+            scores_sent = len(score_payload) if score_refusal is None else 0
             quotas = _commit_quotas(charges)
 
     violations = await _record_evidence(

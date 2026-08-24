@@ -315,7 +315,9 @@ class Experiments:
                             row.scores[score_name] = value
                             if reason:
                                 row.reasons[score_name] = reason
-                            trace.score(score_name, value, reason=reason, source="experiment")
+                            # "sdk" and not "experiment": the telemetry store's
+                            # source enum refuses anything else, batch-wide.
+                            trace.score(score_name, value, reason=reason, source="sdk")
 
             result.rows.append(row)
 
