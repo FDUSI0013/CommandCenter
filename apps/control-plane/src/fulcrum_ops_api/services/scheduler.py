@@ -270,6 +270,84 @@ async def _sweep_secret_statuses(counts: dict[str, int]) -> None:
     counts["secrets_restatused"] = changed
 
 
+#: Grace beyond a run's own deadline before the clock declares it abandoned.
+#: A run genuinely in progress cannot outlive its deadline — the in-process
+#: runner enforces it and writes a terminal state — so anything still
+#: non-terminal past deadline+grace was orphaned by a restart (the runner lives
+#: only in memory) or is wedged. Either way it must not block the suite forever.
+STALE_RUN_GRACE_SECONDS = 120
+
+
+async def _sweep_stale_runs(counts: dict[str, int]) -> None:
+    """Fail-close test runs and evaluations a restart orphaned mid-flight.
+
+    Without this, a deploy while a run is in flight leaves its row Queued or
+    Running forever: the in-process runner is gone, and the one-live-run-per-
+    suite guard then 409s every future run. Reaping by the run's own deadline
+    is race-free — it never touches a run that is still within its lifetime.
+    """
+    from ..services.evaluations import EXECUTION_DEADLINE_SECONDS as EVAL_DEADLINE
+    from ..services.testing import EXECUTION_DEADLINE_SECONDS as SUITE_DEADLINE
+
+    now = _now()
+    reaped = 0
+    async with get_sessionmaker()() as session:
+        from ..models.quality import (
+            EvaluationRun,
+            EvaluationStatus,
+            TestRun,
+            TestRunStatus,
+        )
+
+        suite_cutoff = now - dt.timedelta(seconds=SUITE_DEADLINE + STALE_RUN_GRACE_SECONDS)
+        stale_runs = (
+            (
+                await session.execute(
+                    select(TestRun).where(
+                        TestRun.status.in_(
+                            (TestRunStatus.QUEUED.value, TestRunStatus.RUNNING.value)
+                        ),
+                        func.coalesce(TestRun.started_at, TestRun.created_at) < suite_cutoff,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for run in stale_runs:
+            run.status = TestRunStatus.ERROR.value
+            run.finished_at = now
+            summary = dict(run.summary or {})
+            summary["error"] = "Interrupted before it finished (restart or timeout)."
+            run.summary = summary
+            reaped += 1
+
+        eval_cutoff = now - dt.timedelta(seconds=EVAL_DEADLINE + STALE_RUN_GRACE_SECONDS)
+        stale_evals = (
+            (
+                await session.execute(
+                    select(EvaluationRun).where(
+                        EvaluationRun.status.in_(
+                            (EvaluationStatus.QUEUED.value, EvaluationStatus.RUNNING.value)
+                        ),
+                        func.coalesce(EvaluationRun.started_at, EvaluationRun.created_at)
+                        < eval_cutoff,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for run in stale_evals:
+            run.status = EvaluationStatus.FAILED.value
+            run.finished_at = now
+            run.notes = "Interrupted before it finished (restart or timeout)."
+            reaped += 1
+
+        await session.commit()
+    counts["stale_runs_reaped"] = reaped
+
+
 async def run_once() -> dict[str, int]:
     """One tick of the platform clock. Returns what each sweep did."""
     counts: dict[str, int] = {}
@@ -282,6 +360,7 @@ async def run_once() -> dict[str, int]:
             _sweep_approvals,
             _sweep_alert_mutes,
             _sweep_secret_statuses,
+            _sweep_stale_runs,
         ):
             try:
                 await sweep(counts)

@@ -161,3 +161,34 @@ async def test_a_scheduled_suite_starts_a_run_with_the_schedule_trigger(
 
     again = await scheduler.run_once()
     assert again["test_suites_started"] == 0, "one tick per cadence, not one per sweep"
+
+
+async def test_a_run_orphaned_by_a_restart_is_reaped(db, factory, workspace):
+    """A run left non-terminal past its deadline is failed closed, not stuck."""
+    from fulcrum_ops_api.models.quality import TestRun, TestRunStatus
+
+    suite = await factory.test_suite(workspace, name="Orphan suite")
+    orphan = await factory.add(TestRun(
+        workspace_id=workspace.id, suite_id=suite.id, run_ref="tr-orphan",
+        status=TestRunStatus.RUNNING.value, total_cases=4, trigger="Manual",
+        summary={}, baseline_comparison={},
+    ))
+    # Age it well past the suite deadline so it is unambiguously abandoned.
+    await db.execute(
+        update(TestRun).where(TestRun.id == orphan.id).values(
+            started_at=_now() - dt.timedelta(seconds=3000),
+            created_at=_now() - dt.timedelta(seconds=3000),
+        )
+    )
+    # A fresh run, still within its lifetime, must be left alone.
+    fresh = await factory.add(TestRun(
+        workspace_id=workspace.id, suite_id=suite.id, run_ref="tr-fresh",
+        status=TestRunStatus.RUNNING.value, total_cases=4, trigger="Manual",
+        summary={}, baseline_comparison={},
+    ))
+
+    counts = await scheduler.run_once()
+    assert counts["stale_runs_reaped"] == 1
+
+    assert (await db.get(TestRun, orphan.id)).status == TestRunStatus.ERROR.value
+    assert (await db.get(TestRun, fresh.id)).status == TestRunStatus.RUNNING.value
