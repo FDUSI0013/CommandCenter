@@ -242,6 +242,19 @@ async def test_a_tampered_session_signature_is_refused(client, admin, workspace)
     assert response.status_code == 401
 
 
+async def test_a_forged_token_with_garbage_segments_is_refused_not_crashed(client):
+    """A forged token need not be valid base64 or JSON; it is a 401, never 500."""
+    for bad in (
+        "eyJhbGciOiJIUzI1NiJ9.tampered.signature",  # non-base64 middle/last
+        "not.a.token",
+        "@@@.@@@.@@@",
+        "only-two.parts",
+    ):
+        client.headers["Authorization"] = f"Bearer {bad}"
+        response = await client.get("/api/v1/auth/session")
+        assert response.status_code == 401, f"{bad!r} -> {response.status_code}"
+
+
 async def test_logout_clears_the_cookie_and_is_audited(client, db, signed_up, workspace):
     await client.post(
         "/api/v1/auth/login", json={"email": signed_up.email, "password": PASSWORD}

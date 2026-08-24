@@ -8,6 +8,7 @@ authority for both browser sessions and SDK API keys.
 from __future__ import annotations
 
 import base64
+import binascii
 import datetime as dt
 import hashlib
 import hmac
@@ -153,14 +154,26 @@ def decode_session_token(token: str) -> dict:
     except ValueError as exc:
         raise SessionTokenError("malformed token") from exc
 
+    # A forged token need not carry valid base64 or JSON; a decode failure here
+    # is a bad token, not a server error, so it must surface as one.
+    try:
+        signature = _b64u_decode(sig_b64)
+    except (binascii.Error, ValueError) as exc:
+        raise SessionTokenError("malformed signature") from exc
+
     signing_input = f"{header_b64}.{payload_b64}"
     expected = hmac.new(
         settings.secret_key.encode(), signing_input.encode(), hashlib.sha256
     ).digest()
-    if not hmac.compare_digest(expected, _b64u_decode(sig_b64)):
+    if not hmac.compare_digest(expected, signature):
         raise SessionTokenError("bad signature")
 
-    payload = json.loads(_b64u_decode(payload_b64))
+    try:
+        payload = json.loads(_b64u_decode(payload_b64))
+    except (binascii.Error, ValueError) as exc:
+        raise SessionTokenError("malformed payload") from exc
+    if not isinstance(payload, dict):
+        raise SessionTokenError("malformed payload")
     if payload.get("exp", 0) < dt.datetime.now(dt.UTC).timestamp():
         raise SessionTokenError("expired")
     return payload

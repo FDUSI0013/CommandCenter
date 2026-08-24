@@ -349,11 +349,18 @@ fulcrum_ops.flush()</code></pre>
 <p>The package is <code>fulcrum-ops</code> (import name <code>fulcrum_ops</code>). It needs Python
 3.9 or newer and has exactly one runtime dependency, <code>httpx</code>.</p>
 
-<pre><code>pip install fulcrum_ops-1.0.0-py3-none-any.whl   # local wheel
-pip install "fulcrum-ops[openai]"                # with a provider extra</code></pre>
+<p>It is published to the workspace's private package index (AWS CodeArtifact
+domain <code>fulcrum-ops</code>, repository <code>fulcrum-python</code>). Point pip at it
+once per shell, then install by name:</p>
+
+<pre><code>aws codeartifact login --tool pip --domain fulcrum-ops --repository fulcrum-python
+pip install fulcrum-ops                           # from the private index
+pip install "fulcrum-ops[openai]"                 # with a provider extra</code></pre>
 
 <p>Extras: <code>openai</code>, <code>anthropic</code>, <code>langchain</code>, <code>dev</code>.
-None of the provider packages is a hard dependency — the wrappers import lazily.</p>
+None of the provider packages is a hard dependency — the wrappers import lazily.
+The built wheel is also kept under <code>sdks/python/dist/</code> for an air-gapped
+<code>pip install ./fulcrum_ops-1.0.0-py3-none-any.whl</code>.</p>
 
 <h3>Two ways to configure</h3>
 
