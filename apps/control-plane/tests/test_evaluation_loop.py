@@ -1,0 +1,110 @@
+"""The judged loop, end to end through the product surface.
+
+An SDK experiment runs the agent over a dataset and scores each case onto a
+real trace; the platform's evaluation then links those traces into its own
+experiment, and the judged averages land on the Evaluations screen. These
+tests drive exactly that sequence — dataset in, traces with scores in,
+evaluation out — and pin the linking that makes it close.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import datetime as dt
+import uuid
+
+
+def iso(offset: float = 0.0) -> str:
+    base = dt.datetime.now(dt.UTC) - dt.timedelta(minutes=3)
+    return (base + dt.timedelta(seconds=offset)).isoformat().replace("+00:00", "Z")
+
+
+async def test_an_evaluation_judges_from_the_sdk_experiments_traces(
+    admin_client, ingest_client, factory, workspace, engine
+):
+    await factory.provisioned_agent(workspace, engine, name="Support Bot")
+
+    created = await admin_client.post(
+        "/api/v1/evaluations/datasets",
+        json={"name": "golden-qa", "description": "Three canonical questions."},
+    )
+    assert created.status_code == 201, created.text
+    added = await admin_client.post(
+        "/api/v1/evaluations/datasets/golden-qa/items",
+        json={
+            "items": [
+                {"input": "Where is my order?", "expected_output": "Cite the tracking link."},
+                {"input": "Cancel my plan.", "expected_output": "Offer retention, then cancel."},
+            ]
+        },
+    )
+    assert added.status_code == 201, added.text
+
+    listed = await admin_client.get("/api/v1/evaluations/datasets/golden-qa/items")
+    item_ids = [row["id"] for row in listed.json()["items"]]
+    assert len(item_ids) == 2
+
+    # What client.experiments.evaluate() would leave behind: one trace per
+    # case, stamped with the dataset item id, carrying the scorer's verdicts.
+    for index, item_id in enumerate(item_ids):
+        posted = await ingest_client.post(
+            "/api/v1/ingest/traces",
+            json={
+                "agent": "Support Bot",
+                "traces": [
+                    {
+                        "id": str(uuid.uuid4()),
+                        "name": "experiment:golden-qa",
+                        "start_time": iso(index),
+                        "end_time": iso(index + 1.0),
+                        "metadata": {"dataset": "golden-qa", "dataset_item_id": item_id},
+                        "feedback_scores": [
+                            {"name": "answer_correctness", "value": 0.9 - index * 0.1},
+                            {"name": "groundedness", "value": 0.8},
+                        ],
+                    }
+                ],
+            },
+        )
+        assert posted.json()["accepted"] == 1, posted.text
+
+    started = await admin_client.post(
+        "/api/v1/evaluations", json={"dataset": "golden-qa", "judge_model": "gpt-5"}
+    )
+    assert started.status_code == 202, started.text
+    evaluation_id = started.json()["id"]
+
+    for _ in range(40):
+        progress = (
+            await admin_client.get(f"/api/v1/evaluations/{evaluation_id}/progress")
+        ).json()
+        if progress["is_terminal"]:
+            break
+        await asyncio.sleep(0.5)
+
+    detail = (await admin_client.get(f"/api/v1/evaluations/{evaluation_id}")).json()
+    assert detail["status"] == "Completed", detail.get("notes")
+    assert detail["avg_score"] is not None
+    assert detail["correctness"] is not None
+    assert detail["grounding"] is not None
+
+    trend = (await admin_client.get("/api/v1/evaluations/trend")).json()
+    assert any(point["evaluations"] for point in trend["points"]), (
+        "the judged run must appear on the trend"
+    )
+
+
+async def test_dataset_items_carry_their_provenance(admin_client, engine):
+    """The engine refuses source-less cases; the adapter must send one."""
+    created = await admin_client.post(
+        "/api/v1/evaluations/datasets", json={"name": "provenance-check"}
+    )
+    assert created.status_code == 201, created.text
+    added = await admin_client.post(
+        "/api/v1/evaluations/datasets/provenance-check/items",
+        json={"items": [{"input": "case one"}]},
+    )
+    assert added.status_code == 201, added.text
+
+    dataset = next(iter(engine.dataset_items.values()))
+    assert dataset[0].get("source") == "manual"

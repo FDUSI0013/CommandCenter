@@ -98,6 +98,7 @@ from .evaluations import (
     REGISTER_PHASE_WEIGHT,
     dataset_case_total,
     experiment_scored_count,
+    find_dataset_item_traces,
     item_experiment_result,
     namespaced,
     owner_names,
@@ -456,6 +457,7 @@ class SuiteRunner:
             dataset_ref = suite.dataset_ref
             suite_id = suite.id
             suite_name = suite.name
+            suite_agent_id = suite.agent_id
             run_ref = run.run_ref
             namespace = await workspace_namespace(session, workspace_id)
             run.status = TestRunStatus.RUNNING.value
@@ -499,12 +501,24 @@ class SuiteRunner:
         def _registered(done: int) -> None:
             state.processed = done
 
+        # Same linking the evaluation supervisor does: cases an SDK experiment
+        # already ran carry their traces (and scores) into this run's diff.
+        try:
+            async with get_sessionmaker()() as session:
+                trace_links = await find_dataset_item_traces(
+                    client, session, workspace_id, agent_id=suite_agent_id
+                )
+        except Exception:  # noqa: BLE001 - the lookup is an optimisation
+            log.exception("dataset-item trace lookup failed; registering bare")
+            trace_links = {}
+
         await register_experiment_items(
             client,
             experiment_id=experiment_id,
             experiment_name=experiment_name,
             dataset_name=engine_dataset,
             on_batch=_registered,
+            trace_links=trace_links,
         )
         state.processed = total
         state.phase = PHASE_SCORING

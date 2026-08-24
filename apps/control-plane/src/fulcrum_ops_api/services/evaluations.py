@@ -30,7 +30,7 @@ import contextlib
 import dataclasses
 import datetime as dt
 import logging
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any, Final
 
 from fastapi import Request
@@ -48,6 +48,7 @@ from ..core.errors import (
     TelemetryBackendUnavailable,
     ValidationFailed,
 )
+from ..db.base import new_id
 from ..db.session import get_sessionmaker
 from ..engine import (
     EngineBadRequest,
@@ -325,6 +326,61 @@ def item_experiment_result(
     return None
 
 
+#: How far back and how wide the search for SDK experiment traces reaches.
+#: Bounded the same way the knowledge sync bounds its scan: enough for a demo
+#: fleet, cheap enough to run inside the supervisor.
+TRACE_LINK_WINDOW_DAYS = 30
+TRACE_LINK_MAX_PROJECTS = 10
+TRACE_LINK_MAX_TRACES = 500
+
+
+async def find_dataset_item_traces(
+    client: EngineClient,
+    session: AsyncSession,
+    workspace_id: str,
+    *,
+    agent_id: str | None = None,
+) -> dict[str, str]:
+    """Traces an SDK experiment left behind, keyed by the dataset item they ran.
+
+    ``client.experiments.evaluate`` stamps every trace it makes with
+    ``metadata.dataset_item_id``; finding those traces and linking them into
+    the platform's own experiment is what turns SDK scorer verdicts into the
+    judged averages the Evaluations screen shows. Newest trace per case wins.
+    A failure to look is reported as an empty map, never as a failed run: the
+    run can still be judged engine-side.
+    """
+    stmt = select(Agent.engine_project_name).where(
+        Agent.workspace_id == workspace_id,
+        Agent.engine_project_name.is_not(None),
+    )
+    if agent_id:
+        stmt = stmt.where(Agent.id == agent_id)
+    projects = [row for row in (await session.execute(stmt)).scalars() if row]
+    projects = projects[:TRACE_LINK_MAX_PROJECTS]
+
+    since = _now() - dt.timedelta(days=TRACE_LINK_WINDOW_DAYS)
+    links: dict[str, str] = {}
+    for project in projects:
+        try:
+            rows = await client.search_traces(
+                project_name=project,
+                from_time=since,
+                limit=TRACE_LINK_MAX_TRACES,
+                truncate=True,
+            )
+        except EngineError:
+            continue
+        for row in rows:
+            metadata = row.get("metadata") or {}
+            item_id = metadata.get("dataset_item_id")
+            trace_id = row.get("id")
+            if isinstance(item_id, str) and isinstance(trace_id, str):
+                # Rows stream oldest-first; the last write per case wins.
+                links[item_id] = trace_id
+    return links
+
+
 async def register_experiment_items(
     client: EngineClient,
     *,
@@ -332,12 +388,17 @@ async def register_experiment_items(
     experiment_name: str,
     dataset_name: str,
     on_batch: Any = None,
+    trace_links: Mapping[str, str] | None = None,
 ) -> int:
     """Bind every case of a dataset to an experiment, a page at a time.
 
-    Returns the number of cases registered. ``on_batch`` is called with the
-    running total after each page so the caller can publish real progress.
+    A case with a known trace (``trace_links``) is linked to it, so the
+    experiment aggregates the scores that trace already carries; the rest are
+    registered bare and wait for the engine to judge them. Returns the number
+    of cases registered. ``on_batch`` is called with the running total after
+    each page so the caller can publish real progress.
     """
+    links = dict(trace_links or {})
     registered = 0
     last_id: str | None = None
     while True:
@@ -350,18 +411,35 @@ async def register_experiment_items(
         if not rows:
             break
 
-        items = [{"dataset_item_id": row["id"]} for row in rows if row.get("id")]
-        if items:
-            try:
+        ids = [row["id"] for row in rows if row.get("id")]
+        # Linking needs the experiment's id; without one everything registers
+        # bare, which is exactly the pre-linking behaviour.
+        linkable = set(links) if experiment_id else set()
+        linked = [
+            {
+                "id": new_id(),
+                "experiment_id": experiment_id,
+                "dataset_item_id": item_id,
+                "trace_id": links[item_id],
+            }
+            for item_id in ids
+            if item_id in linkable
+        ]
+        bare = [{"dataset_item_id": item_id} for item_id in ids if item_id not in linkable]
+        try:
+            if linked:
+                await client.create_experiment_items(linked)
+            if bare:
                 await client.create_experiment_items_bulk(
-                    items,
+                    bare,
                     experiment_name=experiment_name,
                     dataset_name=dataset_name,
                     experiment_id=experiment_id,
                 )
-            except EngineError as exc:
-                raise translate_engine_error(exc) from exc
-            registered += len(items)
+        except EngineError as exc:
+            raise translate_engine_error(exc) from exc
+        if ids:
+            registered += len(ids)
             if on_batch is not None:
                 on_batch(registered)
 
@@ -511,12 +589,25 @@ class EvaluationSupervisor:
         def _registered(done: int) -> None:
             state.processed = done
 
+        # An SDK experiment over the same dataset leaves scored traces behind;
+        # linking them is what the judged averages aggregate from. Failing to
+        # look degrades to bare registration, never to a failed run.
+        try:
+            async with get_sessionmaker()() as session:
+                trace_links = await find_dataset_item_traces(
+                    client, session, workspace_id, agent_id=agent_id
+                )
+        except Exception:  # noqa: BLE001 - the lookup is an optimisation
+            log.exception("dataset-item trace lookup failed; registering bare")
+            trace_links = {}
+
         registered = await register_experiment_items(
             client,
             experiment_id=experiment_id,
             experiment_name=experiment_name,
             dataset_name=engine_dataset,
             on_batch=_registered,
+            trace_links=trace_links,
         )
         state.processed = registered or total
         state.phase = PHASE_SCORING
@@ -1461,13 +1552,17 @@ async def add_dataset_items(
     client = get_engine_client()
     resolved = await resolve_dataset(client, engine_namespace(principal), dataset)
 
+    # The engine requires a provenance on every case; ours arrive through the
+    # API, by hand from the console or programmatically from the SDK.
+    source = "sdk" if principal.kind == "api_key" else "manual"
     items = [
         {
+            "source": source,
             "data": {
                 "input": item.input,
                 **({"expected_output": item.expected_output} if item.expected_output else {}),
                 **item.metadata,
-            }
+            },
         }
         for item in payload.items
     ]

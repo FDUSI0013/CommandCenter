@@ -1358,6 +1358,21 @@ class EngineClient:
             ),
         )
 
+    async def create_experiment_items(self, items: Sequence[Mapping[str, Any]]) -> None:
+        """Link existing traces to experiment items, one row per case.
+
+        Unlike the bulk endpoint, this one references traces that already live
+        in the store — which is how the platform's own evaluation runs pick up
+        the traces (and scores) an SDK experiment produced for the same
+        dataset. Every item id must be a version 7 UUID; the engine refuses
+        anything else.
+        """
+        await self._request(
+            "POST",
+            f"{API_ROOT}/experiments/items",
+            json_body={"experiment_items": list(items)},
+        )
+
     async def list_experiment_groups(
         self,
         *,

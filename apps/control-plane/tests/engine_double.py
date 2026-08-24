@@ -544,6 +544,7 @@ class EngineDouble:
             route("DELETE", rf"{root}/datasets/{uid}", self._delete_dataset),
             # -- experiments --
             route("PUT", rf"{root}/experiments/items/bulk", self._create_experiment_items),
+            route("POST", rf"{root}/experiments/items", self._link_experiment_items),
             route(
                 "GET",
                 rf"{root}/experiments/groups/aggregations",
@@ -1762,6 +1763,10 @@ class EngineDouble:
         for item in items:
             if not isinstance(item, Mapping):
                 raise EngineFailure(400, {"errors": ["each item must be an object"]})
+            if not item.get("source"):
+                # The engine requires a provenance on every case; production
+                # answered 422 for exactly this omission on 2026-08-24.
+                raise EngineFailure(422, {"errors": ["items[0].source must not be null"]})
             row = dict(item)
             row.setdefault("id", _new_id())
             row["batch_group_id"] = payload.get("batch_group_id")
@@ -1896,6 +1901,36 @@ class EngineDouble:
         if experiment is None:
             raise EngineFailure(404, {"errors": ["experiment not found"]})
         return self._experiment_row(experiment)
+
+    def _link_experiment_items(self, _match: re.Match, _query: dict, body: Any) -> None:
+        """The classic endpoint: link existing traces, one row per case.
+
+        Mirrors the engine's two sharp edges — every id must be a version 7
+        UUID, and the linked trace's feedback scores become the item's, which
+        is what the experiment aggregation reads.
+        """
+        payload = body or {}
+        rows = payload.get("experiment_items")
+        if not isinstance(rows, list) or not rows:
+            raise EngineFailure(400, {"errors": ["'experiment_items' must be an array"]})
+        for row in rows:
+            if not isinstance(row, Mapping):
+                raise EngineFailure(400, {"errors": ["each experiment item must be an object"]})
+            item_id = str(row.get("id") or "")
+            if len(item_id) != 36 or item_id[14] != "7":
+                raise EngineFailure(
+                    400, {"message": "Experiment Item id must be a version 7 UUID"}
+                )
+            experiment = self.experiments.get(str(row.get("experiment_id")))
+            if experiment is None:
+                raise EngineFailure(404, {"errors": ["experiment not found"]})
+            trace = self.traces.get(str(row.get("trace_id")))
+            stored = {**dict(row)}
+            if trace is not None:
+                stored["feedback_scores"] = list(trace.get("feedback_scores") or [])
+            self.experiment_items.setdefault(experiment["id"], []).append(stored)
+            experiment["last_updated_at"] = _iso()
+        return None
 
     def _create_experiment_items(self, _match: re.Match, _query: dict, body: Any) -> None:
         payload = body or {}
