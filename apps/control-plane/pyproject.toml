@@ -1,0 +1,73 @@
+[project]
+name = "fulcrum-ops-api"
+version = "1.0.0"
+description = "Fulcrum Ops control plane API"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "sqlalchemy[asyncio]>=2.0.36",
+    "alembic>=1.14",
+    "aiosqlite>=0.20",
+    "asyncpg>=0.30",
+    "httpx>=0.27",
+    "passlib[argon2,bcrypt]>=1.7.4",
+    "argon2-cffi>=23.1",
+    "cryptography>=43.0",
+    "python-multipart>=0.0.12",
+    "sse-starlette>=2.1",
+    "croniter>=3.0",
+    "typer>=0.15",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=6.0",
+    "ruff>=0.8",
+    "mypy>=1.13",
+    # Alembic stamps revisions in UTC; Windows has no system zoneinfo database.
+    "tzdata>=2024.2; sys_platform == 'win32'",
+]
+
+[project.scripts]
+fulcrum-ops-api = "fulcrum_ops_api.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fulcrum_ops_api"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "ASYNC", "S"]
+# S101: asserts in tests. B008: FastAPI Depends() in argument defaults.
+# UP042: our enums deliberately subclass (str, Enum) rather than StrEnum —
+#   str(Member) keeps its "Class.MEMBER" form, which several audit strings and
+#   log lines depend on, and Pydantic serialises both identically anyway.
+ignore = ["S101", "B008", "UP042"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S105", "S106"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+filterwarnings = ["error::DeprecationWarning"]
+
+[tool.mypy]
+python_version = "3.11"
+plugins = []
+ignore_missing_imports = true
+warn_unused_ignores = true

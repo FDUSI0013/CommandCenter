@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<!--
+  Fulcrum Ops — analytics store profile settings.
+
+  This is a users.d file, not a config.d one: the setting below belongs to a
+  settings profile rather than to the server.
+
+  ClickHouse 25.8 made the experimental Time/Time64 type opt-in. One of the
+  engine's earlier migrations creates a Time column (a later one drops it
+  again), so a fresh install cannot replay the migration chain without this
+  enabled. It is needed to reach the current schema even though the finished
+  schema does not use the type.
+-->
+<clickhouse>
+    <profiles>
+        <default>
+            <enable_time_time64_type>1</enable_time_time64_type>
+        </default>
+    </profiles>
+</clickhouse>

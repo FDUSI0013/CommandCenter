@@ -1,0 +1,55 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fulcrum-ops"
+version = "1.0.0"
+description = "Report agent traces, spans, feedback scores and governance events to the Fulcrum Ops control plane."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Proprietary" }
+authors = [{ name = "Fulcrum Digital" }]
+keywords = ["agents", "observability", "tracing", "llm", "governance", "fulcrum-ops"]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: System :: Monitoring",
+  "Typing :: Typed",
+]
+
+# One dependency, deliberately. The SDK runs inside the customer's agent
+# process; every package it drags in is a version conflict waiting to happen in
+# somebody else's requirements file.
+dependencies = ["httpx>=0.23,<1"]
+
+[project.urls]
+Homepage = "https://controlplane.fdprod.net"
+Documentation = "https://controlplane.fdprod.net/docs/sdk/python"
+
+[project.optional-dependencies]
+openai = ["openai>=1.0"]
+anthropic = ["anthropic>=0.25"]
+langchain = ["langchain-core>=0.1"]
+dev = ["pytest>=7.0", "pytest-asyncio>=0.21"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fulcrum_ops"]
+
+[tool.hatch.build.targets.sdist]
+include = ["/src", "/tests", "/README.md", "/pyproject.toml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+filterwarnings = ["error::DeprecationWarning:fulcrum_ops.*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"

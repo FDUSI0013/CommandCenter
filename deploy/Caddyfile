@@ -1,0 +1,99 @@
+# Fulcrum Ops — public edge.
+#
+# Terminates TLS, serves the console's static assets, and proxies everything
+# under /api to the control plane. The telemetry engine is not represented
+# here at all: it has no route in, by design.
+
+{
+	email ops@fulcrumops.com
+	servers {
+		trusted_proxies static private_ranges
+	}
+}
+
+(common) {
+	encode zstd gzip
+
+	header {
+		-Server
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy same-origin
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		Content-Security-Policy "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+	}
+
+	# API + docs + streaming
+	handle /api/* {
+		reverse_proxy 127.0.0.1:8080 {
+			header_up X-Real-IP {remote_host}
+			# SSE: never buffer, and let a stream stay open.
+			flush_interval -1
+			transport http {
+				read_timeout 24h
+			}
+		}
+	}
+
+	handle /health {
+		reverse_proxy 127.0.0.1:8080
+	}
+
+	# OpenTelemetry ingest for agents that already speak OTLP/HTTP.
+	handle /v1/traces {
+		reverse_proxy 127.0.0.1:8080 {
+			header_up X-Real-IP {remote_host}
+		}
+	}
+
+	# The console: static files, SPA fallback to index.html.
+	#
+	# The assets have fixed names — js/app.js, not js/app.<hash>.js — so a
+	# browser cannot tell a cached copy from the current one by URL. Without an
+	# explicit Cache-Control, it applies heuristic freshness and may keep serving
+	# a previous deployment's JavaScript against this deployment's HTML, which
+	# fails in ways that look like the app is simply broken. "no-cache" means
+	# revalidate before reuse, not "do not store": an unchanged file still costs
+	# one conditional request answered with 304.
+	handle {
+		root * /srv/fulcrum-ops
+		header Cache-Control "no-cache"
+
+		# A missing *asset* must 404. The SPA fallback below rewrites any
+		# unknown path to index.html, and for a route that is exactly right —
+		# but applied to js/gone.js it answers 200 with HTML, which the browser
+		# then tries to parse as JavaScript. A file that was deleted in a deploy
+		# would look present and fail confusingly instead of failing plainly.
+		@asset path_regexp \.(js|css|map|png|jpg|jpeg|svg|ico|webp|woff2?|ttf|json|txt)$
+		handle @asset {
+			file_server
+		}
+
+		# Everything else is the single page.
+		handle {
+			try_files {path} /index.html
+			file_server
+		}
+	}
+
+	log {
+		output file /var/log/caddy/fulcrum-ops.log {
+			roll_size 50MiB
+			roll_keep 10
+		}
+		format json
+	}
+}
+
+# Which names this host answers to, and therefore which certificates it asks
+# for. Set in /etc/default/caddy so the file itself does not change between
+# staging and production:
+#
+#   staging     FULCRUM_SITE_ADDRESSES="32-196-146-8.sslip.io"
+#   production  FULCRUM_SITE_ADDRESSES="controlplane.fdprod.net, 32-196-146-8.sslip.io"
+#
+# Naming the production domain before DNS points here would make certificate
+# issuance fail and retry in a loop, so it is added at cutover, not before.
+{$FULCRUM_SITE_ADDRESSES} {
+	import common
+}

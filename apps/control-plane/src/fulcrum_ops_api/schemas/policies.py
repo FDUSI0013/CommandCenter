@@ -1,0 +1,486 @@
+"""Wire contracts for the Policy Center.
+
+A policy is two things at once: a row a governance reviewer reads in a table,
+and a machine-readable rule the enforcement path evaluates before an agent
+acts. The schemas below keep both halves honest.
+
+* :class:`PolicyRules` is the small, closed schema every rule body is validated
+  against on create and update — a set of **conditions**, one **action**, and
+  the **severity** stamped on violations it raises. Anything else is rejected,
+  so a rule body that reaches the enforcement path is always interpretable.
+* Read models type their vocabulary fields as ``str`` rather than as enums. The
+  columns are plain strings by design (see ``models.governance``), and a row
+  written before a vocabulary was extended must still be readable: a list
+  endpoint that raises because one row holds an unrecognised label is worse
+  than one that renders the label as it was stored.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+from typing import TYPE_CHECKING, Any, Final, Literal
+
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    computed_field,
+    field_validator,
+    model_validator,
+)
+
+from ..models.governance import (
+    PolicyCategory,
+    PolicyEnforcement,
+    PolicyScope,
+    PolicyStatus,
+    RiskLevel,
+    ViolationSeverity,
+)
+
+if TYPE_CHECKING:  # pragma: no cover - typing only; the wire layer stays ORM-free
+    from ..models.governance import PolicyViolation
+
+
+# ---------------------------------------------------------------------------
+# The rule body
+# ---------------------------------------------------------------------------
+
+#: Comparison vocabulary a condition may use.
+RuleOperator = Literal[
+    "eq", "ne", "lt", "lte", "gt", "gte", "in", "not_in", "contains", "matches", "exists"
+]
+
+#: How multiple conditions combine.
+RuleMatch = Literal["all", "any"]
+
+#: What the enforcement path does when a signal cannot be resolved.
+RuleFailMode = Literal["closed", "open"]
+
+#: Operators that impose an ordering, and therefore constrain the value's type.
+ORDERED_OPERATORS: Final[tuple[str, ...]] = ("lt", "lte", "gt", "gte")
+
+VERSION_PATTERN: Final[str] = r"^v\d+\.\d+\.\d+$"
+
+MAX_IMPORT_ITEMS: Final[int] = 200
+
+
+class PolicyCondition(BaseModel):
+    """One clause evaluated against the request an agent is about to make.
+
+    ``signal`` names a value the enforcement path resolves at decision time
+    (``action_risk``, ``safety_score``, ``data_classification``, ``tokens_used``).
+    The control plane does not interpret signals itself; it guarantees only that
+    the clause is well formed and that a reviewer can read it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    signal: str = Field(
+        min_length=1,
+        max_length=80,
+        description="Value the enforcement path resolves at decision time.",
+    )
+    operator: RuleOperator = Field("eq", description="How the signal compares to the value.")
+    value: Any = Field(None, description="Right-hand side of the comparison.")
+
+    @field_validator("signal")
+    @classmethod
+    def _normalise_signal(cls, value: str) -> str:
+        signal = value.strip()
+        if not signal:
+            raise ValueError("A condition needs a signal name.")
+        return signal
+
+    @model_validator(mode="after")
+    def _value_fits_operator(self) -> PolicyCondition:
+        operator, value = self.operator, self.value
+
+        if operator == "exists":
+            if value is not None:
+                raise ValueError("The 'exists' operator takes no value.")
+            return self
+
+        if value is None:
+            raise ValueError(f"The '{operator}' operator requires a value.")
+
+        if operator in ("in", "not_in"):
+            if not isinstance(value, list) or not value:
+                raise ValueError(f"The '{operator}' operator requires a non-empty list.")
+            return self
+
+        if isinstance(value, (list, dict)):
+            raise ValueError(f"The '{operator}' operator takes a single scalar value.")
+
+        if operator in ("contains", "matches") and not isinstance(value, str):
+            raise ValueError(f"The '{operator}' operator requires a string value.")
+
+        # A number, or a member of an ordered vocabulary such as Low/Medium/High.
+        if operator in ORDERED_OPERATORS and (
+            isinstance(value, bool) or not isinstance(value, (int, float, str))
+        ):
+            raise ValueError(
+                f"The '{operator}' operator requires a number or an ordered label."
+            )
+
+        return self
+
+
+class PolicyAction(BaseModel):
+    """What happens when the conditions match."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: PolicyEnforcement = Field(description="Enforcement applied on a match.")
+    message: str | None = Field(
+        None, max_length=500, description="Explanation surfaced to the caller when it fires."
+    )
+    notify: list[str] = Field(
+        default_factory=list,
+        max_length=10,
+        description="Channels or addresses notified on a match.",
+    )
+    audit: bool = Field(True, description="Write an audit row for every match.")
+
+    @field_validator("notify")
+    @classmethod
+    def _clean_notify(cls, value: list[str]) -> list[str]:
+        targets = [item.strip() for item in value if item and item.strip()]
+        if any(len(target) > 160 for target in targets):
+            raise ValueError("Notification targets are limited to 160 characters.")
+        return targets
+
+
+class PolicyRules(BaseModel):
+    """The complete rule body stored in ``policies.rules``.
+
+    Deliberately small: conditions, one action, one severity. A control that
+    cannot be expressed this way belongs in the enforcement path's own
+    configuration, not in a row a reviewer is asked to sign off.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    match: RuleMatch = Field("all", description="Whether all or any condition must hold.")
+    conditions: list[PolicyCondition] = Field(
+        min_length=1, max_length=25, description="Clauses combined according to 'match'."
+    )
+    action: PolicyAction = Field(description="What the enforcement path does on a match.")
+    severity: ViolationSeverity = Field(
+        ViolationSeverity.MEDIUM,
+        description="Severity stamped on violations this rule raises.",
+    )
+    exceptions: list[str] = Field(
+        default_factory=list,
+        max_length=25,
+        description="Agent ids, principals or tags exempt from this rule.",
+    )
+    fail_mode: RuleFailMode = Field(
+        "closed", description="Behaviour when a signal cannot be resolved."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Policies
+# ---------------------------------------------------------------------------
+
+
+class PolicyCreate(BaseModel):
+    """Body of ``POST /policies``.
+
+    ``rules`` may be omitted. The create form collects category, risk and
+    enforcement before the rule editor is opened, so the service derives one
+    starter condition from those answers rather than storing an empty body that
+    would silently match nothing.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=2, max_length=160)
+    description: str | None = Field(None, max_length=2000)
+    category: PolicyCategory = PolicyCategory.GUARDRAILS
+    scope: PolicyScope = PolicyScope.GLOBAL
+    scope_ref: str | None = Field(
+        None,
+        max_length=64,
+        description="Target of a non-global scope: agent id, connector id or environment name.",
+    )
+    scope_label: str | None = Field(
+        None, max_length=80, description="Label the table renders; derived when omitted."
+    )
+    risk_level: RiskLevel = RiskLevel.MEDIUM
+    status: PolicyStatus = PolicyStatus.ACTIVE
+    enforcement: PolicyEnforcement = PolicyEnforcement.BLOCK
+    rules: PolicyRules | None = None
+    version: str = Field("v1.0.0", pattern=VERSION_PATTERN)
+    owner_user_id: str | None = Field(None, max_length=36)
+
+    @field_validator("name")
+    @classmethod
+    def _clean_name(cls, value: str) -> str:
+        name = " ".join(value.split())
+        if len(name) < 2:
+            raise ValueError("A policy name needs at least two characters.")
+        return name
+
+    @field_validator("description")
+    @classmethod
+    def _clean_description(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return value.strip() or None
+
+    @model_validator(mode="after")
+    def _scope_ref_present(self) -> PolicyCreate:
+        if self.scope is PolicyScope.GLOBAL:
+            self.scope_ref = None
+        elif not (self.scope_ref or "").strip():
+            raise ValueError(f"A {self.scope.value} scope needs a scope_ref naming its target.")
+        return self
+
+
+class PolicyUpdate(BaseModel):
+    """Body of ``PATCH /policies/{id}``; every field is optional.
+
+    ``expected_updated_at`` is the optimistic-concurrency token: send the
+    ``updated_at`` the client last read and the write is rejected with 409 if
+    somebody else changed the policy in the meantime.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = Field(None, min_length=2, max_length=160)
+    description: str | None = Field(None, max_length=2000)
+    category: PolicyCategory | None = None
+    scope: PolicyScope | None = None
+    scope_ref: str | None = Field(None, max_length=64)
+    scope_label: str | None = Field(None, max_length=80)
+    risk_level: RiskLevel | None = None
+    status: PolicyStatus | None = None
+    enforcement: PolicyEnforcement | None = None
+    rules: PolicyRules | None = None
+    owner_user_id: str | None = Field(None, max_length=36)
+    expected_updated_at: dt.datetime | None = Field(
+        None, description="Optimistic lock: the updated_at the client last read."
+    )
+
+    @field_validator("name")
+    @classmethod
+    def _clean_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        name = " ".join(value.split())
+        if len(name) < 2:
+            raise ValueError("A policy name needs at least two characters.")
+        return name
+
+    @field_validator("description")
+    @classmethod
+    def _clean_description(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return value.strip() or None
+
+
+class PolicyRead(BaseModel):
+    """A policy as the Policy Center table and inspector render it."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    name: str
+    description: str | None = None
+    category: str
+    scope: str
+    scope_ref: str | None = None
+    scope_label: str | None = None
+    risk_level: str
+    status: str
+    enforcement: str
+    rules: dict[str, Any] = Field(default_factory=dict)
+    version: str
+    owner_user_id: str | None = None
+
+    last_evaluated_at: dt.datetime | None = None
+    last_triggered_at: dt.datetime | None = None
+
+    # Rollups owned by the governance aggregation job. They are shown as stored
+    # and never recomputed per request, which is why the KPI endpoint queries
+    # the violation table directly instead of summing these columns.
+    violations_30d: int = 0
+    blocked_30d: int = 0
+    requests_30d: int = 0
+    approved_pct: int = 0
+    applies_agents: int = 0
+    applies_tools: int = 0
+    applies_connectors: int = 0
+    applies_envs: int = 0
+
+    created_at: dt.datetime
+    updated_at: dt.datetime
+    created_by: str | None = None
+    updated_by: str | None = None
+
+
+class PolicyViolationRead(BaseModel):
+    """One breach, carrying the policy and agent names the console renders."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    policy_id: str
+    policy_name: str | None = None
+    agent_id: str | None = None
+    agent_name: str | None = None
+    trace_id: str | None = None
+    severity: str
+    action_taken: str
+    detail: dict[str, Any] = Field(default_factory=dict)
+    occurred_at: dt.datetime
+    resolved_at: dt.datetime | None = None
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def resolved(self) -> bool:
+        """A violation is closed once the reviewer has recorded an outcome."""
+        return self.resolved_at is not None
+
+    @classmethod
+    def from_row(
+        cls,
+        violation: PolicyViolation,
+        *,
+        policy_name: str | None = None,
+        agent_name: str | None = None,
+    ) -> PolicyViolationRead:
+        """Build from the ORM row plus the labels resolved alongside the page."""
+        return cls.model_validate(violation).model_copy(
+            update={"policy_name": policy_name, "agent_name": agent_name}
+        )
+
+
+# ---------------------------------------------------------------------------
+# Action bodies
+# ---------------------------------------------------------------------------
+
+
+class PolicyDeactivateRequest(BaseModel):
+    """Body of ``POST /policies/{id}/deactivate``.
+
+    The reason is optional because the console's confirm dialog does not always
+    collect one; when it is supplied it is written verbatim into the audit trail.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str | None = Field(None, max_length=500)
+
+    @field_validator("reason")
+    @classmethod
+    def _clean_reason(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return value.strip() or None
+
+
+class PolicyCloneRequest(BaseModel):
+    """Body of ``POST /policies/{id}/clone``. An empty body is valid."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = Field(
+        None,
+        min_length=2,
+        max_length=160,
+        description="Override for the copy's name; defaults to '<name> (Copy)'.",
+    )
+
+    @field_validator("name")
+    @classmethod
+    def _clean_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        name = " ".join(value.split())
+        if len(name) < 2:
+            raise ValueError("A policy name needs at least two characters.")
+        return name
+
+
+class PolicyActionResponse(BaseModel):
+    """Result of activate, deactivate or clone: the policy plus its blast radius."""
+
+    policy: PolicyRead
+    message: str
+    agents_affected: int = Field(
+        0, description="Agents that gain or lose enforcement because of this change."
+    )
+    bound_agents: int = Field(
+        0, description="Agents explicitly bound to the policy, as opposed to matched by scope."
+    )
+
+
+#: What to do when an imported definition collides with an existing name.
+ImportConflictMode = Literal["skip", "replace", "fail"]
+
+
+class PolicyImportRequest(BaseModel):
+    """Body of ``POST /policies/import`` — the parsed contents of a policy file."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    policies: list[PolicyCreate] = Field(min_length=1, max_length=MAX_IMPORT_ITEMS)
+    on_conflict: ImportConflictMode = Field(
+        "skip", description="What to do when a policy of the same name already exists."
+    )
+    activate: bool = Field(
+        False, description="Force every imported policy Active, ignoring its own status."
+    )
+    source: str | None = Field(
+        None, max_length=255, description="Filename or system the definitions came from."
+    )
+
+
+class PolicyImportIssue(BaseModel):
+    """One definition that could not be imported, reported without failing the batch."""
+
+    index: int = Field(description="Zero-based position in the submitted list.")
+    name: str
+    reason: str
+
+
+class PolicyImportResult(BaseModel):
+    """Outcome of an import run."""
+
+    submitted: int
+    created: int
+    replaced: int
+    skipped: int
+    policy_ids: list[str] = Field(default_factory=list)
+    issues: list[PolicyImportIssue] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# KPI cards
+# ---------------------------------------------------------------------------
+
+
+class PolicySummary(BaseModel):
+    """The KPI cards above the Policy Center table.
+
+    Every number is a SQL aggregate: the status counts come from ``policies``,
+    the windowed numbers from ``policy_violations``.
+    """
+
+    total: int
+    active: int
+    warning: int
+    inactive: int
+    pending_review: int
+    active_pct: int = Field(description="Active policies as a whole percentage of total.")
+
+    blocked_actions_30d: int = Field(description="Violations in the window enforced as Block.")
+    policies_violated_30d: int = Field(
+        description="Distinct policies with at least one breach in the window."
+    )
+    violations_30d: int = Field(description="Violation events in the window.")
+    window_days: int

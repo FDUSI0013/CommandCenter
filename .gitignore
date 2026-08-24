@@ -1,0 +1,26 @@
+# Vendored upstream engine source: fetched at build time, never committed.
+engine/vendor/
+THIRD_PARTY_LICENCE.txt
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# Local state and artefacts
+.artifacts/
+apps/control-plane/var/
+*.db
+*.db-wal
+*.db-shm
+.env
+.env.local
+
+# Node
+node_modules/

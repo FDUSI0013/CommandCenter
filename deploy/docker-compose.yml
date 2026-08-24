@@ -1,0 +1,303 @@
+# Fulcrum Ops — single-host production stack.
+#
+# Public surface is Caddy on the host (80/443) → control-plane (8080).
+# Everything below binds to the internal compose network only; the telemetry
+# engine has no published port and is unreachable from outside the host.
+#
+# Engine images are built by engine/build.sh and, for a real deployment, mirrored
+# into our own registry by deploy/mirror-images.sh. IMAGE_PREFIX selects which:
+#   local build   IMAGE_PREFIX=fulcrum-ops              (the default)
+#   mirrored      IMAGE_PREFIX=<account>.dkr.ecr.<region>.amazonaws.com/fulcrum-ops
+# The datastore images are stock upstream builds, pulled at deploy time.
+
+name: fulcrum-ops
+
+x-restart: &restart
+  restart: unless-stopped
+
+x-logging: &logging
+  logging:
+    driver: json-file
+    options: { max-size: "20m", max-file: "5" }
+
+services:
+  # ---------------------------------------------------------------- state DB
+  state-db:
+    image: mysql:8.4.2
+    <<: [*restart, *logging]
+    environment:
+      MYSQL_ROOT_PASSWORD: ${STATE_DB_ROOT_PASSWORD:?set in .env}
+      MYSQL_DATABASE: ${STATE_DB_NAME:-fulcrum_engine}
+      MYSQL_USER: ${STATE_DB_USER:-fulcrum}
+      MYSQL_PASSWORD: ${STATE_DB_PASSWORD:?set in .env}
+    # MySQL 8.4 removed --default-authentication-plugin; authentication_policy is
+    # its replacement. Passing the old flag makes the server abort at start-up.
+    command: --authentication-policy=caching_sha2_password --max_connections=500
+    volumes:
+      - state-db:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p${STATE_DB_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    deploy:
+      resources:
+        limits: { memory: 1200M }
+
+  # --------------------------------------------------------- analytics store
+  analytics-keeper:
+    image: zookeeper:3.9.4
+    <<: [*restart, *logging]
+    environment:
+      ZOO_MY_ID: 1
+      ZOO_SERVERS: server.1=analytics-keeper:2888:3888;2181
+      ZOO_4LW_COMMANDS_WHITELIST: "*"
+    volumes:
+      - analytics-keeper:/data
+    healthcheck:
+      test: ["CMD-SHELL", "echo ruok | nc -w 2 127.0.0.1 2181 | grep imok"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    deploy:
+      resources:
+        limits: { memory: 600M }
+
+  # Healthchecks address 127.0.0.1 rather than localhost throughout this file.
+  # This VPC has IPv6 disabled: "localhost" resolves to ::1 first, the probe is
+  # refused, and a service listening correctly on IPv4 is reported unhealthy —
+  # which then blocks everything that depends_on it.
+  analytics-db:
+    image: clickhouse/clickhouse-server:26.3.16.16-alpine
+    <<: [*restart, *logging]
+    environment:
+      CLICKHOUSE_DB: ${ANALYTICS_DB_NAME:-fulcrum_analytics}
+      CLICKHOUSE_USER: ${ANALYTICS_DB_USER:-fulcrum}
+      CLICKHOUSE_PASSWORD: ${ANALYTICS_DB_PASSWORD:?set in .env}
+      CLICKHOUSE_SKIP_USER_SETUP: 0
+      # The engine provisions a restricted read-only role for its insights
+      # queries, which requires SQL-driven access control to be switched on.
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    volumes:
+      - analytics-db:/var/lib/clickhouse
+      # Mount the single file, never the directory. The image ships its own
+      # config.d/docker_related_config.xml, which is what makes the server
+      # listen on all interfaces instead of loopback; mounting over the
+      # directory hides it, and the server then refuses every connection from
+      # the rest of the compose network while still passing its own healthcheck.
+      - ./clickhouse/config.d/fulcrum.xml:/etc/clickhouse-server/config.d/fulcrum.xml:ro
+      - ./clickhouse/users.d/fulcrum.xml:/etc/clickhouse-server/users.d/fulcrum.xml:ro
+    depends_on:
+      analytics-keeper:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8123/ping || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 40s
+    deploy:
+      resources:
+        limits: { memory: 5G }
+
+  # ----------------------------------------------------------- cache / queues
+  cache:
+    image: redis:7.2.4-alpine3.19
+    <<: [*restart, *logging]
+    command: ["redis-server", "--requirepass", "${CACHE_PASSWORD:?set in .env}", "--maxmemory", "700mb", "--maxmemory-policy", "noeviction", "--appendonly", "yes"]
+    volumes:
+      - cache:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${CACHE_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    deploy:
+      resources:
+        limits: { memory: 900M }
+
+  # ------------------------------------------------------------ blob storage
+  blob-store:
+    image: minio/minio:RELEASE.2025-03-12T18-04-18Z
+    <<: [*restart, *logging]
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${BLOB_ACCESS_KEY:?set in .env}
+      MINIO_ROOT_PASSWORD: ${BLOB_SECRET_KEY:?set in .env}
+    volumes:
+      - blob-store:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    deploy:
+      resources:
+        limits: { memory: 600M }
+
+  blob-init:
+    image: minio/mc:RELEASE.2025-03-12T17-29-24Z
+    depends_on:
+      blob-store:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://blob-store:9000 ${BLOB_ACCESS_KEY} ${BLOB_SECRET_KEY} &&
+      (mc ls local/${BLOB_BUCKET:-fulcrum-attachments} || mc mb local/${BLOB_BUCKET:-fulcrum-attachments}) &&
+      exit 0"
+    restart: "no"
+
+  # ----------------------------------------------------- user metric sandbox
+  metric-runner:
+    image: ${IMAGE_PREFIX:-fulcrum-ops}/metric-runner:${ENGINE_TAG}
+    <<: [*restart, *logging]
+    environment:
+      PYTHONUNBUFFERED: 1
+      # The image bakes in "docker", which starts docker-in-docker and needs
+      # privileged: true — without it the entrypoint waits for a daemon that
+      # can never start and the container crash-loops. "process" runs user
+      # metric code in an isolated exec namespace with no daemon at all, and is
+      # the vendor's own self-hosted default.
+      PYTHON_CODE_EXECUTOR_STRATEGY: process
+    deploy:
+      resources:
+        limits: { memory: 900M }
+
+  # -------------------------------------------------------- safety inference
+  safety-scanner:
+    image: ${IMAGE_PREFIX:-fulcrum-ops}/safety-scanner:${ENGINE_TAG}
+    <<: [*restart, *logging]
+    deploy:
+      resources:
+        limits: { memory: 2500M }
+
+  # ---------------------------------------------------------- the engine
+  # Private telemetry engine. No published ports: reachable only as
+  # http://telemetry-engine:8080 from inside this network.
+  telemetry-engine:
+    image: ${IMAGE_PREFIX:-fulcrum-ops}/telemetry-engine:${ENGINE_TAG}
+    <<: [*restart, *logging]
+    hostname: telemetry-engine
+    command: ["bash", "-c", "./run_db_migrations.sh && ./entrypoint.sh"]
+    environment:
+      JAVA_OPTS: "-Dliquibase.propertySubstitutionEnabled=true -XX:+UseG1GC -XX:MaxRAMPercentage=75.0"
+
+      STATE_DB_PROTOCOL: "jdbc:mysql://"
+      STATE_DB_URL: "state-db:3306/${STATE_DB_NAME:-fulcrum_engine}?createDatabaseIfNotExist=true&rewriteBatchedStatements=true&connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true"
+      STATE_DB_DATABASE_NAME: ${STATE_DB_NAME:-fulcrum_engine}
+      STATE_DB_USER: ${STATE_DB_USER:-fulcrum}
+      STATE_DB_PASS: ${STATE_DB_PASSWORD}
+
+      ANALYTICS_DB_MIGRATIONS_URL: "jdbc:clickhouse://analytics-db:8123"
+      ANALYTICS_DB_MIGRATIONS_USER: ${ANALYTICS_DB_USER:-fulcrum}
+      ANALYTICS_DB_MIGRATIONS_PASS: ${ANALYTICS_DB_PASSWORD}
+      ANALYTICS_DB_PROTOCOL: "HTTP"
+      ANALYTICS_DB_HOST: "analytics-db"
+      ANALYTICS_DB_PORT: 8123
+      ANALYTICS_DB_DATABASE_NAME: ${ANALYTICS_DB_NAME:-fulcrum_analytics}
+      ANALYTICS_DB_USERNAME: ${ANALYTICS_DB_USER:-fulcrum}
+      ANALYTICS_DB_PASS: ${ANALYTICS_DB_PASSWORD}
+
+      REDIS_URL: "redis://:${CACHE_PASSWORD}@cache:6379/"
+
+      AWS_ACCESS_KEY_ID: ${BLOB_ACCESS_KEY}
+      AWS_SECRET_ACCESS_KEY: ${BLOB_SECRET_KEY}
+      IS_MINIO: "true"
+      S3_URL: "http://blob-store:9000"
+      S3_BUCKET: ${BLOB_BUCKET:-fulcrum-attachments}
+
+      PYTHON_EVALUATOR_URL: "http://metric-runner:8000"
+
+      # Feature toggles for the capabilities the console exposes.
+      TOGGLE_GUARDRAILS_ENABLED: "true"
+      TOGGLE_WELCOME_WIZARD_ENABLED: "false"
+
+      # Outbound reporting is not configured here on purpose: it is pinned off
+      # inside the image by engine/patch-vendor.sh, where no environment
+      # variable can switch it back on. engine/build.sh fails the build if that
+      # is ever untrue, and deploy/verify-no-egress.sh re-checks it on the host.
+
+      AUTH_ENABLED: "false"   # identity is owned by the control plane in front
+      CORS: "false"           # never called by a browser directly
+    depends_on:
+      state-db: { condition: service_healthy }
+      analytics-db: { condition: service_healthy }
+      cache: { condition: service_healthy }
+      blob-store: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8080/health-check"]
+      interval: 10s
+      timeout: 10s
+      retries: 60
+      start_period: 60s
+    tmpfs:
+      - /tmp
+    deploy:
+      resources:
+        limits: { memory: 4G }
+
+  # ------------------------------------------------------- our control plane
+  control-plane:
+    build:
+      # Repository root: the image carries both the API and the console.
+      context: ..
+      dockerfile: apps/control-plane/Dockerfile
+    image: fulcrum-ops/control-plane:${APP_TAG:-local}
+    <<: [*restart, *logging]
+    environment:
+      FULCRUM_OPS_ENVIRONMENT: production
+      FULCRUM_OPS_SECRET_KEY: ${APP_SECRET_KEY:?set in .env}
+      FULCRUM_OPS_ENCRYPTION_KEY: ${APP_ENCRYPTION_KEY:?set in .env}
+      FULCRUM_OPS_DATABASE_URL: postgresql+asyncpg://${APP_DB_USER:-fulcrum}:${APP_DB_PASSWORD}@app-db:5432/${APP_DB_NAME:-fulcrum_ops}
+      FULCRUM_OPS_ENGINE_BASE_URL: http://telemetry-engine:8080
+      FULCRUM_OPS_ENGINE_WORKSPACE: default
+      FULCRUM_OPS_ENGINE_METRIC_LIBRARY: ${ENGINE_METRIC_LIBRARY:-}
+      FULCRUM_OPS_REDIS_URL: redis://:${CACHE_PASSWORD}@cache:6379/1
+      FULCRUM_OPS_PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:?set in .env}
+      FULCRUM_OPS_CORS_ORIGINS: ${PUBLIC_BASE_URL}
+      FULCRUM_OPS_LOG_JSON: "true"
+    ports:
+      - "127.0.0.1:8080:8080"   # Caddy on the host is the only client
+    depends_on:
+      app-db: { condition: service_healthy }
+      telemetry-engine: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=5).status==200 else 1)"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 30s
+    deploy:
+      resources:
+        limits: { memory: 1G }
+
+  app-db:
+    image: postgres:16.4-alpine
+    <<: [*restart, *logging]
+    environment:
+      POSTGRES_DB: ${APP_DB_NAME:-fulcrum_ops}
+      POSTGRES_USER: ${APP_DB_USER:-fulcrum}
+      POSTGRES_PASSWORD: ${APP_DB_PASSWORD:?set in .env}
+    volumes:
+      - app-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${APP_DB_USER:-fulcrum} -d ${APP_DB_NAME:-fulcrum_ops}"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    deploy:
+      resources:
+        limits: { memory: 800M }
+
+volumes:
+  state-db:
+  analytics-db:
+  analytics-keeper:
+  cache:
+  blob-store:
+  app-db:

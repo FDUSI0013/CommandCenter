@@ -1,0 +1,115 @@
+<?xml version="1.0"?>
+<!--
+  Fulcrum Ops — analytics store configuration.
+
+  Two things live here, and they have different reasons to exist.
+
+  REQUIRED BY THE ENGINE. Its schema migrations create ReplicatedMergeTree
+  tables whose paths interpolate the {shard} and {replica} macros and whose
+  coordination goes through the keeper. Without the macros the very first
+  migration fails with NO_ELEMENTS_IN_CONFIG; without the keeper the tables
+  cannot be created at all. A single-node deployment still uses the replicated
+  engine, so this is not optional even though nothing is actually replicated.
+
+  TUNED FOR THIS HOST. ClickHouse's defaults assume a dedicated machine. Here it
+  shares a box with the engine, the control plane, MySQL, Redis, MinIO and the
+  edge proxy, so its appetite is bounded explicitly.
+
+  NOTE: this file is mounted individually, never as a directory over
+  /etc/clickhouse-server/config.d. The image ships its own file there that binds
+  the server to all interfaces; hiding it makes the server listen on loopback
+  only, which passes its own healthcheck and refuses every other container.
+-->
+<clickhouse>
+    <!-- ================================================================ -->
+    <!-- Required by the engine's schema                                   -->
+    <!-- ================================================================ -->
+
+    <!-- One shard, one replica. The names are ours; the keys are the ones
+         the migrations interpolate. -->
+    <macros>
+        <shard>1</shard>
+        <replica>analytics-db</replica>
+        <cluster>fulcrum</cluster>
+    </macros>
+
+    <zookeeper>
+        <node>
+            <host>analytics-keeper</host>
+            <port>2181</port>
+        </node>
+    </zookeeper>
+    <zookeeper_path>/clickhouse</zookeeper_path>
+    <zookeeper_session_timeout_ms>30000</zookeeper_session_timeout_ms>
+
+    <distributed_ddl>
+        <path>/clickhouse/task_queue/ddl</path>
+    </distributed_ddl>
+
+    <!-- A single-node cluster definition, kept in the same shape a multi-node
+         one would have so the migrations do not need a different path. -->
+    <remote_servers>
+        <fulcrum>
+            <shard>
+                <internal_replication>true</internal_replication>
+                <replica>
+                    <host>analytics-db</host>
+                    <port>9000</port>
+                </replica>
+            </shard>
+        </fulcrum>
+    </remote_servers>
+
+    <!-- The engine's read-only insights profile sets SQL_-prefixed custom
+         settings; the server rejects unknown prefixes unless they are declared. -->
+    <custom_settings_prefixes>SQL_</custom_settings_prefixes>
+
+    <!-- Bind IPv4 explicitly. The image's own config listens on "::", which on a
+         dual-stack host also accepts IPv4 — but this VPC has IPv6 disabled, so
+         that bind fails outright and the server ends up listening on nothing
+         while its container still reports as started. Listing an address here
+         adds to the set rather than replacing it, so the IPv6 attempt still
+         happens and still warns; this is the one that succeeds. -->
+    <listen_host>0.0.0.0</listen_host>
+
+    <!-- ================================================================ -->
+    <!-- Tuned for a shared single host                                    -->
+    <!-- ================================================================ -->
+
+    <max_server_memory_usage_to_ram_ratio>0.6</max_server_memory_usage_to_ram_ratio>
+    <mark_cache_size>536870912</mark_cache_size>
+    <uncompressed_cache_size>0</uncompressed_cache_size>
+
+    <!-- The background pool sizes are deliberately NOT overridden. They look
+         like an easy saving on a small host, but the server validates them
+         against number_of_free_entries_in_pool_to_execute_mutation (default 20)
+         and refuses to start when background_pool_size *
+         background_merges_mutations_concurrency_ratio falls below it. The
+         defaults satisfy that relationship; a hand-picked smaller value does
+         not, and the failure arrives as a start-up crash loop. They are
+         mostly-idle threads, so they are not where this host is under pressure. -->
+    <max_concurrent_queries>64</max_concurrent_queries>
+
+    <!-- Logs are the second-largest consumer of disk after the data itself. -->
+    <logger>
+        <level>warning</level>
+        <size>100M</size>
+        <count>3</count>
+    </logger>
+    <query_log>
+        <database>system</database>
+        <table>query_log</table>
+        <ttl>event_date + INTERVAL 14 DAY DELETE</ttl>
+        <flush_interval_milliseconds>15000</flush_interval_milliseconds>
+    </query_log>
+    <trace_log remove="1"/>
+    <metric_log remove="1"/>
+    <asynchronous_metric_log remove="1"/>
+    <session_log remove="1"/>
+    <part_log remove="1"/>
+
+    <!-- No outbound calls of any kind from the analytics store. -->
+    <send_crash_reports>
+        <enabled>false</enabled>
+    </send_crash_reports>
+</clickhouse>

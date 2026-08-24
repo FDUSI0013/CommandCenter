@@ -1,0 +1,1052 @@
+"""Alert triage: raising with flood control, acknowledgement, and closure.
+
+Two things in here matter more than the CRUD around them.
+
+**Dedupe.** A misbehaving integration does not raise one alert, it raises one a
+second. :func:`raise_alert` collapses those onto a single row keyed by
+``dedupe_key``, bumping ``occurrence_count`` and ``last_occurred_at`` instead of
+inserting, so the Alerts screen stays readable during an incident. Every other
+domain raises its alerts through that function.
+
+**Timings.** Acknowledging stamps ``acknowledged_at`` once and never again — the
+first human response is what MTTA measures. Resolving freezes ``mttr_seconds``
+from ``raised_at`` so the KPI never re-derives from timestamps that later move.
+
+Nothing here imports FastAPI beyond the ``Request`` that the audit trail records
+the caller's address from; HTTP concerns live in ``api.v1.alerts``.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+from collections.abc import Sequence
+from typing import Any
+
+from fastapi import Request
+from sqlalchemy import Select, case, func, select, update
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.elements import ColumnElement
+
+from ..api.common import ListParams, apply_filters, apply_search, apply_sort, paginate
+from ..api.deps import Principal
+from ..core.errors import Conflict, NotFound, ValidationFailed
+from ..db.base import new_id
+from ..models.identity import Membership, Role, User
+from ..models.operations import Alert, AlertRule, AlertSeverity, AlertStatus
+from ..schemas.alerts import (
+    AlertAcknowledgeAllRequest,
+    AlertAcknowledgeRequest,
+    AlertAssignRequest,
+    AlertCreate,
+    AlertMuteRequest,
+    AlertResolveRequest,
+    AlertRuleCreate,
+    AlertRuleUpdate,
+    AlertsSummary,
+    AlertUpdate,
+)
+from . import audit
+
+SCREEN = "Alerts"
+
+#: Statuses that still represent a live condition. A muted alert is included on
+#: purpose: muting silences notifications, so recurrences must keep landing on
+#: the muted row rather than escaping as new alerts.
+LIVE_STATUSES: tuple[str, ...] = (
+    AlertStatus.OPEN.value,
+    AlertStatus.INVESTIGATING.value,
+    AlertStatus.ACKNOWLEDGED.value,
+    AlertStatus.MUTED.value,
+)
+
+#: Statuses ``acknowledge-all`` sweeps: the two that mean "nobody has taken this yet".
+UNACKED_STATUSES: tuple[str, ...] = (
+    AlertStatus.OPEN.value,
+    AlertStatus.INVESTIGATING.value,
+)
+
+#: Only these two may be set through ``PATCH``; the rest carry timings that the
+#: dedicated verbs are responsible for stamping.
+PATCHABLE_STATUSES: tuple[str, ...] = (
+    AlertStatus.OPEN.value,
+    AlertStatus.INVESTIGATING.value,
+)
+
+#: Hard ceiling on a CSV export so one click cannot pull an unbounded table.
+MAX_EXPORT_ROWS = 10_000
+
+#: Column order of the Alerts CSV export: (attribute, header).
+EXPORT_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("alert_ref", "Alert ID"),
+    ("severity", "Severity"),
+    ("title", "Alert"),
+    ("description", "Description"),
+    ("source", "Source"),
+    ("status", "Status"),
+    ("raised_at", "Raised At"),
+    ("acknowledged_at", "Acknowledged At"),
+    ("resolved_at", "Resolved At"),
+    ("assigned_to_user_id", "Assigned To"),
+    ("occurrence_count", "Occurrences"),
+    ("last_occurred_at", "Last Occurred"),
+    ("mttr_seconds", "MTTR (seconds)"),
+    ("dedupe_key", "Dedupe Key"),
+)
+
+_SEARCH_COLUMNS = (Alert.title, Alert.description, Alert.source, Alert.alert_ref)
+
+# Severity sorts by meaning, not alphabetically: Critical must lead and Info
+# must trail, which "Critical, High, Info, Low, Medium" would not do.
+_SEVERITY_RANK = case(
+    (Alert.severity == AlertSeverity.CRITICAL.value, 0),
+    (Alert.severity == AlertSeverity.HIGH.value, 1),
+    (Alert.severity == AlertSeverity.MEDIUM.value, 2),
+    (Alert.severity == AlertSeverity.LOW.value, 3),
+    else_=4,
+)
+
+# Keys the console's table sends. The short forms are the column keys the table
+# component uses; the long forms are the field names in the API contract.
+_SORTABLE: dict[str, Any] = {
+    "severity": _SEVERITY_RANK,
+    "sev": _SEVERITY_RANK,
+    "title": Alert.title,
+    "source": Alert.source,
+    "status": Alert.status,
+    "raised_at": Alert.raised_at,
+    "ts": Alert.raised_at,
+    "last_occurred_at": Alert.last_occurred_at,
+    "occurrence_count": Alert.occurrence_count,
+    "acknowledged_at": Alert.acknowledged_at,
+    "resolved_at": Alert.resolved_at,
+    "mttr_seconds": Alert.mttr_seconds,
+    "alert_ref": Alert.alert_ref,
+}
+
+_RULE_SORTABLE: dict[str, Any] = {
+    "name": AlertRule.name,
+    "source": AlertRule.source,
+    "severity": AlertRule.severity,
+    "enabled": AlertRule.enabled,
+    "throttle_minutes": AlertRule.throttle_minutes,
+    "created_at": AlertRule.created_at,
+    "updated_at": AlertRule.updated_at,
+}
+
+
+def _now() -> dt.datetime:
+    return dt.datetime.now(dt.UTC)
+
+
+def _dialect(session: AsyncSession) -> str:
+    bind = session.get_bind()
+    return getattr(getattr(bind, "dialect", None), "name", "")
+
+
+def _ack_latency_seconds(session: AsyncSession) -> ColumnElement[float]:
+    """``acknowledged_at - raised_at`` in seconds, as a database expression.
+
+    Timestamp arithmetic is the one place the two supported backends genuinely
+    diverge: Postgres subtracts to an interval that ``EXTRACT(EPOCH …)`` turns
+    into seconds, while SQLite has no interval type and needs Julian days scaled
+    up. Both keep the work in the database, which is the point — the KPI must
+    never load rows to average them. Rows that were never acknowledged evaluate
+    to NULL and ``AVG`` skips them.
+    """
+    if _dialect(session) == "sqlite":
+        return (
+            func.julianday(Alert.acknowledged_at) - func.julianday(Alert.raised_at)
+        ) * 86_400.0
+    return func.extract("epoch", Alert.acknowledged_at) - func.extract(
+        "epoch", Alert.raised_at
+    )
+
+
+async def _next_alert_ref(session: AsyncSession, workspace_id: str) -> str:
+    """Allocate the next ``al-N`` reference for a workspace.
+
+    Counting then probing keeps references dense and human-quotable. The probe
+    loop covers the race where two raises land at once; after a stubborn run it
+    falls back to an opaque suffix rather than blocking the raise.
+    """
+    used = (
+        await session.execute(
+            select(func.count()).select_from(Alert).where(Alert.workspace_id == workspace_id)
+        )
+    ).scalar_one()
+    candidate = int(used) + 1
+    for _ in range(50):
+        ref = f"al-{candidate}"
+        clash = (
+            await session.execute(
+                select(Alert.id)
+                .where(Alert.workspace_id == workspace_id, Alert.alert_ref == ref)
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if clash is None:
+            return ref
+        candidate += 1
+    return f"al-{new_id()[:8]}"
+
+
+async def _get_alert(session: AsyncSession, principal: Principal, alert_id: str) -> Alert:
+    """Load one alert or raise :class:`NotFound`.
+
+    The workspace predicate is part of the lookup rather than a check after it:
+    an alert belonging to another tenant is indistinguishable from one that does
+    not exist, which is the only answer that leaks nothing.
+    """
+    alert = (
+        await session.execute(
+            select(Alert).where(
+                Alert.id == alert_id, Alert.workspace_id == principal.workspace_id
+            )
+        )
+    ).scalar_one_or_none()
+    if alert is None:
+        raise NotFound("That alert does not exist.")
+    return alert
+
+
+async def _get_rule(session: AsyncSession, principal: Principal, rule_id: str) -> AlertRule:
+    rule = (
+        await session.execute(
+            select(AlertRule).where(
+                AlertRule.id == rule_id, AlertRule.workspace_id == principal.workspace_id
+            )
+        )
+    ).scalar_one_or_none()
+    if rule is None:
+        raise NotFound("That alert rule does not exist.")
+    return rule
+
+
+def _merge_metadata(alert: Alert, extra: dict[str, Any]) -> None:
+    """Replace the JSON document wholesale so SQLAlchemy sees the change.
+
+    Mutating a JSON column in place leaves the attribute unchanged as far as the
+    unit of work is concerned, and the update is silently dropped.
+    """
+    alert.event_metadata = {**(alert.event_metadata or {}), **extra}
+
+
+# --------------------------------------------------------------------------- #
+# Raising
+# --------------------------------------------------------------------------- #
+
+
+async def raise_alert(
+    session: AsyncSession,
+    *,
+    workspace_id: str,
+    title: str,
+    source: str,
+    severity: AlertSeverity | str = AlertSeverity.MEDIUM,
+    description: str | None = None,
+    dedupe_key: str | None = None,
+    source_entity_type: str | None = None,
+    source_entity_id: str | None = None,
+    engine_alert_id: str | None = None,
+    assigned_to_user_id: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    raised_at: dt.datetime | None = None,
+    principal: Principal | None = None,
+    request: Request | None = None,
+) -> tuple[Alert, bool]:
+    """Raise an alert, collapsing recurrences onto the row that is already live.
+
+    This is the entry point every other domain calls — the quota evaluator, the
+    secret rotation sweep, the deployment gate. It takes ``workspace_id`` rather
+    than a principal because most callers are background work with no user
+    attached; pass ``principal`` when a person raised the alert and the action
+    should appear in the audit trail. A machine-raised alert needs no audit row:
+    the alert *is* the record.
+
+    Returns the alert and whether it was newly created; ``False`` means an
+    existing alert absorbed this occurrence.
+    """
+    severity_value = severity.value if isinstance(severity, AlertSeverity) else str(severity)
+    occurred = raised_at or _now()
+    payload = metadata or {}
+
+    if dedupe_key:
+        existing = (
+            await session.execute(
+                select(Alert)
+                .where(
+                    Alert.workspace_id == workspace_id,
+                    Alert.dedupe_key == dedupe_key,
+                    Alert.status.in_(LIVE_STATUSES),
+                )
+                .order_by(Alert.raised_at.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            existing.occurrence_count = (existing.occurrence_count or 1) + 1
+            existing.last_occurred_at = occurred
+            if payload:
+                _merge_metadata(existing, payload)
+            await session.flush()
+            return existing, False
+
+    alert = Alert(
+        workspace_id=workspace_id,
+        alert_ref=await _next_alert_ref(session, workspace_id),
+        severity=severity_value,
+        title=title,
+        description=description,
+        source=source,
+        source_entity_type=source_entity_type,
+        source_entity_id=source_entity_id,
+        status=AlertStatus.OPEN.value,
+        raised_at=occurred,
+        assigned_to_user_id=assigned_to_user_id,
+        dedupe_key=dedupe_key,
+        occurrence_count=1,
+        last_occurred_at=occurred,
+        engine_alert_id=engine_alert_id,
+        event_metadata=payload,
+    )
+    session.add(alert)
+    await session.flush()
+
+    if principal is not None:
+        await audit.record(
+            session,
+            principal=principal,
+            action="Alert raised",
+            entity_type="Alert",
+            entity_id=alert.id,
+            entity_label=alert.title,
+            source_screen=SCREEN,
+            detail=f"{severity_value} alert raised from {source}.",
+            metadata={"alert_ref": alert.alert_ref, "dedupe_key": dedupe_key},
+            request=request,
+        )
+    return alert, True
+
+
+async def create_alert(
+    session: AsyncSession,
+    principal: Principal,
+    payload: AlertCreate,
+    *,
+    request: Request | None = None,
+) -> tuple[Alert, bool]:
+    """Raise an alert on behalf of a signed-in operator or an API key."""
+    principal.require(Role.OPERATOR)
+    if payload.assigned_to_user_id:
+        await _assert_member(session, principal, payload.assigned_to_user_id)
+    return await raise_alert(
+        session,
+        workspace_id=principal.workspace_id,
+        title=payload.title,
+        source=payload.source,
+        severity=payload.severity,
+        description=payload.description,
+        dedupe_key=payload.dedupe_key,
+        source_entity_type=payload.source_entity_type,
+        source_entity_id=payload.source_entity_id,
+        engine_alert_id=payload.engine_alert_id,
+        assigned_to_user_id=payload.assigned_to_user_id,
+        metadata=payload.event_metadata,
+        raised_at=payload.raised_at,
+        principal=principal,
+        request=request,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Reading
+# --------------------------------------------------------------------------- #
+
+
+def _alert_query(
+    workspace_id: str,
+    *,
+    severity: Sequence[str] | None = None,
+    status: Sequence[str] | None = None,
+    source: Sequence[str] | None = None,
+    assigned_to_user_id: str | None = None,
+    raised_since: dt.datetime | None = None,
+    open_only: bool = False,
+) -> Select:
+    stmt = select(Alert).where(Alert.workspace_id == workspace_id)
+    stmt = apply_filters(
+        stmt,
+        {
+            Alert.severity: list(severity) if severity else None,
+            Alert.status: list(status) if status else None,
+            Alert.source: list(source) if source else None,
+            Alert.assigned_to_user_id: assigned_to_user_id,
+        },
+    )
+    if raised_since is not None:
+        stmt = stmt.where(Alert.raised_at >= raised_since)
+    if open_only:
+        stmt = stmt.where(Alert.status.in_(LIVE_STATUSES))
+    return stmt
+
+
+async def list_alerts(
+    session: AsyncSession,
+    principal: Principal,
+    params: ListParams,
+    *,
+    severity: Sequence[str] | None = None,
+    status: Sequence[str] | None = None,
+    source: Sequence[str] | None = None,
+    assigned_to_user_id: str | None = None,
+    raised_since: dt.datetime | None = None,
+    open_only: bool = False,
+) -> tuple[Sequence[Alert], int]:
+    """One page of alerts plus the unpaged total, honouring the screen's filters."""
+    stmt = _alert_query(
+        principal.workspace_id,
+        severity=severity,
+        status=status,
+        source=source,
+        assigned_to_user_id=assigned_to_user_id,
+        raised_since=raised_since,
+        open_only=open_only,
+    )
+    stmt = apply_search(stmt, params, _SEARCH_COLUMNS)
+    stmt = apply_sort(stmt, params, _SORTABLE, Alert.raised_at)
+    # Ties on the sort column would otherwise shuffle between pages.
+    stmt = stmt.order_by(Alert.id.desc())
+    return await paginate(session, stmt, params)
+
+
+async def get_alert(session: AsyncSession, principal: Principal, alert_id: str) -> Alert:
+    """Fetch one alert within the caller's workspace."""
+    return await _get_alert(session, principal, alert_id)
+
+
+async def export_rows(
+    session: AsyncSession,
+    principal: Principal,
+    params: ListParams,
+    *,
+    severity: Sequence[str] | None = None,
+    status: Sequence[str] | None = None,
+    source: Sequence[str] | None = None,
+    assigned_to_user_id: str | None = None,
+    raised_since: dt.datetime | None = None,
+    open_only: bool = False,
+) -> list[dict[str, Any]]:
+    """Rows for the CSV export, filtered exactly as the table was."""
+    stmt = _alert_query(
+        principal.workspace_id,
+        severity=severity,
+        status=status,
+        source=source,
+        assigned_to_user_id=assigned_to_user_id,
+        raised_since=raised_since,
+        open_only=open_only,
+    )
+    stmt = apply_search(stmt, params, _SEARCH_COLUMNS)
+    stmt = apply_sort(stmt, params, _SORTABLE, Alert.raised_at)
+    stmt = stmt.order_by(Alert.id.desc()).limit(MAX_EXPORT_ROWS)
+    rows = (await session.execute(stmt)).scalars().all()
+    return [
+        {
+            key: value.isoformat() if isinstance(value, dt.datetime) else value
+            for key, value in ((k, getattr(alert, k)) for k, _ in EXPORT_COLUMNS)
+        }
+        for alert in rows
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# Editing
+# --------------------------------------------------------------------------- #
+
+
+async def _assert_member(
+    session: AsyncSession, principal: Principal, user_id: str
+) -> str | None:
+    """Confirm a user belongs to this workspace; return their display name."""
+    member = (
+        await session.execute(
+            select(Membership.user_id).where(
+                Membership.user_id == user_id,
+                Membership.workspace_id == principal.workspace_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if member is None:
+        raise ValidationFailed(
+            "That user is not a member of this workspace.",
+            details={"field": "assignee_user_id"},
+        )
+    return (
+        await session.execute(select(User.full_name).where(User.id == user_id))
+    ).scalar_one_or_none()
+
+
+async def update_alert(
+    session: AsyncSession,
+    principal: Principal,
+    alert_id: str,
+    payload: AlertUpdate,
+    *,
+    request: Request | None = None,
+) -> Alert:
+    """Edit an alert's descriptive fields, or move it to/from Investigating."""
+    principal.require(Role.OPERATOR)
+    alert = await _get_alert(session, principal, alert_id)
+    changes = payload.model_dump(exclude_unset=True)
+    touched = sorted(changes)
+
+    # Status is handled here and removed from the generic assignment below, so a
+    # partial update that mentions it explicitly as null cannot blank the column.
+    requested_status = changes.pop("status", None)
+    if requested_status is not None:
+        new_status = AlertStatus(requested_status).value
+        if new_status not in PATCHABLE_STATUSES:
+            raise ValidationFailed(
+                "Use the acknowledge, resolve or mute endpoints to move an alert "
+                "into that state; they record the timings the KPIs depend on.",
+                details={"allowed": list(PATCHABLE_STATUSES)},
+            )
+        if alert.status == AlertStatus.RESOLVED.value:
+            raise Conflict("That alert is resolved and cannot be reopened by editing it.")
+        alert.status = new_status
+
+    if changes.get("assigned_to_user_id"):
+        await _assert_member(session, principal, changes["assigned_to_user_id"])
+
+    if "event_metadata" in changes and changes["event_metadata"] is not None:
+        _merge_metadata(alert, changes.pop("event_metadata"))
+    else:
+        changes.pop("event_metadata", None)
+
+    for field, value in changes.items():
+        if value is None and field in ("title", "severity"):
+            # Optional in the schema only because it is a partial update.
+            continue
+        setattr(alert, field, AlertSeverity(value).value if field == "severity" else value)
+
+    await session.flush()
+    await audit.record(
+        session,
+        principal=principal,
+        action="Alert updated",
+        entity_type="Alert",
+        entity_id=alert.id,
+        entity_label=alert.title,
+        source_screen=SCREEN,
+        detail=f"Updated {', '.join(touched)}.",
+        request=request,
+    )
+    return alert
+
+
+async def delete_alert(
+    session: AsyncSession,
+    principal: Principal,
+    alert_id: str,
+    *,
+    request: Request | None = None,
+) -> None:
+    """Remove an alert. Reserved for admins: the row is incident evidence."""
+    principal.require(Role.ADMIN)
+    alert = await _get_alert(session, principal, alert_id)
+    label, ref = alert.title, alert.alert_ref
+    await session.delete(alert)
+    await session.flush()
+    await audit.record(
+        session,
+        principal=principal,
+        action="Alert deleted",
+        entity_type="Alert",
+        entity_id=alert_id,
+        entity_label=label,
+        source_screen=SCREEN,
+        detail=f"Deleted alert {ref}.",
+        request=request,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Triage verbs
+# --------------------------------------------------------------------------- #
+
+
+async def acknowledge(
+    session: AsyncSession,
+    principal: Principal,
+    alert_id: str,
+    payload: AlertAcknowledgeRequest | None = None,
+    *,
+    request: Request | None = None,
+) -> tuple[Alert, bool]:
+    """Take ownership of an alert.
+
+    Idempotent: acknowledging twice is a double-click, not an error. The second
+    call leaves ``acknowledged_at`` alone so MTTA keeps measuring the first
+    human response. Returns the alert and whether this call changed it.
+    """
+    principal.require(Role.OPERATOR)
+    alert = await _get_alert(session, principal, alert_id)
+
+    if alert.status == AlertStatus.RESOLVED.value:
+        raise Conflict("That alert is already resolved.")
+    if alert.status == AlertStatus.ACKNOWLEDGED.value:
+        return alert, False
+
+    alert.status = AlertStatus.ACKNOWLEDGED.value
+    if alert.acknowledged_at is None:
+        alert.acknowledged_at = _now()
+        alert.acknowledged_by_user_id = principal.user_id
+    if payload is not None and payload.note:
+        _merge_metadata(alert, {"acknowledgement_note": payload.note})
+
+    await session.flush()
+    await audit.record(
+        session,
+        principal=principal,
+        action="Alert acknowledged",
+        entity_type="Alert",
+        entity_id=alert.id,
+        entity_label=alert.title,
+        source_screen=SCREEN,
+        detail=payload.note if payload and payload.note else f"Acknowledged {alert.alert_ref}.",
+        request=request,
+    )
+    return alert, True
+
+
+async def acknowledge_all(
+    session: AsyncSession,
+    principal: Principal,
+    payload: AlertAcknowledgeAllRequest | None = None,
+    *,
+    request: Request | None = None,
+) -> int:
+    """Acknowledge every unclaimed alert, optionally narrowed by severity or source.
+
+    Two statements, in this order: stamp the timings only where they are still
+    unset, then move the statuses. Doing it the other way round would lose the
+    ability to tell which rows had never been acknowledged. One audit row
+    records the sweep — a bulk action is one decision, not N.
+    """
+    principal.require(Role.OPERATOR)
+    now = _now()
+
+    predicates: list[Any] = [
+        Alert.workspace_id == principal.workspace_id,
+        Alert.status.in_(UNACKED_STATUSES),
+    ]
+    if payload is not None and payload.severity:
+        predicates.append(Alert.severity.in_([s.value for s in payload.severity]))
+    if payload is not None and payload.source:
+        predicates.append(Alert.source.in_(list(payload.source)))
+
+    await session.execute(
+        update(Alert)
+        .where(*predicates, Alert.acknowledged_at.is_(None))
+        .values(acknowledged_at=now, acknowledged_by_user_id=principal.user_id)
+        .execution_options(synchronize_session=False)
+    )
+    result = await session.execute(
+        update(Alert)
+        .where(*predicates)
+        .values(status=AlertStatus.ACKNOWLEDGED.value)
+        .execution_options(synchronize_session=False)
+    )
+    count = int(result.rowcount or 0)
+
+    if count:
+        await audit.record(
+            session,
+            principal=principal,
+            action="Alerts acknowledged in bulk",
+            entity_type="Alert",
+            entity_label=f"{count} alerts",
+            source_screen=SCREEN,
+            detail=payload.note if payload and payload.note else f"Acknowledged {count} alerts.",
+            metadata={
+                "count": count,
+                "severity": [s.value for s in payload.severity]
+                if payload and payload.severity
+                else None,
+                "source": list(payload.source) if payload and payload.source else None,
+            },
+            request=request,
+        )
+    return count
+
+
+async def resolve(
+    session: AsyncSession,
+    principal: Principal,
+    alert_id: str,
+    payload: AlertResolveRequest | None = None,
+    *,
+    request: Request | None = None,
+) -> Alert:
+    """Close an alert and freeze its time-to-resolve.
+
+    ``mttr_seconds`` is computed once, here, from ``raised_at``. Storing it
+    rather than deriving it later means the KPI cannot drift if a timestamp is
+    ever corrected, and it keeps the tile a single ``AVG`` over an integer.
+    """
+    principal.require(Role.OPERATOR)
+    alert = await _get_alert(session, principal, alert_id)
+    if alert.status == AlertStatus.RESOLVED.value:
+        raise Conflict("That alert is already resolved.")
+
+    resolved_at = _now()
+    alert.status = AlertStatus.RESOLVED.value
+    alert.resolved_at = resolved_at
+    alert.resolved_by_user_id = principal.user_id
+    alert.mttr_seconds = max(0, int((resolved_at - alert.raised_at).total_seconds()))
+    if payload is not None and payload.resolution_note:
+        _merge_metadata(alert, {"resolution_note": payload.resolution_note})
+
+    await session.flush()
+    await audit.record(
+        session,
+        principal=principal,
+        action="Alert resolved",
+        entity_type="Alert",
+        entity_id=alert.id,
+        entity_label=alert.title,
+        source_screen=SCREEN,
+        detail=(
+            payload.resolution_note
+            if payload and payload.resolution_note
+            else f"Resolved {alert.alert_ref} after {alert.mttr_seconds}s."
+        ),
+        metadata={"mttr_seconds": alert.mttr_seconds},
+        request=request,
+    )
+    return alert
+
+
+async def assign(
+    session: AsyncSession,
+    principal: Principal,
+    alert_id: str,
+    payload: AlertAssignRequest,
+    *,
+    request: Request | None = None,
+) -> Alert:
+    """Route an alert to a named member of this workspace."""
+    principal.require(Role.OPERATOR)
+    alert = await _get_alert(session, principal, alert_id)
+    if alert.status == AlertStatus.RESOLVED.value:
+        raise Conflict("That alert is resolved; reopen it before reassigning.")
+
+    assignee_name = await _assert_member(session, principal, payload.assignee_user_id)
+    alert.assigned_to_user_id = payload.assignee_user_id
+    if payload.note:
+        _merge_metadata(alert, {"assignment_note": payload.note})
+
+    await session.flush()
+    await audit.record(
+        session,
+        principal=principal,
+        action="Alert assigned",
+        entity_type="Alert",
+        entity_id=alert.id,
+        entity_label=alert.title,
+        source_screen=SCREEN,
+        detail=f"Assigned to {assignee_name or payload.assignee_user_id}.",
+        metadata={"assignee_user_id": payload.assignee_user_id},
+        request=request,
+    )
+    return alert
+
+
+async def mute(
+    session: AsyncSession,
+    principal: Principal,
+    alert_id: str,
+    payload: AlertMuteRequest | None = None,
+    *,
+    request: Request | None = None,
+) -> tuple[Alert, dt.datetime]:
+    """Silence an alert for a window without closing it.
+
+    The alert stays live for dedupe, so recurrences keep landing on this row
+    instead of escaping as new alerts while the maintenance window runs. The
+    deadline is kept on the alert's own payload, which is where the raiser's
+    other context already lives.
+    """
+    principal.require(Role.OPERATOR)
+    alert = await _get_alert(session, principal, alert_id)
+    if alert.status == AlertStatus.RESOLVED.value:
+        raise Conflict("That alert is already resolved; there is nothing to mute.")
+
+    minutes = payload.duration_minutes if payload else 1440
+    muted_until = _now() + dt.timedelta(minutes=minutes)
+    alert.status = AlertStatus.MUTED.value
+    _merge_metadata(
+        alert,
+        {
+            "muted_until": muted_until.isoformat(),
+            "muted_by": principal.actor,
+            "mute_reason": payload.reason if payload else None,
+        },
+    )
+
+    await session.flush()
+    await audit.record(
+        session,
+        principal=principal,
+        action="Alert muted",
+        entity_type="Alert",
+        entity_id=alert.id,
+        entity_label=alert.title,
+        source_screen=SCREEN,
+        detail=f"Muted for {minutes} minutes, until {muted_until.isoformat()}.",
+        metadata={"muted_until": muted_until.isoformat(), "duration_minutes": minutes},
+        request=request,
+    )
+    return alert, muted_until
+
+
+# --------------------------------------------------------------------------- #
+# Summary
+# --------------------------------------------------------------------------- #
+
+
+async def summary(session: AsyncSession, principal: Principal) -> AlertsSummary:
+    """The KPI row, as one aggregate query plus one DISTINCT for the filter list.
+
+    Conditional sums do all the counting in a single pass over the workspace's
+    alerts; nothing is loaded into Python to be counted here.
+    """
+    workspace = principal.workspace_id
+    day_ago = _now() - dt.timedelta(hours=24)
+
+    def _count_if(condition: Any) -> Any:
+        return func.coalesce(func.sum(case((condition, 1), else_=0)), 0)
+
+    row = (
+        await session.execute(
+            select(
+                func.count(Alert.id).label("total"),
+                _count_if(Alert.status == AlertStatus.OPEN.value).label("open"),
+                _count_if(Alert.status == AlertStatus.INVESTIGATING.value).label(
+                    "investigating"
+                ),
+                _count_if(Alert.status == AlertStatus.ACKNOWLEDGED.value).label("acknowledged"),
+                _count_if(Alert.status == AlertStatus.MUTED.value).label("muted"),
+                _count_if(
+                    (Alert.severity == AlertSeverity.CRITICAL.value)
+                    & (Alert.status != AlertStatus.RESOLVED.value)
+                ).label("critical"),
+                _count_if(
+                    (Alert.status == AlertStatus.RESOLVED.value)
+                    & (Alert.resolved_at >= day_ago)
+                ).label("resolved_24h"),
+                func.avg(_ack_latency_seconds(session)).label("mtta"),
+                func.avg(Alert.mttr_seconds).label("mttr"),
+            ).where(Alert.workspace_id == workspace)
+        )
+    ).one()
+
+    sources = (
+        (
+            await session.execute(
+                select(Alert.source)
+                .where(Alert.workspace_id == workspace)
+                .distinct()
+                .order_by(Alert.source.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    return AlertsSummary(
+        open=int(row.open or 0),
+        critical=int(row.critical or 0),
+        investigating=int(row.investigating or 0),
+        acknowledged=int(row.acknowledged or 0),
+        muted=int(row.muted or 0),
+        resolved_24h=int(row.resolved_24h or 0),
+        total=int(row.total or 0),
+        mtta_seconds=round(float(row.mtta), 1) if row.mtta is not None else None,
+        mttr_seconds=round(float(row.mttr), 1) if row.mttr is not None else None,
+        sources=[s for s in sources if s],
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Alert rules
+# --------------------------------------------------------------------------- #
+
+
+async def list_rules(
+    session: AsyncSession,
+    principal: Principal,
+    params: ListParams,
+    *,
+    source: Sequence[str] | None = None,
+    severity: Sequence[str] | None = None,
+    enabled: bool | None = None,
+) -> tuple[Sequence[AlertRule], int]:
+    """One page of alert rules for the rules editor."""
+    stmt = select(AlertRule).where(AlertRule.workspace_id == principal.workspace_id)
+    stmt = apply_filters(
+        stmt,
+        {
+            AlertRule.source: list(source) if source else None,
+            AlertRule.severity: list(severity) if severity else None,
+            AlertRule.enabled: enabled,
+        },
+    )
+    stmt = apply_search(
+        stmt, params, (AlertRule.name, AlertRule.description, AlertRule.source)
+    )
+    stmt = apply_sort(stmt, params, _RULE_SORTABLE, AlertRule.name, default_desc=False)
+    stmt = stmt.order_by(AlertRule.id.desc())
+    return await paginate(session, stmt, params)
+
+
+async def get_rule(session: AsyncSession, principal: Principal, rule_id: str) -> AlertRule:
+    """Fetch one alert rule within the caller's workspace."""
+    return await _get_rule(session, principal, rule_id)
+
+
+async def _assert_rule_name_free(
+    session: AsyncSession, principal: Principal, name: str, *, exclude_id: str | None = None
+) -> None:
+    stmt = select(AlertRule.id).where(
+        AlertRule.workspace_id == principal.workspace_id, AlertRule.name == name
+    )
+    if exclude_id:
+        stmt = stmt.where(AlertRule.id != exclude_id)
+    if (await session.execute(stmt.limit(1))).scalar_one_or_none() is not None:
+        raise Conflict(f"An alert rule named '{name}' already exists in this workspace.")
+
+
+async def create_rule(
+    session: AsyncSession,
+    principal: Principal,
+    payload: AlertRuleCreate,
+    *,
+    request: Request | None = None,
+) -> AlertRule:
+    """Define a new alert rule. Rule names are unique within a workspace."""
+    principal.require(Role.ADMIN)
+    await _assert_rule_name_free(session, principal, payload.name)
+
+    rule = AlertRule(
+        workspace_id=principal.workspace_id,
+        name=payload.name,
+        description=payload.description,
+        source=payload.source,
+        condition=dict(payload.condition),
+        severity=payload.severity.value,
+        enabled=payload.enabled,
+        notify_channels=list(payload.notify_channels),
+        throttle_minutes=payload.throttle_minutes,
+        created_by_user_id=principal.user_id,
+        created_by=principal.actor,
+        updated_by=principal.actor,
+    )
+    session.add(rule)
+    try:
+        await session.flush()
+    except IntegrityError as exc:
+        # Lost the race with a concurrent create of the same name.
+        await session.rollback()
+        raise Conflict(
+            f"An alert rule named '{payload.name}' already exists in this workspace."
+        ) from exc
+
+    await audit.record(
+        session,
+        principal=principal,
+        action="Alert rule created",
+        entity_type="AlertRule",
+        entity_id=rule.id,
+        entity_label=rule.name,
+        source_screen=SCREEN,
+        detail=f"{rule.severity} rule watching {rule.source}.",
+        request=request,
+    )
+    return rule
+
+
+async def update_rule(
+    session: AsyncSession,
+    principal: Principal,
+    rule_id: str,
+    payload: AlertRuleUpdate,
+    *,
+    request: Request | None = None,
+) -> AlertRule:
+    """Partially update an alert rule."""
+    principal.require(Role.ADMIN)
+    rule = await _get_rule(session, principal, rule_id)
+    changes = payload.model_dump(exclude_unset=True)
+
+    if changes.get("name") and changes["name"] != rule.name:
+        await _assert_rule_name_free(session, principal, changes["name"], exclude_id=rule.id)
+
+    for field, value in changes.items():
+        if value is None and field in ("name", "source", "condition", "severity"):
+            continue
+        if field == "severity":
+            rule.severity = AlertSeverity(value).value
+        elif field == "condition":
+            rule.condition = dict(value)
+        elif field == "notify_channels":
+            rule.notify_channels = list(value)
+        else:
+            setattr(rule, field, value)
+    rule.updated_by = principal.actor
+
+    try:
+        await session.flush()
+    except IntegrityError as exc:
+        await session.rollback()
+        raise Conflict("Another alert rule in this workspace already uses that name.") from exc
+
+    await audit.record(
+        session,
+        principal=principal,
+        action="Alert rule updated",
+        entity_type="AlertRule",
+        entity_id=rule.id,
+        entity_label=rule.name,
+        source_screen=SCREEN,
+        detail=f"Updated {', '.join(sorted(changes))}.",
+        request=request,
+    )
+    return rule
+
+
+async def delete_rule(
+    session: AsyncSession,
+    principal: Principal,
+    rule_id: str,
+    *,
+    request: Request | None = None,
+) -> None:
+    """Delete an alert rule. Alerts it already raised are left untouched."""
+    principal.require(Role.ADMIN)
+    rule = await _get_rule(session, principal, rule_id)
+    label = rule.name
+    await session.delete(rule)
+    await session.flush()
+    await audit.record(
+        session,
+        principal=principal,
+        action="Alert rule deleted",
+        entity_type="AlertRule",
+        entity_id=rule_id,
+        entity_label=label,
+        source_screen=SCREEN,
+        detail=f"Deleted alert rule '{label}'.",
+        request=request,
+    )

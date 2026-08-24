@@ -1,0 +1,84 @@
+{
+  "name": "@fulcrum-ops/sdk",
+  "version": "1.0.0",
+  "description": "Fulcrum Ops SDK — report agent traces, spans, feedback scores and governance events to the Fulcrum Ops control plane.",
+  "license": "UNLICENSED",
+  "private": false,
+  "type": "module",
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18"
+  },
+  "main": "./dist/cjs/index.js",
+  "module": "./dist/esm/index.js",
+  "types": "./dist/types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/types/index.d.ts",
+      "import": "./dist/esm/index.js",
+      "require": "./dist/cjs/index.js",
+      "default": "./dist/esm/index.js"
+    },
+    "./openai": {
+      "types": "./dist/types/integrations/openai.d.ts",
+      "import": "./dist/esm/integrations/openai.js",
+      "require": "./dist/cjs/integrations/openai.js",
+      "default": "./dist/esm/integrations/openai.js"
+    },
+    "./anthropic": {
+      "types": "./dist/types/integrations/anthropic.d.ts",
+      "import": "./dist/esm/integrations/anthropic.js",
+      "require": "./dist/cjs/integrations/anthropic.js",
+      "default": "./dist/esm/integrations/anthropic.js"
+    },
+    "./langchain": {
+      "types": "./dist/types/integrations/langchain.d.ts",
+      "import": "./dist/esm/integrations/langchain.js",
+      "require": "./dist/cjs/integrations/langchain.js",
+      "default": "./dist/esm/integrations/langchain.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "typesVersions": {
+    "*": {
+      "openai": ["./dist/types/integrations/openai.d.ts"],
+      "anthropic": ["./dist/types/integrations/anthropic.d.ts"],
+      "langchain": ["./dist/types/integrations/langchain.d.ts"],
+      "*": ["./dist/types/index.d.ts"]
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "clean": "node scripts/clean.mjs",
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node scripts/test.mjs",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "fulcrum-ops",
+    "observability",
+    "llm",
+    "agents",
+    "tracing",
+    "governance"
+  ],
+  "dependencies": {},
+  "peerDependencies": {
+    "@anthropic-ai/sdk": ">=0.20.0",
+    "@langchain/core": ">=0.2.0",
+    "openai": ">=4.0.0"
+  },
+  "peerDependenciesMeta": {
+    "openai": { "optional": true },
+    "@anthropic-ai/sdk": { "optional": true },
+    "@langchain/core": { "optional": true }
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2"
+  }
+}
