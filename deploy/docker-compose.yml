@@ -261,6 +261,12 @@ services:
       FULCRUM_OPS_PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:?set in .env}
       FULCRUM_OPS_CORS_ORIGINS: ${PUBLIC_BASE_URL}
       FULCRUM_OPS_LOG_JSON: "true"
+      # Prompt Studio execution: optional — with these unset, Run answers 503
+      # model_unavailable naming exactly what is missing.
+      FULCRUM_OPS_PROMPT_STUDIO_ENDPOINT: ${PROMPT_STUDIO_ENDPOINT:-}
+      FULCRUM_OPS_PROMPT_STUDIO_API_KEY: ${PROMPT_STUDIO_API_KEY:-}
+      FULCRUM_OPS_PROMPT_STUDIO_MODEL: ${PROMPT_STUDIO_MODEL:-gpt-4o-mini}
+      FULCRUM_OPS_PROMPT_STUDIO_API_VERSION: ${PROMPT_STUDIO_API_VERSION:-2024-10-21}
     ports:
       - "127.0.0.1:8080:8080"   # Caddy on the host is the only client
     depends_on:
