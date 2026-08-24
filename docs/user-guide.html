@@ -819,10 +819,16 @@ Live Runs tells you <em>what</em> happened, Replay Studio shows you <em>in what 
 span tree with timings, so you can see the model call that took six seconds, the tool that returned
 nothing, or the guardrail that fired between them.</p>
 <p>Use it when an answer was wrong and you need to find the step that made it wrong.</p>
+<p><strong>The run browser.</strong> The rail on the left holds an agent's <em>complete</em> run
+history — pick an agent, and every run it has ever recorded is listed newest first, each row with
+its status, time, input preview, tokens and duration. Unlike Live Runs there is no time window:
+<strong>Load older runs</strong> pages back through the whole history until the rail says
+"Full history", so a run from months ago is as reachable as one from this morning. Clicking any
+row loads its replay.</p>
 <p>Arriving from Live Runs — the row action, the inspector's Replay button, or the trace view —
-loads <em>that</em> run, even when it is older than the recent-runs list the picker shows. A run
-that genuinely cannot be loaded says so and leaves the picker usable, rather than quietly
-substituting a different execution.</p>
+loads <em>that</em> run directly and selects its agent in the browser. A run that genuinely cannot
+be loaded says so and leaves the browser usable, rather than quietly substituting a different
+execution.</p>
 </div>
 
 <div class="screen">

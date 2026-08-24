@@ -121,6 +121,20 @@ class RunRead(BaseModel):
     user: str | None = None
 
 
+class RunHistoryPage(BaseModel):
+    """One page of an agent's complete run history, newest first.
+
+    Cursor-paged rather than offset-paged: the history has no time floor, so a
+    total would mean scanning the agent's whole project on every page. The
+    cursor is the last row's id; absent means the history is exhausted.
+    """
+
+    agent_id: str
+    agent_name: str
+    items: list[RunRead]
+    next_cursor: str | None = None
+
+
 class RunGuardrails(BaseModel):
     """The inspector's Guardrails & Policy section."""
 

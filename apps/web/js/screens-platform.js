@@ -473,73 +473,144 @@
     title:'Replay Studio',
     render(main){
       let timer = null;
+      let cursor = null;        // next_cursor of the rail's last page; null = exhausted
+      let railAgent = null;     // agent whose history the rail is showing
 
       main.innerHTML = `
-        ${pageHead({title:'Replay Studio', sub:'Step through a recorded execution with its prompt, retrieval, tool and guardrail context.',
-          actions:`<select class="filter-select" id="rpPick" style="min-width:290px;height:34px"><option>Loading runs…</option></select>
-          <button class="btn primary" id="rpPlay" disabled>${ICONS.play}Play Replay</button>`})}
-        <div id="rpBody"><div class="card-loading" style="height:180px"></div></div>`;
+        ${pageHead({title:'Replay Studio', sub:'Pick an agent, browse every run it has ever recorded, and step through any of them.',
+          actions:`<button class="btn primary" id="rpPlay" disabled>${ICONS.play}Play Replay</button>`})}
+        <div class="rp-layout">
+          <div class="card" style="padding-bottom:0">
+            <div class="card-head" style="margin-bottom:10px"><div class="card-title">Run Browser</div>
+              <div class="faint small" id="rpCount"></div></div>
+            <select class="filter-select" id="rpAgent" style="width:100%;height:34px;margin-bottom:10px">
+              <option>Loading agents…</option></select>
+            <div class="rp-rail-list" id="rpRail"><div class="card-loading" style="height:120px;margin:0 14px 14px"></div></div>
+          </div>
+          <div id="rpBody"><div class="empty-state">${ICONS.replay}
+            <div class="es-title">Pick a run to replay</div>
+            <div>Choose an agent on the left, then any run from its history.</div></div></div>
+        </div>`;
 
       const body = document.getElementById('rpBody');
-      const picker = document.getElementById('rpPick');
+      const rail = document.getElementById('rpRail');
+      const agentPick = document.getElementById('rpAgent');
+      const countEl = document.getElementById('rpCount');
       const playBtn = document.getElementById('rpPlay');
 
-      /* The run asked for wins, even when it is older than this page.
-       *
-       * The picker lists recent runs for convenience, but arriving here from
-       * Live Runs names one specific run. Falling back to the newest run when
-       * the named one is off the page would replay a *different* execution
-       * than the one clicked, silently, which is the worst possible failure
-       * for a debugging tool. So a named run is fetched on its own and put at
-       * the head of the list; only an unnamed arrival defaults to the newest.
-       */
+      const railRuns = [];      // every run the rail has fetched so far, newest first
+
+      function runRow(r){
+        const facts = [
+          r.model,
+          r.tokens ? fmtFull(r.tokens)+' tok' : null,
+          r.duration_seconds == null ? null : secs(r.duration_seconds),
+        ].filter(Boolean).join(' · ');
+        return `<button class="rp-run ${r.id===APP.replayRun?'active':''}" data-run="${esc(r.id)}"
+            title="${esc(r.id)}">
+          <div class="rp-run-top">${statusText(r.status||'—')}
+            <span class="faint small" title="${esc(String(r.occurred_at||''))}">${relTime(ts(r.occurred_at))}</span></div>
+          <div class="rp-run-preview">${r.input_preview ? esc(r.input_preview) : '<span class="faint">no input recorded</span>'}</div>
+          <div class="rp-run-facts mono">${esc(String(r.id).slice(0,14))}…${facts?` · ${esc(facts)}`:''}</div>
+        </button>`;
+      }
+
+      function paintRail(){
+        if(!railRuns.length){
+          rail.innerHTML = `<div class="empty-state" style="padding:26px 14px">${ICONS.replay}
+            <div class="es-title" style="font-size:13px">No runs recorded</div>
+            <div class="small">This agent has never reported a run.</div></div>`;
+          countEl.textContent = '';
+          return;
+        }
+        rail.innerHTML = railRuns.map(runRow).join('') +
+          (cursor ? `<div class="rp-more"><button class="btn" id="rpMore" style="width:100%">Load older runs</button></div>`
+                  : `<div class="rp-more faint small" style="text-align:center">Full history — ${railRuns.length} runs</div>`);
+        countEl.textContent = `${railRuns.length} run${railRuns.length===1?'':'s'}${cursor?' so far':''}`;
+        rail.querySelectorAll('.rp-run').forEach(el =>
+          el.addEventListener('click', ()=>load(el.dataset.run)));
+        const more = document.getElementById('rpMore');
+        if(more) more.addEventListener('click', ()=>fetchPage(railAgent));
+      }
+
+      function markActive(runId){
+        rail.querySelectorAll('.rp-run').forEach(el =>
+          el.classList.toggle('active', el.dataset.run === runId));
+      }
+
+      function fetchPage(agentId, andThen){
+        const first = !cursor || railAgent !== agentId;
+        if(first){ railRuns.length = 0; cursor = null; railAgent = agentId;
+          rail.innerHTML = '<div class="card-loading" style="height:120px;margin:0 14px 14px"></div>'; }
+        const more = document.getElementById('rpMore');
+        if(more){ more.disabled = true; more.textContent = 'Loading…'; }
+        API.runs.history({ agent_id: agentId, cursor: cursor || undefined, limit: 50 })
+          .then(page => {
+            if(railAgent !== agentId) return; // agent switched while loading
+            railRuns.push(...(page.items||[]));
+            cursor = page.next_cursor || null;
+            paintRail();
+            if(andThen) andThen();
+          })
+          .catch(err => {
+            rail.innerHTML = '';
+            const box = screenError(err, ()=>fetchPage(agentId, andThen), 'this agent’s history');
+            box.style.margin = '0 14px 14px';
+            rail.appendChild(box);
+          });
+      }
+
+      // Agents come from the registry — every agent, whatever its status,
+      // because history outlives activation. The rail then reads that agent's
+      // complete run history from the telemetry store, page by page.
       const requested = APP.replayRun;
       Promise.all([
-        API.runs.list({ page_size: 30, sort: '-occurred_at' }),
+        API.agents.list({ page_size: 200, sort: 'name' }),
         requested ? API.runs.get(requested).catch(() => null) : Promise.resolve(null),
       ])
-        .then(([page, named]) => {
-          const items = (page.items || []).slice();
-          if(named && !items.some(r => r.id === named.id)) items.unshift(named);
-
+        .then(([agents, named]) => {
+          const items = agents.items || [];
           if(!items.length){
-            picker.innerHTML = '<option>No runs recorded yet</option>';
-            body.innerHTML = `<div class="empty-state">${ICONS.replay}
-              <div class="es-title">Nothing to replay yet</div>
-              <div>Once an agent reports a run, it can be replayed step by step here.</div></div>`;
+            agentPick.innerHTML = '<option>No agents registered</option>';
+            rail.innerHTML = `<div class="empty-state" style="padding:26px 14px">${ICONS.replay}
+              <div class="es-title" style="font-size:13px">Nothing to replay yet</div>
+              <div class="small">Register an agent and report a run first.</div></div>`;
             return;
           }
+          agentPick.innerHTML = items.map(a =>
+            `<option value="${esc(a.id)}">${esc(a.name)} — ${esc(a.status||'')}</option>`).join('');
+          agentPick.addEventListener('change', ()=>{ fetchPage(agentPick.value); });
 
-          // A named run that could not be fetched is said plainly rather than
-          // quietly swapped for another one.
-          if(requested && !items.some(r => r.id === requested)){
-            picker.innerHTML = items.map(o =>
-              `<option value="${esc(o.id)}">${esc(o.agent||'Agent')} — ${esc(String(o.id).slice(0,10))}… (${relTime(ts(o.occurred_at))})</option>`
-            ).join('');
-            picker.addEventListener('change', ()=>load(picker.value));
+          /* The run asked for wins. Arriving here from Live Runs names one
+           * specific run; replaying a different one silently would be the
+           * worst possible failure for a debugging tool. So a named run picks
+           * its own agent and loads directly, and if it cannot be fetched
+           * that is said plainly rather than quietly swapped. */
+          if(requested && named && named.agent_id && items.some(a=>a.id===named.agent_id)){
+            agentPick.value = named.agent_id;
+            fetchPage(named.agent_id, ()=>markActive(requested));
+            load(requested);
+            return;
+          }
+          if(requested && !named){
             body.innerHTML = `<div class="empty-state">${ICONS.alert}
               <div class="es-title">That run could not be loaded</div>
               <div>Run <span class="mono">${esc(String(requested).slice(0,14))}…</span> is not available —
-              it may have passed its retention window. Pick another run above.</div></div>`;
+              it may have passed its retention window. Pick another run from the browser.</div></div>`;
             APP.replayRun = null;
-            return;
           }
-
-          const wanted = requested || items[0].id;
-          picker.innerHTML = items.map(o =>
-            `<option value="${esc(o.id)}" ${o.id===wanted?'selected':''}>${esc(o.agent||'Agent')} — ${esc(String(o.id).slice(0,10))}… (${relTime(ts(o.occurred_at))})</option>`
-          ).join('');
-          picker.addEventListener('change', ()=>load(picker.value));
-          load(wanted);
+          fetchPage(agentPick.value);
         })
         .catch(err => {
-          picker.innerHTML = '<option>Unavailable</option>';
+          agentPick.innerHTML = '<option>Unavailable</option>';
+          rail.innerHTML = '';
           body.innerHTML = '';
-          body.appendChild(screenError(err, ()=>SCREENS['replay'].render(main), 'the run list'));
+          body.appendChild(screenError(err, ()=>SCREENS['replay'].render(main), 'the agent list'));
         });
 
       function load(runId){
         APP.replayRun = runId;
+        markActive(runId);
         playBtn.disabled = true;
         body.innerHTML = '<div class="card-loading" style="height:180px"></div>';
         API.runs.replay(runId)

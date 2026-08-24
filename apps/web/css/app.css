@@ -511,6 +511,24 @@ textarea.input:focus, input.input:focus{border-color:var(--purple);}
 .donut-center .dc-val{font-size:21px;font-weight:700;}
 .donut-center .dc-label{font-size:10.5px;color:var(--text-dim);margin-top:1px;}
 
+/* ================= REPLAY STUDIO BROWSER ================= */
+.rp-layout{display:grid;grid-template-columns:332px minmax(0,1fr);gap:14px;align-items:start;}
+@media (max-width:1100px){.rp-layout{grid-template-columns:1fr;}}
+.rp-rail-list{display:flex;flex-direction:column;max-height:calc(100vh - 305px);min-height:120px;overflow-y:auto;margin:0 -14px -14px;}
+.rp-run{
+  display:block;width:100%;text-align:left;font:inherit;color:inherit;cursor:pointer;
+  background:none;border:0;border-top:1px solid var(--border-soft);padding:9px 14px;
+}
+.rp-run:hover{background:var(--panel-2);}
+.rp-run.active{background:var(--purple-dim);box-shadow:inset 3px 0 0 var(--purple);}
+.rp-run-top{display:flex;align-items:center;justify-content:space-between;gap:8px;}
+.rp-run-preview{
+  color:var(--text-dim);font-size:11.5px;margin-top:3px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+.rp-run-facts{color:var(--text-faint);font-size:10.5px;margin-top:3px;}
+.rp-more{border-top:1px solid var(--border-soft);padding:8px 14px;}
+
 /* ================= TIMELINE / PIPELINE ================= */
 .pipe{display:flex;flex-direction:column;gap:0;}
 .pipe-step{display:flex;gap:11px;position:relative;padding-bottom:16px;}

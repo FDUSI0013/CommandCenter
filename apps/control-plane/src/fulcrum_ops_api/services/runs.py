@@ -76,6 +76,7 @@ from ..schemas.runs import (
     RunFlagRequest,
     RunFlagResult,
     RunGuardrails,
+    RunHistoryPage,
     RunPolicy,
     RunRead,
     RunResponse,
@@ -920,6 +921,55 @@ async def list_runs(
     ordered = _sorted([item.run for item in scanned], params)
     start = params.offset
     return ordered[start : start + params.page_size], len(ordered), info
+
+
+async def run_history(
+    session: AsyncSession,
+    principal: Principal,
+    agent_id: str,
+    *,
+    cursor: str | None = None,
+    limit: int = 50,
+) -> RunHistoryPage:
+    """One agent's complete run history, newest first, one cursor page at a time.
+
+    This is Replay Studio's browser: unlike the Live Runs window it has no
+    time floor — every run the store still holds is reachable by paging. One
+    project, one engine call per page; the cursor is the engine's own
+    ``last_retrieved_id``, so a page is O(page) however deep the history goes.
+    """
+    agent = (
+        await session.execute(
+            select(Agent).where(
+                Agent.workspace_id == principal.workspace_id, Agent.id == agent_id
+            )
+        )
+    ).scalar_one_or_none()
+    if agent is None:
+        raise NotFound(f"Agent '{agent_id}' does not exist.")
+    if not agent.engine_project_id:
+        # Never provisioned means never a single run; an empty page says so
+        # without pretending the store was asked.
+        return RunHistoryPage(agent_id=agent.id, agent_name=agent.name, items=[])
+
+    wanted = max(1, min(limit, ENGINE_PAGE_SIZE))
+    batch = await _call(
+        _client().search_traces(
+            project_id=agent.engine_project_id,
+            limit=wanted,
+            last_retrieved_id=cursor,
+            truncate=True,
+            strip_attachments=True,
+        )
+    )
+    rows = [row for row in batch if isinstance(row, dict) and row.get("id")]
+    items = [_map_run(row, agent, principal) for row in rows]
+    # A short page is the engine's end-of-stream signal — judged on the raw
+    # batch, so a dropped unaddressable row can never silently end the history.
+    next_cursor = str(rows[-1]["id"]) if len(batch) >= wanted and rows else None
+    return RunHistoryPage(
+        agent_id=agent.id, agent_name=agent.name, items=items, next_cursor=next_cursor
+    )
 
 
 async def export_runs(

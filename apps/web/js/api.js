@@ -211,6 +211,7 @@
     },
     runs: {
       list: (params) => get('/runs', params),
+      history: (params) => get('/runs/history', params),
       get: (id) => get(`/runs/${encodeURIComponent(id)}`),
       trace: (id) => get(`/runs/${encodeURIComponent(id)}/trace`),
       replay: (id) => get(`/runs/${encodeURIComponent(id)}/replay`),

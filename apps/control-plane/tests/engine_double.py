@@ -15,10 +15,12 @@ on rather than a convenience:
   header, because :meth:`EngineClient._create` reads the new id off it. Most
   mutations answer ``204``. The three search endpoints answer newline-delimited
   JSON, one row per line, which is what ``_decode_lines`` parses.
-* **Cursor paging.** ``search_traces``/``search_spans``/``search_threads`` order
-  by id and honour ``last_retrieved_id``/``last_retrieved_thread_model_id``,
-  returning fewer rows than ``limit`` once exhausted — that "short page means
-  done" signal is exactly how the scan loop in ``services.runs`` terminates.
+* **Cursor paging.** ``search_traces``/``search_spans``/``search_threads``
+  stream by id *descending* (newest first, as the real engine does) and honour
+  ``last_retrieved_id``/``last_retrieved_thread_model_id`` as an
+  older-rows-only resume point, returning fewer rows than ``limit`` once
+  exhausted — that "short page means done" signal is exactly how the scan loop
+  in ``services.runs`` terminates.
 * **Failure.** :meth:`EngineDouble.fail` makes every route answer 503 so the
   fail-closed behaviour of the telemetry surfaces can be exercised, and
   :attr:`EngineDouble.calls` records every request for assertions about *what*
@@ -1029,15 +1031,17 @@ class EngineDouble:
         *,
         key: str = "id",
     ) -> list[JsonObject]:
-        """Order by id and return the page after ``after``, capped at ``limit``.
+        """Stream newest-first and return the page after ``after``.
 
-        A short page is the engine's end-of-stream signal, which is what the
-        scan loops in the control plane terminate on, so the cap is applied to
-        the *remaining* rows rather than to the whole set.
+        The real engine's search endpoints stream by id *descending* — a
+        UUIDv7 id is a timestamp, so the newest row comes first — and
+        ``last_retrieved_id`` resumes with strictly older rows. A short page
+        is the end-of-stream signal the control plane's scan loops terminate
+        on, so the cap is applied to the *remaining* rows, not the whole set.
         """
-        ordered = sorted(rows, key=lambda row: str(row.get(key)))
+        ordered = sorted(rows, key=lambda row: str(row.get(key)), reverse=True)
         if after:
-            ordered = [row for row in ordered if str(row.get(key)) > str(after)]
+            ordered = [row for row in ordered if str(row.get(key)) < str(after)]
         limit = _as_int(payload.get("limit"), 500)
         return ordered[: max(limit, 0)]
 

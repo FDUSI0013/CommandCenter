@@ -543,6 +543,78 @@ async def test_the_run_list_searches_and_exports_like_the_rest(
     assert len(rows) == 2
 
 
+# ---------------------------------------------------------------------------
+# Replay Studio's run history browser
+# ---------------------------------------------------------------------------
+
+
+def _ordered_trace_id(index: int) -> str:
+    """A trace id whose string order matches its index, like a real UUIDv7."""
+    return f"01900000-0000-7000-8000-{index:012d}"
+
+
+async def test_run_history_pages_the_agents_whole_past_newest_first(
+    admin_client, factory, workspace, engine
+):
+    """The browser has no time floor: every run is reachable by cursor, and
+    the stream comes back newest first, exactly as the engine hands it out."""
+    agent = await factory.provisioned_agent(workspace, engine, name="Support Bot")
+    for index in range(7):
+        engine.add_trace(
+            project_name=agent.engine_project_name,
+            trace_id=_ordered_trace_id(index),
+            name=f"run-{index}",
+        )
+
+    seen: list[str] = []
+    cursor, pages = None, 0
+    while True:
+        params = {"agent_id": agent.id, "limit": 3}
+        if cursor:
+            params["cursor"] = cursor
+        response = await admin_client.get("/api/v1/runs/history", params=params)
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["agent_id"] == agent.id
+        assert body["agent_name"] == "Support Bot"
+        seen.extend(run["id"] for run in body["items"])
+        pages += 1
+        cursor = body["next_cursor"]
+        if cursor is None:
+            break
+
+    assert seen == [_ordered_trace_id(index) for index in reversed(range(7))]
+    assert pages == 3, "7 runs at 3 a page is 3 pages, the last one short"
+
+
+async def test_run_history_is_workspace_scoped(admin_client, factory, engine):
+    """Another workspace's agent answers 404, exactly as if it did not exist."""
+    other = await factory.workspace(name="Someone Else")
+    foreign = await factory.provisioned_agent(other, engine, name="Their Bot")
+    engine.add_trace(project_name=foreign.engine_project_name)
+
+    response = await admin_client.get(
+        "/api/v1/runs/history", params={"agent_id": foreign.id}
+    )
+    assert response.status_code == 404, response.text
+
+
+async def test_run_history_of_an_unprovisioned_agent_is_an_honest_empty_page(
+    admin_client, factory, workspace
+):
+    """No engine project means no runs ever — an empty page, not an engine
+    call that could only invent one."""
+    agent = await factory.agent(workspace, name="Paper Agent")
+
+    response = await admin_client.get(
+        "/api/v1/runs/history", params={"agent_id": agent.id}
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["items"] == []
+    assert body["next_cursor"] is None
+
+
 async def test_the_audit_list_answers_the_same_envelope(admin_client, factory, workspace):
     """The trail is written by other endpoints; its list contract is still ours."""
     for index in range(7):

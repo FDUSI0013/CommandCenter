@@ -28,6 +28,7 @@ from ...schemas.runs import (
     RunDetail,
     RunFlagRequest,
     RunFlagResult,
+    RunHistoryPage,
     RunPolicy,
     RunRead,
     RunResponse,
@@ -223,6 +224,27 @@ async def stream_runs(
             "Cache-Control": "no-cache, no-transform",
             "X-Accel-Buffering": "no",
         },
+    )
+
+
+@router.get(
+    "/history", response_model=RunHistoryPage, summary="Browse one agent's full run history"
+)
+async def run_history(
+    principal: CurrentPrincipal,
+    session: Db,
+    agent_id: Annotated[str, Query(description="Agent whose history to browse")],
+    cursor: Annotated[
+        str | None, Query(description="`next_cursor` from the previous page")
+    ] = None,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+) -> RunHistoryPage:
+    """Replay Studio's browser: every run the store still holds for one agent,
+    newest first, one cursor page at a time. Unlike the run table there is no
+    time floor — keep passing `next_cursor` until it comes back null.
+    """
+    return await service.run_history(
+        session, principal, agent_id, cursor=cursor, limit=limit
     )
 
 
