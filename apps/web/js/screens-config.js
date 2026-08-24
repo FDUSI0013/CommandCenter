@@ -134,7 +134,7 @@
   const CFG_TABS = [
     ['All Configurations', null], ['Models','Model'], ['Prompts','Prompt'], ['Tools','Tool'],
     ['Guardrails','Guardrail'], ['Routing','Routing'], ['Quotas','Quota'],
-    ['Environments','Environment'], ['Connectors','Connector'],
+    ['Environments','Environment'], ['Connectors','Connector'], ['MCP Servers','MCP Server'],
   ];
 
   function cfgStatusColor(s){

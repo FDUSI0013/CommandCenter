@@ -46,7 +46,11 @@
       // Legacy labels stay: alert rows raised before the screens were renamed still carry them.
       const map = { 'Connection Center':'connections','Hosting & Deployment':'connections','Quota, Cost & Capacity':'quota','Policy Center':'policies',
         'Secrets & Credentials':'secrets','Testing & Regression':'testing','RAG & Knowledge Governance':'knowledge',
-        'Deployment & Environment':'deployments','Environments & Releases':'deployments','Live Runs':'live-runs','Agent Registry':'agents','Approvals & Audit':'approvals' };
+        'Deployment & Environment':'deployments','Environments & Releases':'deployments','Live Runs':'live-runs','Agent Registry':'agents','Approvals & Audit':'approvals',
+        'Guardrails':'guardrails','Metrics':'metrics','Evaluations':'evaluations','Configuration Center':'configurations',
+        'Prompt Studio':'prompts','Prompt Manager':'prompts','Connector & MCP Governance':'connectors',
+        'Memory & State Management':'memory','Feedback & Quality Loop':'feedback','Exports':'exports',
+        'Licensing & Entitlements':'licensing' };
       return map[source] || 'alerts';
     },
     /** Re-read the two counts the sidebar shows. Cheap, and safe to call often. */
@@ -67,8 +71,15 @@
         ${it[0]==='alerts'?`<span class="nav-count" data-navcount="alerts">${counts.alerts||''}</span>`:''}
         ${it[0]==='approvals'?`<span class="nav-count" data-navcount="approvals">${counts.approvals||''}</span>`:''}
       </div>`).join('')}
-    </div>`).join('');
-    nav.querySelectorAll('.nav-item').forEach(el=>{
+    </div>`).join('')
+    // The operator manual is a page of its own, not a hash route; it opens
+    // in a new tab so reading it never loses the screen you were on.
+    + `<div class="nav-group"><div class="nav-label">HELP</div>
+      <a class="nav-item" href="/docs/" target="_blank" rel="noopener" title="Operator Manual"
+         style="text-decoration:none;color:inherit">
+        <span class="nav-ico">${ICONS.book||''}</span><span style="overflow:hidden;text-overflow:ellipsis">Documentation</span>
+      </a></div>`;
+    nav.querySelectorAll('.nav-item[data-route]').forEach(el=>{
       el.addEventListener('click', ()=>APP.go(el.dataset.route));
     });
   }

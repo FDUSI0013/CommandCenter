@@ -1205,6 +1205,32 @@ class EngineClient:
             ),
         )
 
+    async def list_dataset_items_with_experiments(
+        self,
+        dataset_id: str,
+        experiment_ids: Sequence[str],
+        *,
+        page: int = 1,
+        size: int = 50,
+        truncate: bool = True,
+    ) -> JsonObject:
+        """Dataset items joined to their experiment items, one page at a time.
+
+        The plain items listing carries no experiment results; this comparison
+        endpoint is the one that answers "how did this experiment do on each
+        case", which is what the suite runner grades from.
+        """
+        return await self._request(
+            "GET",
+            f"{API_ROOT}/datasets/{dataset_id}/items/experiments/items",
+            params=_params(
+                experiment_ids=json.dumps(list(experiment_ids)),
+                page=page,
+                size=size,
+                truncate=truncate,
+            ),
+        )
+
     async def list_dataset_items(
         self,
         dataset_id: str,

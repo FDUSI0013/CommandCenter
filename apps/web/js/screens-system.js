@@ -99,35 +99,38 @@
    * becoming an invented name.
    */
   function memberDirectory(){
-    let byId = null, inflight = null, rows = [];
+    let byId = null, inflight = null, rows = [], loadErr = null;
     return {
       load(){
         if(byId) return Promise.resolve(rows);
         if(!inflight){
-          inflight = API.alerts.assignees({ page_size: 200, sort: 'full_name' })
-            .then(page => {
-              rows = page.items || [];
+          // The directory is a bare {id, full_name, initials} array, not a page.
+          inflight = API.alerts.assignees()
+            .then(list => {
+              rows = list || [];
               byId = {};
               rows.forEach(u => { byId[u.id] = u; });
               return rows;
             })
-            .catch(() => { byId = {}; rows = []; return rows; });
+            // A refusal is not an empty workspace — remember it so callers can say why.
+            .catch(err => { loadErr = err; byId = {}; rows = []; return rows; });
         }
         return inflight;
       },
+      error(){ return loadErr; },
       items(){ return rows; },
       user(id){ return (byId && byId[id]) || null; },
       name(id){
         if(!id) return null;
         const u = byId && byId[id];
-        return u ? (u.full_name || u.email) : null;
+        return u ? u.full_name : null;
       },
       /** A person cell, or the raw id when the directory has not resolved it. */
       cell(id, fallback){
         if(!id) return fallback || dash;
         const u = byId && byId[id];
-        if(!u) return `<span class="mono dim" title="This user is no longer a member of the workspace">${esc(String(id).slice(0,8))}…</span>`;
-        return ownerCell(u.full_name || u.email, u.team || u.job_title || '');
+        if(!u) return `<span class="mono dim" title="${loadErr ? 'Member names could not be loaded' : 'This user is no longer a member of the workspace'}">${esc(String(id).slice(0,8))}…</span>`;
+        return ownerCell(u.full_name, '');
       },
     };
   }
@@ -234,7 +237,10 @@
           { label:'Assign…', icon:'users', onClick:()=>openAssign(r) },
           { label:'Open Source Screen', icon:'external', onClick:()=>APP.go(APP.sourceRoute(r.source)) },
           { sep:true },
-          { label:'Mute for 24h', icon:'clock', onClick:()=>mute(r, 1440) },
+          // A muted alert offers the way back; anything else offers the mute.
+          ...(r.status === 'Muted'
+            ? [{ label:'Unmute', icon:'bell', onClick:()=>unmute(r) }]
+            : [{ label:'Mute for 24h', icon:'clock', onClick:()=>mute(r, 1440) }]),
         ],
       });
 
@@ -310,9 +316,25 @@
         }
       }
 
+      async function unmute(r){
+        if(!allowed('operator','Unmuting an alert requires the operator role.')) return;
+        try {
+          await Store.mutate(() => API.alerts.update(r.id, { status: 'Open' }), { event:'alerts:changed' });
+          toast('info','Unmuted', `${r.title} is open again.`);
+          afterChange();
+          if(selectedId === r.id) showAlert(r);
+        } catch (err) {
+          toast('error','Could not unmute', errText(err));
+        }
+      }
+
       async function openAssign(r){
         if(!allowed('operator','Assigning an alert requires the operator role.')) return;
         const people = await members.load();
+        if(members.error()){
+          toast('error','Not permitted','Seeing member names requires the operator role.');
+          return;
+        }
         if(!people.length){
           toast('warn','No one to assign to','This workspace has no other members yet.');
           return;
@@ -322,7 +344,7 @@
           body:`<div class="quote">${esc(r.title)}</div>
             <div class="form-row mt"><label>ASSIGN TO</label>
               <select class="filter-select w-100" id="alAssignee" style="height:34px">${people.map(u =>
-                `<option value="${esc(u.id)}" ${u.id === r.assigned_to_user_id ? 'selected' : ''}>${esc(u.full_name || u.email)} — ${esc(u.role)}</option>`).join('')}</select></div>
+                `<option value="${esc(u.id)}" ${u.id === r.assigned_to_user_id ? 'selected' : ''}>${esc(u.full_name)}</option>`).join('')}</select></div>
             <div class="form-row"><label>NOTE (OPTIONAL)</label><input class="input" id="alAssignNote" placeholder="Why them?"></div>`,
           footer:[
             { label:'Cancel' },
@@ -468,7 +490,7 @@
             if(!modal.querySelector('#alRulesBody')) return;
             if(!(page.items || []).length){
               body.innerHTML = emptyBlock('sliders','No alert rules are defined yet',
-                'A rule turns a condition on a source screen into an alert. Create one to start raising them automatically.');
+                'A rule records the condition a source screen raises its alerts on, and who should hear about them. The screens raise the alerts; the rule is the paper trail reviewers audit against.');
               return;
             }
             body.innerHTML = `<table class="tbl"><thead><tr><th>Rule</th><th>Condition</th><th>Source</th>
@@ -565,7 +587,7 @@
         try {
           await Store.mutate(() => API.alerts.rules.update(rule.id, { enabled: !rule.enabled }), { event:'alerts:changed' });
           toast('success', rule.enabled ? 'Rule disabled' : 'Rule enabled',
-            rule.enabled ? `${rule.name} will stop raising alerts.` : `${rule.name} is watching ${rule.source} again.`);
+            rule.enabled ? `${rule.name} is retired from ${rule.source}.` : `${rule.name} applies to ${rule.source} again.`);
           if(after) after();
         } catch (err) {
           toast('error','Could not change the rule', errText(err));
@@ -1004,13 +1026,15 @@
       }
 
       function editSchedule(sched, after){
-        if(!allowed('operator', sched ? 'Editing a schedule requires the operator role.' : 'Scheduling an export requires the operator role.')) return;
+        // "Schedule Weekly" seeds a schedule that has no id yet — only an id means an edit.
+        const isEdit = !!(sched && sched.id);
+        if(!allowed('operator', isEdit ? 'Editing a schedule requires the operator role.' : 'Scheduling an export requires the operator role.')) return;
         const s = sched || {};
         const dsOptions = datasets.length
           ? datasets.map(d => `<option ${d.source_screen === s.source_screen ? 'selected' : ''}>${esc(d.source_screen)}</option>`).join('')
           : `<option>${esc(s.source_screen || '')}</option>`;
         openModal({
-          title: sched ? 'Edit Schedule' : 'New Export Schedule', icon:'calendar',
+          title: isEdit ? 'Edit Schedule' : 'New Export Schedule', icon:'calendar',
           body:`<div class="form-row"><label>NAME</label>
               <input class="input" id="esName" value="${esc(s.name || '')}" placeholder="e.g. Weekly audit trail"></div>
             <div class="grid g2">
@@ -1033,7 +1057,7 @@
             <div class="small faint" style="margin-top:6px">The cron expression is evaluated in UTC; the first firing is computed when it is saved.</div>`,
           footer:[
             { label:'Cancel' },
-            { label: sched ? 'Save Schedule' : 'Create Schedule', cls:'primary', onClick: async (close, modal) => {
+            { label: isEdit ? 'Save Schedule' : 'Create Schedule', cls:'primary', onClick: async (close, modal) => {
                 const name = modal.querySelector('#esName').value.trim();
                 const cron = modal.querySelector('#esCron').value.trim();
                 if(!name || !cron){ toast('error','Cannot save','A schedule needs a name and a cron expression.'); return; }
@@ -1048,15 +1072,15 @@
                 };
                 close();
                 try {
-                  const saved = await Store.mutate(() => sched
+                  const saved = await Store.mutate(() => isEdit
                     ? API.exports.schedules.update(sched.id, body)
                     : API.exports.schedules.create(body), { event:'exports:changed' });
-                  toast('success', sched ? 'Schedule saved' : 'Schedule created',
+                  toast('success', isEdit ? 'Schedule saved' : 'Schedule created',
                     saved.next_run_at ? `Next run ${fmtDateTime(ts(saved.next_run_at))}.` : `${name} is paused until enabled.`);
                   loadSummary();
                   if(after) after();
                 } catch (err) {
-                  toast('error', sched ? 'Could not save the schedule' : 'Could not create the schedule', errText(err));
+                  toast('error', isEdit ? 'Could not save the schedule' : 'Could not create the schedule', errText(err));
                 }
               } },
           ],
@@ -1787,7 +1811,7 @@
           body:`${replacesUserId ? `<div class="quote">Releasing the seat held by ${esc(members.name(replacesUserId) || replacesUserId)} and issuing it to somebody else, in one transaction.</div>` : ''}
             <div class="form-row mt"><label>NEW HOLDER</label>
               <select class="filter-select w-100" id="rsUser" style="height:34px">${people.map(u =>
-                `<option value="${esc(u.id)}">${esc(u.full_name || u.email)} — ${esc(u.role)}</option>`).join('')}</select></div>
+                `<option value="${esc(u.id)}">${esc(u.full_name)}</option>`).join('')}</select></div>
             <div class="form-row"><label>SEAT ROLE</label>
               <select class="filter-select w-100" id="rsRole" style="height:34px">${SEAT_ROLES.map(r =>
                 `<option ${r === 'member' ? 'selected' : ''}>${r}</option>`).join('')}</select></div>`,

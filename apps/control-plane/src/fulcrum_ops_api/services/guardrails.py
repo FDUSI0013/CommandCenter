@@ -507,6 +507,7 @@ def _read(
         engine_guardrail_id=guardrail.engine_guardrail_id,
         owner_user_id=guardrail.owner_user_id,
         owner_name=owner,
+        checker_supported=checker_supported(guardrail),
         created_at=guardrail.created_at,
         updated_at=guardrail.updated_at,
         created_by=guardrail.created_by,

@@ -448,11 +448,13 @@
        *
        * Only while the reader is on page one with no search or filters applied:
        * anywhere else, injecting a row would contradict the query on screen, so
-       * the count is bumped and the row is left for the next fetch.
+       * the row is left for the next fetch. The count is bumped only when no
+       * filter or search is active — the arriving row may not match the query,
+       * so it must not inflate a filtered total.
        */
       prependRow(row){
         const filtered = state.query || Object.values(state.filters).some(Boolean);
-        state.total += 1;
+        if(!filtered) state.total += 1;
         if(state.page !== 1 || filtered){ render(); return false; }
         row.__flash = true;
         state.rows.unshift(row);

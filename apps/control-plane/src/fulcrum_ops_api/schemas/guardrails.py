@@ -141,6 +141,12 @@ class GuardrailRead(BaseModel):
     engine_guardrail_id: str | None = None
     owner_user_id: str | None = None
     owner_name: str | None = None
+    checker_supported: bool = Field(
+        True,
+        description="Whether this deployment's inline scanner implements the "
+        "validation; a rule it does not implement is recorded but never "
+        "enforced at ingest, and the screen must say so.",
+    )
 
     created_at: dt.datetime
     updated_at: dt.datetime

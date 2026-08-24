@@ -54,7 +54,7 @@
   SCREENS['live-runs'] = {
     title:'Live Runs',
     render(main){
-      let liveOn = true, runStream = null, currentRunId = null;
+      let liveOn = true, runStream = null, streamKey = '', currentRunId = null;
 
       main.innerHTML = `
         ${pageHead({ title:'Live Runs', sub:'Real-time observability of agent executions across every connected platform.',
@@ -179,15 +179,17 @@
         ],
         source: (params) => API.runs.list(params),
         exportSource: (params) => API.runs.export(params),
-        onLoad: () => loadSummary(),
+        onLoad: () => { loadSummary(); syncStream(); },
         autoSelectFirst: true,
         onSelect: showRun,
         rowActions: r=>[
           {label:'View Full Trace', icon:'activity', onClick:()=>openTrace(r.id)},
           {label:'Open in Replay Studio', icon:'replay', onClick:()=>{ APP.replayRun = r.id; APP.go('replay'); }},
           ...(r.agent_id ? [{label:'View Agent', icon:'bot', onClick:()=>APP.go('agent/'+r.agent_id)}] : []),
-          {sep:true},
-          {label:'Flag for Review', icon:'flag', onClick:()=>flagRun(r)},
+          ...(Store.session.can('member') ? [
+            {sep:true},
+            {label:'Flag for Review', icon:'flag', onClick:()=>flagRun(r)},
+          ] : []),
         ],
       });
 
@@ -208,6 +210,10 @@
       }).catch(()=>{});
 
       async function flagRun(r){
+        if(!Store.session.can('member')){
+          toast('error','Not permitted','Flagging a run requires the member role.');
+          return;
+        }
         try {
           const result = await API.runs.flag(r.id, { reason: 'Flagged from Live Runs' });
           toast('warn','Flagged for review', `${String(result.run_id).slice(0,12)}… routed to the review queue.`);
@@ -350,7 +356,7 @@
 
       function renderSpans(spans, depth){
         return spans.map(s => {
-          const state = s.status === 'error' || s.error ? 'fail' : 'done';
+          const state = s.status === 'fail' || s.error ? 'fail' : 'done';
           const detail = [s.span_type, s.model, s.tokens ? fmtFull(s.tokens)+' tokens' : null,
                           s.cost ? fmtMoney(s.cost,4) : null, s.error || s.output_preview || s.input_preview]
                          .filter(Boolean).join(' · ');
@@ -375,11 +381,17 @@
             : `${ICONS.pause}<span style="margin-left:2px">PAUSED</span>`;
       }
 
+      function streamParams(){
+        const p = table.params();
+        return { tenant: p.tenant, source: p.source, status: p.status, risk: p.risk, policy: p.policy, q: p.q };
+      }
+
       function openStream(){
         if(runStream) return;
-        const p = table.params();
+        const p = streamParams();
+        streamKey = JSON.stringify(p);
         runStream = API.runs.stream({
-          params: { tenant: p.tenant, source: p.source, status: p.status, risk: p.risk, policy: p.policy },
+          params: p,
           events: {
             open: () => setPill('live'),
             run: (frame) => {
@@ -394,6 +406,15 @@
 
       function closeStream(){
         if(runStream){ runStream.close(); runStream = null; }
+      }
+
+      function syncStream(){
+        // The stream answers the query it was opened with; once the filters or
+        // search change it would keep pushing rows the table no longer shows.
+        if(!liveOn) return;
+        if(runStream && JSON.stringify(streamParams()) === streamKey) return;
+        closeStream();
+        openStream();
       }
 
       pill.addEventListener('click', ()=>{
@@ -433,7 +454,8 @@
               close();
               try {
                 const started = await API.agents.run(agentId, input ? { input } : {});
-                toast('success','Run started', `${esc(started.agent || 'Agent')} · ${String(started.run_id||'').slice(0,12)}…`);
+                const d = started.data || {};
+                toast('success','Run started', `${esc(d.agent_name || 'Agent')} · ${String(d.run_id || started.entity_id || '').slice(0,12)}…`);
                 table.refresh();
               } catch (err) {
                 toast('error','Could not start the run', err.message);
@@ -545,7 +567,7 @@
       }
 
       function stepHtml(s, i){
-        const state = s.status === 'error' || s.error ? 'fail' : 'done';
+        const state = s.status === 'fail' || s.error ? 'fail' : 'done';
         const facts = [
           s.model, s.tokens ? fmtFull(s.tokens)+' tokens' : null,
           s.cost ? fmtMoney(s.cost,4) : null,

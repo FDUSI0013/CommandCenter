@@ -685,9 +685,16 @@ async def _read_cases(
     page = 1
     while len(cases) < min(total, CASE_FETCH_LIMIT):
         try:
-            payload = await client.list_dataset_items(
-                dataset_id, page=page, size=CASE_PAGE_SIZE
-            )
+            # The plain items listing carries no experiment results; only the
+            # comparison endpoint joins each case to this run's verdicts.
+            if experiment_id:
+                payload = await client.list_dataset_items_with_experiments(
+                    dataset_id, [experiment_id], page=page, size=CASE_PAGE_SIZE
+                )
+            else:
+                payload = await client.list_dataset_items(
+                    dataset_id, page=page, size=CASE_PAGE_SIZE
+                )
         except EngineError as exc:
             raise translate_engine_error(exc) from exc
         rows = payload.get("content") or payload.get("items") or []

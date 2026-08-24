@@ -43,6 +43,7 @@ from ..models.registry import (
 )
 from ..schemas.connections import (
     ENDPOINT_CONFIG_KEYS,
+    REDACTED,
     ActivityStatus,
     BulkActionSummary,
     ConnectionCreate,
@@ -577,6 +578,16 @@ async def update_connection(
         value = changes.get(field)
         if isinstance(value, (ConnectionStatus, HealthState)):
             changes[field] = value.value
+
+    if isinstance(changes.get("config"), dict):
+        # Reads redact credential-shaped values, so a client that round-trips
+        # what it was shown would overwrite real material with the marker.
+        # A marker value means "unchanged": keep what is stored.
+        stored = dict(connection.config or {})
+        changes["config"] = {
+            key: (stored.get(key) if value == REDACTED else value)
+            for key, value in changes["config"].items()
+        }
 
     for field, value in changes.items():
         setattr(connection, field, value)

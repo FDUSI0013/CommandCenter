@@ -22,6 +22,7 @@ from fastapi import APIRouter, Depends, Query, Request, status
 from fastapi.responses import StreamingResponse
 
 from ...core.errors import PermissionDenied
+from ...models.identity import Role
 from ...models.registry import EnvironmentType
 from ...schemas.identity import (
     API_KEY_SCOPES,
@@ -34,6 +35,7 @@ from ...schemas.identity import (
     ApiKeyUsage,
     MemberCreate,
     MemberRead,
+    MemberRef,
     MemberRoleChange,
     MembersSummary,
     MemberStatus,
@@ -178,6 +180,27 @@ async def get_own_membership(principal: CurrentPrincipal, session: Db) -> Member
         raise PermissionDenied("This endpoint is for signed-in users, not API keys.")
     row = await service.get_member(session, principal, principal.user_id)
     return MemberRead.model_validate(row)
+
+
+@router.get(
+    "/users/directory",
+    response_model=list[MemberRef],
+    summary="Member names for pickers",
+)
+async def member_directory(principal: CurrentPrincipal, session: Db) -> list[MemberRef]:
+    """Names only, for assignment pickers on operator screens.
+
+    The full member list is admin-only so an API key can never enumerate the
+    tenant's staff; this endpoint carries just id, name and initials, and is
+    open only to signed-in people — the alert-assignment and escalation
+    pickers are operator flows, and an operator choosing an assignee needs to
+    see who exists.
+    """
+    if principal.kind != "user":
+        raise PermissionDenied("This endpoint is for signed-in users, not API keys.")
+    principal.require(Role.OPERATOR)
+    rows = await service.member_directory(session, principal)
+    return [MemberRef.model_validate(row) for row in rows]
 
 
 @router.get("/users", response_model=Page[MemberRead], summary="List members")

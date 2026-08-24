@@ -935,6 +935,31 @@ async def list_members(
     return await _attach_users(session, memberships, principal), total
 
 
+async def member_directory(
+    session: AsyncSession, principal: Principal
+) -> list[dict[str, Any]]:
+    """Active members' names only, for assignment pickers on operator screens.
+
+    Deliberately thinner than :func:`list_members`: no emails, roles, teams or
+    login history — nothing worth mining — so it can open to operators without
+    weakening the admin gate on the roster itself. The caller enforces the
+    signed-in-person and operator checks.
+    """
+    stmt = (
+        select(User)
+        .join(Membership, Membership.user_id == User.id)
+        .where(
+            Membership.workspace_id == principal.workspace_id,
+            User.is_active.is_(True),
+        )
+        .order_by(User.full_name.asc())
+    )
+    return [
+        {"id": user.id, "full_name": user.full_name, "initials": user.initials}
+        for user in (await session.execute(stmt)).scalars()
+    ]
+
+
 async def export_members(
     session: AsyncSession,
     principal: Principal,

@@ -152,3 +152,66 @@ async def test_the_exports_summary_actually_carries_its_datasets(admin_client):
     datasets = summary.json()["datasets"]
     assert datasets, "the schema used to silently discard this field"
     assert {"source_screen", "columns", "filterable"} <= set(datasets[0])
+
+
+async def test_round_tripping_a_redacted_config_never_destroys_the_credential(
+    admin_client, db, factory, workspace
+):
+    """Reads redact credentials; writing a read back must not store the marker."""
+    from fulcrum_ops_api.models.registry import Connection
+
+    created = await admin_client.post(
+        "/api/v1/connections",
+        json={
+            "name": "Round-trip probe",
+            "kind": "Custom REST API",
+            "config": {"endpoint_url": "https://api.example.test", "api_key": "sk-real-9911"},
+        },
+    )
+    assert created.status_code == 201, created.text
+    connection_id = created.json()["id"]
+
+    shown = (await admin_client.get(f"/api/v1/connections/{connection_id}")).json()
+    assert shown["config"]["api_key"] == "***redacted***", "reads must redact"
+
+    patched = await admin_client.patch(
+        f"/api/v1/connections/{connection_id}",
+        json={"note": "edited only the note", "config": shown["config"]},
+    )
+    assert patched.status_code == 200, patched.text
+
+    stored = await db.get(Connection, connection_id)
+    assert stored.config["api_key"] == "sk-real-9911", (
+        "the marker must never overwrite the stored credential"
+    )
+
+
+async def test_operators_can_read_the_member_directory_but_keys_cannot(
+    as_role, ingest_client, workspace
+):
+    """Assignment pickers need names; API keys must not enumerate staff."""
+    async with as_role(Role.OPERATOR) as operator:
+        listed = await operator.get("/api/v1/workspaces/users/directory")
+        assert listed.status_code == 200, listed.text
+        rows = listed.json()
+        assert rows and {"id", "full_name", "initials"} <= set(rows[0])
+        assert "email" not in rows[0], "names only — nothing worth mining"
+
+        full = await operator.get("/api/v1/workspaces/users")
+        assert full.status_code == 403, "the full roster stays admin-only"
+
+    async with as_role(Role.MEMBER) as member:
+        refused = await member.get("/api/v1/workspaces/users/directory")
+        assert refused.status_code == 403
+
+    keyed = await ingest_client.get("/api/v1/workspaces/users/directory")
+    assert keyed.status_code == 403, "a key never reads people, whatever its role maps to"
+
+
+async def test_licensing_export_accepts_each_tabs_own_status_vocabulary(admin_client):
+    """Draft is a plan status, Paid an invoice status; the export takes both."""
+    for dataset, status_value in (("plans", "Draft"), ("invoices", "Paid")):
+        r = await admin_client.get(
+            f"/api/v1/licensing/export?dataset={dataset}&status={status_value}"
+        )
+        assert r.status_code == 200, f"{dataset}/{status_value}: {r.status_code} {r.text[:150]}"

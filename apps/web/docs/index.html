@@ -1,0 +1,1318 @@
+<title>Fulcrum Ops Operator Manual</title>
+<style>
+  :root{
+    --ink:#0E1417; --ink-2:#3A474D; --ink-3:#63737A;
+    --paper:#F7F9F9; --surface:#FFFFFF; --surface-2:#EEF3F3;
+    --rule:#DCE4E4; --rule-2:#C6D2D2;
+    --accent:#0F766E; --accent-ink:#0B5D57; --accent-wash:#E2F1EF;
+    --ok:#15803D; --warn:#B45309; --bad:#B91C1C;
+    --code-bg:#F1F5F5; --code-ink:#134E4A;
+    --shadow:0 1px 2px rgba(14,20,23,.05),0 8px 24px -12px rgba(14,20,23,.18);
+    --sans:"IBM Plex Sans",ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
+    --serif:"IBM Plex Serif",ui-serif,Georgia,"Times New Roman",serif;
+    --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --ink:#E7EDED; --ink-2:#AFBEC0; --ink-3:#7E9095;
+      --paper:#0C1113; --surface:#131A1C; --surface-2:#1A2325;
+      --rule:#243033; --rule-2:#334145;
+      --accent:#2DD4BF; --accent-ink:#5EEAD4; --accent-wash:#10302E;
+      --ok:#4ADE80; --warn:#FBBF24; --bad:#F87171;
+      --code-bg:#101819; --code-ink:#7DD3C8;
+      --shadow:0 1px 2px rgba(0,0,0,.4),0 8px 24px -12px rgba(0,0,0,.7);
+    }
+  }
+  :root[data-theme="dark"]{
+    --ink:#E7EDED; --ink-2:#AFBEC0; --ink-3:#7E9095;
+    --paper:#0C1113; --surface:#131A1C; --surface-2:#1A2325;
+    --rule:#243033; --rule-2:#334145;
+    --accent:#2DD4BF; --accent-ink:#5EEAD4; --accent-wash:#10302E;
+    --ok:#4ADE80; --warn:#FBBF24; --bad:#F87171;
+    --code-bg:#101819; --code-ink:#7DD3C8;
+    --shadow:0 1px 2px rgba(0,0,0,.4),0 8px 24px -12px rgba(0,0,0,.7);
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0;background:var(--paper);color:var(--ink);
+    font-family:var(--serif);font-size:17px;line-height:1.65;
+    -webkit-font-smoothing:antialiased;
+  }
+  .shell{display:grid;grid-template-columns:290px minmax(0,1fr);max-width:1360px;margin:0 auto}
+  .toc{
+    position:sticky;top:0;height:100vh;overflow-y:auto;
+    border-right:1px solid var(--rule);padding:28px 22px 60px;background:var(--surface);
+  }
+  .brand{font-family:var(--sans);font-weight:700;font-size:15px;letter-spacing:-.01em;margin:0 0 2px}
+  .brand span{color:var(--accent)}
+  .brand-sub{font-family:var(--mono);font-size:10.5px;text-transform:uppercase;letter-spacing:.11em;color:var(--ink-3);margin:0 0 22px}
+  .toc-group{font-family:var(--mono);font-size:10.5px;text-transform:uppercase;letter-spacing:.11em;
+    color:var(--ink-3);margin:22px 0 7px;padding-bottom:5px;border-bottom:1px solid var(--rule)}
+  .toc a{display:block;font-family:var(--sans);font-size:13.5px;line-height:1.4;
+    color:var(--ink-2);text-decoration:none;padding:5px 9px;margin:1px -9px;border-radius:5px}
+  .toc a:hover{background:var(--surface-2);color:var(--accent)}
+  .toc a:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+  main{padding:56px 52px 120px;min-width:0}
+  .wrap{max-width:73ch}
+  h1{font-family:var(--sans);font-weight:700;font-size:41px;line-height:1.12;letter-spacing:-.022em;
+     margin:0 0 14px;text-wrap:balance}
+  h2{font-family:var(--sans);font-weight:600;font-size:27px;line-height:1.2;letter-spacing:-.015em;
+     margin:64px 0 14px;padding-top:22px;border-top:2px solid var(--rule);text-wrap:balance}
+  h3{font-family:var(--sans);font-weight:600;font-size:19.5px;line-height:1.3;letter-spacing:-.008em;
+     margin:38px 0 10px;text-wrap:balance}
+  h4{font-family:var(--sans);font-weight:600;font-size:16px;margin:26px 0 7px;color:var(--ink)}
+  p{margin:0 0 15px}
+  a{color:var(--accent-ink);text-underline-offset:2px}
+  a:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:2px}
+  ul,ol{margin:0 0 15px;padding-left:23px}
+  li{margin-bottom:6px}
+  strong{font-weight:600}
+  code{font-family:var(--mono);font-size:.855em;background:var(--code-bg);color:var(--code-ink);
+       padding:1.5px 5px;border-radius:4px;border:1px solid var(--rule)}
+  pre{background:var(--code-bg);border:1px solid var(--rule);border-radius:9px;
+      padding:16px 18px;overflow-x:auto;margin:0 0 18px;box-shadow:var(--shadow)}
+  pre code{background:none;border:0;padding:0;font-size:13.2px;line-height:1.62;color:var(--ink)}
+  .lede{font-size:19.5px;line-height:1.55;color:var(--ink-2);margin-bottom:26px}
+  .eyebrow{font-family:var(--mono);font-size:11px;text-transform:uppercase;letter-spacing:.12em;
+    color:var(--accent);margin:0 0 9px}
+  .scroll{overflow-x:auto;margin:0 0 20px;border:1px solid var(--rule);border-radius:9px;background:var(--surface)}
+  table{border-collapse:collapse;width:100%;font-family:var(--sans);font-size:13.8px}
+  th,td{text-align:left;padding:9px 13px;border-bottom:1px solid var(--rule);vertical-align:top}
+  th{font-weight:600;font-size:11.5px;text-transform:uppercase;letter-spacing:.06em;
+     color:var(--ink-3);background:var(--surface-2);white-space:nowrap}
+  tr:last-child td{border-bottom:0}
+  td code{font-size:12.4px}
+  .num{font-variant-numeric:tabular-nums}
+  .note{border-left:3px solid var(--accent);background:var(--accent-wash);
+    padding:13px 17px;border-radius:0 8px 8px 0;margin:0 0 20px;font-size:15.5px}
+  .note.warn{border-left-color:var(--warn);background:color-mix(in srgb,var(--warn) 11%,transparent)}
+  .note.bad{border-left-color:var(--bad);background:color-mix(in srgb,var(--bad) 11%,transparent)}
+  .note p:last-child{margin-bottom:0}
+  .note-t{font-family:var(--sans);font-weight:600;font-size:12.5px;text-transform:uppercase;
+    letter-spacing:.06em;margin:0 0 5px;color:var(--accent-ink)}
+  .note.warn .note-t{color:var(--warn)}
+  .note.bad .note-t{color:var(--bad)}
+  .screen{border:1px solid var(--rule);border-radius:11px;background:var(--surface);
+    padding:20px 22px;margin:0 0 18px;box-shadow:var(--shadow)}
+  .screen h3{margin-top:0}
+  .route{font-family:var(--mono);font-size:12px;color:var(--ink-3);margin:-6px 0 12px}
+  .pill{display:inline-block;font-family:var(--mono);font-size:10.5px;text-transform:uppercase;
+    letter-spacing:.07em;padding:2px 8px;border-radius:20px;border:1px solid var(--rule-2);
+    color:var(--ink-2);background:var(--surface-2);margin:0 5px 5px 0}
+  .pill.role{border-color:var(--accent);color:var(--accent-ink);background:var(--accent-wash)}
+  footer{margin-top:80px;padding-top:24px;border-top:2px solid var(--rule);
+    font-family:var(--sans);font-size:13px;color:var(--ink-3)}
+  @media (max-width:960px){
+    .shell{grid-template-columns:1fr}
+    .toc{position:static;height:auto;border-right:0;border-bottom:1px solid var(--rule);padding:22px}
+    main{padding:34px 22px 80px}
+    h1{font-size:32px}
+    h2{font-size:23px}
+    body{font-size:16px}
+  }
+  @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+
+<div class="shell">
+<nav class="toc">
+  <p class="brand">Fulcrum <span>Ops</span></p>
+  <p class="brand-sub">Operator Manual</p>
+  <p style="margin:-14px 0 22px"><a href="/" style="font-size:12.5px">← Back to the console</a></p>
+
+  <div class="toc-group">Start here</div>
+  <a href="#what">What this is</a>
+  <a href="#concepts">Core concepts</a>
+  <a href="#signin">Signing in and roles</a>
+  <a href="#firstagent">Connect your first agent</a>
+
+  <div class="toc-group">The SDK</div>
+  <a href="#sdk-install">Install and configure</a>
+  <a href="#sdk-trace">Tracing runs</a>
+  <a href="#sdk-spans">Spans, models, usage</a>
+  <a href="#sdk-scores">Scores and feedback</a>
+  <a href="#sdk-governance">Guardrails and violations</a>
+  <a href="#sdk-providers">Provider wrappers</a>
+  <a href="#sdk-prompts">Prompts</a>
+  <a href="#sdk-datasets">Datasets and experiments</a>
+  <a href="#sdk-redaction">Redaction</a>
+  <a href="#sdk-runtime">Batching, flush, stats</a>
+  <a href="#sdk-errors">Errors</a>
+  <a href="#sdk-ts">TypeScript SDK</a>
+  <a href="#otlp">OpenTelemetry (no SDK)</a>
+  <a href="#skill">Onboarding skill</a>
+
+  <div class="toc-group">Platform</div>
+  <a href="#live-runs">Live Runs</a>
+  <a href="#replay">Replay Studio</a>
+  <a href="#metrics">Metrics</a>
+
+  <div class="toc-group">Agent governance</div>
+  <a href="#connections">Hosting &amp; Deployment</a>
+  <a href="#agents">Agent Registry</a>
+  <a href="#agent-detail">Agent Detail</a>
+  <a href="#connectors">Connector and MCP Governance</a>
+  <a href="#policies">Policy Center</a>
+  <a href="#approvals">Approvals and Audit</a>
+
+  <div class="toc-group">Configuration</div>
+  <a href="#configurations">Configuration Center</a>
+  <a href="#prompts">Prompt Studio</a>
+  <a href="#knowledge">RAG and Knowledge</a>
+  <a href="#secrets">Secrets and Credentials</a>
+
+  <div class="toc-group">Operations</div>
+  <a href="#quota">Quota, Cost and Capacity</a>
+  <a href="#memory">Memory and State</a>
+  <a href="#deployments">Environments &amp; Releases</a>
+
+  <div class="toc-group">Quality</div>
+  <a href="#evaluations">Evaluations</a>
+  <a href="#guardrails">Guardrails</a>
+  <a href="#testing">Testing and Regression</a>
+  <a href="#feedback">Feedback and Quality Loop</a>
+
+  <div class="toc-group">System</div>
+  <a href="#alerts">Alerts</a>
+  <a href="#exports">Exports</a>
+  <a href="#licensing">Licensing and Entitlements</a>
+  <a href="#settings">Workspace Settings</a>
+
+  <div class="toc-group">Reference</div>
+  <a href="#api">REST API</a>
+  <a href="#troubleshooting">Troubleshooting</a>
+</nav>
+
+<main><div class="wrap">
+
+<p class="eyebrow">Operator manual</p>
+<h1>Running agents you did not write</h1>
+<p class="lede">Fulcrum Ops is an AI agent control plane. Teams register the agents they run, connect
+them with an SDK or over OpenTelemetry, and then govern them: what they may call, what they cost,
+what they were asked, what they answered, and what has to be approved before they act.</p>
+
+<h2 id="what">What this is</h2>
+
+<p>The product is twenty-four screens over one API, split down the middle by a deliberate
+architectural line.</p>
+
+<p><strong>Governance is yours.</strong> Agents, connections, connectors, policies, approvals, the
+audit chain, secrets, quotas, budgets, deployments and licences live in tables this platform owns,
+with role checks and an append-only, hash-chained audit trail.</p>
+
+<p><strong>Telemetry belongs to the engine.</strong> Runs, traces, spans, feedback scores, prompts,
+datasets, experiments and costs live in a private telemetry engine reached through one adapter. It
+is not addressable from outside; the control plane in front of it is the sole identity authority,
+and one workspace maps to one project namespace inside it.</p>
+
+<p>That line matters when something breaks. If the engine is unreachable, telemetry screens fail
+closed with a plain <code>telemetry_unavailable</code> message and the governance half keeps
+working. You will never see a fabricated zero standing in for a number nobody measured.</p>
+
+<div class="note">
+  <p class="note-t">The one rule worth internalising</p>
+  <p>Nothing in this console is simulated. If a number is on screen, a service computed it. If a
+  service cannot answer, the screen says so instead of showing a zero. A dash means not measured,
+  and that is not the same thing as zero.</p>
+</div>
+
+<h3>How the pieces fit</h3>
+
+<pre><code>   an agent  --SDK or OTLP--&gt;  +------------------+
+                              |  control plane   |  the only public surface
+   the console -------------&gt;  |  (FastAPI)       |  identity . tenancy . governance
+                              +--------+---------+
+                                       |  private network, no published port
+                              +--------v---------+
+                              | telemetry engine |  traces . spans . scores . prompts
+                              +------------------+  datasets . experiments . costs</code></pre>
+
+<h2 id="concepts">Core concepts</h2>
+
+<p>Nine words carry most of the product. Learn these and the screens explain themselves.</p>
+
+<div class="scroll">
+<table>
+<thead><tr><th>Term</th><th>What it means here</th></tr></thead>
+<tbody>
+<tr><td><strong>Workspace</strong></td><td>A tenant. Every query filters on it, so another workspace row is indistinguishable from a row that does not exist. One person can belong to many workspaces: identity is global, access is per-workspace.</td></tr>
+<tr><td><strong>Agent</strong></td><td>A registered thing that runs. Registration creates its private namespace in the telemetry engine, so an unregistered agent has nowhere to report and is invisible to every telemetry read.</td></tr>
+<tr><td><strong>Run</strong></td><td>One execution: a question in, an answer out. A row on Live Runs. Internally a <em>trace</em>.</td></tr>
+<tr><td><strong>Span</strong></td><td>One timed step inside a run, typed <code>general</code>, <code>llm</code>, <code>tool</code> or <code>guardrail</code>. Spans nest, and the nesting is the agent real decision path.</td></tr>
+<tr><td><strong>Connector</strong></td><td>Something an agent is permitted to call: an MCP server, an API, a database, a vector store, a custom tool. Registered by a human and granted to agents, never auto-discovered from traffic.</td></tr>
+<tr><td><strong>Policy</strong></td><td>A rule evaluated on the way in, before telemetry is stored. Scoped Global, Environment, Agent or Connector, enforced as Block, Require Approval, Escalate, Mask, Route, Throttle, Warn or Log Only.</td></tr>
+<tr><td><strong>Guardrail</strong></td><td>A runtime safety filter: prompt injection, PII, toxicity, hallucination, secrets. Produces events you read on the Guardrails screen.</td></tr>
+<tr><td><strong>Quota / budget</strong></td><td>A spend or usage ceiling checked before a run is accepted, not tallied afterwards.</td></tr>
+<tr><td><strong>Entitlement</strong></td><td>What a licence plan permits. Checked at ingest, so an unlicensed capability is refused rather than billed.</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>What happens when an agent reports</h3>
+
+<p>Every batch, from the SDK or from OpenTelemetry, walks the same path. This is worth knowing
+because it explains why things get refused.</p>
+
+<ol>
+<li><strong>Authenticate</strong> the API key and resolve which agent it may write for.</li>
+<li><strong>Evaluate policies</strong> that reach that agent, by binding or by scope.</li>
+<li><strong>Run guardrail checks.</strong> A Block verdict refuses the item; Mask strips the content and keeps the record.</li>
+<li><strong>Check licence entitlement and quota.</strong></li>
+<li><strong>Only then</strong> hand the telemetry to the engine, and commit the evidence — violations, guardrail events, quota consumption — in the same transaction.</li>
+</ol>
+
+<p>An agent therefore cannot opt out of governance by lying to the SDK. The SDK is a reporter; the
+control plane is the enforcer.</p>
+
+<h2 id="signin">Signing in and roles</h2>
+
+<p>Open the console and sign in with your work email and password. Sessions are signed tokens in an
+httpOnly cookie, so several people, and the same person on several devices, can be signed in at
+once without interfering with each other.</p>
+
+<p>Agents never use a password. They authenticate with an API key, issued under
+<strong>Workspace Settings</strong>.</p>
+
+<h3>The six roles</h3>
+
+<div class="scroll">
+<table>
+<thead><tr><th>Role</th><th>Can do</th></tr></thead>
+<tbody>
+<tr><td><span class="pill role">owner</span></td><td>Everything, plus billing, licensing and workspace deletion. Only an owner may grant the owner role.</td></tr>
+<tr><td><span class="pill role">admin</span></td><td>Everything except billing. Issues API keys, manages members, edits policies and secrets.</td></tr>
+<tr><td><span class="pill role">operator</span></td><td>Run, deploy and approve. No policy or secret edits.</td></tr>
+<tr><td><span class="pill role">approver</span></td><td>Approve, reject and escalate only.</td></tr>
+<tr><td><span class="pill role">member</span></td><td>Read, and author prompts, tests and feedback.</td></tr>
+<tr><td><span class="pill role">viewer</span></td><td>Read only.</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Roles are enforced on the server, not in the interface. A control you may not use is disabled
+and says why on hover, and the endpoint behind it refuses the call regardless of what the interface
+showed you.</p>
+
+<h2 id="firstagent">Connect your first agent</h2>
+
+<p>Four steps, five minutes. Do them in order — an ingest key cannot be bound to an agent that does
+not exist yet.</p>
+
+<h3>1. Register the agent</h3>
+
+<p><strong>Agent Registry</strong> &rarr; <strong>New Agent</strong>. Name it, pick a platform
+(<code>Azure AI Foundry</code>, <code>Copilot Studio</code>, <code>M365 Copilot</code>,
+<code>Power Platform</code> or <code>Custom Agent</code>), an environment, an agent type
+(Pro-code, Low-code, Copilot) and a risk level. Then <strong>Activate</strong> it — new agents
+start in Pending Review, and an inactive agent cannot ingest.</p>
+
+<h3>2. Issue an API key bound to it</h3>
+
+<p><strong>Workspace Settings</strong> &rarr; <strong>API Access Tokens</strong> &rarr;
+<strong>Issue Key</strong>. Name it, leave the scopes at <code>ingest</code> and <code>read</code>,
+and — this is the part worth doing — set <strong>Bind to agent</strong> to the agent you just
+created. A bound key can only ever write that agent telemetry, so a leaked key cannot impersonate
+the rest of your fleet.</p>
+
+<div class="note warn">
+  <p class="note-t">The key is shown once</p>
+  <p>The server stores only a SHA-256 hash. When the mint dialog closes, the plaintext is gone for
+  good and the table keeps a hint like <code>fo_live_263...lgga</code>. Copy it before you close.
+  If you lose it, revoke the key and mint another.</p>
+</div>
+
+<h3>3. Point your agent at the platform</h3>
+
+<pre><code>export FULCRUM_OPS_API_KEY=fo_live_...
+export FULCRUM_OPS_BASE_URL=https://your-control-plane/api/v1
+export FULCRUM_OPS_WORKSPACE=your-workspace-slug</code></pre>
+
+<h3>4. Instrument and run</h3>
+
+<pre><code>import fulcrum_ops
+from fulcrum_ops import trace
+
+fulcrum_ops.configure(agent="Support Bot", environment="Production")
+
+@trace
+def answer(question: str) -> str:
+    return "..."
+
+answer("where is my order?")
+fulcrum_ops.flush()</code></pre>
+
+<p>Open <strong>Live Runs</strong>. The run appears within a few seconds.</p>
+
+<h2 id="sdk-install">The Python SDK: install and configure</h2>
+
+<p>The package is <code>fulcrum-ops</code> (import name <code>fulcrum_ops</code>). It needs Python
+3.9 or newer and has exactly one runtime dependency, <code>httpx</code>.</p>
+
+<p>It is published to the workspace's private package index (AWS CodeArtifact
+domain <code>fulcrum-ops</code>, repository <code>fulcrum-python</code>). Point pip at it
+once per shell, then install by name:</p>
+
+<pre><code>aws codeartifact login --tool pip --domain fulcrum-ops --repository fulcrum-python
+pip install fulcrum-ops                           # from the private index
+pip install "fulcrum-ops[openai]"                 # with a provider extra</code></pre>
+
+<p>Extras: <code>openai</code>, <code>anthropic</code>, <code>langchain</code>, <code>dev</code>.
+None of the provider packages is a hard dependency — the wrappers import lazily.
+The built wheel is also kept under <code>sdks/python/dist/</code> for an air-gapped
+<code>pip install ./fulcrum_ops-1.0.0-py3-none-any.whl</code>.</p>
+
+<h3>Two ways to configure</h3>
+
+<p>A module-level default client, which decorators find on their own:</p>
+
+<pre><code>import fulcrum_ops
+
+fulcrum_ops.configure(
+    agent="Support Bot",
+    environment="Production",
+    api_key="fo_live_...",              # or FULCRUM_OPS_API_KEY
+    base_url="https://host/api/v1",     # or FULCRUM_OPS_BASE_URL
+)</code></pre>
+
+<p>Or an explicit client, which is a context manager that flushes and closes on exit:</p>
+
+<pre><code>from fulcrum_ops import FulcrumOps
+
+with FulcrumOps(agent="Batch Job", environment="Staging") as client:
+    with client.span("work", type="tool") as s:
+        s.set_output({"rows": 128})</code></pre>
+
+<h3>Every environment variable</h3>
+
+<div class="scroll">
+<table>
+<thead><tr><th>Variable</th><th>Default</th><th>What it does</th></tr></thead>
+<tbody>
+<tr><td><code>FULCRUM_OPS_API_KEY</code></td><td>—</td><td>Ingest key. <strong>Absent means the SDK disables itself</strong> and decorated functions still run.</td></tr>
+<tr><td><code>FULCRUM_OPS_BASE_URL</code></td><td><code>http://127.0.0.1:8080/api/v1</code></td><td>A bare host is auto-suffixed with <code>/api/v1</code>.</td></tr>
+<tr><td><code>FULCRUM_OPS_WORKSPACE</code></td><td>—</td><td>Workspace slug, sent as a header.</td></tr>
+<tr><td><code>FULCRUM_OPS_AGENT</code></td><td>—</td><td>Default agent name for reports.</td></tr>
+<tr><td><code>FULCRUM_OPS_ENVIRONMENT</code></td><td>—</td><td>Production, Staging, Development and so on.</td></tr>
+<tr><td><code>FULCRUM_OPS_SAMPLING_RATE</code></td><td><code>1.0</code></td><td>Fraction of runs reported.</td></tr>
+<tr><td><code>FULCRUM_OPS_CAPTURE_INPUT</code></td><td><code>true</code></td><td>Record inputs.</td></tr>
+<tr><td><code>FULCRUM_OPS_CAPTURE_OUTPUT</code></td><td><code>true</code></td><td>Record outputs.</td></tr>
+<tr><td><code>FULCRUM_OPS_TIMEOUT_SECONDS</code></td><td><code>30</code></td><td>HTTP timeout.</td></tr>
+<tr><td><code>FULCRUM_OPS_DEBUG</code></td><td><code>false</code></td><td>Verbose SDK logging.</td></tr>
+<tr><td><code>FULCRUM_OPS_DISABLED</code></td><td>unset</td><td>Hard off switch.</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note">
+  <p class="note-t">Your platform team can tighten these remotely</p>
+  <p>At start-up the SDK fetches <code>/ingest/config</code> and narrows its own options to whatever
+  the deployment enforces. Sampling and batch limits take the <em>lower</em> of local and server;
+  capture flags are a conjunction, so either side can switch content capture off and
+  <strong>neither can switch it back on</strong>. A platform team can therefore disable prompt
+  capture across an entire estate and no agent-side setting can override it.</p>
+</div>
+
+<h2 id="sdk-trace">Tracing runs</h2>
+
+<p><code>@trace</code> is the whole beginner API. The outermost decorated call opens a run; nested
+decorated calls become child spans automatically, because parentage travels in a
+<code>contextvar</code> rather than through your function signatures.</p>
+
+<pre><code>from fulcrum_ops import trace
+
+@trace(name="retrieve", type="tool")
+def retrieve(question: str) -> list[str]:
+    return ["doc-1", "doc-2"]
+
+@trace                       # bare form works too
+def answer(question: str) -> str:
+    docs = retrieve(question)     # becomes a child span
+    return f"Based on {len(docs)} docs..."</code></pre>
+
+<p>It handles all four callable shapes — plain functions, coroutines, generators and async
+generators — and drops <code>self</code>/<code>cls</code> when it binds arguments.</p>
+
+<div class="scroll">
+<table>
+<thead><tr><th>Argument</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><code>name</code></td><td>Span name. Defaults to the function name.</td></tr>
+<tr><td><code>type</code></td><td><code>general</code>, <code>llm</code>, <code>tool</code> or <code>guardrail</code>.</td></tr>
+<tr><td><code>capture_input</code> / <code>capture_output</code></td><td>Override capture for this function only — useful on one function that handles secrets.</td></tr>
+<tr><td><code>metadata</code>, <code>tags</code></td><td>Attached to the span.</td></tr>
+<tr><td><code>agent</code>, <code>thread_id</code></td><td>Override the agent, or group runs into a conversation.</td></tr>
+<tr><td><code>client</code></td><td>Use a specific client instead of the module default.</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="sdk-spans">Spans, models and usage</h2>
+
+<p>Open spans by hand when you want to describe what happened inside a step:</p>
+
+<pre><code>client = fulcrum_ops.get_client()
+
+with client.span("generate", type="llm") as span:
+    span.set_model("gpt-5", "azure")
+    span.set_input({"prompt_tokens_est": 180})
+    reply = call_the_model()
+    span.set_usage(prompt_tokens=180, completion_tokens=42)
+    span.set_output(reply)
+    span.score("grounded", 1.0, reason="cites retrieved doc")</code></pre>
+
+<div class="scroll">
+<table>
+<thead><tr><th>Method</th><th>Use it for</th></tr></thead>
+<tbody>
+<tr><td><code>set_input(value)</code> / <code>set_output(value)</code></td><td>What went in and came out.</td></tr>
+<tr><td><code>set_model(model, provider)</code></td><td>The model that served the call. <strong>Report what actually ran</strong>, not a deployment alias — cost tables are keyed on the real model name.</td></tr>
+<tr><td><code>set_usage(prompt_tokens=, completion_tokens=)</code></td><td>Measured tokens. Prefer the provider response over an estimate.</td></tr>
+<tr><td><code>set_cost(cost)</code></td><td>State cost yourself when you know it better than the engine.</td></tr>
+<tr><td><code>set_metadata(**kw)</code> / <code>add_tags(*t)</code></td><td>Arbitrary structure for filtering later.</td></tr>
+<tr><td><code>log(message, **fields)</code></td><td>A structured log line inside the span.</td></tr>
+<tr><td><code>score(name, value, reason=)</code></td><td>A quality score on this span.</td></tr>
+<tr><td><code>record_exception(exc)</code></td><td>Attach a failure without raising.</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note">
+  <p class="note-t">Getting cost to resolve</p>
+  <p>Cost is computed from <em>model plus provider</em>. If either is missing or spelled in a
+  vocabulary the price table does not use, cost comes back zero. Azure-served OpenAI models want
+  provider <code>azure</code>, not <code>azure-openai</code>. A span with no open trace opens one
+  around itself, so a stray <code>client.span(...)</code> still produces a valid run.</p>
+</div>
+
+<h2 id="sdk-scores">Scores and feedback</h2>
+
+<p>A score attached to an open span or trace travels inside that payload. A standalone score posts
+separately, which is how you record a judgement that arrives later — a thumbs-up an hour after the
+run, or an offline evaluation result.</p>
+
+<pre><code>with client.span("answer", type="llm") as s:
+    s.score("faithfulness", 0.93, reason="all claims cited")
+
+client.score(trace_id, "user_rating", 1.0, target="trace")
+client.log_feedback(trace_id=trace_id, rating=1, body="fixed my problem")</code></pre>
+
+<p><code>target</code> is <code>trace</code>, <code>span</code> or <code>thread</code>. Scores show
+up on Live Runs, feed the Evaluations trend, and are what Feedback and Quality Loop aggregates.</p>
+<h3>Feedback in the shapes products actually collect</h3>
+<p><code>log_feedback</code> is the general form. These wrap it so a caller never has to remember
+that sentiment is a string or that a rating is 1&ndash;5:</p>
+<pre><code>client.thumbs_up(trace_id)
+client.thumbs_down(trace_id, "wrong account")
+client.rate(4, trace_id, comment="close, missed the caveat")
+client.report_issue("Cites stale pricing", severity="High", trace_id=trace_id)</code></pre>
+<p>Each is also available at module level — <code>fulcrum_ops.thumbs_up(...)</code> — like
+<code>flush()</code>. <code>rate()</code> derives sentiment from the score and treats the
+<strong>midpoint as neutral</strong> rather than positive: three out of five is not praise, and
+counting it as praise would flatter every quality report built on the signal.
+<code>report_issue()</code> is for the agent noticing its own failure — a retrieval that returned
+nothing, a tool that answered nonsense — rather than waiting for a person to complain; it raises a
+row on Feedback and Quality Loop with a severity of <code>Critical</code>, <code>High</code>,
+<code>Medium</code> or <code>Low</code>.</p>
+
+<h2 id="sdk-governance">Guardrails and policy violations</h2>
+
+<p>When your agent runs its own safety check, report the verdict so the platform can govern on it:</p>
+
+<pre><code>client.log_guardrail_event(
+    "PII scan",
+    action_taken="Warn",          # Warn | Block | Mask | Log
+    score=0.9,
+    matched={"EMAIL": 1, "PHONE": 2},   # a mapping, not a list
+    sample=text[:80],
+    trace_id=trace_id,
+)
+
+client.log_policy_violation(
+    "No external email without approval",
+    severity="High",
+    detail={"attempted_recipient": "gmail.com"},   # a mapping, not a string
+)</code></pre>
+
+<div class="note warn">
+  <p class="note-t">Two shapes that bite</p>
+  <p><code>matched</code> must be a <strong>mapping</strong> of label to count, not a list of
+  labels, and <code>detail</code> on a policy violation must be a mapping too; a string or a
+  list is accepted locally and rejected by the server. <code>action_taken</code> is one of
+  <code>Warn</code>, <code>Block</code>, <code>Mask</code> or <code>Log</code> — casing and
+  common variants (<code>Warned</code>, <code>Blocked</code>) are normalised server-side, but
+  there is no <code>Passed</code>. Watch <code>on_error</code> during first integration and
+  these show up immediately.</p>
+</div>
+
+<h2 id="sdk-providers">Provider wrappers</h2>
+
+<p>Rather than writing <code>llm</code> spans by hand, wrap the provider client and every completion
+call becomes a span with the model, usage and output already filled in.</p>
+
+<pre><code>from openai import OpenAI, AzureOpenAI
+from anthropic import Anthropic
+from fulcrum_ops.integrations import track_openai, track_anthropic
+
+openai = track_openai(OpenAI())
+azure  = track_openai(AzureOpenAI(...))    # duck-typed, works the same
+claude = track_anthropic(Anthropic())</code></pre>
+
+<p>Streaming responses keep the span open until the stream is exhausted, so a streamed answer is
+timed correctly rather than closing at first token. For LangChain, use the callback handler:</p>
+
+<pre><code>from fulcrum_ops.integrations import FulcrumOpsCallbackHandler
+
+chain.invoke(payload, config={"callbacks": [FulcrumOpsCallbackHandler()]})</code></pre>
+
+<h2 id="sdk-prompts">Prompts</h2>
+
+<p>Prompts authored in <strong>Prompt Studio</strong> can be pulled at runtime, so changing a
+system prompt does not require a redeploy.</p>
+
+<pre><code>from fulcrum_ops import get_prompt, template_variables
+
+p = get_prompt("support-system-prompt")        # cached; server is revalidated
+print(template_variables(p.template))          # ['customer_name', 'tier']
+text = p.format(customer_name="Dana", tier="gold")</code></pre>
+
+<p>The prompt version used is recorded on the run, so a quality regression can be traced back to
+the exact wording that produced it.</p>
+
+<h2 id="sdk-datasets">Datasets and experiments</h2>
+
+<p>Offline evaluation: build a dataset of cases, run a candidate against it, and get a scored
+result you can compare on the Evaluations screen.</p>
+
+<p>Build the dataset through the client's <code>datasets</code> handle:</p>
+
+<pre><code>client = fulcrum_ops.get_client()
+
+client.datasets.create("support-golden", description="Answers we agree are correct")
+client.datasets.add_items("support-golden", [
+    {"input": "where is my order?", "expected_output": "Ships in 2 days."},
+])</code></pre>
+
+<p>Then either run the candidate <strong>locally</strong> and score it yourself, or hand the
+dataset to the <strong>server-side judge</strong>. Local first — scorers are functions that
+return one or more named scores, and are called <code>scorer(output, expected_output, case)</code>
+(extra arguments are dropped to match the function's arity):</p>
+
+<pre><code>def correctness(output, expected):
+    return {"correctness": 1.0 if expected.lower() in output.lower() else 0.0}
+
+result = client.evaluate(
+    "support-golden",
+    task=lambda item: answer(item),          # item is the case's input
+    scorers=[correctness],
+    name="prompt-v4 candidate",
+)
+
+print(result.total, result.failures)
+print(result.averages)      # {"correctness": 0.91}
+print(result.summary())</code></pre>
+
+<p>Every case becomes a real trace tagged with the experiment name, and every scorer verdict
+lands on that trace — so the run shows up under Evaluations next to production traffic. To have
+the platform judge the dataset instead, start a server-side run and poll it:</p>
+
+<pre><code>run = client.experiments.run(
+    "support-golden",
+    judge_model="gpt-5",
+    name="prompt-v4 candidate",
+)
+evaluation_id = run["id"]              # run() returns the evaluation record
+detail = client.experiments.get(evaluation_id)</code></pre>
+
+<p><code>client.datasets</code> gives you <code>list</code>, <code>create</code>,
+<code>add_items</code> and <code>items</code>; <code>client.experiments</code> gives
+<code>run</code>, <code>get</code>, <code>list</code> and <code>evaluate</code>
+(<code>client.evaluate(...)</code> is the shortcut used above). Each run appears under
+Evaluations with its judged average, so a candidate can be compared against the baseline
+before it ships.</p>
+
+<h2 id="sdk-redaction">Redaction</h2>
+
+<p>Redaction runs <strong>in your process, before anything leaves it</strong>. Twelve entity
+classes are recognised without a server-supplied pattern:</p>
+
+<p><code>api_key</code> &middot; <code>aws_access_key</code> &middot; <code>credit_card</code>
+&middot; <code>email</code> &middot; <code>iban</code> &middot; <code>ip</code> &middot;
+<code>ipv4</code> &middot; <code>ipv6</code> &middot; <code>jwt</code> &middot; <code>phone</code>
+&middot; <code>ssn</code> &middot; <code>url</code></p>
+
+<pre><code>from fulcrum_ops import RedactionRule
+
+fulcrum_ops.configure(
+    agent="Support Bot",
+    redaction=[
+        RedactionRule(name="contact-details", entity_types=["email", "phone"]),
+        RedactionRule(name="cards", entity_types=["credit_card"],
+                      applies_to=["input", "output"],
+                      replacement="[removed]"),
+    ],
+)</code></pre>
+
+<p>Rules apply to <code>input</code> and <code>output</code> by default; <code>metadata</code> is
+also available. The default replacement is <code>[redacted by policy]</code>.</p>
+
+<h2 id="sdk-runtime">Batching, flushing and self-monitoring</h2>
+
+<p>Nothing about reporting blocks your agent. Items are enqueued to an in-memory deque and a
+background worker cuts batches on item count, byte budget or a flush interval.</p>
+
+<div class="scroll">
+<table>
+<thead><tr><th>Option</th><th>Default</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td><code>batch_max_items</code></td><td>100</td><td>Items per batch.</td></tr>
+<tr><td><code>batch_max_bytes</code></td><td>4 MiB</td><td>A 413 response halves the batch and retries.</td></tr>
+<tr><td><code>flush_interval_seconds</code></td><td>5</td><td>Time-based cut.</td></tr>
+<tr><td><code>max_queue_size</code></td><td>10,000</td><td>Bounded. On overflow the <strong>oldest</strong> item is dropped so your agent never blocks.</td></tr>
+<tr><td><code>retry_max_attempts</code></td><td>3</td><td>Exponential backoff with full jitter, honouring <code>Retry-After</code>.</td></tr>
+<tr><td><code>on_error</code></td><td>—</td><td><code>fn(error, operation)</code>. Set this during first integration.</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre><code>client.flush(timeout=10)   # returns False on timeout, never raises
+client.close()             # idempotent; an atexit hook also flushes
+client.stats()             # submitted / sent / accepted / rejected / blocked / dropped_overflow / dropped_failed</code></pre>
+
+<div class="note">
+  <p class="note-t">A 200 does not mean every row was accepted</p>
+  <p>Batches are partial-success. Check <code>client.stats()</code> for a non-zero
+  <code>rejected</code> count — the usual cause is <code>agent_unprovisioned</code>, meaning the
+  agent name does not exist in the workspace or your key is bound to a different one.</p>
+</div>
+
+<h2 id="sdk-errors">Errors</h2>
+
+<p>Every failure is a typed subclass of <code>FulcrumOpsError</code>, so you can catch the ones you
+care about and ignore the rest.</p>
+
+<p><code>ConfigurationError</code> &middot; <code>ApiError</code> &middot;
+<code>AuthenticationError</code> &middot; <code>PermissionDeniedError</code> &middot;
+<code>QuotaExceededError</code> &middot; <code>EntitlementError</code> &middot;
+<code>ValidationError</code> &middot; <code>NotFoundError</code> &middot;
+<code>PayloadTooLargeError</code> &middot; <code>RateLimitError</code> &middot;
+<code>ServerError</code> &middot; <code>TelemetryUnavailableError</code> &middot;
+<code>TransportError</code> &middot; <code>NetworkError</code> &middot; <code>TimeoutError</code></p>
+
+<p>Telemetry failures never propagate into your agent path — they surface through
+<code>on_error</code> and the stats counters instead.</p>
+
+<h2 id="sdk-ts">TypeScript SDK</h2>
+
+<p><code>@fulcrum-ops/sdk</code> — ESM and CJS, zero runtime dependencies (it uses global
+<code>fetch</code>), Node 18+ or a browser. The same env vars and defaults as Python, with two
+differences: there is <strong>no <code>FULCRUM_OPS_DISABLED</code></strong> (pass
+<code>enabled: false</code> in code to turn it off), and the timeout variable is
+<strong><code>FULCRUM_OPS_TIMEOUT_MS</code></strong> in milliseconds, not
+<code>FULCRUM_OPS_TIMEOUT_SECONDS</code>.</p>
+
+<pre><code>import { FulcrumOps } from "@fulcrum-ops/sdk";
+import { trackOpenAI } from "@fulcrum-ops/sdk/openai";
+
+const fulcrum = new FulcrumOps({ agent: "Support Bot", environment: "Production" });
+
+await fulcrum.trace("answer", async () => {
+  await fulcrum.span({ name: "retrieve", type: "tool" }, (s) =&gt; {
+    s.setOutput({ docs: 2 });
+  });
+
+  await fulcrum.span({ name: "generate", type: "llm" }, async (s) =&gt; {
+    s.setModel("gpt-5", "azure");
+    s.setUsage({ promptTokens: 180, completionTokens: 42 });
+    s.setOutput("Ships in 2 days.");
+  });
+});
+
+await fulcrum.close();</code></pre>
+
+<p>Tracing is callback-style rather than decorator-style; nesting uses
+<code>AsyncLocalStorage</code> on Node and a stack fallback in browsers. Subpath exports:
+<code>./openai</code>, <code>./anthropic</code>, <code>./langchain</code>.</p>
+
+<h2 id="otlp">OpenTelemetry, with no SDK at all</h2>
+
+<p>An agent already emitting OpenTelemetry needs no Fulcrum code. Point the exporter at the control
+plane and it lands in the same pipeline, with identical policy, guardrail, entitlement and quota
+treatment.</p>
+
+<pre><code>from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+
+OTLPSpanExporter(
+    endpoint="https://your-control-plane/v1/traces",
+    headers={"X-Fulcrum-Api-Key": "fo_live_..."},
+)
+# resource attribute service.name  ->  matched to the registered agent
+# span attributes gen_ai.* / llm.* ->  model, tokens, provider</code></pre>
+
+<div class="scroll">
+<table>
+<thead><tr><th>Detail</th><th>Value</th></tr></thead>
+<tbody>
+<tr><td>Path</td><td><code>POST /v1/traces</code> at the app root, not under <code>/api/v1</code></td></tr>
+<tr><td>Auth</td><td><code>Authorization: Bearer fo_...</code> or <code>X-Fulcrum-Api-Key</code>, ingest scope</td></tr>
+<tr><td>Content types</td><td><code>application/x-protobuf</code>, <code>application/json</code>; anything else is a 415</td></tr>
+<tr><td>Agent matching</td><td>The <code>service.name</code> resource attribute</td></tr>
+<tr><td>Response</td><td>OTLP partial-success envelope; governance-refused spans appear in <code>rejectedSpans</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Use this when you do not own the agent source, or when a team has standardised on OpenTelemetry
+and will not adopt a vendor SDK. Use the SDK when you want prompts, datasets, redaction and
+guardrail reporting, none of which OTLP carries.</p>
+
+<h2 id="skill">Onboarding an existing agent</h2>
+
+<p>Connecting an agent is the same five steps every time: register it, mint a key bound to it,
+instrument the entry point, wire the environment, and verify a run actually arrived. That sequence
+ships as a skill at <code>skills/connect-agent/</code>, so an assistant can do it against a repo
+rather than a person doing it by hand.</p>
+
+<p>Point it at an agent codebase and it will read the code to find the entry point, the model calls
+and any safety checks already present; register and activate the agent; mint a bound ingest key;
+add the dependency and the instrumentation; place the key where that runtime expects secrets; then
+run the agent once and confirm the run is visible with the right agent, model, tokens and span
+tree.</p>
+
+<div class="note">
+  <p class="note-t">The step it refuses to skip</p>
+  <p>The skill will not report success on an unverified integration. "It should be reporting now"
+  is not the deliverable — a run visible in Live Runs is, with its model populated and its tokens
+  non-zero. If nothing arrived it works the diagnosis list instead: key present in the process,
+  agent Active, <code>stats()</code> showing rejections, base URL reachable from where the agent
+  runs.</p>
+</div>
+
+<h2 id="live-runs">Platform &mdash; Live Runs</h2>
+
+<div class="screen">
+<h3>Live Runs</h3>
+<p class="route">#/live-runs &middot; every role can read</p>
+<p>Real-time observability of agent executions across every connected platform. This is the screen
+you leave open.</p>
+<p><strong>KPI row:</strong> total runs, success rate, average latency, policy violations, tokens
+used, estimated cost, fallback rate, human escalations.</p>
+<p><strong>Live stream:</strong> a server-sent event connection pushes new runs as they arrive,
+reconnecting with exponential backoff up to 30 seconds if the connection drops. The LIVE badge in
+the header tells you the stream is attached.</p>
+<p><strong>Filters:</strong> free-text search, tenant, source platform, status (Completed, Warned,
+Failed, Running), risk, policy result (Allowed, Warned, Blocked) and a time range.</p>
+<p><strong>Table columns:</strong> run id, source, agent, status, model, input preview, tools,
+tokens, cost, duration, confidence, risk, policy, tenant, time.</p>
+<p><strong>Click any row</strong> for the run inspector: execution summary, prompt and response,
+model and cost, tools and connectors, guardrails and policy verdicts, retrieval and citations,
+errors and fallbacks, and audit and replay. From there, <strong>View Full Trace</strong> opens the
+span tree and <strong>Replay</strong> hands off to Replay Studio.</p>
+<p><strong>Also here:</strong> flag a run for review, and export the filtered set as CSV.</p>
+</div>
+
+<div class="screen">
+<h3 id="replay">Replay Studio</h3>
+<p class="route">#/replay &middot; reached from a run, or directly</p>
+<p>Step through a recorded execution with its prompt, retrieval, tool and guardrail context. Where
+Live Runs tells you <em>what</em> happened, Replay Studio shows you <em>in what order</em> — the
+span tree with timings, so you can see the model call that took six seconds, the tool that returned
+nothing, or the guardrail that fired between them.</p>
+<p>Use it when an answer was wrong and you need to find the step that made it wrong.</p>
+<p>Arriving from Live Runs — the row action, the inspector's Replay button, or the trace view —
+loads <em>that</em> run, even when it is older than the recent-runs list the picker shows. A run
+that genuinely cannot be loaded says so and leaves the picker usable, rather than quietly
+substituting a different execution.</p>
+</div>
+
+<div class="screen">
+<h3 id="metrics">Metrics</h3>
+<p class="route">#/metrics</p>
+<p>Platform-wide execution, latency, token and cost trends over a selectable window (24h, 7d, 30d,
+90d), each KPI measured twice — once over the window, once over the window immediately before it —
+so a delta compares equal spans of time.</p>
+<p><strong>Six KPI cards:</strong> total runs, success rate, p50 latency, p90 latency, tokens, cost.</p>
+<p><strong>Eight series</strong> you can overlay on shared axes: <code>runs</code>,
+<code>success_rate</code>, <code>latency_p50</code>, <code>latency_p90</code>, <code>tokens</code>,
+<code>cost</code>, <code>violations</code>, <code>escalations</code>. The first six come from the
+telemetry engine; violations and escalations come from your own governance tables, and they land on
+the same bucket grid so one chart can carry both.</p>
+<p><strong>Breakdowns:</strong> per-model usage (runs, tokens, cost, share) and per-platform runs.
+Export the whole daily table as CSV.</p>
+<p><strong>Per-agent metrics.</strong> The agent picker beside the window control narrows every
+number on the screen — KPIs, both charts, the model table and the export — to one agent. The same
+filter is available on the API as a repeatable <code>agent_id</code> parameter on
+<code>/metrics/summary</code>, <code>/series</code>, <code>/models</code>, <code>/platforms</code>
+and <code>/export</code>, so you can compare a few agents in one call. Agent Registry has a
+<strong>View Metrics</strong> row action that arrives here with the filter already set.</p>
+<div class="note">
+  <p class="note-t">Why a latency percentile can be blank</p>
+  <p>Percentiles are combined across agents as a runs-weighted mean, because no cross-project
+  percentile exists. If the store reports no series for a bucket, the chart is empty there rather
+  than interpolated — a neighbouring percentile is a different number and showing it under this
+  name would be a lie.</p>
+</div>
+</div>
+
+<h2 id="connections">Agent governance</h2>
+
+<div class="screen">
+<h3>Hosting &amp; Deployment</h3>
+<p class="route">#/connections &middot; <span class="pill">member to edit</span></p>
+<p>The platforms your agents are hosted on, the traffic flowing through them, and their health.</p>
+<p><strong>Add Connection</strong> takes a name, a kind (<code>Azure AI Foundry</code>,
+<code>Copilot Studio</code>, <code>MCP Server</code>, <code>Vector Database</code>,
+<code>Microsoft Purview</code>, <code>Custom REST API</code>), an endpoint URL and free-form
+metadata pairs such as Environment or Authentication.</p>
+<p><strong>Test Connection</strong> probes the endpoint and reports what came back. The probe
+carries no credentials, so it answers reachability only — and a 401 is a <em>healthy</em> answer,
+because it proves the endpoint is up and guarding itself.</p>
+<p><strong>Sync</strong> pulls the current state. <strong>Test All</strong> and <strong>Sync
+All</strong> do the whole list. Every test, sync and registration is recorded in the activity feed
+below the table, and connection health is charted beside it.</p>
+<p><strong>Tool Calls &amp; Data</strong> answers the question health cannot: is anything actually
+using this. It lists every tool the agents on this platform called — with call counts, error rate,
+average duration and when it was last used — and the retrieval and data operations alongside them,
+over a 7, 30 or 90 day window.</p>
+<p>Nothing there is declared on the connection. It is derived from the spans of agents whose
+platform matches the connection's kind, so an empty result means no agent reported through it in
+the window — a different statement from the connection being unhealthy, and the screen says which
+of the two it is.</p>
+<p>There is a third case, and it is said plainly rather than shown as a zero. Connection kinds are a
+superset of agent platforms: an agent runs <em>on</em> Azure AI Foundry, but nothing runs "on" a
+Vector Database or a Custom REST API. For those kinds traffic cannot be attributed at all, the
+response sets <code>attributable: false</code>, and the panel says so and points at Connector &amp;
+MCP Governance, which is where tools reached through them are governed. On the API this is
+<code>GET /connections/{id}/traffic?window_days=30</code>.</p>
+</div>
+
+<div class="screen">
+<h3 id="agents">Agent Registry</h3>
+<p class="route">#/agents &middot; <span class="pill">member to create</span></p>
+<p>Every AI agent across your organisation, and the front door for registering new ones.</p>
+<p><strong>New Agent</strong> requires a name and takes platform, environment, agent type
+(Pro-code, Low-code, Copilot), risk level, description and an owner. Registration is what creates
+the agent telemetry namespace, so nothing can report until this exists.</p>
+<p><strong>Lifecycle:</strong> agents start <code>Pending Review</code> and move to
+<code>Active</code> or <code>Inactive</code>. Only listed transitions are allowed; anything else is
+refused with a 409. An inactive agent cannot ingest.</p>
+<p><strong>Row actions:</strong> activate, deactivate (with a reason), clone, run, export the
+configuration manifest, and delete.</p>
+</div>
+
+<div class="screen">
+<h3 id="agent-detail">Agent Detail</h3>
+<p class="route">#/agent/&lt;id&gt; &middot; click any agent</p>
+<p>Nine tabs covering everything known about one agent:</p>
+<p><strong>Overview</strong> — status, owner, risk, environment, and its run statistics for the
+window. <strong>Runs</strong> — its executions, the Live Runs table scoped to this agent.
+<strong>Model &amp; Prompt</strong> — the model it is configured with and its system prompt.
+<strong>Tools &amp; Connectors</strong> — what it is granted permission to call.
+<strong>Security &amp; Access</strong> — access scope and controls.
+<strong>Memory &amp; State</strong> — its stores and sessions.
+<strong>Evaluations</strong> — quality results for this agent.
+<strong>Configuration</strong> — the versioned config, where you commit a new prompt version and
+diff two versions against each other.
+<strong>Audit Trail</strong> — every governance change made to this agent, in order.</p>
+<p>Version history is real: each commit of the system prompt is a version, and the diff view shows
+exactly what changed between any two.</p>
+</div>
+
+<div class="screen">
+<h3 id="connectors">Connector &amp; MCP Governance</h3>
+<p class="route">#/connectors &middot; <span class="pill">member to register</span> <span class="pill">operator to block</span></p>
+<p>Govern and monitor all tools, connectors and MCP servers agents may use. Tabs scope the list to
+<strong>All Connectors</strong>, <strong>MCP Servers</strong>, <strong>Tools</strong>,
+<strong>External Systems</strong> and <strong>Data Sources</strong>.</p>
+<p><strong>Add Connector</strong> takes a name, a type (<code>API</code>, <code>MCP Server</code>,
+<code>Database</code>, <code>Vector Store</code>, <code>Custom Tool</code>), provider, risk level,
+access level (Read, Read-Write, Admin), data classification, auth mode, endpoint URL and scopes.</p>
+<p><strong>Block</strong> requires a reason and is the interesting state change. A blocked connector
+keeps its row, its grants and its history, and <strong>every agent holding a grant fails closed
+against it</strong> from that moment. That is how you stop a tool estate-wide without editing a
+single agent.</p>
+<div class="note">
+  <p class="note-t">Why this screen can be empty while agents are running</p>
+  <p>Connectors are a registry, not a discovery feed. Nothing here is created from observed traffic:
+  a connector exists because a person registered it and granted it. That makes "what this agent may
+  call" an approval decision rather than an inventory of what it happened to call.</p>
+</div>
+</div>
+
+<div class="screen">
+<h3 id="policies">Policy Center</h3>
+<p class="route">#/policies &middot; <span class="pill">admin</span></p>
+<p>Create, manage and enforce the rules that run on every ingest. Tabs filter by category:
+Access Control, Guardrails, Data Protection, Approval &amp; Escalation, Routing &amp; Orchestration,
+Usage &amp; Quotas, Logging &amp; Retention, Security, Compliance.</p>
+<p><strong>Create Policy</strong> takes a name, category, enforcement, scope, risk level and
+status. Optionally supply a <code>rules</code> JSON object; omit it and the server derives one.</p>
+<div class="scroll">
+<table>
+<thead><tr><th>Field</th><th>Values</th></tr></thead>
+<tbody>
+<tr><td>Enforcement</td><td><code>Block</code>, <code>Require Approval</code>, <code>Escalate</code>, <code>Mask</code>, <code>Route</code>, <code>Throttle</code>, <code>Warn</code>, <code>Log Only</code></td></tr>
+<tr><td>Scope</td><td><code>Global</code>, <code>Environment</code>, <code>Agent</code>, <code>Connector</code> — anything but Global needs a <code>scope_ref</code></td></tr>
+<tr><td>Status</td><td><code>Active</code>, <code>Inactive</code>, <code>Warning</code>, <code>Pending Review</code></td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Actions:</strong> activate, deactivate (with a reason), clone, import and export a policy
+bundle as JSON. A <strong>Violations</strong> view lists what each policy has actually caught, which
+is the honest test of whether a rule is doing anything.</p>
+<p>Policies reach an agent either by explicit binding or by scope match, and per-agent or per-tag
+exceptions remove specific agents from a rule that would otherwise cover them.</p>
+</div>
+
+<div class="screen">
+<h3 id="approvals">Approvals &amp; Audit</h3>
+<p class="route">#/approvals &middot; <span class="pill">approver</span></p>
+<p>The human-in-the-loop queue, plus the tamper-evident record of everything that has happened.</p>
+<p><strong>Approvals:</strong> requests raised by a <code>Require Approval</code> or
+<code>Escalate</code> policy — typical triggers are a financial action above a threshold, a bulk
+data export, an external communication, or a production config change. Approve, reject, escalate,
+or add a comment; every decision records who, when and why.</p>
+<p><strong>Audit:</strong> an append-only, hash-chained trail of every governance action across
+every screen, filterable by actor, action, entity and time. <strong>Verify</strong> re-walks the
+chain and confirms no row has been altered or removed — the point of hash-chaining is that
+tampering is detectable, not merely discouraged.</p>
+<p>Export either view as CSV for a compliance reviewer.</p>
+</div>
+
+<h2 id="configurations">Configuration</h2>
+
+<div class="screen">
+<h3>Configuration Center</h3>
+<p class="route">#/configurations &middot; <span class="pill">admin to edit</span></p>
+<p>Manage and version every configuration asset. Tabs: <strong>All Configurations</strong>,
+Models, Prompts, Tools, Guardrails, Routing, Quotas, Environments, Connectors.</p>
+<p>Each configuration is versioned, so you can see what changed, when, and by whom — and roll back.
+<strong>Import</strong> and <strong>Export</strong> move a configuration bundle between
+environments as JSON, which is how you promote a tested config from Staging to Production without
+retyping it. A schema endpoint describes the accepted shape.</p>
+</div>
+
+<div class="screen">
+<h3 id="prompts">Prompt Studio</h3>
+<p class="route">#/prompts &middot; <span class="pill">member to author</span></p>
+<p>Author, version, review and approve system prompts across all agents. Prompts live in the
+telemetry engine prompt library under the agent namespace, so a commit list is a real version
+history.</p>
+<p>Create a prompt with a name and template, commit new versions, diff versions, and pull them at
+runtime with <code>get_prompt()</code>. Because the version used is recorded on each run, a quality
+change can be traced to the exact wording that caused it.</p>
+<h4>Running a prompt</h4>
+<p><strong>Run Prompt</strong> renders the template with one variable set and sends it to a model,
+returning the answer, the provider's own token counts and the round-trip latency — so a wording
+change can be judged on output, cost and speed together. Optionally override the model, add a
+system message, or cap output tokens.</p>
+<p>This is the one place the control plane calls a model itself, so it is <strong>off unless
+configured</strong>. Set <code>FULCRUM_OPS_PROMPT_STUDIO_ENDPOINT</code> and
+<code>FULCRUM_OPS_PROMPT_STUDIO_API_KEY</code> (plus optionally
+<code>_MODEL</code>, <code>_API_VERSION</code>, <code>_MAX_OUTPUT_TOKENS</code>) and restart.
+Any OpenAI-compatible chat completions endpoint works — OpenAI, Azure OpenAI, or a local gateway;
+Azure is detected from the endpoint and authenticated with its own header. Unconfigured, the editor
+still renders and diffs, and only Run is refused — naming the missing setting rather than failing
+obscurely.</p>
+<p>Every run is audited as <code>prompt.executed</code>. It is deliberately <em>not</em> recorded as
+an agent run: no agent executed it, and folding a person's experiment into the figures the platform
+reports as agent behaviour would corrupt them. On the API:
+<code>POST /prompts/{id}/execute</code>. Use <code>/test</code> instead to render and score a whole
+dataset without calling a model.</p>
+</div>
+
+<div class="screen">
+<h3 id="knowledge">RAG &amp; Knowledge Governance</h3>
+<p class="route">#/knowledge &middot; <span class="pill">member to add</span></p>
+<p>Five tabs governing what your agents retrieve from: <strong>Knowledge Sources</strong>,
+<strong>Vector Indexes</strong>, <strong>Retrieval Policies</strong>, <strong>Citations &amp;
+Grounding</strong> and <strong>Data Access &amp; Lineage</strong>.</p>
+<p>Register a source, watch its sync status (Active, Syncing, Failed), set retrieval policies, and
+review grounding quality — retrieved document counts, grounding scores, citation accuracy and
+source freshness, all of which also appear per-run in the Live Runs inspector.</p>
+<p>Data Access &amp; Lineage answers the question an auditor asks: which agents can reach this
+source, and where did this answer material come from.</p>
+</div>
+
+<div class="screen">
+<h3 id="secrets">Secrets &amp; Credentials</h3>
+<p class="route">#/secrets &middot; <span class="pill">admin</span> <span class="pill role">admin + justification to reveal</span></p>
+<p>The vault for credentials your agents use to reach <em>other</em> systems. Tabs:
+<strong>All Secrets</strong>, API Keys, OAuth Clients, Certificates, Service Principals,
+Connector Credentials.</p>
+<p>This is the most locked-down screen in the product, and deliberately so.</p>
+<ul>
+<li>Material enters on create and rotate only, and is encrypted before it touches a row. The
+plaintext is never written to a log line, an audit detail or a CSV cell.</li>
+<li>Reading a value goes through one path that demands the <strong>admin role and a written
+justification</strong>, and refuses disabled or revoked credentials outright.</li>
+<li>Every reveal writes two independent records: an access-log row for operators and an audit-chain
+row for compliance.</li>
+<li><strong>A refused attempt is evidence too.</strong> Denials are committed before the error
+unwinds the request, because who tried and was stopped is exactly what the failed-attempts counter
+exists to show.</li>
+</ul>
+<p><strong>Lifecycle governance:</strong> rotation periods with overdue tracking, expiry warnings,
+per-secret ownership and risk classification. A secret may also hold only a <em>reference</em> to
+material living in an external vault — Key Vault, Secrets Manager — in which case
+<code>has_material</code> is false and this platform governs who may use it, when it rotates and
+who touched it, without ever holding the value.</p>
+<div class="note">
+  <p class="note-t">Not the same thing as API Access Tokens</p>
+  <p>Secrets are credentials for traffic going <strong>out</strong>, and are encrypted because the
+  value must be retrievable. API keys are credentials for traffic coming <strong>in</strong>, and
+  are hashed because they never need to be read back. Different direction, different storage,
+  different screen.</p>
+</div>
+</div>
+
+<h2 id="quota">Operations</h2>
+
+<div class="screen">
+<h3>Quota, Cost &amp; Capacity</h3>
+<p class="route">#/quota &middot; <span class="pill">operator to edit budgets</span></p>
+<p>Spend, usage quotas and infrastructure capacity across environments, services and teams.</p>
+<p><strong>Views:</strong> a cost breakdown by service and by team, usage and capacity time series,
+a forecast, top drivers of spend, and an events feed of quota trips.</p>
+<p><strong>Budgets and quotas</strong> are checked <em>before</em> a run is accepted, not tallied
+after the fact — a quota that is exhausted refuses new work rather than reporting an overspend
+tomorrow. Refresh budgets to re-evaluate immediately.</p>
+<p>Team allocation shows who is consuming the envelope, which is the number that actually settles
+arguments about cost.</p>
+</div>
+
+<div class="screen">
+<h3 id="memory">Memory &amp; State Management</h3>
+<p class="route">#/memory &middot; <span class="pill">operator</span></p>
+<p>Govern agent memory, session state and conversation context across environments.</p>
+<p><strong>Memory stores</strong> — what persists between runs. <strong>Sessions</strong> and
+<strong>Conversations</strong> — live and historical context, grouped by thread.
+<strong>Agent state</strong> — what each agent is currently holding. <strong>Retention
+policies</strong> — how long any of it survives. <strong>Backups</strong> — snapshots you can
+restore from.</p>
+<p>Actions include purge, backup and restore. Retention is where the compliance answer lives: an
+agent that remembers a customer indefinitely is a data-protection problem, and this screen is where
+you bound it.</p>
+</div>
+
+<div class="screen">
+<h3 id="deployments">Environments &amp; Releases</h3>
+<p class="route">#/deployments &middot; <span class="pill">operator</span></p>
+<p>Environments, releases and rollouts for every governed agent. The default environments are
+Production, Staging, UAT, Development, QA, Sandbox and DR.</p>
+<p>A deployment moves an agent version through stages. Actions: <strong>promote</strong> to the next
+stage, <strong>halt</strong> a rollout in progress, <strong>approve</strong> a gated stage,
+<strong>roll back</strong> to the previous version, and <strong>restart</strong> an environment.</p>
+<p>Because agent configuration is versioned, a rollback is a real return to a known state rather
+than an attempt to remember what the settings used to be.</p>
+</div>
+
+<h2 id="evaluations">Quality</h2>
+
+<div class="screen">
+<h3>Evaluations</h3>
+<p class="route">#/evaluations &middot; <span class="pill">member to run</span></p>
+<p>LLM quality evaluations across agents — correctness, grounding, faithfulness and safety.</p>
+<p>Run an evaluation against a dataset, either from this screen or from the SDK with
+<code>client.experiments.run(...)</code>. Each completed run records a judged average, and the
+trend chart plots those averages over time so a regression is visible rather than anecdotal.</p>
+<p><strong>Compare</strong> puts a baseline and a candidate side by side — the question you actually
+have before shipping a prompt change. Datasets are shared with the SDK, so a case added in code
+appears here.</p>
+</div>
+
+<div class="screen">
+<h3 id="guardrails">Guardrails</h3>
+<p class="route">#/guardrails &middot; <span class="pill">admin to configure</span></p>
+<p>Runtime safety filters for prompts and responses: prompt injection, PII, toxicity, hallucination
+and secrets.</p>
+<p>Configure a guardrail, set its action — <code>Warn</code>, <code>Block</code>,
+<code>Mask</code> or <code>Log</code> — and watch the <strong>events</strong> feed for what it has
+caught, with the matched entity counts and a sample of the offending text. The inline content
+checker on this deployment implements the <code>PII</code>, <code>Topic</code> and
+<code>Prompt Injection</code> validations; a guardrail whose type it does not implement cannot be
+tested (the Test button answers plainly rather than inventing a verdict).</p>
+<p>Guardrails run at ingest, so a Block verdict refuses the item before it is ever stored, and Mask
+strips the content while keeping the record that something happened. Agents can also report their
+own guardrail verdicts via <code>log_guardrail_event()</code>, which is how a check that runs inside
+your process still shows up here.</p>
+</div>
+
+<div class="screen">
+<h3 id="testing">Testing &amp; Regression Suite</h3>
+<p class="route">#/testing &middot; <span class="pill">member</span></p>
+<p>Seven tabs: <strong>Test Suites</strong>, <strong>Test Runs</strong>, <strong>Datasets</strong>,
+<strong>Evaluations</strong>, <strong>Baselines</strong>, <strong>Schedules</strong>,
+<strong>Environments</strong>.</p>
+<p>Build a suite, run it against an environment, and compare the result against a recorded
+<strong>baseline</strong> — the mechanism that turns "it seems worse" into a number. Schedules run
+suites automatically, which is what makes regression testing continuous rather than remembered.</p>
+</div>
+
+<div class="screen">
+<h3 id="feedback">Feedback &amp; Quality Loop</h3>
+<p class="route">#/feedback &middot; <span class="pill">member</span></p>
+<p>Eight tabs closing the loop from user complaint to shipped fix: <strong>Overview</strong>,
+<strong>Feedback</strong>, <strong>Quality Insights</strong>, <strong>Issues</strong>,
+<strong>Improvement Backlog</strong>, <strong>Actions</strong>, <strong>Reports</strong>,
+<strong>Settings</strong>.</p>
+<p>Feedback arrives from the SDK (<code>log_feedback()</code>) or from users. <strong>Analyze</strong>
+groups recent negative feedback into themes rather than leaving you to read it all. A theme becomes
+an <strong>issue</strong>, an issue becomes a <strong>backlog item</strong>, and the funnel view
+shows how much of it actually reached a fix — including SLA rules for how quickly it should.</p>
+</div>
+
+<h2 id="alerts">System</h2>
+
+<div class="screen">
+<h3>Alerts</h3>
+<p class="route">#/alerts &middot; <span class="pill">member to act</span> <span class="pill">admin for rules</span></p>
+<p>Operational alerts across connections, policies, quotas, secrets, tests and deployments.
+Severities are Critical, High, Medium, Low and Info.</p>
+<p><strong>Act on an alert:</strong> acknowledge, resolve with a note, assign to a person, or mute.
+Acknowledge All clears a noisy backlog in one action.</p>
+<p><strong>Alert rules</strong> define what raises an alert: a name, a source screen, a severity, a
+condition (stored as JSON and evaluated by the source screen), notify channels — Teams, Email,
+PagerDuty, Slack, Webhook — and a throttle in minutes so one failing thing cannot page you fifty
+times.</p>
+</div>
+
+<div class="screen">
+<h3 id="exports">Exports</h3>
+<p class="route">#/exports &middot; <span class="pill">member to request</span> <span class="pill">operator to delete</span></p>
+<p>Generate and download platform data exports for reporting, audit and BI, in CSV, JSON, XLSX, PDF
+or Parquet.</p>
+<p>Every export records what dataset it came from, which filters were replayed, how many rows it
+wrote and who asked for it. <strong>Schedules</strong> make an export recurring.
+<strong>Retention</strong> is a deployment setting, not a per-job one — a file past its window is
+dropped and the row says so rather than offering a download that would fail.</p>
+<p>Nearly every table in the product also has its own inline export button, which respects the
+filters currently on screen.</p>
+</div>
+
+<div class="screen">
+<h3 id="licensing">Licensing &amp; Entitlements</h3>
+<p class="route">#/licensing &middot; <span class="pill role">owner</span></p>
+<p>Six tabs: <strong>Plans &amp; Tiers</strong>, <strong>Tenants &amp; Licenses</strong>,
+<strong>Seats &amp; Assignments</strong>, <strong>Usage &amp; Limits</strong>, <strong>Billing &amp;
+Renewals</strong>, <strong>Audit Log</strong>.</p>
+<p>Define what a plan includes, issue a licence to a tenant, assign seats to people, and watch usage
+against the limits. Entitlements are checked at ingest, so a capability the licence does not include
+is refused at the door rather than billed and argued about later.</p>
+<p><strong>Issuing a licence seeds its entitlements.</strong> A plan's <code>features</code> list
+becomes one soft entitlement per feature — granted, but not blocking — and its
+<code>included_seats</code>, <code>included_tokens</code> and <code>included_runs</code> become
+hard entitlements, because a metered ceiling is the thing a plan actually sells and letting it run
+past silently is how a bill becomes a surprise. Check any one of them with
+<code>GET /licensing/entitlement-check?key=…</code>, which is the same resolution the ingest path
+performs.</p>
+</div>
+
+<div class="screen">
+<h3 id="settings">Workspace Settings</h3>
+<p class="route">#/settings &middot; user menu, bottom left &middot; <span class="pill">admin</span></p>
+<p>Not in the sidebar — reach it from your user card at the bottom left. Three tabs.</p>
+
+<h4>API Access Tokens</h4>
+<p>The keys agents authenticate with. KPI row: total keys, expiring soon, never used, agent-bound.
+The table shows scopes, bound agent, environment, status, last used (with the calling IP on hover)
+and expiry.</p>
+<p><strong>Issue Key</strong> takes a name, scopes, an optional agent binding, an environment and a
+TTL in days (maximum 730). The plaintext appears once, with copy-ready snippets for environment
+variables, the Python SDK, the TypeScript SDK and curl.</p>
+<p><strong>Scopes:</strong> <code>ingest</code> writes telemetry, <code>read</code> queries it,
+<code>admin</code> additionally lets a key auto-register unknown agents — grant that one rarely.</p>
+<p><strong>View Usage</strong> on any key shows what it has actually done, read from the audit
+trail: total calls, ingest records, a per-operation breakdown and active days.
+<strong>Revoke</strong> takes effect immediately and cannot be undone.</p>
+
+<h4>Users</h4>
+<p>Workspace membership. KPI row: members, privileged, never signed in, added in the last 30 days.</p>
+<p><strong>Add Member</strong> takes a name, email, role, job title, team and an optional initial
+password shown in clear so you can hand it over. <strong>Change Role</strong> records an optional
+reason on the audit trail. <strong>Set Password</strong> gives sign-in to an account that has none.
+<strong>Remove From Workspace</strong> revokes access without deleting the person.</p>
+<p>Two rules the server enforces: only an owner may grant the owner role, and you cannot remove your
+own membership. An email the platform already knows is <em>joined</em> to this workspace rather than
+duplicated, and a supplied password is refused in that case — an existing credential belongs to its
+owner, not to whoever is adding them.</p>
+
+<h4>Profile</h4>
+<p>Your own identity, role and workspace as the server holds them. Profile fields are managed by an
+admin on the Users tab.</p>
+</div>
+
+<h2 id="api">REST API</h2>
+
+<p>Everything the console does, it does over the same public API — there is no private back channel.
+Base path <code>/api/v1</code>, contract at <code>/api/docs</code>.</p>
+
+<div class="scroll">
+<table>
+<thead><tr><th>Area</th><th>Representative endpoints</th></tr></thead>
+<tbody>
+<tr><td>Auth</td><td><code>POST /auth/login</code>, <code>POST /auth/logout</code>, <code>GET /auth/me</code>, <code>POST /auth/workspace</code></td></tr>
+<tr><td>Ingest</td><td><code>POST /ingest/traces|spans|scores|events</code>, <code>GET /ingest/config</code>, and <code>POST /v1/traces</code> at the root for OTLP</td></tr>
+<tr><td>Runs</td><td><code>GET /runs</code>, <code>/runs/{id}</code>, <code>/runs/{id}/trace</code>, <code>/replay</code>, <code>/response</code>, <code>/runs/stream</code> (SSE), <code>POST /runs/{id}/flag</code></td></tr>
+<tr><td>Metrics</td><td><code>GET /metrics/summary|series|models|platforms</code>, all accepting repeatable <code>agent_id</code></td></tr>
+<tr><td>Governance</td><td><code>/agents</code>, <code>/connections</code>, <code>GET /connections/{id}/traffic</code>, <code>/connectors</code>, <code>/policies</code>, <code>/approvals</code>, <code>/audit</code>, <code>/audit/verify</code></td></tr>
+<tr><td>Configuration</td><td><code>/configurations</code>, <code>/prompts</code>, <code>POST /prompts/{id}/execute</code>, <code>/knowledge</code>, <code>/secrets</code></td></tr>
+<tr><td>Operations</td><td><code>/quota</code>, <code>/memory</code>, <code>/deployments</code>, <code>/environments</code></td></tr>
+<tr><td>Quality</td><td><code>/evaluations</code>, <code>/guardrails</code>, <code>/testing</code>, <code>/feedback</code></td></tr>
+<tr><td>System</td><td><code>/alerts</code>, <code>/exports</code>, <code>/licensing</code>, <code>/workspaces/users</code>, <code>/workspaces/api-keys</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<p><strong>Conventions.</strong> Collections take <code>page</code>, <code>page_size</code>,
+<code>q</code>, <code>sort</code> (prefix <code>-</code> for descending) and per-screen filters.
+Most collections also expose <code>/summary</code> for the KPI row and <code>/export</code> for a
+file download. Authentication is either the session cookie or
+<code>Authorization: Bearer fo_...</code>; ingest endpoints accept only API keys and refuse a
+browser session with a 403.</p>
+
+<pre><code>curl -s https://your-control-plane/api/v1/runs?page_size=5 \
+  -H "Authorization: Bearer fo_live_..."</code></pre>
+
+<h2 id="troubleshooting">Troubleshooting</h2>
+
+<div class="scroll">
+<table>
+<thead><tr><th>Symptom</th><th>Cause and fix</th></tr></thead>
+<tbody>
+<tr><td>Agent runs, nothing appears in Live Runs</td><td>Check <code>client.stats()</code>. A non-zero <code>rejected</code> count with <code>agent_unprovisioned</code> means the agent name does not exist in the workspace, or your key is bound to a different agent. Register and activate the agent, or rebind the key.</td></tr>
+<tr><td>Everything is silently not reported</td><td>No <code>FULCRUM_OPS_API_KEY</code>. The SDK disables itself by design and your functions still run. Check <code>/health</code> on your agent or print <code>client.enabled</code>.</td></tr>
+<tr><td>Cost shows <code>$0.00</code> but tokens are right</td><td>The price table is keyed on <em>model plus provider</em>. Report the real model (not a deployment alias) and the provider vocabulary the table uses — <code>azure</code> for Azure-served OpenAI models, not <code>azure-openai</code>.</td></tr>
+<tr><td>A telemetry screen shows <code>telemetry_unavailable</code></td><td>The engine is unreachable. Governance screens keep working. Check the engine container and <code>/health</code>, which reports <code>"telemetry": false</code> when the adapter cannot reach it.</td></tr>
+<tr><td>A number is a dash</td><td>Not an error. It means nothing was measured for that window. Zero would be a claim the platform is not entitled to make.</td></tr>
+<tr><td>Guardrail event rejected as malformed</td><td><code>matched</code> must be a mapping of label to count, not a list. <code>action_taken</code> must be <code>Warn</code>, <code>Block</code>, <code>Mask</code> or <code>Log</code> (casing and variants like <code>Warned</code> are normalised; there is no <code>Passed</code>).</td></tr>
+<tr><td>Batch returned 200 but rows are missing</td><td>Ingest is partial-success. Individual items can be refused by policy, guardrail, entitlement or quota while the batch succeeds. The per-item verdicts say which.</td></tr>
+<tr><td>Connector or Policy screen is empty</td><td>Expected on a new workspace. Both are registries — nothing is created from observed traffic. Register what agents may call, then grant it.</td></tr>
+<tr><td>An agent cannot reach a tool it used yesterday</td><td>Check whether the connector was blocked. A blocked connector keeps its grants and fails every holder closed, by design.</td></tr>
+<tr><td>Sign-in works but a button is disabled</td><td>Role. Hover it for the reason. The endpoint refuses the call too, so the interface is not the thing stopping you.</td></tr>
+<tr><td>Runs are attributed to the wrong agent name</td><td>The bound key decides attribution, not the agent string in your code. Mint a key bound to the agent you want, or set <code>FULCRUM_OPS_AGENT</code> to a name the key is allowed to write.</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>Health checks worth knowing</h3>
+
+<pre><code>curl https://your-control-plane/health
+# {"status":"ok","telemetry":true,...}   telemetry:false means the engine is down
+
+python -c "import fulcrum_ops; print(fulcrum_ops.get_client().stats())"
+# submitted / sent / accepted / rejected / blocked / dropped</code></pre>
+
+<div class="note">
+  <p class="note-t">When you are unsure whether it is you or the platform</p>
+  <p>Set <code>on_error</code> on the client and turn on <code>FULCRUM_OPS_DEBUG</code>. Every
+  transport failure, rejected row and retry prints with the server own message. Most first-time
+  integration problems announce themselves in the first thirty seconds of doing this.</p>
+</div>
+
+<footer>
+  <p><strong>Fulcrum Ops Operator Manual.</strong> Twenty-four screens, two SDKs, one API. Written
+  against the running product — every field, action, enum and endpoint named here exists in the
+  code that serves it.</p>
+</footer>
+
+</div></main>
+</div>

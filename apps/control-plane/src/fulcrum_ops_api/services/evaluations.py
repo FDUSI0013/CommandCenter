@@ -1107,7 +1107,14 @@ async def _load_items(
         return [], 0
 
     try:
-        payload = await client.list_dataset_items(dataset_id, page=max(1, page), size=size)
+        # The plain items listing carries no experiment results; the comparison
+        # endpoint joins each case to this run's verdicts and outputs.
+        if run.engine_experiment_id:
+            payload = await client.list_dataset_items_with_experiments(
+                dataset_id, [run.engine_experiment_id], page=max(1, page), size=size
+            )
+        else:
+            payload = await client.list_dataset_items(dataset_id, page=max(1, page), size=size)
     except EngineError as exc:
         raise translate_engine_error(exc) from exc
 

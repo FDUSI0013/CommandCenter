@@ -162,3 +162,85 @@ async def test_the_newest_run_per_case_is_the_one_that_judges(
     detail = (await admin_client.get(f"/api/v1/evaluations/{evaluation_id}")).json()
     assert detail["status"] == "Completed", detail.get("notes")
     assert detail["correctness"] == 0.75, "the scored (newest) run judges the case"
+
+
+async def test_a_suite_run_grades_every_case_and_promotes_a_baseline(
+    admin_client, ingest_client, factory, workspace, engine
+):
+    """The full regression loop: scored traces in, per-case verdicts out.
+
+    This is the path production shipped broken — the runner read the plain
+    items listing, which carries no experiment results, and graded every case
+    Unscored. The comparison endpoint is the one that joins the verdicts.
+    """
+    await factory.provisioned_agent(workspace, engine, name="Support Bot")
+    created = await admin_client.post(
+        "/api/v1/evaluations/datasets", json={"name": "suite-set"}
+    )
+    assert created.status_code == 201, created.text
+    await admin_client.post(
+        "/api/v1/evaluations/datasets/suite-set/items",
+        json={"items": [{"input": "case A"}, {"input": "case B"}]},
+    )
+    items = (await admin_client.get("/api/v1/evaluations/datasets/suite-set/items")).json()[
+        "items"
+    ]
+    for index, item in enumerate(items):
+        posted = await ingest_client.post(
+            "/api/v1/ingest/traces",
+            json={
+                "agent": "Support Bot",
+                "traces": [
+                    {
+                        "name": "experiment:suite-set",
+                        "start_time": iso(index),
+                        "end_time": iso(index + 1.0),
+                        "metadata": {"dataset_item_id": item["id"]},
+                        "feedback_scores": [
+                            {"name": "answer_correctness", "value": 0.9 if index == 0 else 0.2}
+                        ],
+                    }
+                ],
+            },
+        )
+        assert posted.json()["accepted"] == 1, posted.text
+
+    suite = await admin_client.post(
+        "/api/v1/testing/suites",
+        json={
+            "name": "Suite loop", "suite_type": "Regression",
+            "environment": "Staging", "dataset": "suite-set", "status": "Active",
+        },
+    )
+    assert suite.status_code == 201, suite.text
+    suite_id = suite.json()["id"]
+
+    started = await admin_client.post(
+        f"/api/v1/testing/suites/{suite_id}/run", json={"trigger": "Manual"}
+    )
+    assert started.status_code == 202, started.text
+    run_id = started.json()["id"]
+
+    for _ in range(60):
+        progress = (
+            await admin_client.get(
+                f"/api/v1/testing/suites/{suite_id}/runs/{run_id}/progress"
+            )
+        ).json()
+        if progress["is_terminal"]:
+            break
+        await asyncio.sleep(0.5)
+
+    detail = (await admin_client.get(f"/api/v1/testing/runs/{run_id}")).json()
+    assert detail["status"] == "Failed", detail  # one case under 0.5 -> run Failed
+    assert detail["pass_rate"] == 50.0
+    statuses = sorted(case["status"] for case in detail["cases"])
+    assert statuses == ["Failed", "Passed"], statuses
+    assert all(case.get("trace_id") for case in detail["cases"]), (
+        "each verdict must cite the trace it was judged from"
+    )
+
+    promoted = await admin_client.post(
+        f"/api/v1/testing/suites/{suite_id}/promote-baseline", json={}
+    )
+    assert promoted.status_code == 200, promoted.text

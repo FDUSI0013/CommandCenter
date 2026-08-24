@@ -430,15 +430,20 @@
             <div class="form-row"><label>ENDPOINT / RESOURCE URI</label><input class="input" id="cfgEndpoint" value="${esc((cn.config||{}).endpoint_url||'')}" placeholder="https://…"></div>
             <div class="form-row"><label>NOTE</label><textarea class="input" id="cfgNote" rows="2">${esc(cn.note||'')}</textarea></div>`,
           footer:[{label:'Cancel'},{label:'Save Changes', cls:'primary', onClick: async (close, modal)=>{
+            const endpoint = modal.querySelector('#cfgEndpoint').value.trim();
+            if(endpoint && !/^https?:\/\//i.test(endpoint)){ toast('error','Check the endpoint','The endpoint must be an absolute http(s) URL.'); return; }
+            const config = Object.assign({}, cn.config || {}, { endpoint_url: endpoint || null });
+            // The server redacts secret values on read — echoing the markers back would store them.
+            Object.keys(config).forEach(k=>{ if(config[k] === '***redacted***') delete config[k]; });
             const body = {
               name: modal.querySelector('#cfgName').value.trim() || cn.name,
               kind: modal.querySelector('#cfgKind').value.trim() || cn.kind,
               note: modal.querySelector('#cfgNote').value.trim() || null,
-              config: Object.assign({}, cn.config || {}, { endpoint_url: modal.querySelector('#cfgEndpoint').value.trim() || null }),
+              config,
             };
-            close();
             try {
               const saved = await Store.mutate(()=>API.connections.update(cn.id, body), { event:'connections:changed' });
+              close();
               toast('success','Connection updated', saved.name+' saved.');
               reloadAll();
             } catch (err) { toast('error','Could not save', err.message); }
@@ -536,15 +541,17 @@
           footer:[{label:'Cancel'},{label:'Connect & Validate', cls:'primary', onClick: async (close, modal)=>{
             const kind = modal.querySelector('#ncType').value;
             const name = modal.querySelector('#ncName').value.trim() || (kind + ' — New');
+            const endpoint = modal.querySelector('#ncUri').value.trim();
+            if(endpoint && !/^https?:\/\//i.test(endpoint)){ toast('error','Check the endpoint','The endpoint must be an absolute http(s) URL.'); return; }
             const body = {
               name, kind, logo_key: KIND_LOGO[kind] || 'custom',
               metadata_pairs: [['Environment', modal.querySelector('#ncEnv').value], ['Authentication', modal.querySelector('#ncAuth').value]],
-              config: { endpoint_url: modal.querySelector('#ncUri').value.trim() || null },
+              config: { endpoint_url: endpoint || null },
               enabled: true,
             };
-            close();
             try {
               const created = await Store.mutate(()=>API.connections.create(body), { event:'connections:changed' });
+              close();
               toast('success','Connection added', `${created.name} registered — test it to confirm the endpoint answers.`);
               reloadAll();
             } catch (err) { toast('error','Could not add the connection', err.message); }
@@ -1852,9 +1859,22 @@
         if(!host) return;
         host.innerHTML = '';
         tabsEl = tabBar(host, TAB_SCOPES.map(t=>({label:t.label, count:t.key ? (s ? s[t.key] : null) : null})),
-          i=>{ activeTab = i; TAB_SCOPES[i].apply(); table.state.page = 1; table.refresh(); }, activeTab);
+          i=>{ activeTab = i; TAB_SCOPES[i].apply(); syncScopedFilters(); table.state.page = 1; table.refresh(); }, activeTab);
       }
       paintTabs(null);
+
+      /* extraParams overwrites same-named query params, so while a tab pins
+         type or access the matching dropdown is parked rather than silently ignored. */
+      function syncScopedFilters(){
+        [['type','0'],['access','3']].forEach(([key, fi])=>{
+          const sel = table.filterEl && table.filterEl.querySelector(`[data-fi="${fi}"]`);
+          if(!sel) return;
+          const pinned = scope[key] != null;
+          sel.disabled = pinned;
+          sel.title = pinned ? `The ${TAB_SCOPES[activeTab].label} tab is already filtering by ${key}.` : '';
+          if(pinned && sel.value){ sel.value = ''; table.state.filters[key] = ''; }
+        });
+      }
 
       /* ---- the governance table ---- */
       const table = dataTable({
@@ -2291,9 +2311,21 @@
       tabBar(tabsHost, [{label:'All Policies'}].concat(POLICY_CATEGORIES.map(c=>({label:c}))), i=>{
         activeTab = i;
         if(i === 0) delete scope.category; else scope.category = POLICY_CATEGORIES[i-1];
+        syncCategoryFilter();
         table.state.page = 1;
         table.refresh();
       }, activeTab);
+
+      /* extraParams overwrites the same-named query param, so while a category
+         tab is active the Category dropdown is parked rather than silently ignored. */
+      function syncCategoryFilter(){
+        const sel = table.filterEl && table.filterEl.querySelector('[data-fi="1"]');
+        if(!sel) return;
+        const pinned = !!scope.category;
+        sel.disabled = pinned;
+        sel.title = pinned ? `The ${scope.category} tab is already filtering by category.` : '';
+        if(pinned && sel.value){ sel.value = ''; table.state.filters.category = ''; }
+      }
 
       /* ---- the policy table ---- */
       const table = dataTable({
@@ -2411,7 +2443,7 @@
             <div class="form-row"><label>STATUS</label><select class="filter-select w-100" id="pfStatus" style="height:34px">${optionList(POLICY_STATES, p ? p.status : 'Active')}</select></div>
           </div>
           <div class="form-row"><label>DESCRIPTION</label><textarea class="input" id="pfDesc" rows="2" placeholder="What does this policy enforce?">${esc(p ? (p.description||'') : '')}</textarea></div>
-          <div class="form-row"><label>RULE BODY (JSON — LEAVE BLANK TO DERIVE ONE)</label>
+          <div class="form-row"><label>RULE BODY (JSON — ${p ? 'LEAVE BLANK TO KEEP THE CURRENT RULES' : 'LEAVE BLANK TO DERIVE ONE'})</label>
             <textarea class="input" id="pfRules" rows="6" style="font-family:Consolas,monospace;font-size:11.5px">${
               p && p.rules && Object.keys(p.rules).length ? esc(JSON.stringify(p.rules, null, 2)) : ''}</textarea></div>`;
       }
@@ -2452,9 +2484,9 @@
             let body;
             try { body = readPolicyForm(modal); }
             catch (err) { toast('error','Check the form', err.message); return; }
-            close();
             try {
               const created = await Store.mutate(()=>API.policies.create(body), { event:'policies:changed' });
+              close();
               toast('success','Policy created', `${created.name} is ${created.status === 'Active' ? 'now enforced' : 'saved as ' + created.status}.`);
               refreshAll();
             } catch (err) { toast('error','Could not create the policy', err.message); }
@@ -2472,9 +2504,9 @@
             try { body = readPolicyForm(modal); }
             catch (err) { toast('error','Check the form', err.message); return; }
             body.expected_updated_at = modal.dataset.updatedAt || null;
-            close();
             try {
               const saved = await Store.mutate(()=>API.policies.update(r.id, body), { event:'policies:changed' });
+              close();
               toast('success','Policy updated', `${saved.name} saved as ${saved.version}.`);
               refreshAll();
               if(currentId === r.id) showPolicy(saved);

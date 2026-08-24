@@ -69,9 +69,10 @@
 			file_server
 		}
 
-		# Everything else is the single page.
+		# Everything else is the single page — except a directory that carries
+		# its own index (the operator manual at /docs/), which serves that.
 		handle {
-			try_files {path} /index.html
+			try_files {path} {path}/index.html /index.html
 			file_server
 		}
 	}

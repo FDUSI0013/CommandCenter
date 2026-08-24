@@ -223,7 +223,7 @@ async def export_metrics(
         )
 
     daily: list[dict[str, Any]] = await service.daily_rows(
-        session, principal, window=window, interval=interval
+        session, principal, window=window, interval=interval, agent_ids=agent_id
     )
     # Validate on the way out so the CSV and the JSON API can never disagree
     # about what a column is called.

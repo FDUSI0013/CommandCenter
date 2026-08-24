@@ -90,7 +90,10 @@
         if(currentTab === 1 || currentTab === 5) renderTab(currentTab);
       });
       document.getElementById('qcExport').addEventListener('click', async () => {
-        try { await API.quota.export({ q: searchTerm }); toast('success','Export complete','Quotas exported to CSV.'); }
+        // The endpoint exports one table at a time, so the button follows the active tab.
+        const dataset = currentTab === 1 ? 'quotas' : currentTab === 3 ? 'capacity' : currentTab === 5 ? 'budgets' : 'teams';
+        const named = { quotas:'Quotas', capacity:'Capacity', budgets:'Budgets', teams:'Team allocation' };
+        try { await API.quota.export({ q: searchTerm, dataset }); toast('success','Export complete', `${named[dataset]} exported to CSV.`); }
         catch (err) { toast('error','Export failed', err.message); }
       });
       document.getElementById('qcCreate').addEventListener('click', createQuota);
@@ -118,7 +121,7 @@
         </div>`;
 
         section(document.getElementById('qcSpend'),
-          () => API.quota.usageSeries({ metric: 'cost' }),
+          () => API.quota.usageSeries({ metric: 'spend' }),
           res => {
             const s = (res.series || [])[0];
             if(!s || !s.points.length) return emptyCard('Spend Over Time','No spend recorded in this period');
@@ -145,7 +148,7 @@
           }, 'the cost breakdown');
 
         section(document.getElementById('qcQuotaMini'),
-          () => API.quota.quotas.list({ page_size: 6, sort: '-utilization_percent' }),
+          () => API.quota.quotas.list({ page_size: 6, sort: '-used_value' }),
           page => {
             if(!page.items.length) return emptyCard('Quota Utilization','No quotas defined yet');
             return card('Quota Utilization',
@@ -224,21 +227,20 @@
             { key:'scope', label:'Scope', render:r=>esc(r.scope) },
             { key:'used_value', label:'Used', align:'right', cls:'num', render:r=>esc(r.used_display) },
             { key:'limit_value', label:'Limit', align:'right', cls:'num', render:r=>esc(r.limit_display) },
-            { key:'utilization_percent', label:'Utilization', render:r=>barPct(r.utilization_percent, healthColor(r.health)) },
+            { key:'utilization_percent', label:'Utilization', sortable:false, render:r=>barPct(r.utilization_percent, healthColor(r.health)) },
             { key:'enforcement', label:'Enforcement', render:r=>badge(r.enforcement) },
             { key:'period', label:'Period', render:r=>esc(r.period) },
-            { key:'resets_label', label:'Resets', render:r=>r.resets_label?esc(r.resets_label):dash },
-            { key:'health', label:'Status', render:r=>statusText(r.health, healthColor(r.health)) },
+            { key:'resets_label', label:'Resets', sortable:false, render:r=>r.resets_label?esc(r.resets_label):dash },
+            { key:'health', label:'Status', sortable:false, render:r=>statusText(r.health, healthColor(r.health)) },
           ],
           rowId:'id', itemName:'quotas', pageSize:10, emptyText:'No quotas defined yet',
           extraParams: searchTerm ? { q: searchTerm } : null,
           filters:[
             {key:'resource', label:'Resource', param:'resource', options:['Tokens','Requests','Cost','Concurrency','Storage'], allLabel:'All Resources'},
             {key:'scope', label:'Scope', param:'scope', options:['Workspace','Agent','Team','Environment'], allLabel:'All Scopes'},
-            {key:'health', label:'Health', param:'health', options:['Healthy','Watch','Critical'], allLabel:'All'},
           ],
           source: (p) => API.quota.quotas.list(p),
-          exportSource: (p) => API.quota.export(p),
+          exportSource: (p) => API.quota.export(Object.assign({ dataset: 'quotas' }, p)),
           rowActions: r => [
             {label:'Request Increase', icon:'trendUp', onClick:()=>requestIncrease(r)},
             {label:'Edit Quota', icon:'pen', onClick:()=>editQuota(r)},
@@ -274,8 +276,8 @@
       }
 
       function createQuota(){
-        if(!Store.session.can('operator')){
-          toast('error','Not permitted','Creating a quota requires the operator role.');
+        if(!Store.session.can('admin')){
+          toast('error','Not permitted','Creating a quota requires the admin role.');
           return;
         }
         openModal({
@@ -287,26 +289,41 @@
               <label class="auth-field"><span>Scope</span><select class="filter-select" id="cqScope" style="height:34px">
                 ${['Workspace','Agent','Team','Environment'].map(o=>`<option>${o}</option>`).join('')}</select></label>
             </div>
+            <label class="auth-field" id="qScopeRefField" style="margin-top:10px;display:none"><span>Scope target</span>
+              <input type="text" id="qScopeRef" placeholder="Agent id, team or environment name"></label>
             <div class="grid g2" style="margin-top:10px">
               <label class="auth-field"><span>Limit</span><input type="number" id="cqLimit" value="1000000" min="1"></label>
               <label class="auth-field"><span>Period</span><select class="filter-select" id="cqPeriod" style="height:34px">
-                ${['Daily','Weekly','Monthly'].map(o=>`<option>${o}</option>`).join('')}</select></label>
+                ${['Monthly','Quarterly','Annual'].map(o=>`<option ${o==='Monthly'?'selected':''}>${o}</option>`).join('')}</select></label>
             </div>
             <label class="auth-field" style="margin-top:10px"><span>Enforcement</span><select class="filter-select" id="cqEnf" style="height:34px">
-              ${['Warn','Throttle','Block'].map(o=>`<option>${o}</option>`).join('')}</select></label>`,
+              ${['Block','Warn','Log'].map(o=>`<option>${o}</option>`).join('')}</select></label>`,
+          onOpen(modal){
+            // Anything narrower than the workspace needs a named target to bind to.
+            modal.querySelector('#cqScope').addEventListener('change', e => {
+              modal.querySelector('#qScopeRefField').style.display = e.target.value === 'Workspace' ? 'none' : '';
+            });
+          },
           footer:[
             {label:'Create Quota', cls:'primary', onClick: async (close, modal) => {
+              const scope = modal.querySelector('#cqScope').value;
+              const scopeRef = modal.querySelector('#qScopeRef').value.trim();
+              if(scope !== 'Workspace' && !scopeRef){
+                toast('error','Scope target required', `Name the ${scope.toLowerCase()} this quota applies to.`);
+                return;
+              }
               const payload = {
                 name: modal.querySelector('#cqName').value.trim(),
                 resource: modal.querySelector('#cqResource').value,
-                scope: modal.querySelector('#cqScope').value,
+                scope,
                 limit_value: Number(modal.querySelector('#cqLimit').value),
                 period: modal.querySelector('#cqPeriod').value,
                 enforcement: modal.querySelector('#cqEnf').value,
               };
-              close();
+              if(scope !== 'Workspace') payload.scope_ref = scopeRef;
               try {
                 await API.quota.quotas.create(payload);
+                close();
                 toast('success','Quota created', `${payload.name} is now enforced.`);
                 loadKpis();
                 if(currentTab === 1) renderTab(1);
@@ -318,11 +335,15 @@
       }
 
       function editQuota(r){
+        if(!Store.session.can('admin')){
+          toast('error','Not permitted','Editing a quota requires the admin role.');
+          return;
+        }
         openModal({
           title:'Edit Quota — ' + r.name, icon:'pen',
           body:`<label class="auth-field"><span>Limit</span><input type="number" id="eqLimit" value="${r.limit_value}" min="1"></label>
             <label class="auth-field" style="margin-top:10px"><span>Enforcement</span><select class="filter-select" id="eqEnf" style="height:34px">
-              ${['Warn','Throttle','Block'].map(o=>`<option ${o===r.enforcement?'selected':''}>${o}</option>`).join('')}</select></label>`,
+              ${['Block','Warn','Log'].map(o=>`<option ${o===r.enforcement?'selected':''}>${o}</option>`).join('')}</select></label>`,
           footer:[
             {label:'Save', cls:'primary', onClick: async (close, modal) => {
               const payload = { limit_value: Number(modal.querySelector('#eqLimit').value),
@@ -341,6 +362,10 @@
       }
 
       function deleteQuota(r){
+        if(!Store.session.can('admin')){
+          toast('error','Not permitted','Deleting a quota requires the admin role.');
+          return;
+        }
         confirmModal({
           title:'Delete Quota', confirmLabel:'Delete', danger:true,
           msg:`Delete “${r.name}”? Usage against it stops being enforced immediately.`,
@@ -421,7 +446,7 @@
       function usageTab(){
         body.innerHTML = `<div class="grid g2" id="qcUsageCharts"></div>`;
         const host = document.getElementById('qcUsageCharts');
-        [['tokens','Tokens Over Time'],['cost','Cost Over Time']].forEach(([metric,title]) => {
+        [['tokens','Tokens Over Time'],['spend','Cost Over Time']].forEach(([metric,title]) => {
           const slot = document.createElement('div');
           host.appendChild(slot);
           section(slot, () => API.quota.usageSeries({ metric }), res => {
@@ -444,14 +469,14 @@
         const table = dataTable({
           columns:[
             { key:'name', label:'Budget', render:r=>entityCell(r.name, r.scope_ref || r.scope, 'creditCard', 'blue') },
-            { key:'period', label:'Period', render:r=>esc(r.period) },
+            { key:'period', label:'Period', sortable:false, render:r=>esc(r.period) },
             { key:'spent_usd', label:'Spent', align:'right', cls:'num', render:r=>esc(r.spent_display) },
             { key:'amount_usd', label:'Budget', align:'right', cls:'num', render:r=>esc(r.amount_display) },
-            { key:'utilization_percent', label:'Utilization', render:r=>barPct(r.utilization_percent, healthColor(r.health)) },
-            { key:'projected_spend_usd', label:'Projected', align:'right', cls:'num', render:r=>r.projected_spend_usd==null?dash:`${money(r.projected_spend_usd)}${r.on_pace_to_breach?' <span class="st-red">over</span>':''}` },
-            { key:'warn_threshold_percent', label:'Thresholds', render:r=>`<span class="faint">${r.warn_threshold_percent}% / ${r.hard_threshold_percent}%</span>` },
-            { key:'resets_label', label:'Resets', render:r=>r.resets_label?esc(r.resets_label):dash },
-            { key:'health', label:'Status', render:r=>statusText(r.health, healthColor(r.health)) },
+            { key:'utilization_percent', label:'Utilization', sortable:false, render:r=>barPct(r.utilization_percent, healthColor(r.health)) },
+            { key:'projected_spend_usd', label:'Projected', align:'right', cls:'num', sortable:false, render:r=>r.projected_spend_usd==null?dash:`${money(r.projected_spend_usd)}${r.on_pace_to_breach?' <span class="st-red">over</span>':''}` },
+            { key:'warn_threshold_percent', label:'Thresholds', sortable:false, render:r=>`<span class="faint">${r.warn_threshold_percent}% / ${r.hard_threshold_percent}%</span>` },
+            { key:'resets_label', label:'Resets', sortable:false, render:r=>r.resets_label?esc(r.resets_label):dash },
+            { key:'health', label:'Status', sortable:false, render:r=>statusText(r.health, healthColor(r.health)) },
           ],
           rowId:'id', itemName:'budgets', pageSize:10, emptyText:'No budgets set',
           extraParams: searchTerm ? { q: searchTerm } : null,
@@ -459,18 +484,28 @@
           rowActions: r => [
             {label:'Edit Thresholds', icon:'settings', onClick:()=>editThresholds(r)},
             {sep:true},
-            {label:'Delete Budget', icon:'trash', danger:true, onClick:()=>confirmModal({
-              title:'Delete Budget', confirmLabel:'Delete', danger:true,
-              msg:`Delete “${r.name}”? Spend against it stops being tracked.`,
-              onConfirm: async () => {
-                try { await API.quota.budgets.remove(r.id); toast('success','Budget deleted', r.name+' removed.'); table.refresh(); }
-                catch (err) { toast('error','Could not delete budget', err.message); }
-              } })},
+            {label:'Delete Budget', icon:'trash', danger:true, onClick:()=>{
+              if(!Store.session.can('admin')){
+                toast('error','Not permitted','Deleting a budget requires the admin role.');
+                return;
+              }
+              confirmModal({
+                title:'Delete Budget', confirmLabel:'Delete', danger:true,
+                msg:`Delete “${r.name}”? Spend against it stops being tracked.`,
+                onConfirm: async () => {
+                  try { await API.quota.budgets.remove(r.id); toast('success','Budget deleted', r.name+' removed.'); table.refresh(); }
+                  catch (err) { toast('error','Could not delete budget', err.message); }
+                } });
+            }},
           ],
         });
         document.getElementById('qcBudgetTable').appendChild(table.el);
 
         document.getElementById('qcRefreshBudgets').addEventListener('click', async (e) => {
+          if(!Store.session.can('operator')){
+            toast('error','Not permitted','Re-measuring spend requires the operator role.');
+            return;
+          }
           e.currentTarget.disabled = true;
           try {
             const res = await API.quota.refreshBudgets();
@@ -481,13 +516,17 @@
         });
 
         document.getElementById('qcNewBudget').addEventListener('click', () => {
+          if(!Store.session.can('admin')){
+            toast('error','Not permitted','Creating a budget requires the admin role.');
+            return;
+          }
           openModal({
             title:'New Budget', icon:'creditCard',
             body:`<label class="auth-field"><span>Name</span><input type="text" id="nbName" placeholder="Production monthly"></label>
               <div class="grid g2" style="margin-top:10px">
                 <label class="auth-field"><span>Amount (USD)</span><input type="number" id="nbAmount" value="5000" min="1"></label>
                 <label class="auth-field"><span>Period</span><select class="filter-select" id="nbPeriod" style="height:34px">
-                  ${['Daily','Weekly','Monthly'].map(o=>`<option ${o==='Monthly'?'selected':''}>${o}</option>`).join('')}</select></label>
+                  ${['Monthly','Quarterly','Annual'].map(o=>`<option ${o==='Monthly'?'selected':''}>${o}</option>`).join('')}</select></label>
               </div>
               <div class="grid g2" style="margin-top:10px">
                 <label class="auth-field"><span>Warn at (%)</span><input type="number" id="nbWarn" value="80" min="1" max="100"></label>
@@ -517,6 +556,10 @@
       }
 
       function editThresholds(r){
+        if(!Store.session.can('admin')){
+          toast('error','Not permitted','Editing thresholds requires the admin role.');
+          return;
+        }
         openModal({
           title:'Edit Thresholds — ' + r.name, icon:'settings',
           body:`<div class="small muted" style="margin-bottom:10px">Crossing a threshold raises an alert against this budget.</div>
@@ -562,12 +605,12 @@
               ${kv([['Method', esc(f.method)],['Days elapsed', String(f.days_elapsed)],['Days remaining', String(f.days_remaining)]])}
               ${kv([['Observed spend', money(f.observed_spend_usd)],['Projected spend', money(f.projected_spend_usd)],['Budget', money(f.budget_usd)]])}
               ${kv([['Projected utilisation', pct(f.projected_utilization_percent)],
-                    ['Confidence', `±${money(f.confidence_interval_usd)} at ${pct(f.confidence_level*100,0)}`],
+                    ['Confidence', `±${money(f.confidence_interval_usd)} at ${pct(f.confidence_level,0)}`],
                     ['Daily growth', f.daily_growth_usd==null?dash:money(f.daily_growth_usd,2)]])}
             </div>
             ${f.highest_growth_driver ? `<div class="scan-note" style="margin-top:12px">${ICONS.trendUp} Fastest-growing driver: <b>${esc(f.highest_growth_driver)}</b>, up ${money(f.highest_growth_delta_usd,2)} over the period.</div>` : ''}
             ${f.anomalies_detected ? `<div class="scan-note" style="margin-top:8px">${ICONS.alert} ${f.anomalies_detected} spend anomal${f.anomalies_detected===1?'y':'ies'} detected${(f.anomaly_days||[]).length?` on ${f.anomaly_days.map(esc).join(', ')}`:''}.</div>` : ''}`,
-            `<span class="badge bg-purple">Projected ${esc(money(f.projected_spend_usd))}</span>`);
+            `<span class="badge bg-purple">Projected ${f.projected_spend_usd==null?'—':esc(money(f.projected_spend_usd))}</span>`);
         }, 'the forecast');
       }
     },
@@ -712,14 +755,14 @@
           'sessions': {
             fetch: (p) => API.memory.sessions(p), name:'sessions', empty:'No sessions recorded',
             columns:[
-              { key:'session_id', label:'Session', render:r=>`<span class="mono">${esc(String(r.session_id).slice(0,18))}…</span>` },
-              { key:'agent_name', label:'Agent', render:r=>r.agent_id?`<span class="link" data-nav="agent/${esc(r.agent_id)}">${esc(r.agent_name)}</span>`:esc(r.agent_name||'—') },
-              { key:'user', label:'User', render:r=>r.user?esc(r.user):dash },
-              { key:'turns', label:'Turns', align:'right', cls:'num', render:r=>fmtFull(r.turns) },
-              { key:'duration_ms', label:'Duration', align:'right', cls:'num', render:r=>r.duration_ms==null?dash:(r.duration_ms/1000).toFixed(1)+'s' },
-              { key:'started_at', label:'Started', render:r=>`<span class="dim nowrap">${when(r.started_at)}</span>` },
-              { key:'last_activity_at', label:'Last Activity', render:r=>`<span class="dim nowrap">${when(r.last_activity_at)}</span>` },
-              { key:'state', label:'State', render:r=>statusText(r.state) },
+              { key:'session_id', label:'Session', sortable:false, render:r=>`<span class="mono">${esc(String(r.session_id).slice(0,18))}…</span>` },
+              { key:'agent_name', label:'Agent', sortable:false, render:r=>r.agent_id?`<span class="link" data-nav="agent/${esc(r.agent_id)}">${esc(r.agent_name)}</span>`:esc(r.agent_name||'—') },
+              { key:'user', label:'User', sortable:false, render:r=>r.user?esc(r.user):dash },
+              { key:'turns', label:'Turns', align:'right', cls:'num', sortable:false, render:r=>fmtFull(r.turns) },
+              { key:'duration_ms', label:'Duration', align:'right', cls:'num', sortable:false, render:r=>r.duration_ms==null?dash:(r.duration_ms/1000).toFixed(1)+'s' },
+              { key:'started_at', label:'Started', sortable:false, render:r=>`<span class="dim nowrap">${when(r.started_at)}</span>` },
+              { key:'last_activity_at', label:'Last Activity', sortable:false, render:r=>`<span class="dim nowrap">${when(r.last_activity_at)}</span>` },
+              { key:'state', label:'State', sortable:false, render:r=>statusText(r.state) },
             ],
             rowId:'session_id',
           },
@@ -727,23 +770,23 @@
             fetch: (p) => API.memory.agentState(p), name:'agent state records', empty:'No agent state recorded',
             columns:[
               { key:'agent_name', label:'Agent', render:r=>r.agent_id?`<span class="link" data-nav="agent/${esc(r.agent_id)}">${esc(r.agent_name||r.agent_id)}</span>`:esc(r.agent_name||'—') },
-              { key:'state_store', label:'Store', render:r=>esc(r.state_store||'—') },
-              { key:'session_count', label:'Sessions', align:'right', cls:'num', render:r=>r.session_count==null?dash:fmtFull(r.session_count) },
+              { key:'state_store', label:'Store', sortable:false, render:r=>esc(r.state_store||'—') },
+              { key:'session_count', label:'Sessions', align:'right', cls:'num', sortable:false, render:r=>r.session_count==null?dash:fmtFull(r.session_count) },
               { key:'last_activity_at', label:'Last Activity', render:r=>`<span class="dim nowrap">${when(r.last_activity_at)}</span>` },
-              { key:'sync_state', label:'Sync State', render:r=>statusText(r.sync_state) },
+              { key:'sync_state', label:'Sync State', sortable:false, render:r=>statusText(r.sync_state) },
             ],
             rowId:'agent_id',
           },
           'conversations': {
             fetch: (p) => API.memory.conversations(p), name:'conversations', empty:'No conversation state recorded',
             columns:[
-              { key:'conversation_id', label:'Conversation', render:r=>`<span class="mono">${esc(String(r.conversation_id||'').slice(0,18))}…</span>` },
-              { key:'agent_name', label:'Agent', render:r=>esc(r.agent_name||'—') },
-              { key:'messages', label:'Messages', align:'right', cls:'num', render:r=>fmtFull(r.messages) },
-              { key:'context_tokens', label:'Context Tokens', align:'right', cls:'num', render:r=>r.context_tokens==null?dash:fmtNum(r.context_tokens) },
-              { key:'retention_policy', label:'Retention', render:r=>r.retention_policy?esc(r.retention_policy):dash },
-              { key:'last_activity_at', label:'Last Activity', render:r=>`<span class="dim nowrap">${when(r.last_activity_at)}</span>` },
-              { key:'expires_at', label:'Expires', render:r=>`<span class="dim nowrap">${when(r.expires_at)}</span>` },
+              { key:'conversation_id', label:'Conversation', sortable:false, render:r=>`<span class="mono">${esc(String(r.conversation_id||'').slice(0,18))}…</span>` },
+              { key:'agent_name', label:'Agent', sortable:false, render:r=>esc(r.agent_name||'—') },
+              { key:'messages', label:'Messages', align:'right', cls:'num', sortable:false, render:r=>fmtFull(r.messages) },
+              { key:'context_tokens', label:'Context Tokens', align:'right', cls:'num', sortable:false, render:r=>r.context_tokens==null?dash:fmtNum(r.context_tokens) },
+              { key:'retention_policy', label:'Retention', sortable:false, render:r=>r.retention_policy?esc(r.retention_policy):dash },
+              { key:'last_activity_at', label:'Last Activity', sortable:false, render:r=>`<span class="dim nowrap">${when(r.last_activity_at)}</span>` },
+              { key:'expires_at', label:'Expires', sortable:false, render:r=>`<span class="dim nowrap">${when(r.expires_at)}</span>` },
             ],
             rowId:'conversation_id',
           },
@@ -775,13 +818,13 @@
       function backupsTab(){
         const t = dataTable({
           columns:[
-            { key:'created_at', label:'Taken', render:r=>`<span class="dim nowrap">${when(r.created_at)}</span>` },
-            { key:'store_name', label:'Store', render:r=>esc(r.store_name||'—') },
-            { key:'kind', label:'Kind', render:r=>badge(r.kind) },
-            { key:'record_count', label:'Records', align:'right', cls:'num', render:r=>fmtNum(r.record_count) },
-            { key:'payload_bytes', label:'Size', align:'right', cls:'num', render:r=>r.payload_bytes==null?dash:U.fmtBytes(r.payload_bytes) },
-            { key:'created_by', label:'By', render:r=>r.created_by?esc(r.created_by):dash },
-            { key:'status', label:'Status', render:r=>statusText(r.status) },
+            { key:'created_at', label:'Taken', sortable:false, render:r=>`<span class="dim nowrap">${when(r.created_at)}</span>` },
+            { key:'store_name', label:'Store', sortable:false, render:r=>esc(r.store_name||'—') },
+            { key:'kind', label:'Kind', sortable:false, render:r=>badge(r.kind) },
+            { key:'record_count', label:'Records', align:'right', cls:'num', sortable:false, render:r=>fmtNum(r.record_count) },
+            { key:'payload_bytes', label:'Size', align:'right', cls:'num', sortable:false, render:r=>r.payload_bytes==null?dash:U.fmtBytes(r.payload_bytes) },
+            { key:'created_by', label:'By', sortable:false, render:r=>r.created_by?esc(r.created_by):dash },
+            { key:'status', label:'Status', sortable:false, render:r=>statusText(r.status) },
           ],
           rowId:'id', itemName:'backups', pageSize:15, emptyText:'No backups taken yet',
           source: (p) => API.memory.backups(p),
@@ -1056,6 +1099,10 @@
       }
 
       function restartEnvironment(r){
+        if(!Store.session.can('operator')){
+          toast('error','Not permitted','Restarting services requires the operator role.');
+          return;
+        }
         confirmModal({
           title:'Restart Services', confirmLabel:'Restart', danger:true,
           msg:`Restart every service in “${r.name}”? In-flight requests to agents in this environment will fail.`,
@@ -1070,6 +1117,10 @@
       }
 
       function environmentSettings(r){
+        if(!Store.session.can('admin')){
+          toast('error','Not permitted','Environment settings require the admin role.');
+          return;
+        }
         openModal({
           title:'Environment Settings — ' + r.name, icon:'settings',
           body:`<div class="grid g2">
@@ -1126,8 +1177,8 @@
               actions.push({label:'Halt Deployment', icon:'pause', danger:true, onClick:()=>act(r,'halt','Halted')});
               actions.push({label:'Approve', icon:'stamp', onClick:()=>act(r,'approve','Approved')});
             }
-            actions.push({label:'Promote', icon:'trendUp', onClick:()=>promote(r)});
-            if(r.is_terminal) actions.push({label:'Roll Back', icon:'refresh', danger:true, onClick:()=>act(r,'rollback','Rolled back')});
+            if(r.status === 'Succeeded') actions.push({label:'Promote', icon:'trendUp', onClick:()=>promote(r)});
+            if(r.is_terminal && r.status !== 'RolledBack') actions.push({label:'Roll Back', icon:'refresh', danger:true, onClick:()=>act(r,'rollback','Rolled back')});
             return actions;
           },
         });
@@ -1137,6 +1188,12 @@
       }
 
       async function act(r, verb, past){
+        // Approval closes a gate on someone else's release, so it takes its own role.
+        const role = verb === 'approve' ? 'approver' : 'operator';
+        if(!Store.session.can(role)){
+          toast('error','Not permitted', `The ${verb} action requires the ${role} role.`);
+          return;
+        }
         try {
           await API.deployments[verb](r.id, {});
           toast('success', past, `${r.deployment_ref} ${past.toLowerCase()}.`);
@@ -1146,6 +1203,10 @@
       }
 
       async function promote(r){
+        if(!Store.session.can('operator')){
+          toast('error','Not permitted','Promoting a deployment requires the operator role.');
+          return;
+        }
         let envs;
         try { envs = await API.deployments.environments({ page_size: 50 }); }
         catch (err) { toast('error','Could not load environments', err.message); return; }
@@ -1265,16 +1326,18 @@
             <label class="auth-field" style="margin-top:10px"><span>Notes</span><input type="text" id="cdNotes" placeholder="What is in this release?"></label>`,
           footer:[
             {label:'Deploy', cls:'primary', onClick: async (close, modal) => {
+              const version = modal.querySelector('#cdVersion').value.trim();
+              if(!version){ toast('error','Version required','Give the release a version, e.g. v1.4.0.'); return; }
               const payload = {
                 agent_id: modal.querySelector('#cdAgent').value,
                 environment_id: modal.querySelector('#cdEnv').value,
-                version: modal.querySelector('#cdVersion').value.trim(),
+                version,
                 strategy: modal.querySelector('#cdStrategy').value,
                 notes: modal.querySelector('#cdNotes').value.trim() || null,
               };
-              close();
               try {
                 const created = await API.deployments.create(payload);
+                close();
                 toast('success','Deployment started', `${created.deployment_ref} is running.`);
                 watchDeployment(created);
               } catch (err) { toast('error','Could not start deployment', err.message); }

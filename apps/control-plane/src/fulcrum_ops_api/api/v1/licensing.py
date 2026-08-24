@@ -135,7 +135,12 @@ async def export_licensing(
         ExportDataset, Query(description="Which tab to export")
     ] = "plans",
     license_status: Annotated[
-        LicenseStatus | None, Query(alias="status", description="Licence or invoice status")
+        # A plain string on purpose: each tab has its own status vocabulary
+        # (plan Draft/Retired, invoice Paid/Overdue, licence Active/Trial…) and
+        # the service applies it per-dataset; an enum here 422s every tab but
+        # the licences one.
+        str | None,
+        Query(alias="status", description="Status in the exported tab's own vocabulary"),
     ] = None,
     tier: Annotated[PlanTier | None, Query(description="Plan tier")] = None,
     billing_period: Annotated[str | None, Query(description="Monthly or Annual")] = None,
@@ -164,7 +169,7 @@ async def export_licensing(
         dataset=dataset,
         q=params.q,
         sort=params.sort,
-        status=license_status.value if license_status else None,
+        status=license_status,
         tier=tier.value if tier else None,
         billing_period=billing_period,
         plan_id=plan_id,

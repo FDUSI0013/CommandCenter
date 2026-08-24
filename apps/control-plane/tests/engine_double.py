@@ -539,6 +539,11 @@ class EngineDouble:
             route("POST", rf"{root}/datasets/items/delete", self._delete_dataset_items),
             route("GET", rf"{root}/datasets", self._list_datasets),
             route("POST", rf"{root}/datasets", self._create_dataset),
+            route(
+                "GET",
+                rf"{root}/datasets/{uid}/items/experiments/items",
+                self._list_dataset_items_with_experiments,
+            ),
             route("GET", rf"{root}/datasets/{uid}/items", self._list_dataset_items),
             route("GET", rf"{root}/datasets/{uid}", self._get_dataset),
             route("DELETE", rf"{root}/datasets/{uid}", self._delete_dataset),
@@ -1794,11 +1799,47 @@ class EngineDouble:
         if dataset_id not in self.datasets:
             raise EngineFailure(404, {"errors": ["dataset not found"]})
         rows = [dict(row) for row in self.dataset_items.get(dataset_id, [])]
+        # The plain listing deliberately carries NO experiment_items — the real
+        # engine only joins them on the comparison endpoint below, and the
+        # suite runner shipped broken because the double blurred that line.
+        for row in rows:
+            row.pop("experiment_items", None)
         rows = [
             row
             for row in rows
             if _matches_filters(row, _json_param(self._query_one(query, "filters")))
         ]
+        return _page(
+            rows,
+            _as_int(self._query_one(query, "page"), 1),
+            _as_int(self._query_one(query, "size"), 50),
+        )
+
+    def _list_dataset_items_with_experiments(
+        self, match: re.Match, query: dict, _body: Any
+    ) -> JsonObject:
+        """Dataset items joined to the named experiments' items — the shape the
+        suite runner and the evaluation detail read their verdicts from."""
+        dataset_id = match.group(1)
+        if dataset_id not in self.datasets:
+            raise EngineFailure(404, {"errors": ["dataset not found"]})
+        wanted = _json_param(self._query_one(query, "experiment_ids")) or []
+        wanted_ids = {str(x) for x in wanted} if isinstance(wanted, list) else set()
+        joined: dict[str, list[JsonObject]] = {}
+        for experiment_id, items in self.experiment_items.items():
+            if wanted_ids and experiment_id not in wanted_ids:
+                continue
+            for item in items:
+                key = str(item.get("dataset_item_id") or "")
+                if key:
+                    stamped = dict(item)
+                    stamped.setdefault("experiment_id", experiment_id)
+                    joined.setdefault(key, []).append(stamped)
+        rows = []
+        for row in self.dataset_items.get(dataset_id, []):
+            merged = dict(row)
+            merged["experiment_items"] = joined.get(str(row.get("id")), [])
+            rows.append(merged)
         return _page(
             rows,
             _as_int(self._query_one(query, "page"), 1),

@@ -534,6 +534,9 @@
   const GR_ACTIONS = ['Block','Mask','Warn','Log'];
   const GR_STATUS = ['Active','Disabled','Tuning'];
   const GR_SCOPES = ['Global','Agent','Environment'];
+  // The inline checker on this deployment implements only these three
+  // validations; any other type is recorded but cannot block or mask at ingest.
+  const GR_ENFORCEABLE = ['PII','Topic','Prompt Injection'];
 
   SCREENS['guardrails'] = {
     title:'Guardrails',
@@ -581,7 +584,10 @@
         columns:[
           { key:'name', label:'Guardrail', render:r => entityCell(r.name, r.coverage, 'shieldCheck',
               r.status === 'Active' ? 'green' : r.status === 'Tuning' ? 'amber' : 'gray') },
-          { key:'guardrail_type', label:'Type', render:r => badge(r.guardrail_type, 'purple') },
+          { key:'guardrail_type', label:'Type', render:r => badge(r.guardrail_type, 'purple')
+              + (r.checker_supported === false
+                ? ` <span class="small faint" title="This deployment's content checker does not implement this validation; the rule is recorded but not enforced at ingest.">not enforced</span>`
+                : '') },
           { key:'status', label:'Status', render:r => statusText(r.status, r.status === 'Active' ? 'green' : r.status === 'Tuning' ? 'amber' : 'gray') },
           { key:'action', label:'Action', render:r => badge(r.action, r.action === 'Block' ? 'red' : r.action === 'Mask' ? 'amber' : 'gray') },
           { key:'triggers_30d', label:'Triggers (30d)', align:'right', cls:'num', render:r => num(r.triggers_30d) },
@@ -639,7 +645,9 @@
             ['Added Latency', ms(row.added_latency_ms)],
             ['Owner', row.owner_name ? esc(row.owner_name) : dash],
             ['Updated', row.updated_at ? fmtDateTime(ts(row.updated_at)) : dash],
-          ]))}
+          ]) + (row.checker_supported === false
+            ? `<div class="small" style="margin-top:8px;color:var(--amber,#b58900)">This deployment's content checker does not implement the ${esc(row.guardrail_type)} validation, so this rule is recorded but never enforced at ingest. Agents can still report its verdicts through the SDK.</div>`
+            : ''))}
           ${inspSection('Activity (30d)','chart', `<div class="grid g2" style="gap:8px">
             ${[['Triggers', num(row.triggers_30d)], ['Blocked', num(row.blocked_30d)],
                ['Masked', num(row.masked_30d)],
@@ -765,8 +773,14 @@
           footer:[
             { label:'Cancel' },
             { label:'Save Threshold', cls:'primary', onClick: async (close, modal) => {
+                // min/max on a number input do not stop typed values, so
+                // check before the request rather than bouncing off a 422.
+                const threshold = parseFloat(modal.querySelector('#tuVal').value);
+                if(Number.isNaN(threshold) || threshold < 0 || threshold > 1){
+                  toast('error','Threshold out of range','Enter a threshold between 0 and 1.'); return;
+                }
                 const body = {
-                  threshold: parseFloat(modal.querySelector('#tuVal').value),
+                  threshold,
                   action: modal.querySelector('#tuAction').value,
                 };
                 const reason = modal.querySelector('#tuReason').value.trim();
@@ -791,7 +805,7 @@
           title:'New Guardrail', icon:'shieldCheck',
           body:`<div class="form-row"><label>NAME</label><input class="input" id="ngName" placeholder="e.g. Regulated Advice Filter"></div>
             <div class="grid g2">
-              <div class="form-row"><label>TYPE</label><select class="filter-select w-100" id="ngType" style="height:34px">${GR_TYPES.map(t=>`<option>${t}</option>`).join('')}</select></div>
+              <div class="form-row"><label>TYPE</label><select class="filter-select w-100" id="ngType" style="height:34px">${GR_TYPES.map(t=>`<option value="${t}">${t}${GR_ENFORCEABLE.includes(t) ? '' : ' — recorded only'}</option>`).join('')}</select></div>
               <div class="form-row"><label>ACTION</label><select class="filter-select w-100" id="ngAction" style="height:34px">${GR_ACTIONS.map(a=>`<option>${a}</option>`).join('')}</select></div>
             </div>
             <div class="grid g2">
@@ -799,7 +813,8 @@
               <div class="form-row"><label>THRESHOLD</label><input class="input" id="ngThreshold" type="number" min="0" max="1" step="0.01" value="0.80"></div>
             </div>
             <div class="form-row" id="ngRefRow" style="display:none"><label>SCOPE REFERENCE</label>
-              <input class="input" id="ngRef" placeholder="Agent id, or environment name"></div>`,
+              <input class="input" id="ngRef" placeholder="Agent id, or environment name"></div>
+            <div class="small faint" id="ngTypeHint" style="margin-top:2px"></div>`,
           footer:[
             { label:'Cancel' },
             { label:'Create Guardrail', cls:'primary', onClick: async (close, modal) => {
@@ -820,7 +835,9 @@
                 close();
                 try {
                   const created = await Store.mutate(() => API.guardrails.create(body), { event:'guardrails:changed' });
-                  toast('success','Guardrail created', `${created.name} is enforcing across ${created.coverage}.`);
+                  toast('success','Guardrail created', GR_ENFORCEABLE.includes(created.guardrail_type)
+                    ? `${created.name} is enforcing across ${created.coverage}.`
+                    : `${created.name} is recorded; this deployment's checker cannot enforce it.`);
                   table.refresh();
                   loadSummary();
                 } catch (err) {
@@ -831,6 +848,12 @@
           onOpen(modal){
             const scope = modal.querySelector('#ngScope'), row = modal.querySelector('#ngRefRow');
             scope.addEventListener('change', ()=>{ row.style.display = scope.value === 'Global' ? 'none' : ''; });
+            // The person creating an unenforceable type deserves to know now.
+            const type = modal.querySelector('#ngType'), hint = modal.querySelector('#ngTypeHint');
+            const paintHint = ()=>{ hint.textContent = GR_ENFORCEABLE.includes(type.value)
+              ? 'Enforced at ingest by the inline content checker.'
+              : 'Recorded only: the content checker on this deployment does not implement this validation, so it cannot block or mask at ingest. Agents can still report its verdicts through the SDK.'; };
+            type.addEventListener('change', paintHint); paintHint();
           },
         });
       });
@@ -1511,7 +1534,7 @@
         ${pageHead({title:'Feedback & Quality Loop', sub:'Capture feedback, analyze quality signals, prioritize improvements, and drive continuous AI agent excellence.',
           actions:`${searchBox('fbSearch','Search feedback…')}
           <button class="btn" id="fbExport">${ICONS.download}Export</button>
-          <button class="btn primary" id="fbSubmit">${ICONS.plus}Submit Feedback</button>`})}
+          <button class="btn primary" id="fbSubmit"${gate('member','Submitting feedback requires the member role.')}>${ICONS.plus}Submit Feedback</button>`})}
         <div id="fbKpis">${kpiSkeleton(FB_PRIMARY)}</div>
         <div id="fbKpis2" class="mt">${kpiSkeleton(FB_SECONDARY, 150)}</div>
         <div id="fbTabs"></div>
@@ -1604,7 +1627,10 @@
             { label:'Add to Backlog', icon:'plus', onClick:()=>openAddBacklog(r) },
             { label:'Assign to Team', icon:'users', onClick:()=>openAssignTeam(r) },
             { sep:true },
-            { label:'View Run', icon:'activity', onClick:()=>APP.go('live-runs') },
+            // Feedback with a trace opens that exact run in Replay Studio;
+            // without one there is no run to show, so the item is not offered.
+            ...(r.trace_id ? [{ label:'View Run', icon:'replay',
+              onClick:()=>{ APP.replayRun = r.trace_id; APP.go('replay'); } }] : []),
           ],
         });
       }
@@ -1851,7 +1877,7 @@
                       <span class="legend-item"><span class="sw" style="background:#DC2626"></span><span class="lg-label">Negative %</span></span></div>`
                   : emptyBlock('chart','Not enough days to plot sentiment','')}</div>
               <div class="card"><div class="card-head"><div class="card-title">Top Themes</div>
-                  <button class="btn sm" id="fbInsAnalyze">${ICONS.beaker}Analyze</button></div>
+                  <button class="btn sm" id="fbInsAnalyze"${gate('member','Analyzing feedback requires the member role.')}>${ICONS.beaker}Analyze</button></div>
                 ${themes.length
                   ? `<table class="tbl"><thead><tr><th>Theme</th><th class="right">Items</th><th class="right">Negative</th><th class="right">Avg Rating</th><th>Issue</th></tr></thead><tbody>
                       ${themes.map(t => `<tr style="cursor:default"><td class="cell-main">${esc(t.theme)}</td>
@@ -1912,7 +1938,8 @@
             { label:'Add to Backlog', icon:'plus', onClick:()=>promoteIssue(r, ()=>t.refresh()) },
             { label:'Assign to Team', icon:'users', onClick:()=>openAssignIssue(r, ()=>t.refresh()) },
             { sep:true },
-            ...(r.status !== 'Resolved' ? [{ label:'Resolve Issue', icon:'checkCircle', onClick:()=>resolveIssue(r, ()=>t.refresh()) }] : []),
+            // Wont Fix cannot be resolved, so only the live statuses offer it.
+            ...(r.status === 'Open' || r.status === 'In Progress' ? [{ label:'Resolve Issue', icon:'checkCircle', onClick:()=>resolveIssue(r, ()=>t.refresh()) }] : []),
           ],
         });
         const holder = document.getElementById('fbIssuesTbl');
@@ -1946,7 +1973,8 @@
             { label:'Create Fix Task', icon:'tool', onClick:()=>openFixTask(r, ()=>t.refresh()) },
             ...(r.status !== 'Done' ? [{ label:'Move to ' + nextStatus(r.status), icon:'arrowRight', onClick:()=>moveBacklog(r, nextStatus(r.status), ()=>t.refresh()) }] : []),
             { sep:true },
-            ...(r.status !== 'Done' ? [{ label:'Mark Deployed', icon:'rocket', onClick:()=>moveBacklog(r, 'Done', ()=>t.refresh()) }] : []),
+            // The API refuses a jump to Done from Backlog or Planned.
+            ...(r.status === 'In Progress' ? [{ label:'Mark Deployed', icon:'rocket', onClick:()=>moveBacklog(r, 'Done', ()=>t.refresh()) }] : []),
           ],
         });
         const holder = document.getElementById('fbBacklogTbl');
@@ -1973,11 +2001,11 @@
           <div class="card flex between"><div class="flex" style="gap:10px">
             <span class="kpi-ico" style="background:var(--purple-dim);color:var(--purple-bright)">${ICONS[a.icon]}</span>
             <div><b>${esc(a.label)}</b><div class="small dim">${esc(a.desc)}</div></div></div>
-            <button class="btn sm ${a.run ? 'primary' : ''}" data-act="${k}"${a.run ? '' : ` disabled title="${esc(a.why)}"`}>Run</button></div>`).join('')}
+            <button class="btn sm ${a.run ? 'primary' : ''}" data-act="${k}"${a.run ? gate('member','Analyzing feedback requires the member role.') : ` disabled title="${esc(a.why)}"`}>Run</button></div>`).join('')}
           </div>
           <div class="card mt"><div class="card-head"><div class="card-title">Clustering</div></div>
             <div class="small dim">Analysis is deterministic: the same window analysed twice produces the same clusters, so an issue title suggested here can be reproduced.</div>
-            <button class="btn sm primary mt" id="fbAnalyzeAll">${ICONS.beaker}Analyze all feedback (30d)</button></div>`;
+            <button class="btn sm primary mt" id="fbAnalyzeAll"${gate('member','Analyzing feedback requires the member role.')}>${ICONS.beaker}Analyze all feedback (30d)</button></div>`;
         body.querySelectorAll('[data-act]').forEach(b => {
           const a = ACTIONS[b.dataset.act];
           if(a.run) b.addEventListener('click', a.run);
@@ -2119,7 +2147,7 @@
           title:'Edit SLA Rules', icon:'edit',
           body:`<div class="grid g2">
               <div class="form-row"><label>TRIAGE SLA (HOURS)</label><input class="input" id="slHours" type="number" min="1" value="${s.triage_sla_hours}"></div>
-              <div class="form-row"><label>AUTO-ISSUE THRESHOLD</label><input class="input" id="slThreshold" type="number" min="1" value="${s.auto_issue_threshold}"></div>
+              <div class="form-row"><label>AUTO-ISSUE THRESHOLD</label><input class="input" id="slThreshold" type="number" min="2" value="${s.auto_issue_threshold}"></div>
             </div>
             <div class="grid g2">
               <div class="form-row"><label>BUSINESS HOURS ONLY</label><select class="filter-select w-100" id="slBiz" style="height:34px">
@@ -2170,6 +2198,7 @@
 
       // ---- feedback actions ---------------------------------------------------
       function openCreateIssue(seed, after){
+        if(!allowed('member','Creating an issue requires the member role.')) return;
         openModal({
           title:'Create Issue', icon:'bug',
           body:`<div class="form-row"><label>TITLE</label><input class="input" id="ciTitle" value="${esc(seed.title || '')}" placeholder="What is going wrong?"></div>
@@ -2207,6 +2236,7 @@
       }
 
       function openAddBacklog(r){
+        if(!allowed('member','Adding to the backlog requires the member role.')) return;
         openModal({
           title:'Add to Improvement Backlog', icon:'plus',
           body:`<div class="form-row"><label>TITLE</label><input class="input" id="abTitle" value="${esc((r.body || '').slice(0,80))}" placeholder="What should change?"></div>
@@ -2239,6 +2269,7 @@
       }
 
       function openAssignTeam(r){
+        if(!allowed('member','Assigning a team requires the member role.')) return;
         if(!r.issue_id){
           confirmModal({
             title:'No issue to route', icon:'users', confirmLabel:'Create Issue',
@@ -2265,6 +2296,7 @@
       }
 
       function openAssignIssue(r, after){
+        if(!allowed('member','Assigning an issue requires the member role.')) return;
         openModal({
           title:'Assign Issue — ' + r.issue_ref, icon:'users',
           body:`<div class="form-row"><label>TEAM</label><input class="input" id="aiTeam" value="${esc(r.assigned_team || '')}" placeholder="e.g. Document Intelligence"></div>
@@ -2285,6 +2317,7 @@
       }
 
       function resolveIssue(r, after){
+        if(!allowed('member','Resolving an issue requires the member role.')) return;
         openModal({
           title:'Resolve Issue — ' + r.issue_ref, icon:'checkCircle',
           body:`<div class="form-row"><label>RESOLUTION NOTE</label><textarea class="input" id="riNote" rows="3" placeholder="What changed?"></textarea></div>
@@ -2305,6 +2338,7 @@
       }
 
       function promoteIssue(r, after){
+        if(!allowed('member','Planning an issue requires the member role.')) return;
         openModal({
           title:'Add to Backlog — ' + r.issue_ref, icon:'plus',
           body:`<div class="grid g2">
@@ -2335,6 +2369,7 @@
       }
 
       function openFixTaskFromIssue(r, after){
+        if(!allowed('member','Creating a fix task requires the member role.')) return;
         if(!r.backlog_item_id){
           confirmModal({
             title:'Not on the backlog yet', icon:'tool', confirmLabel:'Add to Backlog',
@@ -2347,6 +2382,7 @@
       }
 
       function openFixTask(item, after){
+        if(!allowed('member','Creating a fix task requires the member role.')) return;
         openModal({
           title:'Create Fix Task', icon:'tool',
           body:`<div class="quote"><b>${esc(item.title)}</b><div class="small dim">The metric is captured as it stands now, so the before/after published when the fix ships is a measurement rather than a recollection.</div></div>
@@ -2383,6 +2419,7 @@
       }
 
       function moveBacklog(r, status, after){
+        if(!allowed('member','Moving a backlog item requires the member role.')) return;
         const isDeploy = status === 'Done';
         openModal({
           title: isDeploy ? 'Mark Deployed — ' + r.title : `Move to ${status}`, icon: isDeploy ? 'rocket' : 'arrowRight',
@@ -2412,6 +2449,7 @@
 
       /** The clustering pass, and the clusters it actually found. */
       function openAnalyze(opts){
+        if(!allowed('member','Analyzing feedback requires the member role.')) return;
         const req = Object.assign({ window_days: 30, min_cluster_size: 2, recluster: false, negative_only: false }, opts || {});
         openModal({
           title:'Analyze Feedback', icon:'beaker', wide:true,
@@ -2471,6 +2509,7 @@
           .catch(err=>toast('error','Export failed', errText(err)));
       });
       document.getElementById('fbSubmit').addEventListener('click', async () => {
+        if(!allowed('member','Submitting feedback requires the member role.')) return;
         let agents = { items: [] };
         try { agents = await API.agents.list({ page_size: 100 }); } catch (_) { /* the picker degrades to none */ }
         openModal({

@@ -203,6 +203,8 @@
       users: Object.assign(collection('/workspaces/users'), {
         summary: () => get('/workspaces/users/summary'),
         me: () => get('/workspaces/users/me'),
+        /** Every member as a bare {id, full_name, initials} array — operator-readable. */
+        directory: () => get('/workspaces/users/directory'),
         setRole: (id, body) => post(`/workspaces/users/${encodeURIComponent(id)}/role`, body || {}),
         export: (params) => download('/workspaces/users/export', params),
       }),
@@ -499,7 +501,7 @@
       mute: (id, body) => post(`/alerts/${encodeURIComponent(id)}/mute`, body || {}),
       rules: collection('/alerts/rules'),
       /** Members an alert may be routed to — the Assign dialog's picker. */
-      assignees: (params) => get('/workspaces/users', params),
+      assignees: () => get('/workspaces/users/directory'),
       export: (params) => download('/alerts/export', params),
     }),
     exports: Object.assign(collection('/exports'), {

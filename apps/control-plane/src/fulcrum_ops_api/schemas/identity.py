@@ -325,6 +325,16 @@ class UserProfile(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class MemberRef(BaseModel):
+    """A name an assignment picker can offer — nothing an API key could mine."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    full_name: str
+    initials: str
+
+
 class MemberRead(BaseModel):
     """One person in this workspace, as the member table renders the row."""
 
