@@ -495,7 +495,7 @@ run, or an offline evaluation result.</p>
     s.score("faithfulness", 0.93, reason="all claims cited")
 
 client.score(trace_id, "user_rating", 1.0, target="trace")
-client.log_feedback(trace_id, rating=1, comment="fixed my problem")</code></pre>
+client.log_feedback(trace_id=trace_id, rating=1, body="fixed my problem")</code></pre>
 
 <p><code>target</code> is <code>trace</code>, <code>span</code> or <code>thread</code>. Scores show
 up on Live Runs, feed the Evaluations trend, and are what Feedback and Quality Loop aggregates.</p>
@@ -521,7 +521,7 @@ row on Feedback and Quality Loop with a severity of <code>Critical</code>, <code
 
 <pre><code>client.log_guardrail_event(
     "PII scan",
-    action_taken="Warn",          # Passed | Warn | Block | Mask
+    action_taken="Warn",          # Warn | Block | Mask | Log
     score=0.9,
     matched={"EMAIL": 1, "PHONE": 2},   # a mapping, not a list
     sample=text[:80],
@@ -531,16 +531,18 @@ row on Feedback and Quality Loop with a severity of <code>Critical</code>, <code
 client.log_policy_violation(
     "No external email without approval",
     severity="High",
-    detail="agent attempted send to gmail.com",
+    detail={"attempted_recipient": "gmail.com"},   # a mapping, not a string
 )</code></pre>
 
 <div class="note warn">
   <p class="note-t">Two shapes that bite</p>
   <p><code>matched</code> must be a <strong>mapping</strong> of label to count, not a list of
-  labels; a list is accepted locally and rejected by the server. And
-  <code>action_taken</code> takes the server vocabulary — <code>Warn</code>, not
-  <code>Warned</code>. Watch <code>on_error</code> during first integration and both show up
-  immediately.</p>
+  labels, and <code>detail</code> on a policy violation must be a mapping too; a string or a
+  list is accepted locally and rejected by the server. <code>action_taken</code> is one of
+  <code>Warn</code>, <code>Block</code>, <code>Mask</code> or <code>Log</code> — casing and
+  common variants (<code>Warned</code>, <code>Blocked</code>) are normalised server-side, but
+  there is no <code>Passed</code>. Watch <code>on_error</code> during first integration and
+  these show up immediately.</p>
 </div>
 
 <h2 id="sdk-providers">Provider wrappers</h2>
@@ -568,11 +570,11 @@ chain.invoke(payload, config={"callbacks": [FulcrumOpsCallbackHandler()]})</code
 <p>Prompts authored in <strong>Prompt Studio</strong> can be pulled at runtime, so changing a
 system prompt does not require a redeploy.</p>
 
-<pre><code>from fulcrum_ops import get_prompt, render_template, template_variables
+<pre><code>from fulcrum_ops import get_prompt, template_variables
 
 p = get_prompt("support-system-prompt")        # cached; server is revalidated
-print(template_variables(p.template))          # ("customer_name", "tier")
-text = render_template(p.template, customer_name="Dana", tier="gold")</code></pre>
+print(template_variables(p.template))          # ['customer_name', 'tier']
+text = p.format(customer_name="Dana", tier="gold")</code></pre>
 
 <p>The prompt version used is recorded on the run, so a quality regression can be traced back to
 the exact wording that produced it.</p>
@@ -582,39 +584,62 @@ the exact wording that produced it.</p>
 <p>Offline evaluation: build a dataset of cases, run a candidate against it, and get a scored
 result you can compare on the Evaluations screen.</p>
 
-<pre><code>from fulcrum_ops import Datasets, Experiments
+<p>Build the dataset through the client's <code>datasets</code> handle:</p>
 
-ds = Datasets()
-ds.create("support-golden", description="Answers we agree are correct")
-ds.add_items("support-golden", [
-    {"input": {"question": "where is my order?"},
-     "expected_output": "Ships in 2 days."},
-])
+<pre><code>client = fulcrum_ops.get_client()
 
-result = Experiments().run(
-    dataset="support-golden",
-    task=lambda item: answer(item["input"]["question"]),
-    scorers=["correctness", "grounding"],
+client.datasets.create("support-golden", description="Answers we agree are correct")
+client.datasets.add_items("support-golden", [
+    {"input": "where is my order?", "expected_output": "Ships in 2 days."},
+])</code></pre>
+
+<p>Then either run the candidate <strong>locally</strong> and score it yourself, or hand the
+dataset to the <strong>server-side judge</strong>. Local first — scorers are functions that
+return one or more named scores, and are called <code>scorer(output, expected_output, case)</code>
+(extra arguments are dropped to match the function's arity):</p>
+
+<pre><code>def correctness(output, expected):
+    return {"correctness": 1.0 if expected.lower() in output.lower() else 0.0}
+
+result = client.evaluate(
+    "support-golden",
+    task=lambda item: answer(item),          # item is the case's input
+    scorers=[correctness],
     name="prompt-v4 candidate",
 )
 
-print(result.ok, result.total, result.failures)
-print(result.averages)      # {"correctness": 0.91, "grounding": 0.88}
+print(result.total, result.failures)
+print(result.averages)      # {"correctness": 0.91}
 print(result.summary())</code></pre>
 
-<p><code>Datasets</code> gives you <code>list</code>, <code>create</code>, <code>add_items</code>
-and <code>items</code>; <code>Experiments</code> gives <code>run</code>, <code>get</code>,
-<code>list</code> and <code>evaluate</code>. Each run appears under Evaluations with its judged
-average, so a candidate prompt can be compared against the baseline before it ships.</p>
+<p>Every case becomes a real trace tagged with the experiment name, and every scorer verdict
+lands on that trace — so the run shows up under Evaluations next to production traffic. To have
+the platform judge the dataset instead, start a server-side run and poll it:</p>
+
+<pre><code>run = client.experiments.run(
+    "support-golden",
+    judge_model="gpt-5",
+    name="prompt-v4 candidate",
+)
+evaluation_id = run["id"]              # run() returns the evaluation record
+detail = client.experiments.get(evaluation_id)</code></pre>
+
+<p><code>client.datasets</code> gives you <code>list</code>, <code>create</code>,
+<code>add_items</code> and <code>items</code>; <code>client.experiments</code> gives
+<code>run</code>, <code>get</code>, <code>list</code> and <code>evaluate</code>
+(<code>client.evaluate(...)</code> is the shortcut used above). Each run appears under
+Evaluations with its judged average, so a candidate can be compared against the baseline
+before it ships.</p>
 
 <h2 id="sdk-redaction">Redaction</h2>
 
-<p>Redaction runs <strong>in your process, before anything leaves it</strong>. Ten entity classes
-are recognised without a server-supplied pattern:</p>
+<p>Redaction runs <strong>in your process, before anything leaves it</strong>. Twelve entity
+classes are recognised without a server-supplied pattern:</p>
 
 <p><code>api_key</code> &middot; <code>aws_access_key</code> &middot; <code>credit_card</code>
 &middot; <code>email</code> &middot; <code>iban</code> &middot; <code>ip</code> &middot;
-<code>jwt</code> &middot; <code>phone</code> &middot; <code>ssn</code> &middot; <code>url</code></p>
+<code>ipv4</code> &middot; <code>ipv6</code> &middot; <code>jwt</code> &middot; <code>phone</code>
+&middot; <code>ssn</code> &middot; <code>url</code></p>
 
 <pre><code>from fulcrum_ops import RedactionRule
 
@@ -623,7 +648,7 @@ fulcrum_ops.configure(
     redaction=[
         RedactionRule(name="contact-details", entity_types=["email", "phone"]),
         RedactionRule(name="cards", entity_types=["credit_card"],
-                      fields=["input", "output"],
+                      applies_to=["input", "output"],
                       replacement="[removed]"),
     ],
 )</code></pre>
@@ -652,7 +677,7 @@ background worker cuts batches on item count, byte budget or a flush interval.</
 
 <pre><code>client.flush(timeout=10)   # returns False on timeout, never raises
 client.close()             # idempotent; an atexit hook also flushes
-client.stats()             # submitted / sent / accepted / rejected / dropped</code></pre>
+client.stats()             # submitted / sent / accepted / rejected / blocked / dropped_overflow / dropped_failed</code></pre>
 
 <div class="note">
   <p class="note-t">A 200 does not mean every row was accepted</p>
@@ -680,8 +705,11 @@ care about and ignore the rest.</p>
 <h2 id="sdk-ts">TypeScript SDK</h2>
 
 <p><code>@fulcrum-ops/sdk</code> — ESM and CJS, zero runtime dependencies (it uses global
-<code>fetch</code>), Node 18+ or a browser. Same env vars, same defaults, same disable-without-a-key
-behaviour as Python.</p>
+<code>fetch</code>), Node 18+ or a browser. The same env vars and defaults as Python, with two
+differences: there is <strong>no <code>FULCRUM_OPS_DISABLED</code></strong> (pass
+<code>enabled: false</code> in code to turn it off), and the timeout variable is
+<strong><code>FULCRUM_OPS_TIMEOUT_MS</code></strong> in milliseconds, not
+<code>FULCRUM_OPS_TIMEOUT_SECONDS</code>.</p>
 
 <pre><code>import { FulcrumOps } from "@fulcrum-ops/sdk";
 import { trackOpenAI } from "@fulcrum-ops/sdk/openai";
@@ -1086,8 +1114,8 @@ than an attempt to remember what the settings used to be.</p>
 <p class="route">#/evaluations &middot; <span class="pill">member to run</span></p>
 <p>LLM quality evaluations across agents — correctness, grounding, faithfulness and safety.</p>
 <p>Run an evaluation against a dataset, either from this screen or from the SDK with
-<code>Experiments().run(...)</code>. Each completed run records a judged average, and the trend
-chart plots those averages over time so a regression is visible rather than anecdotal.</p>
+<code>client.experiments.run(...)</code>. Each completed run records a judged average, and the
+trend chart plots those averages over time so a regression is visible rather than anecdotal.</p>
 <p><strong>Compare</strong> puts a baseline and a candidate side by side — the question you actually
 have before shipping a prompt change. Datasets are shared with the SDK, so a case added in code
 appears here.</p>
@@ -1098,9 +1126,12 @@ appears here.</p>
 <p class="route">#/guardrails &middot; <span class="pill">admin to configure</span></p>
 <p>Runtime safety filters for prompts and responses: prompt injection, PII, toxicity, hallucination
 and secrets.</p>
-<p>Configure a guardrail, set its action — <code>Passed</code>, <code>Warn</code>,
-<code>Block</code>, <code>Mask</code> — and watch the <strong>events</strong> feed for what it has
-caught, with the matched entity counts and a sample of the offending text.</p>
+<p>Configure a guardrail, set its action — <code>Warn</code>, <code>Block</code>,
+<code>Mask</code> or <code>Log</code> — and watch the <strong>events</strong> feed for what it has
+caught, with the matched entity counts and a sample of the offending text. The inline content
+checker on this deployment implements the <code>PII</code>, <code>Topic</code> and
+<code>Prompt Injection</code> validations; a guardrail whose type it does not implement cannot be
+tested (the Test button answers plainly rather than inventing a verdict).</p>
 <p>Guardrails run at ingest, so a Block verdict refuses the item before it is ever stored, and Mask
 strips the content while keeping the record that something happened. Agents can also report their
 own guardrail verdicts via <code>log_guardrail_event()</code>, which is how a check that runs inside
@@ -1254,7 +1285,7 @@ browser session with a 403.</p>
 <tr><td>Cost shows <code>$0.00</code> but tokens are right</td><td>The price table is keyed on <em>model plus provider</em>. Report the real model (not a deployment alias) and the provider vocabulary the table uses — <code>azure</code> for Azure-served OpenAI models, not <code>azure-openai</code>.</td></tr>
 <tr><td>A telemetry screen shows <code>telemetry_unavailable</code></td><td>The engine is unreachable. Governance screens keep working. Check the engine container and <code>/health</code>, which reports <code>"telemetry": false</code> when the adapter cannot reach it.</td></tr>
 <tr><td>A number is a dash</td><td>Not an error. It means nothing was measured for that window. Zero would be a claim the platform is not entitled to make.</td></tr>
-<tr><td>Guardrail event rejected as malformed</td><td><code>matched</code> must be a mapping of label to count, not a list. <code>action_taken</code> must be <code>Passed</code>, <code>Warn</code>, <code>Block</code> or <code>Mask</code>.</td></tr>
+<tr><td>Guardrail event rejected as malformed</td><td><code>matched</code> must be a mapping of label to count, not a list. <code>action_taken</code> must be <code>Warn</code>, <code>Block</code>, <code>Mask</code> or <code>Log</code> (casing and variants like <code>Warned</code> are normalised; there is no <code>Passed</code>).</td></tr>
 <tr><td>Batch returned 200 but rows are missing</td><td>Ingest is partial-success. Individual items can be refused by policy, guardrail, entitlement or quota while the batch succeeds. The per-item verdicts say which.</td></tr>
 <tr><td>Connector or Policy screen is empty</td><td>Expected on a new workspace. Both are registries — nothing is created from observed traffic. Register what agents may call, then grant it.</td></tr>
 <tr><td>An agent cannot reach a tool it used yesterday</td><td>Check whether the connector was blocked. A blocked connector keeps its grants and fails every holder closed, by design.</td></tr>

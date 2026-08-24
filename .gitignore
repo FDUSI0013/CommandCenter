@@ -24,3 +24,8 @@ apps/control-plane/var/
 
 # Node
 node_modules/
+
+# docs toolchain (installed on demand for build-docx.js)
+docs/node_modules/
+docs/package-lock.json
+docs/package.json
