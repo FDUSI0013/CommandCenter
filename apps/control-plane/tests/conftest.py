@@ -86,6 +86,16 @@ ENGINE_BASE_URL = "http://telemetry-engine.internal"
 APP_BASE_URL = "http://control-plane.test"
 
 
+@pytest.fixture(autouse=True)
+def _fresh_rate_windows():
+    """The limiter's windows are process-global; tests must not share them."""
+    from fulcrum_ops_api.core import ratelimit
+
+    ratelimit.reset()
+    yield
+    ratelimit.reset()
+
+
 # ---------------------------------------------------------------------------
 # Database
 # ---------------------------------------------------------------------------

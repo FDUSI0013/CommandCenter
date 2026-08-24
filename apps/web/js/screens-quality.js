@@ -229,11 +229,15 @@
                   points.length ? 'One judged run so far — a second gives the chart a line to draw.' : 'Run an evaluation and its judged average appears here.')}</div>`;
               return;
             }
+            // lineChart cannot draw a gap, and shifting a series' points onto
+            // other days would misdate them — so a metric the judge did not
+            // score on every plotted day stays off the chart entirely rather
+            // than being plotted at an invented 0.
             const series = TREND_SERIES
-              .filter(([key]) => points.some(p => p[key] != null))
+              .filter(([key]) => points.every(p => p[key] != null))
               .map(([key, name, color]) => ({
                 name, color, area: key === 'avg_score',
-                points: points.map(p => p[key] == null ? 0 : p[key]),
+                points: points.map(p => p[key]),
               }));
             host.innerHTML = `<div class="card">
               <div class="card-head"><div class="card-title">Score Trend</div>
@@ -951,10 +955,13 @@
         const sel = table.filterEl && table.filterEl.querySelector('[data-fi="3"]');
         if(!sel) return;
         const have = new Set(Array.from(sel.options).map(o => o.value || o.textContent));
+        // The `owner` query param filters on owner_user_id, so the id must be
+        // the option's value; the name is only its label.
         (rows || []).forEach(r => {
-          if(r.owner_name && !have.has(r.owner_name)){
-            have.add(r.owner_name);
+          if(r.owner_user_id && r.owner_name && !have.has(r.owner_user_id)){
+            have.add(r.owner_user_id);
             const o = document.createElement('option');
+            o.value = r.owner_user_id;
             o.textContent = r.owner_name;
             sel.appendChild(o);
           }
@@ -1185,9 +1192,11 @@
       async function newSchedule(after){
         if(!allowed('operator','Scheduling a suite requires the operator role.')) return;
         let suites = { items: [] };
-        try { suites = await API.testing.list({ page_size: 100 }); }
+        // Scheduling an already-scheduled suite is a guaranteed 409, so the
+        // picker only offers the suites without a cadence.
+        try { suites = await API.testing.list({ page_size: 100, scheduled: false }); }
         catch (err) { toast('error','Could not load suites', errText(err)); return; }
-        if(!suites.items.length){ toast('warn','No suites to schedule','Create a test suite first.'); return; }
+        if(!suites.items.length){ toast('warn','No suites to schedule','Every suite already has a schedule, or none exists yet.'); return; }
         openModal({
           title:'Schedule a Suite', icon:'calendar',
           body:`<div class="form-row"><label>SUITE</label><select class="filter-select w-100" id="scSuite" style="height:34px">
@@ -1239,10 +1248,23 @@
         });
       }
 
-      function openSchedule(suite){
-        const sched = document.querySelectorAll('#tsTabs .tab')[5];
-        if(sched) sched.click();
-        toast('info','Schedules', `Editing the cadence for ${suite.name}.`);
+      async function openSchedule(suite){
+        if(!allowed('operator','Changing a schedule requires the operator role.')) return;
+        if(!suite.schedule_cron){
+          toast('warn','Not scheduled', `${suite.name} has no schedule yet — create one from the Schedules tab.`);
+          return;
+        }
+        // A schedule shares its suite's id but has no single-row endpoint,
+        // so the row the editor needs is fished out of the list.
+        let page;
+        try { page = await API.testing.schedules.list({ q: suite.name, page_size: 100 }); }
+        catch (err) { toast('error','Could not load the schedule', errText(err)); return; }
+        const row = (page.items || []).find(s => s.id === suite.id);
+        if(!row){
+          toast('warn','Not scheduled', `${suite.name} no longer has a schedule.`);
+          return;
+        }
+        editSchedule(row, ()=>table.refresh());
       }
 
       // ---- inspector -----------------------------------------------------------
@@ -2458,7 +2480,7 @@
               ${(agents.items || []).map(a => `<option value="${esc(a.id)}">${esc(a.name)}</option>`).join('')}</select></div>
             <div class="grid g2">
               <div class="form-row"><label>RATING</label><select class="filter-select w-100" id="nfRating" style="height:34px">
-                ${[[5,'5 — Excellent'],[4,'4 — Good'],[3,'3 — OK'],[2,'2 — Poor'],[1,'1 — Bad']].map(([v, l]) =>
+                ${[[5,'5 — Excellent'],[4,'4 — Good'],[3,'3 — OK'],[2,'2 — Poor'],[1,'1 — Bad'],['','No rating']].map(([v, l]) =>
                   `<option value="${v}" ${v === 5 ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
               <div class="form-row"><label>SOURCE</label><select class="filter-select w-100" id="nfSource" style="height:34px">
                 ${FB_SOURCES.map(s => `<option ${s === 'Manual Review' ? 'selected' : ''}>${esc(s)}</option>`).join('')}</select></div>
@@ -2466,15 +2488,17 @@
             <div class="form-row"><label>RUN / TRACE ID (OPTIONAL)</label><input class="input" id="nfTrace" placeholder="Links the rating onto the trace"></div>
             <div class="form-row"><label>FEEDBACK</label><textarea class="input" id="nfText" rows="3" placeholder="Describe the experience…"></textarea></div>`,
           footer:[{ label:'Cancel' }, { label:'Submit', cls:'primary', onClick: async (close, modal) => {
-            const b = {
-              rating: parseInt(modal.querySelector('#nfRating').value, 10),
-              source: modal.querySelector('#nfSource').value,
-            };
+            const rating = modal.querySelector('#nfRating').value;
+            const text = modal.querySelector('#nfText').value.trim();
+            // The API 422s a body with neither ("feedback needs a rating, a
+            // comment, or both"), so say so before the request is made.
+            if(!rating && !text){ toast('error','Comment required','Feedback without a rating needs a comment to carry it.'); return; }
+            const b = { source: modal.querySelector('#nfSource').value };
+            if(rating) b.rating = parseInt(rating, 10);
             const agentId = modal.querySelector('#nfAgent').value;
             if(agentId) b.agent_id = agentId;
             const trace = modal.querySelector('#nfTrace').value.trim();
             if(trace) b.trace_id = trace;
-            const text = modal.querySelector('#nfText').value.trim();
             if(text) b.body = text;
             close();
             try {

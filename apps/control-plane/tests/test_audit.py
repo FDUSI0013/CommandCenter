@@ -337,18 +337,6 @@ async def test_truncating_the_tail_is_not_detectable_by_replay_alone(
     assert body["checked"] == len(rows) - 1
 
 
-@pytest.mark.xfail(
-    reason=(
-        "AuditEvent.previous_checksum is declared with the comment 'Checksum of the "
-        "preceding event in this workspace; NULL for the genesis row', but "
-        "services.audit.record never assigns it, so every row stores NULL. The chain "
-        "still verifies because verify_chain recomputes the predecessor's checksum "
-        "as it walks; the cost is that the CSV export — the artefact handed to an "
-        "external reviewer — carries each row's own checksum and no link, so the "
-        "chain cannot be re-verified outside this database."
-    ),
-    strict=True,
-)
 async def test_a_row_stores_the_checksum_it_chains_from(
     admin_client, db, factory, workspace, engine
 ):

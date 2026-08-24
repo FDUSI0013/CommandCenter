@@ -955,6 +955,7 @@ async def list_suites(
     environment: str | None = None,
     owner_user_id: str | None = None,
     agent_id: str | None = None,
+    scheduled: bool | None = None,
 ) -> tuple[Sequence[TestSuite], int]:
     """One page of the workspace's suites, ordered by name by default."""
     stmt = _filtered_stmt(
@@ -965,6 +966,7 @@ async def list_suites(
         environment=environment,
         owner_user_id=owner_user_id,
         agent_id=agent_id,
+        scheduled=scheduled,
     )
     return await paginate(session, stmt, params)
 

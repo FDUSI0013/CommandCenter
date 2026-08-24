@@ -163,20 +163,6 @@
     setTimeout(()=>{},0);
   }
 
-  // ---------------- async button simulation ----------------
-  function runAsync(btn, cfg){
-    // cfg: {busy, ms, done(btn)}
-    if(btn.disabled) return;
-    const orig = btn.innerHTML;
-    btn.disabled = true;
-    btn.innerHTML = `<span class="spin">${ICONS.refresh}</span>${esc(cfg.busy||'Working…')}`;
-    setTimeout(()=>{
-      btn.disabled = false;
-      btn.innerHTML = orig;
-      cfg.done && cfg.done(btn);
-    }, cfg.ms || (900 + Math.random()*900));
-  }
-
   // ---------------- page head ----------------
   function pageHead(cfg){
     // {title, sub, crumbs, actions: html string}
@@ -542,6 +528,6 @@
   }
 
   window.C = { elem, badge, statusText, riskBadge, avatarHtml, ownerCell, entityCell, platformCell,
-    kpiCard, kpiRow, kpiSkeleton, miniKpi, toast, openModal, confirmModal, openMenu, closeMenu, runAsync,
+    kpiCard, kpiRow, kpiSkeleton, miniKpi, toast, openModal, confirmModal, openMenu, closeMenu,
     pageHead, searchBox, tabBar, inspSection, kv, dataTable, screenError };
 })();

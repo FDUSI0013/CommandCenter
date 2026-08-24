@@ -651,7 +651,7 @@
           ],
           rowId:'id', itemName:'memory stores', pageSize:10, emptyText:'No memory stores yet',
           filters:[
-            {key:'store_type', label:'Type', param:'store_type', options:['Conversation','Vector','Key-Value','Session','Long-term'], allLabel:'All Types'},
+            {key:'store_type', label:'Type', param:'type', options:['Conversation','Vector','Key-Value','Session','Long-term'], allLabel:'All Types'},
             {key:'environment', label:'Environment', param:'environment', options:['Production','Staging','Development'], allLabel:'All Environments'},
             {key:'status', label:'Status', param:'status', options:['Active','Paused','Degraded'], allLabel:'All'},
           ],
@@ -727,22 +727,25 @@
             fetch: (p) => API.memory.agentState(p), name:'agent state records', empty:'No agent state recorded',
             columns:[
               { key:'agent_name', label:'Agent', render:r=>r.agent_id?`<span class="link" data-nav="agent/${esc(r.agent_id)}">${esc(r.agent_name||r.agent_id)}</span>`:esc(r.agent_name||'—') },
-              { key:'store_name', label:'Store', render:r=>esc(r.store_name||'—') },
-              { key:'record_count', label:'Records', align:'right', cls:'num', render:r=>fmtNum(r.record_count) },
-              { key:'last_updated_at', label:'Updated', render:r=>`<span class="dim nowrap">${when(r.last_updated_at)}</span>` },
+              { key:'state_store', label:'Store', render:r=>esc(r.state_store||'—') },
+              { key:'session_count', label:'Sessions', align:'right', cls:'num', render:r=>r.session_count==null?dash:fmtFull(r.session_count) },
+              { key:'last_activity_at', label:'Last Activity', render:r=>`<span class="dim nowrap">${when(r.last_activity_at)}</span>` },
+              { key:'sync_state', label:'Sync State', render:r=>statusText(r.sync_state) },
             ],
             rowId:'agent_id',
           },
           'conversations': {
             fetch: (p) => API.memory.conversations(p), name:'conversations', empty:'No conversation state recorded',
             columns:[
-              { key:'thread_id', label:'Thread', render:r=>`<span class="mono">${esc(String(r.thread_id||r.id||'').slice(0,18))}…</span>` },
+              { key:'conversation_id', label:'Conversation', render:r=>`<span class="mono">${esc(String(r.conversation_id||'').slice(0,18))}…</span>` },
               { key:'agent_name', label:'Agent', render:r=>esc(r.agent_name||'—') },
-              { key:'turns', label:'Turns', align:'right', cls:'num', render:r=>fmtFull(r.turns) },
-              { key:'last_activity_at', label:'Last Activity', render:r=>`<span class="dim nowrap">${when(r.last_activity_at||r.updated_at)}</span>` },
-              { key:'status', label:'Status', render:r=>r.status?statusText(r.status):dash },
+              { key:'messages', label:'Messages', align:'right', cls:'num', render:r=>fmtFull(r.messages) },
+              { key:'context_tokens', label:'Context Tokens', align:'right', cls:'num', render:r=>r.context_tokens==null?dash:fmtNum(r.context_tokens) },
+              { key:'retention_policy', label:'Retention', render:r=>r.retention_policy?esc(r.retention_policy):dash },
+              { key:'last_activity_at', label:'Last Activity', render:r=>`<span class="dim nowrap">${when(r.last_activity_at)}</span>` },
+              { key:'expires_at', label:'Expires', render:r=>`<span class="dim nowrap">${when(r.expires_at)}</span>` },
             ],
-            rowId:'thread_id',
+            rowId:'conversation_id',
           },
         };
         const spec = specs[kind];
@@ -815,17 +818,22 @@
       }
 
       function updateRetention(r){
+        if(!Store.session.can('admin')){
+          toast('error','Not permitted','Updating a retention policy requires the admin role.');
+          return;
+        }
         openModal({
           title:'Update Retention Policy — ' + r.name, icon:'settings',
           body:`<label class="auth-field"><span>Policy name</span><input type="text" id="urPolicy" value="${esc(r.retention_policy||'')}" placeholder="e.g. 90-day rolling"></label>
             <label class="auth-field" style="margin-top:10px"><span>Retention (days)</span>
-              <input type="number" id="urDays" value="${r.retention_days == null ? '' : r.retention_days}" min="1" placeholder="Leave blank to keep indefinitely"></label>
+              <input type="number" id="urDays" value="${r.retention_days == null ? '' : r.retention_days}" min="1" placeholder="e.g. 90"></label>
             <div class="small muted" style="margin-top:8px">Records older than the retention window become eligible for purge. Changing this does not delete anything on its own.</div>`,
           footer:[
             {label:'Save Policy', cls:'primary', onClick: async (close, modal) => {
-              const days = modal.querySelector('#urDays').value;
-              const payload = { policy: modal.querySelector('#urPolicy').value.trim() || null,
-                                retention_days: days === '' ? null : Number(days) };
+              const days = Number(modal.querySelector('#urDays').value);
+              if(!Number.isInteger(days) || days < 1){ toast('error','Retention required','Retention is a whole number of days, at least 1.'); return; }
+              const payload = { retention_policy: modal.querySelector('#urPolicy').value.trim() || null,
+                                retention_days: days };
               close();
               try {
                 await API.memory.retention(r.id, payload);
@@ -859,6 +867,10 @@
       }
 
       function createBackup(r){
+        if(!Store.session.can('operator')){
+          toast('error','Not permitted','Creating a backup requires the operator role.');
+          return;
+        }
         openModal({
           title:'Create Backup — ' + r.name, icon:'save',
           body:`<div class="small muted">A backup captures the store's current records and metadata. It can be restored from the Backups tab.</div>`,
@@ -879,6 +891,10 @@
       }
 
       function restoreBackup(r){
+        if(!Store.session.can('admin')){
+          toast('error','Not permitted','Restoring from a backup requires the admin role.');
+          return;
+        }
         openModal({
           title:'Restore — ' + r.name, icon:'refresh',
           body:`<div class="card-loading" style="height:120px"></div>`,
@@ -918,6 +934,10 @@
       }
 
       function createStore(){
+        if(!Store.session.can('operator')){
+          toast('error','Not permitted','Creating a memory store requires the operator role.');
+          return;
+        }
         openModal({
           title:'Create Memory Store', icon:'database',
           body:`<label class="auth-field"><span>Name</span><input type="text" id="csName" placeholder="Support conversation memory"></label>
@@ -928,7 +948,7 @@
                 ${['Production','Staging','Development'].map(o=>`<option>${o}</option>`).join('')}</select></label>
             </div>
             <label class="auth-field" style="margin-top:10px"><span>Retention (days)</span>
-              <input type="number" id="csDays" placeholder="Leave blank to keep indefinitely" min="1"></label>`,
+              <input type="number" id="csDays" placeholder="Defaults to 90" min="1"></label>`,
           footer:[
             {label:'Create Store', cls:'primary', onClick: async (close, modal) => {
               const days = modal.querySelector('#csDays').value;
@@ -936,8 +956,9 @@
                 name: modal.querySelector('#csName').value.trim(),
                 store_type: modal.querySelector('#csType').value,
                 environment: modal.querySelector('#csEnv').value,
-                retention_days: days === '' ? null : Number(days),
               };
+              // Blank means the server's 90-day default, not "indefinite" — the API has no indefinite.
+              if(days !== '') payload.retention_days = Number(days);
               close();
               try {
                 await API.memory.create(payload);
@@ -1054,7 +1075,7 @@
           body:`<div class="grid g2">
               <label class="auth-field"><span>Region</span><input type="text" id="esRegion" value="${esc(r.region||'')}"></label>
               <label class="auth-field"><span>Status</span><select class="filter-select" id="esStatus" style="height:34px">
-                ${['Healthy','Degraded','Offline'].map(o=>`<option ${o===r.status?'selected':''}>${o}</option>`).join('')}</select></label>
+                ${['Healthy','Degraded','Standby','Offline'].map(o=>`<option ${o===r.status?'selected':''}>${o}</option>`).join('')}</select></label>
             </div>
             <label class="auth-field" style="margin-top:10px"><span>Description</span><input type="text" id="esDesc" value="${esc(r.description||'')}"></label>`,
           footer:[
@@ -1092,7 +1113,7 @@
           emptyText: extra.terminal ? 'No completed deployments yet' : 'No deployments yet',
           extraParams: extra.terminal ? { terminal: true } : null,
           filters:[
-            {key:'status', label:'Status', param:'status', options:['Queued','Running','Succeeded','Failed','Halted','Rolled Back'], allLabel:'All Statuses'},
+            {key:'status', label:'Status', param:'status', options:['Queued','Running','Succeeded','Failed','Halted','RolledBack'], allLabel:'All Statuses'},
             {key:'strategy', label:'Strategy', param:'strategy', options:['Rolling','Blue-Green','Canary','Recreate'], allLabel:'All Strategies'},
           ],
           source: (p) => API.deployments.list(p),
@@ -1139,7 +1160,7 @@
               const envId = modal.querySelector('#prEnv').value;
               close();
               try {
-                await API.deployments.promote(r.id, { environment_id: envId });
+                await API.deployments.promote(r.id, { target_environment_id: envId });
                 toast('success','Promoted', `${r.deployment_ref} promoted.`);
                 if(table) table.refresh();
                 loadKpis();
@@ -1183,11 +1204,13 @@
       }
 
       function stageHtml(s){
-        const state = s.status === 'Failed' ? 'fail' : s.status === 'Succeeded' ? 'done' : 'run';
+        // Approved closes an approval gate and Warning passes while flagging, so both are finished.
+        const finished = s.status === 'Completed' || s.status === 'Approved' || s.status === 'Warning';
+        const state = s.status === 'Failed' ? 'fail' : s.status === 'Skipped' ? 'skip' : finished ? 'done' : 'run';
         const dur = s.started_at && s.finished_at
           ? Math.round((new Date(s.finished_at) - new Date(s.started_at)) / 1000) + 's' : '';
         return `<div class="pipe-step">
-          <div class="pipe-dot ${state}">${state==='fail'?ICONS.x:state==='done'?ICONS.check:ICONS.clock}</div>
+          <div class="pipe-dot ${state}">${state==='fail'?ICONS.x:state==='done'?ICONS.check:state==='skip'?ICONS.chevRight:ICONS.clock}</div>
           <div class="pipe-body"><div class="pipe-title"><span>${esc(s.name)}</span><span class="faint num">${dur}</span></div>
           <div class="pipe-sub">${esc(s.log || s.status)}</div></div></div>`;
       }
@@ -1278,18 +1301,21 @@
         }
 
         if(liveStream) liveStream.close();
+        // The stream's frames are unnamed: each is a full pipeline snapshot, and
+        // the server closes after the terminal one — we must close our end too,
+        // or the EventSource would reconnect against a finished deployment forever.
         liveStream = API.deployments.stream(deployment.id, {
-          events: {
-            stage: (frame) => { if(frame && frame.stages) paint(frame.stages); else refreshStages(); },
-            done: () => {
-              refreshStages();
-              if(table) table.refresh();
-              loadKpis();
-              toast('success','Deployment finished', `${deployment.deployment_ref} completed.`);
-              if(liveStream){ liveStream.close(); liveStream = null; }
-            },
+          onMessage: (frame) => {
+            if(!frame) return;
+            if(frame.stages) paint(frame.stages);
+            if(!frame.is_terminal) return;
+            if(liveStream){ liveStream.close(); liveStream = null; }
+            if(table) table.refresh();
+            loadKpis();
+            const ok = frame.status === 'Succeeded';
+            toast(ok ? 'success' : 'warn', 'Deployment finished',
+              `${deployment.deployment_ref} ${ok ? 'completed' : 'finished with status ' + frame.status}.`);
           },
-          onMessage: () => refreshStages(),
           onError: () => refreshStages(),
         });
 

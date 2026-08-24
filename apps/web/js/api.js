@@ -259,6 +259,8 @@
       block: (id, body) => post(`/connectors/${encodeURIComponent(id)}/block`, body || {}),
       unblock: (id) => post(`/connectors/${encodeURIComponent(id)}/unblock`, {}),
       test: (id) => post(`/connectors/${encodeURIComponent(id)}/test`, {}),
+      grant: (id, body) => post(`/connectors/${encodeURIComponent(id)}/grants`, body),
+      revokeGrant: (id, agentId) => del(`/connectors/${encodeURIComponent(id)}/grants/${encodeURIComponent(agentId)}`),
       export: (params) => download('/connectors/export', params),
     }),
     policies: Object.assign(collection('/policies'), {
@@ -323,7 +325,7 @@
       createVersion: (id, body) => post(`/prompts/${encodeURIComponent(id)}/versions`, body),
       restore: (id, version) => post(`/prompts/${encodeURIComponent(id)}/restore/${encodeURIComponent(version)}`, {}),
       diff: (id, params) => get(`/prompts/${encodeURIComponent(id)}/diff`, params),
-      submitReview: (id) => post(`/prompts/${encodeURIComponent(id)}/submit-review`, {}),
+      submitReview: (id, body) => post(`/prompts/${encodeURIComponent(id)}/submit-review`, body || {}),
       approve: (id, body) => post(`/prompts/${encodeURIComponent(id)}/approve`, body || {}),
       block: (id, body) => post(`/prompts/${encodeURIComponent(id)}/block`, body || {}),
       test: (id, body) => post(`/prompts/${encodeURIComponent(id)}/test`, body || {}),

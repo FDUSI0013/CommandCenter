@@ -258,3 +258,7 @@ class ExportsSummary(BaseModel):
         default_factory=list,
         description="Distinct datasets exported, for the Source Screen filter.",
     )
+    datasets: list[ExportDatasetRead] = Field(
+        default_factory=list,
+        description="Every exportable dataset, so one summary call can seed the picker.",
+    )

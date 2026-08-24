@@ -20,6 +20,7 @@ from fastapi import Depends, Header, Request
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ..core import ratelimit
 from ..core.errors import PermissionDenied, Unauthenticated
 from ..core.security import (
     SessionTokenError,
@@ -185,6 +186,7 @@ async def get_principal(
         principal = await _principal_from_api_key(candidate, session, request)
         if principal is not None:
             request.state.principal = principal
+            ratelimit.check(principal.api_key_id or "api-key", request.url.path)
             return principal
 
     token = bearer or request.cookies.get(SESSION_COOKIE) or ""
@@ -193,6 +195,7 @@ async def get_principal(
 
     principal = await _principal_from_session(token, session, x_fulcrum_workspace)
     request.state.principal = principal
+    ratelimit.check(principal.user_id or "session", request.url.path)
     return principal
 
 

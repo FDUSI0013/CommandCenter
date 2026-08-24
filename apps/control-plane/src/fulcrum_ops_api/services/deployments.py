@@ -562,6 +562,7 @@ def _deployment_stmt(
     strategy: str | None,
     agent_id: str | None,
     version: str | None,
+    terminal: bool | None = None,
 ) -> Select:
     stmt = select(Deployment).where(Deployment.workspace_id == principal.workspace_id)
     stmt = apply_filters(
@@ -574,6 +575,19 @@ def _deployment_stmt(
             Deployment.version: version,
         },
     )
+    if terminal is not None:
+        finished = tuple(
+            value.value
+            for value in (
+                DeploymentStatus.SUCCEEDED,
+                DeploymentStatus.FAILED,
+                DeploymentStatus.HALTED,
+                DeploymentStatus.ROLLED_BACK,
+            )
+        )
+        stmt = stmt.where(
+            Deployment.status.in_(finished) if terminal else Deployment.status.not_in(finished)
+        )
     stmt = apply_search(
         stmt,
         params,
@@ -613,6 +627,7 @@ async def list_deployments(
     strategy: str | None = None,
     agent_id: str | None = None,
     version: str | None = None,
+    terminal: bool | None = None,
 ) -> tuple[Sequence[Deployment], int]:
     """Page of the deployment history, newest first by default."""
     stmt = _deployment_stmt(
@@ -623,6 +638,7 @@ async def list_deployments(
         strategy=strategy,
         agent_id=agent_id,
         version=version,
+        terminal=terminal,
     )
     return await paginate(session, stmt, params)
 

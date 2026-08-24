@@ -35,7 +35,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..api.common import ListParams, apply_filters, apply_search, apply_sort, paginate
 from ..api.deps import Principal
-from ..core.errors import Conflict, NotFound, PreconditionFailed, ValidationFailed
+from ..core.errors import (
+    Conflict,
+    NotFound,
+    PermissionDenied,
+    PreconditionFailed,
+    ValidationFailed,
+)
 from ..models.governance import (
     ApprovalComment,
     ApprovalRequest,
@@ -754,6 +760,19 @@ async def _decide(
     principal.require(Role.APPROVER)
     row = await _load_request(session, principal, request_id)
     _assert_transition(row, target)
+
+    # Separation of duties: the four-eyes gate is the whole point of this
+    # screen, so raising a request and deciding it must be two people.
+    # Escalating your own request is allowed - that is asking for eyes, not
+    # supplying them.
+    if (
+        target is not ApprovalStatus.ESCALATED
+        and principal.user_id is not None
+        and row.requested_by_user_id == principal.user_id
+    ):
+        raise PermissionDenied(
+            "You raised this request; a different reviewer has to decide it."
+        )
 
     cleaned_note = (note or "").strip() or None
     if target is ApprovalStatus.REJECTED and cleaned_note is None:

@@ -395,6 +395,16 @@ class MemberUpdate(BaseModel):
     is_active: bool | None = Field(
         None, description="Deactivating blocks sign-in everywhere, not just here"
     )
+    password: str | None = Field(
+        None,
+        max_length=MAX_PASSWORD_LENGTH,
+        description="Set a sign-in password for a member who has none, or reset one",
+    )
+
+    @field_validator("password")
+    @classmethod
+    def _strength(cls, value: str | None) -> str | None:
+        return None if value is None else validate_password(value)
 
     @field_validator("full_name")
     @classmethod

@@ -107,6 +107,12 @@ class Settings(BaseSettings):
     rate_limit_read_per_minute: int = 1_200
     redis_url: str | None = None  # optional; in-process limiter when unset
 
+    # ---- background scheduler --------------------------------------------
+    # The platform's own clock: export schedules, test-suite cadences, SLA
+    # expiry, mute expiry and secret-status recomputation all hang off it.
+    scheduler_enabled: bool = True
+    scheduler_interval_seconds: float = 30.0
+
     @field_validator("cors_origins")
     @classmethod
     def _strip_origins(cls, v: str) -> str:

@@ -1900,6 +1900,8 @@
           {label:'View Details', icon:'eye', onClick:()=>showConn(r)},
           {label:'Test Connection', icon:'activity', onClick:()=>testConn(r)},
           {label:'Edit Permissions', icon:'lock', onClick:()=>editPermissions(r)},
+          // A blocked connector fails closed, so a fresh grant would be dead on arrival.
+          ...(r.status !== 'Blocked' ? [{label:'Grant to Agent…', icon:'bot', onClick:()=>grantToAgent(r)}] : []),
           {sep:true},
           r.status !== 'Blocked'
             ? {label:'Block Connector', icon:'xCircle', danger:true, onClick:()=>blockConn(r)}
@@ -1990,6 +1992,40 @@
               if(currentId === r.id) showConn(saved);
             } catch (err) { toast('error','Could not save the permissions', err.message); }
           }}],
+        });
+      }
+
+      function grantToAgent(r){
+        if(!allowed('operator','Granting a connector to an agent')) return;
+        openModal({
+          title:'Grant to Agent — '+r.name, icon:'bot',
+          body:`<p style="margin-top:0">The agent can call <b style="color:var(--text)">${esc(r.name)}</b> at its recorded access level the moment the grant is recorded.</p>
+            <div class="form-row"><label>AGENT</label>
+              <select class="filter-select w-100" id="cnGrantAgent" style="height:34px"><option value="">Loading agents…</option></select></div>`,
+          footer:[{label:'Cancel'},{label:'Grant Access', cls:'primary', onClick: async (close, modal)=>{
+            const select = modal.querySelector('#cnGrantAgent');
+            const agentId = select.value;
+            if(!agentId){ toast('error','Agent required','Pick the agent that receives this grant.'); return; }
+            const agentName = select.options[select.selectedIndex] ? select.options[select.selectedIndex].textContent : 'The agent';
+            close();
+            try {
+              await Store.mutate(()=>API.connectors.grant(r.id, { agent_id: agentId }), { event:'connectors:changed' });
+              toast('success','Grant recorded', `${agentName} now holds a grant on ${r.name}.`);
+              refreshAll();
+              if(currentId === r.id) showConn(r);
+            } catch (err) { toast('error','Could not record the grant', err.message); }
+          }}],
+          onOpen(modal){
+            const select = modal.querySelector('#cnGrantAgent');
+            API.agents.list({ status:'Active', page_size:100 })
+              .then(page => {
+                const items = page.items || [];
+                select.innerHTML = items.length
+                  ? items.map(a=>`<option value="${esc(a.id)}">${esc(a.name)}</option>`).join('')
+                  : '<option value="">No active agents to grant to</option>';
+              })
+              .catch(err => { select.innerHTML = `<option value="">Agents unavailable — ${esc(err.message)}</option>`; });
+          },
         });
       }
 
@@ -2099,7 +2135,8 @@
               ${inspSection('Used By Agents ('+(c.agents||[]).length+')','bot',
                 ((c.agents||[]).length
                   ? c.agents.map(a=>`<div class="flex" style="gap:8px;padding:4px 0">${avatarHtml(a.name, true)}
-                      <span class="link" data-nav="agent/${esc(a.id)}" style="font-size:12px">${esc(a.name)}</span></div>`).join('')
+                      <span class="link grow" data-nav="agent/${esc(a.id)}" style="font-size:12px">${esc(a.name)}</span>
+                      <button class="btn sm" data-revoke="${esc(a.id)}">Revoke</button></div>`).join('')
                   : '<span class="faint small">No agent holds a grant on this connector.</span>')
                 + `<button class="link" data-nav="agents" style="margin-top:6px">View all agents ${ICONS.arrowRight}</button>`)}
               <div class="insp-section"><div class="flex" style="gap:8px">
@@ -2109,6 +2146,18 @@
               .addEventListener('click', ()=>editPermissions(c));
             requireRole(bodyEl.querySelector('#cnTestBtn'), 'member', 'Testing a connector')
               .addEventListener('click', ()=>testConn(c));
+            bodyEl.querySelectorAll('[data-revoke]').forEach(btn=>{
+              const agent = (c.agents||[]).find(a=>a.id === btn.dataset.revoke);
+              requireRole(btn, 'operator', 'Revoking a connector grant').addEventListener('click', async ()=>{
+                if(!allowed('operator','Revoking a connector grant')) return;
+                try {
+                  await Store.mutate(()=>API.connectors.revokeGrant(c.id, btn.dataset.revoke), { event:'connectors:changed' });
+                  toast('success','Grant revoked', `${agent ? agent.name : 'The agent'} no longer holds a grant on ${c.name}.`);
+                  refreshAll();
+                  showConn(c);
+                } catch (err) { toast('error','Could not revoke the grant', err.message); }
+              });
+            });
           }
           else if(i === 1){
             bodyEl.innerHTML = `

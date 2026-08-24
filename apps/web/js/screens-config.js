@@ -163,7 +163,7 @@
         </div>`;
 
       requireRole(document.getElementById('cfNew'), 'operator', 'Creating a configuration');
-      requireRole(document.getElementById('cfImport'), 'operator', 'Importing configurations');
+      requireRole(document.getElementById('cfImport'), 'admin', 'Importing configurations');
 
       /* ---- KPI cards, all six off /configurations/summary ---- */
       function loadSummary(){
@@ -231,8 +231,8 @@
           {label:'View History', icon:'history', onClick:()=>{ showCfg(r); openTab(1); }},
           {sep:true},
           (r.status === 'Deprecated' || r.status === 'Archived')
-            ? roleItem('operator','Restoring a configuration', {label:'Restore', icon:'refresh', onClick:()=>restoreCfg(r)})
-            : roleItem('operator','Deprecating a configuration', {label:'Deprecate', icon:'clock', danger:true, onClick:()=>deprecateCfg(r)}),
+            ? roleItem('admin','Restoring a configuration', {label:'Restore', icon:'refresh', onClick:()=>restoreCfg(r)})
+            : roleItem('admin','Deprecating a configuration', {label:'Deprecate', icon:'clock', danger:true, onClick:()=>deprecateCfg(r)}),
         ],
       });
 
@@ -465,6 +465,7 @@
       }
 
       function validateCfg(r){
+        if(!allowed('member','Validating a configuration')) return;
         openModal({
           title:'Validation — ' + r.name, icon:'shieldCheck', wide:true,
           body: LOADING(160), footer:[{label:'Close'}],
@@ -505,7 +506,7 @@
       }
 
       function deprecateCfg(r){
-        if(!allowed('operator','Deprecating a configuration')) return;
+        if(!allowed('admin','Deprecating a configuration')) return;
         openModal({
           title:'Deprecate Configuration', icon:'clock',
           body:`<p style="margin-top:0">Deprecate <b style="color:var(--text)">${esc(r.name)}</b> ${esc(r.current_version || '')}?</p>
@@ -534,7 +535,7 @@
       }
 
       async function restoreCfg(r){
-        if(!allowed('operator','Restoring a configuration')) return;
+        if(!allowed('admin','Restoring a configuration')) return;
         try {
           const res = await Store.mutate(() => API.configurations.restore(r.id), { event:'configurations:changed' });
           toast('success','Configuration restored', res.message || `${r.name} is active again.`);
@@ -546,7 +547,7 @@
       }
 
       function rollbackCfg(r, version){
-        if(!allowed('operator','Rolling a configuration back')) return;
+        if(!allowed('admin','Rolling a configuration back')) return;
         openModal({
           title:'Roll Back — ' + r.name, icon:'replay',
           body:`<p style="margin-top:0">Republish <b class="mono" style="color:var(--text)">${esc(version)}</b> as the live body of <b style="color:var(--text)">${esc(r.name)}</b>?</p>
@@ -574,7 +575,7 @@
       /* ------------------------------- import ------------------------------- */
 
       document.getElementById('cfImport').addEventListener('click', ()=>{
-        if(!allowed('operator','Importing configurations')) return;
+        if(!allowed('admin','Importing configurations')) return;
         openModal({
           title:'Import Configuration Bundle', icon:'upload', wide:true,
           body:`<div class="form-row"><label>BUNDLE (JSON)</label><textarea class="input" id="imBody" rows="12" placeholder='{"items":[…]}'></textarea></div>
@@ -705,9 +706,9 @@
         bind('#qaEdit', ()=>editCfg(r), 'operator', 'Editing a configuration');
         bind('#qaClone', ()=>cloneCfg(r), 'operator', 'Cloning a configuration');
         bind('#qaVer', ()=>newVersion(r), 'operator', 'Cutting a new version');
-        bind('#qaVal', ()=>validateCfg(r));
-        bind('#qaDep', ()=>deprecateCfg(r), 'operator', 'Deprecating a configuration');
-        bind('#qaRestore', ()=>restoreCfg(r), 'operator', 'Restoring a configuration');
+        bind('#qaVal', ()=>validateCfg(r), 'member', 'Validating a configuration');
+        bind('#qaDep', ()=>deprecateCfg(r), 'admin', 'Deprecating a configuration');
+        bind('#qaRestore', ()=>restoreCfg(r), 'admin', 'Restoring a configuration');
       }
 
       function versionsTab(host, r){
@@ -740,7 +741,7 @@
               <button class="btn sm" id="cfDiffGo" style="margin-top:8px">${ICONS.git}Compare versions</button>`);
             host.querySelectorAll('[data-view]').forEach(b=>b.addEventListener('click', ()=>viewVersion(r, b.dataset.view)));
             host.querySelectorAll('[data-roll]').forEach(b=>{
-              requireRole(b, 'operator', 'Rolling a configuration back');
+              requireRole(b, 'admin', 'Rolling a configuration back');
               b.addEventListener('click', ()=>rollbackCfg(r, b.dataset.roll));
             });
             const go = host.querySelector('#cfDiffGo');
@@ -975,9 +976,7 @@
             {label, cls: verb === 'block' ? 'danger' : 'primary', onClick: async (close, modal) => {
               const note = (modal.querySelector('#lcNote').value || '').trim() || null;
               try {
-                const res = await Store.mutate(() => verb === 'submitReview'
-                  ? API.prompts.submitReview(r.id)
-                  : API.prompts[verb](r.id, { note }), { event:'prompts:changed' });
+                const res = await Store.mutate(() => API.prompts[verb](r.id, { note }), { event:'prompts:changed' });
                 close();
                 const p = res.prompt || {};
                 toast(verb === 'block' ? 'warn' : 'success', label + 'd',
@@ -1082,7 +1081,7 @@
       }
 
       function restoreVersion(r, version){
-        if(!allowed('member','Restoring a prompt version')) return;
+        if(!allowed('operator','Restoring a prompt version')) return;
         confirmModal({
           title:'Restore Version', icon:'replay', confirmLabel:'Restore', danger:true,
           msg:`Re-commit ${version} as the head of ${r.name}? The history is kept — a new commit carries the old body.`,
@@ -1340,7 +1339,7 @@
               <button class="btn sm" id="pmDiffGo" style="margin-top:8px">${ICONS.git}Compare commits</button>`);
             host.querySelectorAll('[data-pv]').forEach(b=>b.addEventListener('click', ()=>viewCommit(p, b.dataset.pv)));
             host.querySelectorAll('[data-pr]').forEach(b=>{
-              requireRole(b, 'member', 'Restoring a prompt version');
+              requireRole(b, 'operator', 'Restoring a prompt version');
               b.addEventListener('click', ()=>restoreVersion(p, b.dataset.pr));
             });
             const go = host.querySelector('#pmDiffGo');
@@ -1803,10 +1802,12 @@
                 environment: modal.querySelector('#esEnv').value,
                 owner_user_id: modal.querySelector('#esOwner').value || null,
                 has_acl: modal.querySelector('#esAcl').checked,
-                settings: {
+                // The server replaces the whole settings block, so overlay the
+                // edits on the loaded values or the unedited keys are wiped.
+                settings: Object.assign({}, st, {
                   description: (modal.querySelector('#esDesc').value || '').trim() || null,
                   location: (modal.querySelector('#esLoc').value || '').trim() || null,
-                },
+                }),
                 expected_updated_at: r.updated_at || null,
               };
               if(!isNaN(topK) || !isNaN(minScore)){
@@ -2109,13 +2110,15 @@
           fillOptions(table, 3, vaults);
         },
         rowActions: r=>[
-          roleItem('operator','Rotating a secret', {label:'Rotate Secret', icon:'refresh', onClick:()=>rotate(r)}),
+          roleItem('admin','Rotating a secret', {label:'Rotate Secret', icon:'refresh', onClick:()=>rotate(r)}),
           {label:'View Audit Log', icon:'history', onClick:()=>auditLog(r)},
           roleItem('admin','Editing access', {label:'Edit Access', icon:'lock', onClick:()=>editAccess(r)}),
           {sep:true},
-          r.status !== 'Disabled'
-            ? roleItem('admin','Disabling a secret', {label:'Disable Secret', icon:'xCircle', danger:true, onClick:()=>disable(r)})
-            : roleItem('admin','Enabling a secret', {label:'Enable Secret', icon:'checkCircle', onClick:()=>enable(r)}),
+          // Disabling a revoked secret always 409s, so offer neither action there.
+          ...(r.status === 'Disabled'
+            ? [roleItem('admin','Enabling a secret', {label:'Enable Secret', icon:'checkCircle', onClick:()=>enable(r)})]
+            : r.status === 'Revoked' ? []
+            : [roleItem('admin','Disabling a secret', {label:'Disable Secret', icon:'xCircle', danger:true, onClick:()=>disable(r)})]),
           roleItem('admin','Deleting a secret', {label:'Delete Secret', icon:'trash', danger:true, onClick:()=>removeSecret(r)}),
         ],
       });
@@ -2308,7 +2311,7 @@
 
       /** The reveal is a privileged read: it needs a reason and it is logged. */
       function reveal(r){
-        if(!allowed('operator','Revealing a secret')) return;
+        if(!allowed('admin','Revealing a secret')) return;
         openModal({
           title:'Reveal Secret — ' + r.name, icon:'eye',
           body:`<p style="margin-top:0" class="small">The value is shown once and an access-log row is written naming you, the time and the reason below.</p>
@@ -2343,7 +2346,7 @@
 
       /** Rotation is a real multi-step flow: choose, confirm, then read the result. */
       function rotate(r){
-        if(!allowed('operator','Rotating a secret')) return;
+        if(!allowed('admin','Rotating a secret')) return;
         openModal({
           title:'Rotate Secret — ' + r.name, icon:'refresh', wide:true,
           body:`<div id="rtStep1">
@@ -2582,7 +2585,7 @@
             </div></div>`;
         insp.querySelector('#scClose').addEventListener('click', ()=>document.getElementById('scLayout').classList.add('collapsed'));
 
-        const eye = requireRole(insp.querySelector('#svEye'), 'operator', 'Revealing a secret');
+        const eye = requireRole(insp.querySelector('#svEye'), 'admin', 'Revealing a secret');
         if(!s.has_material && !eye.disabled){
           eye.disabled = true;
           eye.title = 'No material is stored for this credential — only a vault reference.';
@@ -2590,7 +2593,7 @@
         eye.addEventListener('click', ()=>reveal(s));
         insp.querySelector('#svCopy').addEventListener('click', ()=>
           copyText(s.vault_reference, 'Vault reference copied'));
-        requireRole(insp.querySelector('#qaRotate'), 'operator', 'Rotating a secret')
+        requireRole(insp.querySelector('#qaRotate'), 'admin', 'Rotating a secret')
           .addEventListener('click', ()=>rotate(s));
         insp.querySelector('#qaAudit').addEventListener('click', ()=>auditLog(s));
         requireRole(insp.querySelector('#qaAccess'), 'admin', 'Editing secret access')

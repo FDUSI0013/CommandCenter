@@ -43,9 +43,10 @@
     route:null, param:null, currentTitle:'', replayRun:null, metricsAgent:null, _cleanup:null,
     go(route){ location.hash = '#/'+route; },
     sourceRoute(source){
-      const map = { 'Connection Center':'connections','Quota, Cost & Capacity':'quota','Policy Center':'policies',
+      // Legacy labels stay: alert rows raised before the screens were renamed still carry them.
+      const map = { 'Connection Center':'connections','Hosting & Deployment':'connections','Quota, Cost & Capacity':'quota','Policy Center':'policies',
         'Secrets & Credentials':'secrets','Testing & Regression':'testing','RAG & Knowledge Governance':'knowledge',
-        'Deployment & Environment':'deployments','Live Runs':'live-runs','Agent Registry':'agents','Approvals & Audit':'approvals' };
+        'Deployment & Environment':'deployments','Environments & Releases':'deployments','Live Runs':'live-runs','Agent Registry':'agents','Approvals & Audit':'approvals' };
       return map[source] || 'alerts';
     },
     /** Re-read the two counts the sidebar shows. Cheap, and safe to call often. */

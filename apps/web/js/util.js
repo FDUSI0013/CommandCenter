@@ -1,31 +1,6 @@
-/* Fulcrum Ops — utilities: RNG, formatting, CSV export, SVG charts */
+/* Fulcrum Ops — utilities: formatting, CSV export, SVG charts */
 (function(){
   'use strict';
-
-  // ---------- seeded RNG (deterministic data generation) ----------
-  function mulberry32(seed){
-    let a = seed >>> 0;
-    return function(){
-      a |= 0; a = a + 0x6D2B79F5 | 0;
-      let t = Math.imul(a ^ a >>> 15, 1 | a);
-      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
-      return ((t ^ t >>> 14) >>> 0) / 4294967296;
-    };
-  }
-  const rng = mulberry32(20260707);
-  const R = {
-    f: () => rng(),
-    int: (min, max) => Math.floor(rng() * (max - min + 1)) + min,
-    pick: (arr) => arr[Math.floor(rng() * arr.length)],
-    weighted: (pairs) => { // [[value, weight], ...]
-      const total = pairs.reduce((s,p)=>s+p[1],0);
-      let x = rng()*total;
-      for(const [v,w] of pairs){ if((x-=w) <= 0) return v; }
-      return pairs[pairs.length-1][0];
-    },
-    hex: (n) => { let s=''; for(let i=0;i<n;i++) s += '0123456789abcdef'[Math.floor(rng()*16)]; return s; },
-    chance: (p) => rng() < p,
-  };
 
   // ---------- time helpers ----------
   const NOW = Date.now();
@@ -125,18 +100,6 @@
     a.download = filename.endsWith('.csv') ? filename : filename + '.csv';
     document.body.appendChild(a); a.click();
     setTimeout(()=>{ URL.revokeObjectURL(a.href); a.remove(); }, 400);
-  }
-
-  // ---------- series generation ----------
-  function genSeries(n, start, drift, noise, min, max){
-    const out = []; let v = start;
-    for(let i=0;i<n;i++){
-      v += drift + (rng()-0.5)*noise;
-      if(min != null && v < min) v = min + rng()*noise*0.5;
-      if(max != null && v > max) v = max - rng()*noise*0.5;
-      out.push(v);
-    }
-    return out;
   }
 
   // ---------- SVG chart builders ----------
@@ -256,5 +219,5 @@
     return `<span class="stars">${s}</span>`;
   }
 
-  window.U = { R, NOW, MIN, HOUR, DAY, relTime, fmtDate, fmtDateTime, fmtTime, fmtNum, fmtFull, fmtMoney, fmtPct, fmtDur, fmtBytes, esc, initials, avColor, downloadCSV, genSeries, sparkline, lineChart, donut, gaugeRing, hbars, barPct, starRating, cc };
+  window.U = { NOW, MIN, HOUR, DAY, relTime, fmtDate, fmtDateTime, fmtTime, fmtNum, fmtFull, fmtMoney, fmtPct, fmtDur, fmtBytes, esc, initials, avColor, downloadCSV, sparkline, lineChart, donut, gaugeRing, hbars, barPct, starRating, cc };
 })();

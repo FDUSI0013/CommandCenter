@@ -364,6 +364,10 @@ async def list_suites(
     ] = None,
     owner_user_id: Annotated[str | None, Query(alias="owner")] = None,
     agent_id: Annotated[str | None, Query()] = None,
+    scheduled: Annotated[
+        bool | None,
+        Query(description="true: only suites with a cadence; false: only ones without"),
+    ] = None,
 ) -> Page[TestSuiteRead]:
     """One page of the workspace's suites, ordered by name by default.
 
@@ -380,6 +384,7 @@ async def list_suites(
         environment=environment,
         owner_user_id=owner_user_id,
         agent_id=agent_id,
+        scheduled=scheduled,
     )
     records = await service.read_suites(session, principal, rows)
     return Page.build(records, total, params.page, params.page_size)

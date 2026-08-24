@@ -697,7 +697,7 @@ async def export_feedback_rows(
 # ---------------------------------------------------------------------------
 
 
-async def _mirror_score(
+async def mirror_score(
     session: AsyncSession, principal: Principal, item: FeedbackItem
 ) -> str | None:
     """Write the rating onto the trace as a telemetry feedback score.
@@ -812,7 +812,7 @@ async def submit(
         await session.rollback()
         raise Conflict(f"Feedback '{reference}' was already submitted.") from exc
 
-    item.engine_feedback_score_id = await _mirror_score(session, principal, item)
+    item.engine_feedback_score_id = await mirror_score(session, principal, item)
 
     await audit.record(
         session,

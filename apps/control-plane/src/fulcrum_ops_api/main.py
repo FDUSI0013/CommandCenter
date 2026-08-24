@@ -7,11 +7,12 @@ talks to sits on a private network and is never addressable from outside.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import pathlib
 import re
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
@@ -75,6 +76,10 @@ async def lifespan(app: FastAPI):
         else:
             log.warning("%s — telemetry features will degrade", msg)
 
+    from .services import scheduler
+
+    scheduler_task = scheduler.start()
+
     log.info(
         "control plane ready (env=%s, db=%s)",
         settings.environment,
@@ -83,6 +88,10 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        if scheduler_task is not None:
+            scheduler_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await scheduler_task
         await client.aclose()
         await db_session.dispose()
 

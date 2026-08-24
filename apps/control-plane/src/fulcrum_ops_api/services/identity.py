@@ -1144,6 +1144,14 @@ async def update_member(
         if field in changes:
             setattr(user, field, changes[field])
 
+    if changes.get("password"):
+        # An admin setting a member's credential: the console's "Set Password"
+        # action for accounts created without one, or a reset. Clearing the
+        # lockout alongside, or the fresh password would bounce off it.
+        user.password_hash = hash_password(changes["password"])
+        user.failed_login_count = 0
+        user.locked_until = None
+
     await audit.record(
         session,
         principal=principal,
@@ -1152,6 +1160,8 @@ async def update_member(
         entity_id=user.id,
         entity_label=user.email,
         source_screen=SOURCE_SCREEN_MEMBERS,
+        # The audit trail records that a password changed, never anything
+        # about the password itself.
         detail="Updated " + ", ".join(sorted(changes)),
         metadata={"fields": sorted(changes), "role": membership.role},
         request=request,

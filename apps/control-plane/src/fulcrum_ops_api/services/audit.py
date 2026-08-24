@@ -102,6 +102,9 @@ async def record(
         ip_address=_client_ip(request),
         user_agent=(request.headers.get("user-agent") if request else None),
         event_metadata=metadata or {},
+        # Stored alongside the recomputable value so an external verifier can
+        # walk the chain row by row without reconstructing the ordering first.
+        previous_checksum=previous,
         checksum=_checksum(canonical, previous),
     )
     session.add(event)

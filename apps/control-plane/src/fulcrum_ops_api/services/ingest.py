@@ -1996,20 +1996,28 @@ async def ingest_events(
             )
             continue
         seen_refs.add(ref)
-        session.add(
-            FeedbackItem(
-                workspace_id=principal.workspace_id,
-                feedback_ref=ref,
-                agent_id=agent_id,
-                trace_id=event.trace_id,
-                rating=event.rating,
-                sentiment=_sentiment(event),
-                body=event.body,
-                source=_feedback_source(event),
-                submitted_by=event.submitted_by,
-                submitted_at=occurred_at,
-                event_metadata=dict(event.detail),
-            )
+        item = FeedbackItem(
+            workspace_id=principal.workspace_id,
+            feedback_ref=ref,
+            agent_id=agent_id,
+            trace_id=event.trace_id,
+            rating=event.rating,
+            sentiment=_sentiment(event),
+            body=event.body,
+            source=_feedback_source(event),
+            submitted_by=event.submitted_by,
+            submitted_at=occurred_at,
+            event_metadata=dict(event.detail),
+        )
+        session.add(item)
+        # The same mirror the console's submit path applies: the rating lands
+        # on the trace as a feedback score, so SDK- and console-submitted
+        # feedback read identically in the telemetry store. Best effort - an
+        # engine outage degrades the mirror, never the capture.
+        from . import feedback as feedback_service
+
+        item.engine_feedback_score_id = await feedback_service.mirror_score(
+            session, principal, item
         )
         recorded += 1
         results[index] = results[index].model_copy(update={"id": ref, "agent_id": agent_id})

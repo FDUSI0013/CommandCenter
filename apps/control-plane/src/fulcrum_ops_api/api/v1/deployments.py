@@ -260,6 +260,10 @@ async def list_deployments(
     strategy: Annotated[DeploymentStrategy | None, Query()] = None,
     agent_id: Annotated[str | None, Query()] = None,
     version: Annotated[str | None, Query()] = None,
+    terminal: Annotated[
+        bool | None,
+        Query(description="true: only finished deployments (the History tab)"),
+    ] = None,
 ) -> Page[DeploymentRead]:
     """Deployment history, newest first, filtered by the console's environment,
     status, strategy, agent and version dropdowns."""
@@ -272,6 +276,7 @@ async def list_deployments(
         strategy=strategy.value if strategy else None,
         agent_id=agent_id,
         version=version,
+        terminal=terminal,
     )
     items = await _read_deployments(session, principal, rows)
     return Page.build(items, total, params.page, params.page_size)

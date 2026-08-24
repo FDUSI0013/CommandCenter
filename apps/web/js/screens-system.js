@@ -633,7 +633,6 @@
                 color: s.failed_30d ? 'red' : 'cyan',
                 sub: `${fmtFull(s.ready)} downloadable now` },
             ]);
-            formats = (s.formats || []).length ? s.formats : formats;
             fillScreens(s.source_screens || []);
           })
           .catch(err => { host.innerHTML = ''; host.appendChild(screenError(err, loadSummary, 'the export summary')); });
@@ -669,7 +668,7 @@
         defaultSort:{ key:'requested_at', dir:-1 },
         emptyText:'No exports have been generated in this workspace yet',
         filters:[
-          { key:'export_format', label:'Format', param:'export_format', options:['CSV','JSON','XLSX','PDF','Parquet'], allLabel:'All Formats' },
+          { key:'export_format', label:'Format', param:'export_format', options:['CSV','JSON','XLSX','PDF'], allLabel:'All Formats' },
           { key:'source_screen', label:'Source Screen', param:'source_screen', options:[], allLabel:'All Screens' },
           { key:'status', label:'Status', param:'status', options:EX_STATUS, allLabel:'All Status' },
         ],
