@@ -533,7 +533,7 @@
         openModal({
           title:'Add Connection', icon:'plus',
           body:`<div class="form-row"><label>CONNECTION TYPE</label><select class="filter-select w-100" id="ncType" style="height:34px">
-              ${optionList(['Azure AI Foundry','Copilot Studio','MCP Server','Vector Database','Microsoft Purview','Custom REST API'])}</select></div>
+              ${optionList(['Azure AI Foundry','Copilot Studio','M365 Copilot','Power Platform','Custom Agent','MCP Server','Vector Database','Microsoft Purview','Custom REST API'])}</select></div>
             <div class="form-row"><label>DISPLAY NAME</label><input class="input" id="ncName" placeholder="e.g. Fulcrum-Foundry-EU"></div>
             <div class="form-row"><label>ENDPOINT / RESOURCE URI</label><input class="input" id="ncUri" placeholder="https://…"></div>
             <div class="form-row"><label>AUTHENTICATION</label><select class="filter-select w-100" id="ncAuth" style="height:34px">${optionList(AUTH_MODES)}</select></div>

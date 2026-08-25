@@ -744,6 +744,7 @@ class Factory:
         agent_id: str | None = None,
         trace_id: str | None = None,
         score: float | None = 0.9,
+        matched: dict | None = None,
     ) -> GuardrailEvent:
         return await self.add(
             GuardrailEvent(
@@ -754,7 +755,7 @@ class Factory:
                 occurred_at=_now(),
                 action_taken=action_taken,
                 score=score,
-                matched={},
+                matched=matched if matched is not None else {},
             )
         )
 

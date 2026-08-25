@@ -866,10 +866,13 @@ and <code>/export</code>, so you can compare a few agents in one call. Agent Reg
 <h3>Hosting &amp; Deployment</h3>
 <p class="route">#/connections &middot; <span class="pill">member to edit</span></p>
 <p>The platforms your agents are hosted on, the traffic flowing through them, and their health.</p>
-<p><strong>Add Connection</strong> takes a name, a kind (<code>Azure AI Foundry</code>,
-<code>Copilot Studio</code>, <code>MCP Server</code>, <code>Vector Database</code>,
-<code>Microsoft Purview</code>, <code>Custom REST API</code>), an endpoint URL and free-form
-metadata pairs such as Environment or Authentication.</p>
+<p><strong>Add Connection</strong> takes a name, a kind, an endpoint URL and free-form
+metadata pairs such as Environment or Authentication. The kinds fall in two groups: the agent
+platforms (<code>Azure AI Foundry</code>, <code>Copilot Studio</code>, <code>M365 Copilot</code>,
+<code>Power Platform</code>, <code>Custom Agent</code>) — the kinds whose traffic can be attributed
+to agents — and the infrastructure kinds (<code>MCP Server</code>, <code>Vector Database</code>,
+<code>Microsoft Purview</code>, <code>Custom REST API</code>), which cannot host an agent and are
+governed through their tools instead.</p>
 <p><strong>Test Connection</strong> probes the endpoint and reports what came back. The probe
 carries no credentials, so it answers reachability only — and a 401 is a <em>healthy</em> answer,
 because it proves the endpoint is up and guarding itself.</p>
@@ -933,6 +936,10 @@ exactly what changed between any two.</p>
 <p><strong>Add Connector</strong> takes a name, a type (<code>API</code>, <code>MCP Server</code>,
 <code>Database</code>, <code>Vector Store</code>, <code>Custom Tool</code>), provider, risk level,
 access level (Read, Read-Write, Admin), data classification, auth mode, endpoint URL and scopes.</p>
+<p>Three further type values — <code>Connector</code>, <code>Data Source</code> and
+<code>Tool</code> — are legacy groupings: the dialog no longer offers them, but rows registered
+through the API may still carry them and the tab filters still honour them. Treat a
+<code>Tool</code> row as a <code>Custom Tool</code> that predates the current vocabulary.</p>
 <p><strong>Block</strong> requires a reason and is the interesting state change. A blocked connector
 keeps its row, its grants and its history, and <strong>every agent holding a grant fails closed
 against it</strong> from that moment. That is how you stop a tool estate-wide without editing a

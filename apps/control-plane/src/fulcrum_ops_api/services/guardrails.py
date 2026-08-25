@@ -604,16 +604,37 @@ async def get_guardrail(
 
 
 def _match_count(matched: dict[str, Any] | None) -> int:
-    """How many things one event's checker call pointed at."""
+    """How many things one event's ``matched`` payload points at.
+
+    Two producers write this field in different shapes. The inline checker
+    writes ``{"count": N, "labels": [...], "spans": [...]}``; the SDK's
+    ``log_guardrail_event`` passes the reporter's own dict through verbatim,
+    which by convention is a label→count map like ``{"CARD": 1, "PHONE": 1}``
+    (a label may also carry the list of matched values). Both must total the
+    same way — an event whose ``matched`` names real entities must never
+    render as zero matches beside them.
+    """
     if not matched:
         return 0
     count = matched.get("count")
-    if isinstance(count, int):
+    if isinstance(count, int) and not isinstance(count, bool):
         return count
     spans = matched.get("spans")
     if isinstance(spans, list):
         return len(spans)
-    return 0
+    total = 0
+    for value in matched.values():
+        if not value:
+            continue
+        if isinstance(value, bool):
+            total += 1
+        elif isinstance(value, int):
+            total += value
+        elif isinstance(value, (list, tuple)):
+            total += len(value)
+        else:
+            total += 1
+    return total
 
 
 async def list_events(

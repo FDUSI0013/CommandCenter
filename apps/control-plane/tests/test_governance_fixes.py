@@ -215,3 +215,37 @@ async def test_licensing_export_accepts_each_tabs_own_status_vocabulary(admin_cl
             f"/api/v1/licensing/export?dataset={dataset}&status={status_value}"
         )
         assert r.status_code == 200, f"{dataset}/{status_value}: {r.status_code} {r.text[:150]}"
+
+
+async def test_match_count_agrees_with_the_matched_payload_beside_it(
+    admin_client, factory, workspace
+):
+    """An event whose `matched` names real entities must never render zero.
+
+    Two producers write `matched` in different shapes: the inline checker's
+    {"count", "labels", "spans"} envelope and the SDK's pass-through label map
+    ({"CARD": 1, "PHONE": 1}). An intern's doc-derived test pack caught the
+    label-map shape totalling 0 on all fifty sampled events while the entities
+    sat right beside it.
+    """
+    guardrail = await factory.guardrail(workspace, name="PII scan")
+    shapes = [
+        ({"CARD": 1, "PHONE": 1}, 2),            # SDK label -> count map
+        ({"EMAIL": ["a@x.io", "b@y.io"]}, 2),    # label -> matched values
+        ({"count": 3, "labels": ["SSN"], "spans": [{}, {}, {}]}, 3),  # checker envelope
+        ({}, 0),                                  # nothing matched, honest zero
+    ]
+    for matched, _ in shapes:
+        await factory.guardrail_event(workspace, guardrail, matched=matched)
+
+    listed = await admin_client.get("/api/v1/guardrails/events", params={"page_size": 50})
+    assert listed.status_code == 200, listed.text
+    rows = listed.json()["items"]
+
+    by_shape = {tuple(sorted((r.get("matched") or {}).keys())): r for r in rows}
+    for matched, expected in shapes:
+        row = by_shape[tuple(sorted(matched.keys()))]
+        assert row["match_count"] == expected, (
+            f"matched={matched!r} rendered match_count={row['match_count']}, "
+            f"expected {expected}"
+        )
