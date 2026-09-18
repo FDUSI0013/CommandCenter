@@ -44,7 +44,7 @@ from ..core.errors import (
     TelemetryBackendUnavailable,
     ValidationFailed,
 )
-from ..db.base import new_id
+from ..db.base import new_id, stamp
 from ..engine import (
     EngineBadRequest,
     EngineClient,
@@ -1494,7 +1494,7 @@ async def trigger_run(
 
     await _call(_client().create_traces_batch([trace]))
 
-    agent.last_used_at = started_at
+    await stamp(session, [agent], last_used_at=started_at)
     agent.updated_by = principal.actor
     await audit.record(
         session,

@@ -652,6 +652,10 @@ class GuardrailVerdict(BaseModel):
     matched: dict[str, Any] = Field(default_factory=dict)
     sample: str | None = Field(None, max_length=MAX_SAMPLE_LENGTH)
     reason: str | None = Field(None, max_length=500)
+    #: The literal strings a ``Mask`` verdict found, so ingest can remove exactly
+    #: those and nothing else. Excluded from every serialisation: this is the
+    #: sensitive text itself, and it exists only between the check and the write.
+    redactions: list[str] = Field(default_factory=list, exclude=True, repr=False)
 
 
 # ---------------------------------------------------------------------------

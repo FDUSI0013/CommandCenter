@@ -109,7 +109,7 @@ async def test_the_health_probe_is_bounded(upstream: str) -> None:
     client = EngineClient(base_url=upstream, retries=0)
     try:
         started = asyncio.get_running_loop().time()
-        assert await client.health(timeout=0.3) is False
+        assert await client.health(timeout_seconds=0.3) is False
         assert asyncio.get_running_loop().time() - started < 1.5
     finally:
         await client.aclose()

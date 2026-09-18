@@ -431,7 +431,7 @@ class EngineClient:
         json_body: Any = None,
         retries: int | None = None,
         headers: Mapping[str, str] | None = None,
-        timeout: float | None = None,
+        timeout_seconds: float | None = None,
     ) -> httpx.Response:
         """Issue one call, retrying only what is safe to replay.
 
@@ -459,11 +459,11 @@ class EngineClient:
                 request_id,
             )
             extra: dict[str, Any] = {}
-            if timeout is not None:
+            if timeout_seconds is not None:
                 extra["timeout"] = httpx.Timeout(
-                    timeout,
-                    connect=min(timeout, self._connect_timeout_seconds),
-                    pool=min(timeout, settings.engine_pool_timeout_seconds),
+                    timeout_seconds,
+                    connect=min(timeout_seconds, self._connect_timeout_seconds),
+                    pool=min(timeout_seconds, settings.engine_pool_timeout_seconds),
                 )
             try:
                 response = await self._exchange(
@@ -519,7 +519,7 @@ class EngineClient:
         params: Mapping[str, str] | None = None,
         json_body: Any = None,
         retries: int | None = None,
-        timeout: float | None = None,
+        timeout_seconds: float | None = None,
     ) -> Any:
         response = await self._send(
             method,
@@ -527,7 +527,7 @@ class EngineClient:
             params=params,
             json_body=json_body,
             retries=retries,
-            timeout=timeout,
+            timeout_seconds=timeout_seconds,
         )
         return _decode(response)
 
@@ -555,7 +555,7 @@ class EngineClient:
 
     # -- health ------------------------------------------------------------
 
-    async def health(self, *, timeout: float = 3.0) -> bool:
+    async def health(self, *, timeout_seconds: float = 3.0) -> bool:
         """Liveness only -- a probe must fail fast, so it never retries.
 
         A probe that can take the full request timeout is worse than none: the
@@ -563,7 +563,7 @@ class EngineClient:
         """
         try:
             payload = await self._request(
-                "GET", HEALTH_PATH, retries=0, timeout=timeout
+                "GET", HEALTH_PATH, retries=0, timeout_seconds=timeout_seconds
             )
         except EngineError:
             return False
@@ -1664,7 +1664,11 @@ class EngineClient:
         )
 
     async def evaluate_guardrails(
-        self, text: str, validations: Sequence[Mapping[str, Any]]
+        self,
+        text: str,
+        validations: Sequence[Mapping[str, Any]],
+        *,
+        timeout_seconds: float | None = None,
     ) -> JsonObject:
         """Run the inline checks against a piece of text, synchronously.
 
@@ -1677,6 +1681,7 @@ class EngineClient:
             "POST",
             target,
             json_body={"text": text, "validations": list(validations)},
+            timeout_seconds=timeout_seconds,
         )
 
     # -- alerts ------------------------------------------------------------

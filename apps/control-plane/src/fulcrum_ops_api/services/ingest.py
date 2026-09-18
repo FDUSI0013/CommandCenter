@@ -68,7 +68,7 @@ from ..core.errors import (
     TelemetryBackendUnavailable,
     ValidationFailed,
 )
-from ..db.base import new_id
+from ..db.base import new_id, stamp
 from ..engine import EngineBadRequest, EngineError, EngineUnavailable, get_engine_client
 from ..models.governance import (
     Policy,
@@ -131,7 +131,7 @@ from ..schemas.ingest import (
     SpanType,
     TraceIn,
 )
-from . import audit, licensing
+from . import audit, licensing, telemetry_cache
 
 logger = logging.getLogger(__name__)
 
@@ -385,9 +385,37 @@ async def _bound_agent(session: AsyncSession, principal: Principal) -> Agent | N
     return agent
 
 
-async def _key_environment(session: AsyncSession, principal: Principal) -> str:
-    """Environment an auto-registered agent inherits from the key that reported it."""
+def _reported_environments(items: Iterable[Any], envelope: Any) -> dict[str, str]:
+    """agent name (lower-cased) -> the environment its own telemetry states.
+
+    The SDKs stamp every trace with the environment they were configured with.
+    It is read only to decide where a *never-seen* agent is filed; an agent that
+    is already registered keeps whatever an operator set.
+    """
     allowed = {env.value.lower(): env.value for env in EnvironmentType}
+    reported: dict[str, str] = {}
+    for item in items:
+        name = (getattr(item, "agent", None) or getattr(envelope, "agent", None) or "").strip()
+        metadata = getattr(item, "metadata", None)
+        stated = metadata.get("environment") if isinstance(metadata, Mapping) else None
+        if name and isinstance(stated, str) and stated.strip().lower() in allowed:
+            reported.setdefault(name.lower(), allowed[stated.strip().lower()])
+    return reported
+
+
+async def _key_environment(
+    session: AsyncSession, principal: Principal, reported: str | None = None
+) -> str:
+    """Environment an auto-registered agent is filed under.
+
+    What the agent says about itself wins: a service configured as Production
+    and filed as Development lists under the wrong tile, inherits the wrong
+    policy set, and reads as a mistake to whoever goes looking for it. The key's
+    environment is the fallback, and Development the fallback to that.
+    """
+    allowed = {env.value.lower(): env.value for env in EnvironmentType}
+    if reported and reported.strip().lower() in allowed:
+        return allowed[reported.strip().lower()]
     if principal.api_key_id is None:
         return EnvironmentType.DEVELOPMENT.value
     named = (
@@ -418,7 +446,12 @@ async def _unique_slug(session: AsyncSession, workspace_id: str, base: str) -> s
 
 
 async def _register_agent(
-    session: AsyncSession, principal: Principal, name: str, *, request: Request | None
+    session: AsyncSession,
+    principal: Principal,
+    name: str,
+    *,
+    request: Request | None,
+    reported_environment: str | None = None,
 ) -> Agent:
     """Create an agent because telemetry arrived for a name we have never seen.
 
@@ -451,7 +484,7 @@ async def _register_agent(
         description="Registered automatically on first telemetry from the SDK.",
         platform=Platform.CUSTOM_AGENT.value,
         agent_type=AgentType.PRO_CODE.value,
-        environment=await _key_environment(session, principal),
+        environment=await _key_environment(session, principal, reported_environment),
         status=AgentStatus.PENDING_REVIEW.value,
         risk=RiskLevel.LOW.value,
         tags=["auto-registered"],
@@ -493,6 +526,7 @@ async def _resolve_agents(
     *,
     request: Request | None,
     allow_register: bool = True,
+    environments: Mapping[str, str] | None = None,
 ) -> _Agents:
     """Resolve every agent name in a batch with one statement, registering misses.
 
@@ -534,7 +568,13 @@ async def _resolve_agents(
     for name in sorted(wanted):
         if name.lower() in resolved.by_key:
             continue
-        agent = await _register_agent(session, principal, name, request=request)
+        agent = await _register_agent(
+            session,
+            principal,
+            name,
+            request=request,
+            reported_environment=(environments or {}).get(name.lower()),
+        )
         resolved.by_key[agent.slug.lower()] = agent
         resolved.by_key[agent.name.lower()] = agent
         resolved.registered.append(agent)
@@ -1185,6 +1225,46 @@ def _redacted() -> dict[str, Any]:
     return {"value": REDACTION_MARKER, "redacted": True}
 
 
+#: Containers are walked this deep when redacting; anything deeper is replaced
+#: whole rather than searched, so a hostile payload cannot make this expensive.
+_REDACTION_DEPTH: Final[int] = 12
+
+
+def _scrub(value: Any, needles: Sequence[str], depth: int = 0) -> Any:
+    """Return ``value`` with every occurrence of each needle replaced by the marker."""
+    if isinstance(value, str):
+        for needle in needles:
+            if needle in value:
+                value = value.replace(needle, REDACTION_MARKER)
+        return value
+    if depth >= _REDACTION_DEPTH:
+        return _redacted() if isinstance(value, (dict, list, tuple)) else value
+    if isinstance(value, dict):
+        return {key: _scrub(item, needles, depth + 1) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_scrub(item, needles, depth + 1) for item in value]
+    return value
+
+
+def _masked_payload(value: Any, masked: bool, redactions: Sequence[str]) -> Any:
+    """What a masked item stores in place of ``value``.
+
+    A guardrail that masks has found *something* in the content, not condemned
+    all of it. When the checker says what it found, exactly that is removed and
+    the rest of the run stays readable -- a support transcript with an email
+    address in it is still a support transcript. Only a verdict that cannot say
+    what it matched (a topic classifier has no span to point at) falls back to
+    withholding the whole payload, which is the safe reading of "mask this".
+    """
+    if not masked or value is None:
+        return value
+    if not redactions:
+        return _redacted()
+    # Longest first, so a needle that contains another is removed as one piece.
+    needles = sorted({needle for needle in redactions if needle}, key=len, reverse=True)
+    return _scrub(value, needles)
+
+
 def _trace_model(trace: TraceIn) -> str | None:
     """The model that produced this run, read from its own spans.
 
@@ -1204,7 +1284,14 @@ def _trace_model(trace: TraceIn) -> str | None:
     return None
 
 
-def _engine_trace(trace: TraceIn, trace_id: str, agent: Agent, *, masked: bool) -> dict[str, Any]:
+def _engine_trace(
+    trace: TraceIn,
+    trace_id: str,
+    agent: Agent,
+    *,
+    masked: bool,
+    redactions: Sequence[str] = (),
+) -> dict[str, Any]:
     metadata: dict[str, Any] = {
         **trace.metadata,
         "fulcrum_agent_id": agent.id,
@@ -1225,15 +1312,21 @@ def _engine_trace(trace: TraceIn, trace_id: str, agent: Agent, *, masked: bool) 
         "thread_id": trace.thread_id,
         "tags": list(trace.tags),
         "metadata": metadata,
-        "input": _redacted() if masked else trace.input,
-        "output": _redacted() if masked else trace.output,
+        "input": _masked_payload(trace.input, masked, redactions),
+        "output": _masked_payload(trace.output, masked, redactions),
         "error_info": trace.error_info.model_dump(exclude_none=True) if trace.error_info else None,
     }
     return {key: value for key, value in payload.items() if value is not None}
 
 
 def _engine_span(
-    span: SpanIn, *, span_id: str, trace_id: str, agent: Agent, masked: bool
+    span: SpanIn,
+    *,
+    span_id: str,
+    trace_id: str,
+    agent: Agent,
+    masked: bool,
+    redactions: Sequence[str] = (),
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "id": span_id,
@@ -1250,8 +1343,8 @@ def _engine_span(
         "model": span.model,
         "provider": span.provider,
         "total_estimated_cost": span.total_estimated_cost,
-        "input": _redacted() if masked else span.input,
-        "output": _redacted() if masked else span.output,
+        "input": _masked_payload(span.input, masked, redactions),
+        "output": _masked_payload(span.output, masked, redactions),
         "error_info": span.error_info.model_dump(exclude_none=True) if span.error_info else None,
     }
     return {key: value for key, value in payload.items() if value is not None}
@@ -1309,6 +1402,10 @@ class _Accepted:
     spans: int = 0
     tokens: int = 0
     masked: bool = False
+    #: What to remove when ``masked``; empty means "withhold the whole payload".
+    redactions: list[str] = dataclasses.field(default_factory=list)
+    #: Set once any masking verdict could not say what it matched.
+    mask_everything: bool = False
 
 
 async def ingest_traces(
@@ -1341,6 +1438,9 @@ async def ingest_traces(
         principal,
         {(item.agent or parsed.envelope.agent or "") for _, item in parsed.valid},
         request=request,
+        environments=_reported_environments(
+            (item for _, item in parsed.valid), parsed.envelope
+        ),
     )
     policies = await _load_policies(session, principal, [agent.id for agent in agents.touched])
     connector_blocks = await _connector_blocks(session, principal, agents)
@@ -1455,7 +1555,13 @@ async def ingest_traces(
             if trace is None:  # pragma: no cover - ParsedBatch.valid guarantees this
                 continue
             traces_payload.append(
-                _engine_trace(trace, entry.trace_id, entry.agent, masked=entry.masked)
+                _engine_trace(
+                    trace,
+                    entry.trace_id,
+                    entry.agent,
+                    masked=entry.masked,
+                    redactions=entry.redactions,
+                )
             )
             trace_scores.extend(
                 _engine_score(
@@ -1483,6 +1589,7 @@ async def ingest_traces(
                         trace_id=entry.trace_id,
                         agent=entry.agent,
                         masked=entry.masked,
+                        redactions=entry.redactions,
                     )
                 )
                 span_scores.extend(
@@ -1501,6 +1608,8 @@ async def ingest_traces(
 
         client = get_engine_client()
         refusal = await _push(client.create_traces_batch, traces_payload)
+        for project_id in {str(entry.agent.engine_project_id) for entry in accepted}:
+            telemetry_cache.project_written(project_id)
         if refusal is not None:
             for entry in accepted:
                 _reject(results, entry.index, RejectionCode.TELEMETRY_REJECTED, refusal)
@@ -1572,6 +1681,9 @@ async def ingest_spans(
         principal,
         {(item.agent or parsed.envelope.agent or "") for _, item in parsed.valid},
         request=request,
+        environments=_reported_environments(
+            (item for _, item in parsed.valid), parsed.envelope
+        ),
     )
     policies = await _load_policies(session, principal, [agent.id for agent in agents.touched])
     connector_blocks = await _connector_blocks(session, principal, agents)
@@ -1687,6 +1799,7 @@ async def ingest_spans(
                     trace_id=entry.trace_id,
                     agent=entry.agent,
                     masked=entry.masked,
+                    redactions=entry.redactions,
                 )
             )
             score_payload.extend(
@@ -1960,7 +2073,7 @@ async def ingest_events(
                     sample=event.sample,
                 )
             )
-            guardrail.last_triggered_at = occurred_at
+            await stamp(session, [guardrail], last_triggered_at=occurred_at)
             recorded += 1
             results[index] = results[index].model_copy(
                 update={"agent_id": agent_id, "guardrail_id": guardrail.id}
@@ -1989,7 +2102,7 @@ async def ingest_events(
                     occurred_at=occurred_at,
                 )
             )
-            policy.last_triggered_at = occurred_at
+            await stamp(session, [policy], last_triggered_at=occurred_at)
             recorded += 1
             violations += 1
             results[index] = results[index].model_copy(
@@ -2412,12 +2525,14 @@ def _apply_verdicts(
         return accepted
 
     blocked: dict[int, GuardrailVerdict] = {}
-    masked: dict[int, GuardrailVerdict] = {}
+    masked: dict[int, list[GuardrailVerdict]] = {}
     for verdict in verdicts:
         if verdict.action == GuardrailAction.BLOCK.value:
             blocked.setdefault(verdict.index, verdict)
         elif verdict.action == GuardrailAction.MASK.value:
-            masked.setdefault(verdict.index, verdict)
+            # Every masking verdict counts: two guardrails that each found
+            # something must both have what they found removed.
+            masked.setdefault(verdict.index, []).append(verdict)
 
     survivors: list[_Accepted] = []
     for entry in accepted:
@@ -2433,11 +2548,18 @@ def _apply_verdicts(
                 }
             )
             continue
-        mask = masked.get(entry.index)
-        if mask is not None:
+        masks = masked.get(entry.index)
+        if masks:
             entry.masked = True
+            for mask in masks:
+                if mask.redactions:
+                    entry.redactions.extend(mask.redactions)
+                else:
+                    entry.mask_everything = True
+            if entry.mask_everything:
+                entry.redactions = []
             results[entry.index] = results[entry.index].model_copy(
-                update={"masked": True, "guardrail_id": mask.guardrail_id}
+                update={"masked": True, "guardrail_id": masks[0].guardrail_id}
             )
         survivors.append(entry)
     return survivors
@@ -2543,7 +2665,8 @@ async def _record_evidence(
         await session.execute(
             sa_update(Policy)
             .where(Policy.workspace_id == principal.workspace_id, Policy.id.in_(policy_ids))
-            .values(last_triggered_at=now)
+            # Named, and set to itself, so that a policy firing is not an edit to it.
+            .values(last_triggered_at=now, updated_at=Policy.updated_at)
         )
     await session.flush()
     violations = sum(1 for row in rows if isinstance(row, PolicyViolation))
@@ -2579,10 +2702,8 @@ async def _touch_agents(session: AsyncSession, agents: _Agents, *, accepted: boo
     """Stamp ``last_used_at`` once per batch, not once per item."""
     if not accepted:
         return
-    now = _now()
-    for agent in agents.touched:
-        agent.last_used_at = now
     await session.flush()
+    await stamp(session, agents.touched, last_used_at=_now())
 
 
 def _finish(

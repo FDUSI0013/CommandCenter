@@ -96,6 +96,25 @@ def _fresh_rate_windows():
     ratelimit.reset()
 
 
+@pytest.fixture(autouse=True)
+def _no_run_screen_memory(monkeypatch):
+    """The run screens' short-lived caches are off unless a test asks for them.
+
+    A test writes telemetry and reads it back in the same breath; it has to see
+    what it wrote, not what was remembered a second ago. The tests that are
+    *about* the caches switch them back on for themselves.
+    """
+    from fulcrum_ops_api.core.config import settings
+    from fulcrum_ops_api.services import telemetry_cache
+
+    monkeypatch.setattr(settings, "runs_activity_cache_seconds", 0.0)
+    monkeypatch.setattr(settings, "runs_scan_cache_seconds", 0.0)
+    monkeypatch.setattr(settings, "runs_summary_cache_seconds", 0.0)
+    telemetry_cache.reset()
+    yield
+    telemetry_cache.reset()
+
+
 # ---------------------------------------------------------------------------
 # Database
 # ---------------------------------------------------------------------------

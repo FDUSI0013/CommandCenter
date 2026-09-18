@@ -5,9 +5,14 @@ from __future__ import annotations
 import datetime as dt
 import secrets
 import uuid
+from collections.abc import Iterable
+from typing import Any
 
 from sqlalchemy import DateTime, MetaData, String, func
+from sqlalchemy import update as sa_update
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.orm.attributes import set_committed_value
 from sqlalchemy.types import JSON, TypeDecorator
 
 # Explicit naming convention so Alembic autogenerate produces stable,
@@ -111,3 +116,33 @@ class WorkspaceScopedMixin:
     workspace_id: Mapped[str] = mapped_column(
         String(36), index=True, nullable=False
     )
+
+
+async def stamp(session: AsyncSession, rows: Iterable[Any], **values: Any) -> None:
+    """Record bookkeeping on rows without it counting as an edit.
+
+    ``updated_at`` is the optimistic-concurrency token: the console sends back
+    the value it read, and a row whose value has moved on answers 409 "changed by
+    someone else". It is stamped by ``onupdate``, which fires for *any* UPDATE
+    that does not name the column -- so writing ``last_used_at`` on every ingest
+    batch, or ``last_triggered_at`` on every policy hit, made an agent that is
+    busy reporting, or a policy that is busy firing, impossible to edit. Those
+    are observations about a row, not changes to it.
+
+    Naming ``updated_at`` in the statement, set to itself, is what stops
+    ``onupdate`` firing. The instances are brought into line without being marked
+    dirty, so the unit of work does not write them a second time.
+    """
+    rows = [row for row in rows if row is not None]
+    if not rows or not values:
+        return
+    model = type(rows[0])
+    await session.execute(
+        sa_update(model)
+        .where(model.id.in_([row.id for row in rows]))
+        .values(**values, updated_at=model.updated_at)
+        .execution_options(synchronize_session=False)
+    )
+    for row in rows:
+        for name, value in values.items():
+            set_committed_value(row, name, value)

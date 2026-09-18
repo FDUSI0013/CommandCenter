@@ -198,6 +198,13 @@ async def stream_runs(
 
     slot = await service.acquire_stream_slot()
 
+    # Everything this request needs from the database it has now read. The
+    # request's session would otherwise stay checked out -- idle, inside the
+    # transaction authentication opened -- for as long as the stream is open,
+    # which is up to half an hour per tab. Ending the transaction hands the
+    # connection back; the stream opens a short-lived session for each poll.
+    await session.commit()
+
     def frame(event: str, run: RunRead | None = None) -> ServerSentEvent:
         payload = RunStreamEvent(
             event=event,

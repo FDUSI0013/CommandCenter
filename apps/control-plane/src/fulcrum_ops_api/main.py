@@ -154,7 +154,7 @@ def create_app() -> FastAPI:
         engine = get_engine_client()
         db_ok, engine_ok = await asyncio.gather(
             bounded(db_session.ping()),
-            bounded(engine.health(timeout=HEALTH_CHECK_SECONDS)),
+            bounded(engine.health(timeout_seconds=HEALTH_CHECK_SECONDS)),
         )
         ok = db_ok and (engine_ok or not settings.engine_required)
         return JSONResponse(

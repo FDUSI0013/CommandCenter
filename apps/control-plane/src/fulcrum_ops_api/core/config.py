@@ -90,6 +90,26 @@ class Settings(BaseSettings):
     # into the engine's rule store — inline enforcement is unaffected.
     engine_metric_library: str = ""
 
+    # ---- run screens: what is remembered between requests ----------------
+    # See services/telemetry_cache.py. Seconds; zero switches a memory off.
+    # How long "which projects were written to, and when" is trusted.
+    runs_activity_cache_seconds: float = 2.0
+    # How long one project's rows for one window are shared between the table,
+    # the KPI row and the live-stream subscribers that all want them at once.
+    runs_scan_cache_seconds: float = 4.0
+    # How long a finished KPI row is served before it is folded again.
+    runs_summary_cache_seconds: float = 20.0
+
+    # ---- inline guardrail checks on the ingest path -----------------------
+    # One scanner call may take this long...
+    guardrail_check_timeout_seconds: float = 8.0
+    # ...and all of a batch's checks together may take this long, after which
+    # the batch is stored unevaluated rather than held. Telemetry is a record of
+    # something that already happened; a slow checker must not cost the record.
+    guardrail_batch_budget_seconds: float = 12.0
+    # A validation the scanner cannot run is not asked for again for this long.
+    guardrail_suspend_seconds: float = 300.0
+
     # ---- ingest -----------------------------------------------------------
     ingest_max_batch_spans: int = 1000
     ingest_max_body_bytes: int = 8 * 1024 * 1024

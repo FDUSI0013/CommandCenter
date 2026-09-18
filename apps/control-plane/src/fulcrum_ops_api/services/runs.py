@@ -94,7 +94,7 @@ from ..schemas.runs import (
     TranscriptMessage,
     as_metadata,
 )
-from . import audit
+from . import audit, telemetry_cache
 
 T = TypeVar("T")
 
@@ -372,10 +372,20 @@ def _provisioned_agents_stmt(principal: Principal) -> Select:
 async def _agents_for(
     session: AsyncSession, principal: Principal, agent_id: str | None
 ) -> list[Agent]:
-    """The projects one request may read, already scoped to the workspace."""
+    """The projects one request may read, already scoped to the workspace.
+
+    A key bound to one agent reads that agent's runs and no others. That is a
+    scoping rule -- a deployed agent has no business listing its neighbours'
+    runs -- and it is also what keeps an agent runtime polling for its own
+    ``Running`` rows every few seconds to one project instead of all of them.
+    """
     stmt = _provisioned_agents_stmt(principal)
-    if agent_id:
-        stmt = stmt.where(Agent.id == agent_id)
+    bound = principal.api_key_agent_id
+    if bound and agent_id and agent_id != bound:
+        return []
+    scoped = agent_id or bound
+    if scoped:
+        stmt = stmt.where(Agent.id == scoped)
     return list((await session.execute(stmt.limit(MAX_SCAN_AGENTS))).scalars().all())
 
 
@@ -409,7 +419,101 @@ async def _agent_for_project(
     ).scalar_one_or_none()
 
 
+#: A project is skipped only when its last write is older than the window start
+#: by more than this. The store stamps the write a moment after accepting it, so
+#: the margin is what keeps a run that has *just* landed from being skipped.
+ACTIVITY_MARGIN: Final[dt.timedelta] = dt.timedelta(seconds=120)
+
+#: Projects asked about in one activity read. Beyond it a project is simply
+#: unknown, and an unknown project is scanned.
+ACTIVITY_PAGE_SIZE: Final[int] = 1_000
+
+
+async def _project_activity(client: EngineClient) -> telemetry_cache.ProjectActivity:
+    """When each project was last written to, or ``None`` when that is unknown.
+
+    One inexpensive call answers for every project at once. Any failure reading
+    it degrades to "unknown", which means every project is scanned exactly as it
+    was before this existed: it is an economy, never a correctness dependency.
+    """
+    if settings.runs_activity_cache_seconds <= 0:
+        return None
+
+    async def read() -> telemetry_cache.ProjectActivity:
+        try:
+            page = await client.list_projects(size=ACTIVITY_PAGE_SIZE)
+        except EngineError:
+            return None
+        rows = page.get("content") if isinstance(page, dict) else None
+        if not isinstance(rows, list):
+            return None
+        return {
+            str(row["id"]): _instant(row.get("last_updated_trace_at"))
+            for row in rows
+            if isinstance(row, dict) and row.get("id")
+        }
+
+    return await telemetry_cache.project_activity.get("projects", read)
+
+
+def _may_have_runs(
+    activity: telemetry_cache.ProjectActivity, agent: Agent, since: dt.datetime
+) -> bool:
+    """Could this project hold a run that started at or after ``since``?
+
+    A run cannot be written before it starts, so a project last written to
+    before the window opened holds nothing inside it. Anything not positively
+    known to be quiet -- no activity read, a project absent from it, a project
+    with no recorded write -- is scanned.
+    """
+    if activity is None:
+        return True
+    project_id = str(agent.engine_project_id)
+    if project_id not in activity:
+        return True
+    last_write = activity[project_id]
+    if last_write is None:
+        return True
+    return last_write >= since - ACTIVITY_MARGIN
+
+
+def _grid(moment: dt.datetime, step: float, *, up: bool) -> int:
+    """Snap an instant to a grid of ``step`` seconds, for use in a cache key."""
+    ticks = moment.timestamp() / step
+    return int(-(-ticks // 1)) if up else int(ticks // 1)
+
+
 async def _scan_project(
+    client: EngineClient,
+    agent: Agent,
+    *,
+    since: dt.datetime,
+    until: dt.datetime,
+    limit: int,
+) -> tuple[list[dict[str, Any]], bool]:
+    """One project's traces in the window, shared with whoever else wants them.
+
+    The table, its KPI row and every live-stream subscriber ask for the same
+    rows within the same few seconds. The window is snapped to a grid for the
+    key only, so requests a moment apart share one read; the read itself uses
+    the exact window it was asked for.
+    """
+    step = settings.runs_scan_cache_seconds
+    if step <= 0:
+        return await _read_project(client, agent, since=since, until=until, limit=limit)
+    key = (
+        str(agent.engine_project_id),
+        _grid(since, step, up=False),
+        _grid(until, step, up=True),
+        limit,
+    )
+    rows, truncated = await telemetry_cache.project_scans.get(
+        key, lambda: _read_project(client, agent, since=since, until=until, limit=limit)
+    )
+    return list(rows), truncated
+
+
+async def _read_project(
     client: EngineClient,
     agent: Agent,
     *,
@@ -455,6 +559,18 @@ async def _scan(
     """Read the window across every in-scope project, with bounded concurrency."""
     if not agents:
         return [], False
+
+    # Most projects are quiet most of the time. Asking once which ones have been
+    # written to since the window opened turns "one store query per project"
+    # into "one per project that could possibly answer".
+    activity = await _project_activity(client)
+    quiet = [agent for agent in agents if not _may_have_runs(activity, agent, since)]
+    agents = [agent for agent in agents if _may_have_runs(activity, agent, since)]
+    if not agents:
+        return [(agent, []) for agent in quiet], False
+
+    # The row budget is shared between the projects actually read, so skipping
+    # the quiet ones also raises the ceiling on the busy ones.
     per_agent = max(MIN_ROWS_PER_AGENT, budget // len(agents))
     semaphore = asyncio.Semaphore(SCAN_CONCURRENCY)
 
@@ -467,7 +583,8 @@ async def _scan(
 
     results = await asyncio.gather(*(one(agent) for agent in agents))
     truncated = any(flag for _, _, flag in results)
-    return [(agent, rows) for agent, rows, _ in results], truncated
+    scanned = [(agent, rows) for agent, rows, _ in results]
+    return scanned + [(agent, []) for agent in quiet], truncated
 
 
 # --------------------------------------------------------------------------- #
@@ -1445,12 +1562,36 @@ async def summarise(
     change rather than a guess. Fallback and escalation counts come from the
     same scan: they are recorded on the run's metadata by the ingest contract.
     """
-    since, until = window_for(time_range)
-    previous_since, previous_until = window_for(time_range, end=since)
-
     # The scope is resolved once, before the concurrency starts: the two scans
     # below share this request's session and it serves one operation at a time.
     scope = await _scope(session, principal, filters)
+
+    # The KPI row folds two windows of thousands of rows and changes slowly, yet
+    # the console asks for it on every table load, sort, page and streamed run.
+    # Everyone asking the same question within its lifetime shares one answer.
+    key = (
+        "runs-summary",
+        principal.workspace_id,
+        str(principal.role),
+        time_range.value,
+        tuple(sorted(str(agent.id) for agent in scope.agents)),
+        repr(filters),
+    )
+    return await telemetry_cache.summaries.get(
+        key, lambda: _summarise(scope, principal, filters=filters, time_range=time_range)
+    )
+
+
+async def _summarise(
+    scope: _Scope,
+    principal: Principal,
+    *,
+    filters: RunFilters,
+    time_range: TimeRange,
+) -> RunsSummary:
+    since, until = window_for(time_range)
+    previous_since, previous_until = window_for(time_range, end=since)
+
     (current, info), (previous, _) = await asyncio.gather(
         _gather(scope, principal, filters=filters, since=since, until=until),
         _gather(
