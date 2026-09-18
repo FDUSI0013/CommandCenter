@@ -77,7 +77,8 @@ def test_evaluate_traces_every_case_and_scores_it(
     assert all("experiment" in row["tags"] for row in traces)
     assert traces[0]["metadata"]["dataset"] == "qa"
     assert traces[0]["feedback_scores"][0]["name"] == "contains_expected"
-    assert traces[0]["feedback_scores"][0]["source"] == "experiment"
+    # "sdk", not "experiment": the telemetry store's source enum refuses anything else.
+    assert traces[0]["feedback_scores"][0]["source"] == "sdk"
 
 
 def test_a_failing_case_is_recorded_and_the_run_continues(

@@ -12,6 +12,7 @@ import hashlib
 import logging
 import pathlib
 import re
+from collections.abc import Awaitable
 from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI
@@ -38,6 +39,11 @@ from .db import session as db_session
 from .engine import EngineClient, set_engine_client
 
 log = logging.getLogger("fulcrum_ops")
+
+#: Ceiling on each dependency check behind /health. The container healthcheck
+#: allows 10 s and an uptime monitor rather less; a probe has to answer inside
+#: that even when -- especially when -- something behind it is hanging.
+HEALTH_CHECK_SECONDS = 3.0
 
 DESCRIPTION = """
 The Fulcrum Ops control plane API.
@@ -137,8 +143,19 @@ def create_app() -> FastAPI:
     async def health() -> JSONResponse:
         from .engine import get_engine_client
 
-        db_ok = await db_session.ping()
-        engine_ok = await get_engine_client().health()
+        async def bounded(check: Awaitable[bool]) -> bool:
+            """A dependency that does not answer in time is down, not pending."""
+            try:
+                return bool(await asyncio.wait_for(check, timeout=HEALTH_CHECK_SECONDS))
+            except Exception:  # noqa: BLE001 - a probe reports, it never raises
+                return False
+
+        # Together, not in turn: the probe's worst case is one timeout, not two.
+        engine = get_engine_client()
+        db_ok, engine_ok = await asyncio.gather(
+            bounded(db_session.ping()),
+            bounded(engine.health(timeout=HEALTH_CHECK_SECONDS)),
+        )
         ok = db_ok and (engine_ok or not settings.engine_required)
         return JSONResponse(
             status_code=200 if ok else 503,
@@ -147,6 +164,7 @@ def create_app() -> FastAPI:
                 "version": app.version,
                 "environment": settings.environment,
                 "checks": {"database": db_ok, "telemetry": engine_ok},
+                "engine_pool": engine.pool_stats(),
             },
         )
 

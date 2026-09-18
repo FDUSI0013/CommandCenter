@@ -59,6 +59,10 @@ IDEMPOTENT_METHODS: Final[frozenset[str]] = frozenset({"GET", "PUT", "DELETE"})
 
 _BACKOFF_BASE_SECONDS: Final[float] = 0.25
 _BACKOFF_CAP_SECONDS: Final[float] = 4.0
+
+#: Never rebuild the connection pool more often than this, however many calls
+#: notice it is full at once.
+_RECYCLE_MIN_INTERVAL_SECONDS: Final[float] = 30.0
 _ERROR_BODY_LIMIT: Final[int] = 2048
 
 JsonObject = dict[str, Any]
@@ -246,21 +250,42 @@ class EngineClient:
             # reads it raw off Authorization.
             headers["authorization"] = self._api_key
 
-        pool = max_connections or settings.engine_max_connections
-        self._client = httpx.AsyncClient(
+        self._headers = headers
+        self._max_connections = max_connections or settings.engine_max_connections
+        self._timeout_seconds = timeout_seconds or settings.engine_timeout_seconds
+        self._connect_timeout_seconds = (
+            connect_timeout_seconds or settings.engine_connect_timeout_seconds
+        )
+        self._transport = transport
+        self._client = self._build_http_client()
+
+        #: Exchanges still running after their caller went away. Held so they
+        #: are not garbage-collected mid-flight and so shutdown can wait on them.
+        self._inflight: set[asyncio.Future[httpx.Response]] = set()
+        self._retiring: set[asyncio.Task[None]] = set()
+        self._recycles = 0
+        self._last_recycle_at = 0.0
+
+    def _build_http_client(self) -> httpx.AsyncClient:
+        pool = self._max_connections
+        return httpx.AsyncClient(
             base_url=self._base_url,
-            headers=headers,
+            headers=self._headers,
             limits=httpx.Limits(
                 max_connections=pool,
                 max_keepalive_connections=max(1, pool // 4),
                 keepalive_expiry=30.0,
             ),
             timeout=httpx.Timeout(
-                timeout_seconds or settings.engine_timeout_seconds,
-                connect=connect_timeout_seconds
-                or settings.engine_connect_timeout_seconds,
+                self._timeout_seconds,
+                connect=self._connect_timeout_seconds,
+                # Waiting for a free pooled connection is not the engine being
+                # slow, it is this process being out of connections. Thirty
+                # seconds of that per request is how one wedged pool turns into
+                # a wedged worker, so fail fast and let the pool heal itself.
+                pool=settings.engine_pool_timeout_seconds,
             ),
-            transport=transport,
+            transport=self._transport,
             follow_redirects=False,
         )
 
@@ -275,7 +300,68 @@ class EngineClient:
         return self._base_url
 
     async def aclose(self) -> None:
+        if self._inflight:
+            # Let orphaned exchanges finish so their connections are released
+            # rather than torn down underneath them.
+            await asyncio.wait(list(self._inflight), timeout=5.0)
+        for task in list(self._retiring):
+            task.cancel()
         await self._client.aclose()
+
+    def pool_stats(self) -> dict[str, int]:
+        """Connection-pool occupancy, for the health endpoint.
+
+        Reads the transport's private pool, so every access is guarded: a
+        library upgrade that moves it must degrade this to zeros, never break
+        a health check.
+        """
+        connections: list[Any] = []
+        try:
+            pool = self._client._transport._pool  # type: ignore[attr-defined]  # noqa: SLF001
+            connections = list(pool.connections)
+            idle = sum(1 for connection in connections if connection.is_idle())
+        except Exception:  # noqa: BLE001 - diagnostics must never raise
+            idle = 0
+        return {
+            "connections": len(connections),
+            "idle": idle,
+            "busy": len(connections) - idle,
+            "limit": self._max_connections,
+            "orphaned_exchanges": len(self._inflight),
+            "recycles": self._recycles,
+        }
+
+    def _recycle_pool(self, reason: str) -> None:
+        """Swap in a fresh connection pool and retire the old one.
+
+        The last line of defence. If connections are ever leaked faster than
+        they are released, the pool fills, and every later call in this process
+        fails until it restarts. Rebuilding the pool bounds that to seconds:
+        new calls use the new pool immediately, and the old one is closed --
+        which force-closes whatever it leaked -- once anything legitimately
+        still using it has had time to finish.
+        """
+        if self._transport is not None:
+            return  # an injected transport (tests) is not ours to rebuild
+        now = asyncio.get_running_loop().time()
+        if now - self._last_recycle_at < _RECYCLE_MIN_INTERVAL_SECONDS:
+            return
+        self._last_recycle_at = now
+        self._recycles += 1
+        retired, self._client = self._client, self._build_http_client()
+        logger.error(
+            "engine connection pool recycled (%s); recycle #%d for this process",
+            reason,
+            self._recycles,
+        )
+
+        async def _retire() -> None:
+            await asyncio.sleep(self._timeout_seconds + 5.0)
+            await retired.aclose()
+
+        task = asyncio.ensure_future(_retire())
+        self._retiring.add(task)
+        task.add_done_callback(self._retiring.discard)
 
     async def __aenter__(self) -> EngineClient:
         return self
@@ -308,6 +394,34 @@ class EngineClient:
             ),
         )
 
+    async def _exchange(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        """One HTTP exchange that its caller's cancellation cannot interrupt.
+
+        A cancelled caller must not tear an exchange down half way. When the
+        live-runs stream is dropped by the browser, its generator is cancelled
+        in the middle of a scan with a dozen engine calls in flight, and the
+        pooled connections under those calls are left marked busy forever --
+        never released, never closed. A hundred of those and the pool is full:
+        every later call in the process waits out the pool timeout and fails,
+        and the worker answers 503 until it is restarted.
+
+        So the exchange runs as its own task and the caller waits on a shield.
+        Cancelling the caller abandons the *wait*; the exchange itself runs to
+        completion -- bounded by the ordinary timeouts -- and hands its
+        connection back the normal way.
+        """
+        exchange = asyncio.ensure_future(self._client.request(method, path, **kwargs))
+        self._inflight.add(exchange)
+        exchange.add_done_callback(self._settle)
+        return await asyncio.shield(exchange)
+
+    def _settle(self, exchange: asyncio.Future[httpx.Response]) -> None:
+        self._inflight.discard(exchange)
+        if not exchange.cancelled():
+            # Retrieve the outcome so an exchange nobody is waiting for any
+            # more does not log "exception was never retrieved".
+            exchange.exception()
+
     async def _send(
         self,
         method: str,
@@ -317,6 +431,7 @@ class EngineClient:
         json_body: Any = None,
         retries: int | None = None,
         headers: Mapping[str, str] | None = None,
+        timeout: float | None = None,
     ) -> httpx.Response:
         """Issue one call, retrying only what is safe to replay.
 
@@ -343,14 +458,30 @@ class EngineClient:
                 attempts,
                 request_id,
             )
+            extra: dict[str, Any] = {}
+            if timeout is not None:
+                extra["timeout"] = httpx.Timeout(
+                    timeout,
+                    connect=min(timeout, self._connect_timeout_seconds),
+                    pool=min(timeout, settings.engine_pool_timeout_seconds),
+                )
             try:
-                response = await self._client.request(
+                response = await self._exchange(
                     method,
                     path,
                     params=dict(params) if params else None,
                     json=json_body,
                     headers={ENGINE_REQUEST_ID_HEADER: request_id, **(headers or {})},
+                    **extra,
                 )
+            except httpx.PoolTimeout as exc:
+                # Not the engine: this process ran out of connections to it.
+                # Retrying would only queue behind the same full pool, so fail
+                # now and rebuild the pool for whoever calls next.
+                self._recycle_pool("no free connection within the pool timeout")
+                raise EngineUnavailable(
+                    f"no free connection to the engine for {method} {path}"
+                ) from exc
             except httpx.TimeoutException as exc:
                 last_error = EngineTimeout(f"engine timed out on {method} {path}")
                 last_cause = exc
@@ -388,9 +519,15 @@ class EngineClient:
         params: Mapping[str, str] | None = None,
         json_body: Any = None,
         retries: int | None = None,
+        timeout: float | None = None,
     ) -> Any:
         response = await self._send(
-            method, path, params=params, json_body=json_body, retries=retries
+            method,
+            path,
+            params=params,
+            json_body=json_body,
+            retries=retries,
+            timeout=timeout,
         )
         return _decode(response)
 
@@ -418,10 +555,16 @@ class EngineClient:
 
     # -- health ------------------------------------------------------------
 
-    async def health(self) -> bool:
-        """Liveness only -- a probe must fail fast, so it never retries."""
+    async def health(self, *, timeout: float = 3.0) -> bool:
+        """Liveness only -- a probe must fail fast, so it never retries.
+
+        A probe that can take the full request timeout is worse than none: the
+        container healthcheck and every uptime monitor hang with it.
+        """
         try:
-            payload = await self._request("GET", HEALTH_PATH, retries=0)
+            payload = await self._request(
+                "GET", HEALTH_PATH, retries=0, timeout=timeout
+            )
         except EngineError:
             return False
         if isinstance(payload, dict):

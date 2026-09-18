@@ -40,6 +40,7 @@ def create_engine(url: str | None = None) -> AsyncEngine:
         kwargs.update(
             pool_size=settings.database_pool_size,
             max_overflow=settings.database_max_overflow,
+            pool_timeout=settings.database_pool_timeout_seconds,
             pool_pre_ping=True,
             pool_recycle=1800,
         )

@@ -96,10 +96,12 @@
         <size>100M</size>
         <count>3</count>
     </logger>
+    <!-- query_log is the one system log worth its disk: it is how a slow screen
+         gets traced back to the query behind it. A week is plenty. -->
     <query_log>
         <database>system</database>
         <table>query_log</table>
-        <ttl>event_date + INTERVAL 14 DAY DELETE</ttl>
+        <ttl>event_date + INTERVAL 7 DAY DELETE</ttl>
         <flush_interval_milliseconds>15000</flush_interval_milliseconds>
     </query_log>
     <trace_log remove="1"/>
@@ -107,6 +109,29 @@
     <asynchronous_metric_log remove="1"/>
     <session_log remove="1"/>
     <part_log remove="1"/>
+    <!-- Per-processor profiling of every query. Nobody reads it, and on this
+         host it had grown to 584 million rows and 12 GB — three quarters of the
+         whole analytics volume, against 43 MB of actual traces and spans — while
+         taxing every query with the writes. The rest below are the same kind of
+         exhaust at smaller scale.
+         Removing a log here stops it being written; it does not drop what is
+         already on disk. Reclaim that once, by hand, after deploying this:
+           TRUNCATE TABLE IF EXISTS system.processors_profile_log;  (and the others) -->
+    <processors_profile_log remove="1"/>
+    <query_metric_log remove="1"/>
+    <query_thread_log remove="1"/>
+    <query_views_log remove="1"/>
+    <text_log remove="1"/>
+    <error_log remove="1"/>
+    <latency_log remove="1"/>
+    <opentelemetry_span_log remove="1"/>
+    <asynchronous_insert_log remove="1"/>
+    <background_schedule_pool_log remove="1"/>
+    <aggregated_zookeeper_log remove="1"/>
+    <zookeeper_log remove="1"/>
+    <zookeeper_connection_log remove="1"/>
+    <blob_storage_log remove="1"/>
+    <backup_log remove="1"/>
 
     <!-- No outbound calls of any kind from the analytics store. -->
     <send_crash_reports>

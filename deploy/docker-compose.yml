@@ -164,17 +164,39 @@ services:
       # metric code in an isolated exec namespace with no daemon at all, and is
       # the vendor's own self-hosted default.
       PYTHON_CODE_EXECUTOR_STRATEGY: process
+      # The runner pre-forks this many executor processes and keeps them warm.
+      # Each imports the whole metric library and settles at ~310 MB, so the
+      # memory limit below has to cover PARALLEL_NUM x 310 MB plus the server.
+      # It used to be 5 (the image default) under a 900 MB limit: the fifth
+      # process could never fit, the kernel killed it, the pool forked another,
+      # and that loop ran ~450 times an hour at a full core — invisibly, since
+      # the gunicorn master survived and the container never restarted.
+      PYTHON_CODE_EXECUTOR_PARALLEL_NUM: ${METRIC_RUNNER_PARALLEL:-4}
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -T 4 -O /dev/null http://127.0.0.1:8000/healthcheck || exit 1"]
+      interval: 20s
+      timeout: 6s
+      retries: 6
+      start_period: 60s
     deploy:
       resources:
-        limits: { memory: 900M }
+        # User-supplied metric code runs here. It may have one and a half cores
+        # and no more, so a runaway metric cannot starve the API beside it.
+        limits: { memory: 2500M, cpus: "1.5" }
 
   # -------------------------------------------------------- safety inference
   safety-scanner:
     image: ${IMAGE_PREFIX:-fulcrum-ops}/safety-scanner:${ENGINE_TAG}
     <<: [*restart, *logging]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:5000/healthcheck', timeout=4).status==200 else 1)"]
+      interval: 20s
+      timeout: 6s
+      retries: 6
+      start_period: 120s
     deploy:
       resources:
-        limits: { memory: 2500M }
+        limits: { memory: 3G, cpus: "2.0" }
 
   # ---------------------------------------------------------- the engine
   # Private telemetry engine. No published ports: reachable only as
@@ -287,11 +309,27 @@ services:
       start_period: 30s
     deploy:
       resources:
-        limits: { memory: 1G }
+        # Four workers at ~240 MB each sat at 870 MB of a 1 GB limit — one busy
+        # export away from the kernel killing the API. The host has 32 GB.
+        limits: { memory: 3G }
 
   app-db:
     image: postgres:16.4-alpine
     <<: [*restart, *logging]
+    # max_connections: the API opens workers x (pool_size + max_overflow)
+    # connections — 4 x 16 = 64 — and the scheduler, the backup and an operator's
+    # psql need room on top. At the default of 100 against the old 4 x 30 a busy
+    # hour ended in "sorry, too many clients already".
+    # idle_in_transaction_session_timeout: a request that dies holding a
+    # transaction open must not pin its connection for ever.
+    command:
+      - postgres
+      - -c
+      - max_connections=200
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - idle_in_transaction_session_timeout=300000
     environment:
       POSTGRES_DB: ${APP_DB_NAME:-fulcrum_ops}
       POSTGRES_USER: ${APP_DB_USER:-fulcrum}
@@ -305,7 +343,7 @@ services:
       retries: 20
     deploy:
       resources:
-        limits: { memory: 800M }
+        limits: { memory: 1500M }
 
 volumes:
   state-db:

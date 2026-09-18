@@ -43,7 +43,38 @@ F = TypeVar("F", bound=Callable[..., Any])
 #: ingest quota, so the tail is counted rather than stored.
 MAX_YIELDED_ITEMS = 100
 
-_Item = Union[Trace, Span]
+class _TypedRoot:
+    """A trace together with the one typed span that is its whole body.
+
+    ``@trace(type="llm")`` on a function nobody else has traced opens a run, and
+    that run *is* an LLM call. A trace carries no type, no model and no token
+    counts -- only a span does -- so recording the trace alone leaves a run with
+    a name, a duration and nothing else: no model, no tokens, no cost and an
+    empty step list. Opening the span as well is what makes the decorator's
+    ``type`` mean something at the root, and gives ``current_span()`` something
+    to hang ``set_model()`` and ``set_usage()`` on.
+    """
+
+    __slots__ = ("trace", "span")
+
+    def __init__(self, trace: Trace, span: Span) -> None:
+        self.trace = trace
+        self.span = span
+
+    def set_output(self, value: Any) -> None:
+        self.span.set_output(value)
+        self.trace.set_output(value)
+
+    def record_exception(self, exc: BaseException) -> None:
+        self.span.record_exception(exc)
+        self.trace.record_exception(exc)
+
+    def end(self) -> None:
+        self.span.end()  # first: it nests itself inside the trace it closes into
+        self.trace.end()
+
+
+_Item = Union[Trace, Span, _TypedRoot]
 _Tokens = Tuple[Any, Any]
 
 
@@ -52,6 +83,8 @@ _Tokens = Tuple[Any, Any]
 
 def _attach(item: _Item) -> _Tokens:
     """Make ``item`` current, returning the tokens that undo it."""
+    if isinstance(item, _TypedRoot):
+        return (_context.attach_trace(item.trace), _context.attach_span(item.span))
     if isinstance(item, Trace):
         return (_context.attach_trace(item), _context.attach_span(None))
     return (None, _context.attach_span(item))
@@ -185,7 +218,7 @@ def trace(  # noqa: C901 - one function, four wrapper shapes; splitting it hides
                     else None
                 )
                 if _context.current_trace() is None:
-                    return active.trace(
+                    root = active.trace(
                         span_name,
                         input=captured,
                         metadata=metadata,
@@ -193,6 +226,19 @@ def trace(  # noqa: C901 - one function, four wrapper shapes; splitting it hides
                         agent=agent,
                         thread_id=thread_id,
                     )
+                    if type == "general":
+                        return root
+                    # The span is opened with the trace current and no span
+                    # current, exactly as it would be inside ``with trace:`` --
+                    # otherwise a sibling's leftover span becomes its parent.
+                    tokens = _attach(root)
+                    try:
+                        body = root.span(
+                            span_name, type=type, input=captured, metadata=metadata, tags=tags
+                        )
+                    finally:
+                        _detach(tokens)
+                    return _TypedRoot(root, body)
                 return active.span(
                     span_name,
                     type=type,

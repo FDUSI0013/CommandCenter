@@ -56,8 +56,18 @@ class Settings(BaseSettings):
     # ---- our own domain database -----------------------------------------
     # SQLite for local development, Postgres in every deployed environment.
     database_url: str = "sqlite+aiosqlite:///./fulcrum-ops.db"
-    database_pool_size: int = 10
-    database_max_overflow: int = 20
+    # Per *process*. Every uvicorn worker opens its own pool, so the ceiling on
+    # the server is workers x (pool_size + max_overflow) and that product has to
+    # stay under Postgres's max_connections with room for the scheduler, psql and
+    # the backup. 4 x (8 + 8) = 64 against a server configured for 200. It was
+    # 4 x 30 = 120 against 100, which is how a busy hour ended in "sorry, too
+    # many clients already" rather than in a queue.
+    database_pool_size: int = 8
+    database_max_overflow: int = 8
+    # How long a request waits for a pooled connection before giving up. The
+    # library default is 30 s, which turns an exhausted pool into a 30 s hang on
+    # every request -- including the health probe -- instead of a fast failure.
+    database_pool_timeout_seconds: float = 5.0
     database_echo: bool = False
 
     # ---- observability engine (private, never exposed to clients) --------
@@ -66,6 +76,8 @@ class Settings(BaseSettings):
     engine_api_key: str | None = None
     engine_timeout_seconds: float = 30.0
     engine_connect_timeout_seconds: float = 5.0
+    # Wait for a free pooled connection. Deliberately short: see EngineClient.
+    engine_pool_timeout_seconds: float = 3.0
     engine_max_connections: int = 100
     engine_retries: int = 2
     # When false, telemetry reads/writes degrade gracefully instead of 502ing.

@@ -52,9 +52,19 @@ WORKDIR /app
 USER fulcrum
 EXPOSE 8080
 
+# 127.0.0.1, not localhost: on a host with IPv6 disabled "localhost" resolves to
+# ::1 first and a server listening correctly on IPv4 is reported unhealthy.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
-  CMD curl -fsS http://localhost:8080/health || exit 1
+  CMD curl -fsS http://127.0.0.1:8080/health || exit 1
 
 # Migrations run before the server so a rolling restart never serves against
 # an older schema.
-CMD ["sh", "-c", "alembic upgrade head && exec uvicorn fulcrum_ops_api.main:app --host 0.0.0.0 --port 8080 --proxy-headers --forwarded-allow-ips='*' --workers ${WEB_CONCURRENCY:-4}"]
+#
+# --limit-max-requests retires each worker after a bounded number of requests
+# and the supervisor starts a fresh one in its place. It is a backstop, not a
+# fix: whatever a long-lived process slowly leaks — a socket, a pooled
+# connection, memory — a worker that is replaced every few days cannot
+# accumulate enough of it to fail. The jitter keeps the four from retiring
+# together, and the graceful-shutdown ceiling stops an open live-runs stream
+# from holding a retiring worker open indefinitely.
+CMD ["sh", "-c", "alembic upgrade head && exec uvicorn fulcrum_ops_api.main:app --host 0.0.0.0 --port 8080 --proxy-headers --forwarded-allow-ips='*' --workers ${WEB_CONCURRENCY:-4} --limit-max-requests ${WORKER_MAX_REQUESTS:-20000} --limit-max-requests-jitter ${WORKER_MAX_REQUESTS_JITTER:-4000} --timeout-graceful-shutdown 25"]

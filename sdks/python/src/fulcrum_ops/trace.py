@@ -373,6 +373,14 @@ class Span(_Recordable):
             self._client._report_span(self)
 
         if self._owns_trace and self.trace is not None:
+            # A span that is the whole run *is* the run: the console reads a
+            # run's input and output off the trace, so a trace opened only to
+            # carry this span would otherwise list as a run that took nothing
+            # in and gave nothing back.
+            if self.trace.input is None:
+                self.trace.input = self.input
+            if self.trace.output is None:
+                self.trace.output = self.output
             # This span opened the trace implicitly, so it also has to take the
             # trace's context tokens back down — going through ``__exit__``
             # rather than ``end()`` is what does that.

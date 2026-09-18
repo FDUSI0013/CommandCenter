@@ -345,6 +345,8 @@ class EngineDouble:
             "visibility": "private",
             "created_at": _iso(),
             "last_updated_at": _iso(),
+            # A project nothing has reported to yet has no last-trace time.
+            "last_updated_trace_at": None,
         }
         self.projects[project["id"]] = project
         return project
@@ -885,6 +887,10 @@ class EngineDouble:
         if project is not None:
             row["project_id"] = project["id"]
             row["project_name"] = project["name"]
+            # Stamped when a trace is *written*, not with the trace's own start
+            # time -- which is what lets a reader skip a project that has had
+            # nothing written to it since before the window it is asking about.
+            project["last_updated_trace_at"] = _iso()
         row.setdefault("id", _new_id())
         row.setdefault("start_time", _iso())
         existing = self.traces.get(row["id"], {})

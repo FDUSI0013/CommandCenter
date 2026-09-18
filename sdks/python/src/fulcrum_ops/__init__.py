@@ -33,8 +33,9 @@ Anthropic nor LangChain present.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
+from . import context as _context
 from ._version import SDK_NAME, SDK_VERSION, USER_AGENT
 from .client import FulcrumOps, configure, get_client, set_default_client, shutdown
 from .datasets import (
@@ -88,6 +89,8 @@ __all__ = [
     "trace",
     "traced",
     "span",
+    "current_span",
+    "current_trace",
     "Trace",
     "Span",
     "SPAN_TYPES",
@@ -157,6 +160,31 @@ def span(name: str, **kwargs: Any) -> Span:
             s.set_output({"chunks": len(chunks)})
     """
     return get_client().span(name, **kwargs)  # type: ignore[union-attr]
+
+
+def current_span() -> Optional[Span]:
+    """The innermost open span here, or ``None`` outside one.
+
+    This is how the body of a decorated function reports what only it knows::
+
+        @trace(name="answer", type="llm")
+        def answer(question: str) -> str:
+            reply = model.respond(question)
+            step = fulcrum_ops.current_span()
+            if step is not None:
+                step.set_model(reply.model, "openai")
+                step.set_usage(prompt_tokens=reply.usage.input_tokens,
+                               completion_tokens=reply.usage.output_tokens)
+            return reply.text
+
+    It needs no client: the span is carried by the execution context.
+    """
+    return _context.current_span()
+
+
+def current_trace() -> Optional[Trace]:
+    """The trace this thread or task is inside, or ``None`` outside one."""
+    return _context.current_trace()
 
 
 def score(trace_id: str, name: str, value: float, **kwargs: Any) -> bool:
