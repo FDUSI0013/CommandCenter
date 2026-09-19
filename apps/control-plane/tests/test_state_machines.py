@@ -676,8 +676,12 @@ async def test_a_rollback_is_a_new_deployment_pointing_at_the_one_it_undoes(
     assert data["version"] == "v1.9.0", "the rollback deploys the previous good version"
     assert data["rollback_of_deployment_id"] == broken.id
 
+    # Asking for a rollback undoes nothing: v2.0.0 is still what is serving until
+    # the rollback has been through its own gate and landed, and the screen must
+    # not say otherwise. (tests/test_audit_deployments.py follows it all the way
+    # to RolledBack; rolling the same release back twice is the next test.)
     source = await admin_client.get(f"/api/v1/deployments/{broken.id}")
-    assert source.json()["status"] == DeploymentStatus.ROLLED_BACK.value
+    assert source.json()["status"] == DeploymentStatus.SUCCEEDED.value
     assert "deployment.rollback" in await audit_actions(db, workspace)
 
 
