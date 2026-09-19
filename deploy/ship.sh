@@ -113,10 +113,12 @@ if ! cmp -s Caddyfile /etc/caddy/Caddyfile; then
   cp /etc/caddy/Caddyfile \$ROOT/releases/Caddyfile-before-\$SHA-\$STAMP
   # systemd's EnvironmentFile is not a shell script. The site addresses are
   # written unquoted and comma-separated -- FOO=a.example, b.example -- which
-  # systemd reads as one value and `source` reads as an assignment prefixing the
-  # command "b.example". Sourcing it therefore sets nothing, the site block
-  # expands to no address, and Caddy rejects it as a second global block. Read
+  # systemd reads as one value, while sourcing it reads an assignment prefixing
+  # the command "b.example" and so sets nothing at all: the site block then
+  # expands to no address and Caddy rejects it as a second global block. Read
   # the file the way systemd does: everything after the first "=" is the value.
+  # (No backticks anywhere in this heredoc -- it is unquoted, so they would run
+  # on the workstation while the release is being built.)
   while IFS= read -r line; do
     case "\$line" in ""|"#"*) continue ;; esac
     export "\${line%%=*}"="\${line#*=}"
@@ -127,7 +129,13 @@ if ! cmp -s Caddyfile /etc/caddy/Caddyfile; then
     cp Caddyfile /etc/caddy/Caddyfile
     systemctl reload caddy
     sleep 2
-    edge=\$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 https://127.0.0.1/health --resolve "\$(hostname -f):443:127.0.0.1" || true)
+    # Ask for the site by name, resolved to this host: Caddy serves named sites
+    # and answers a request for a bare IP with a TLS handshake failure, which
+    # the previous probe read as "the site is down" and rolled back a working
+    # configuration for.
+    addr=\$(printf '%s' "\$FULCRUM_SITE_ADDRESSES" | cut -d, -f1 | tr -d ' ')
+    edge=\$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 \
+      --resolve "\$addr:443:127.0.0.1" "https://\$addr/health" || true)
     if [ "\$edge" = "200" ] || [ "\$edge" = "503" ]; then
       echo "      edge reloaded (answers \$edge)"
     else
