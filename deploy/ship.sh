@@ -111,7 +111,16 @@ echo "[8/8] the edge, only if its configuration actually changed"
 # finish), and put back if the site stops answering afterwards.
 if ! cmp -s Caddyfile /etc/caddy/Caddyfile; then
   cp /etc/caddy/Caddyfile \$ROOT/releases/Caddyfile-before-\$SHA-\$STAMP
-  set -a; . /etc/default/caddy 2>/dev/null || true; set +a
+  # systemd's EnvironmentFile is not a shell script. The site addresses are
+  # written unquoted and comma-separated -- FOO=a.example, b.example -- which
+  # systemd reads as one value and `source` reads as an assignment prefixing the
+  # command "b.example". Sourcing it therefore sets nothing, the site block
+  # expands to no address, and Caddy rejects it as a second global block. Read
+  # the file the way systemd does: everything after the first "=" is the value.
+  while IFS= read -r line; do
+    case "\$line" in ""|"#"*) continue ;; esac
+    export "\${line%%=*}"="\${line#*=}"
+  done < /etc/default/caddy
   if ! caddy validate --config Caddyfile --adapter caddyfile >/dev/null 2>&1; then
     echo "      REFUSED: the new Caddyfile does not validate; the edge is untouched"
   else
