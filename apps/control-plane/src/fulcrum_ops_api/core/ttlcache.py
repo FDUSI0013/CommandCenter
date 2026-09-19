@@ -64,10 +64,16 @@ class SingleFlightCache(Generic[V]):
         return await asyncio.shield(running)
 
     def _settle(self, key: Hashable, ttl: float, done: asyncio.Future[V]) -> None:
-        if self._inflight.get(key) is done:
+        detached = self._inflight.get(key) is not done
+        if not detached:
             del self._inflight[key]
         if done.cancelled() or done.exception() is not None:
             return  # retrieved, so it is never reported as unobserved; not cached
+        if detached:
+            # invalidate() ran while this was computing. What it read may predate
+            # the write that invalidated it, so its waiters get their answer and
+            # the cache does not: storing it would undo the invalidation.
+            return
         self._entries[key] = (time.monotonic() + ttl, done.result())
         self._entries.move_to_end(key)
         while len(self._entries) > self._max_entries:

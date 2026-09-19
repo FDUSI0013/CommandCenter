@@ -30,8 +30,9 @@ import calendar
 import datetime as dt
 import functools
 import logging
+import time
 from collections.abc import Awaitable, Callable, Sequence
-from typing import Any
+from typing import Any, Final
 
 from sqlalchemy import Select, func, select
 from sqlalchemy import update as sa_update
@@ -617,6 +618,66 @@ async def _sweep_stale_runs(counts: dict[str, int]) -> None:
     counts["stale_runs_reaped"] = reaped
 
 
+#: How often the cached counters on ``policies`` are recounted. They feed a
+#: table column and a sort order, not an enforcement decision, so minutes-stale
+#: is fine and recounting every tick would be work for nothing.
+POLICY_ROLLUP_INTERVAL_SECONDS: Final[float] = 300.0
+_last_policy_rollup: float = 0.0
+
+
+async def _sweep_policy_rollups(counts: dict[str, int]) -> None:
+    """Recount the Policy Center's "Violations (30d)" and reach columns.
+
+    Nothing wrote them, so the table, its sort, the inspector's summary, the CSV
+    and Agent Detail's policy rows all read zero beside KPI cards that -- counting
+    the violation table directly -- did not. Short SQL, so it runs under the lock:
+    the lock is what makes one worker the writer.
+    """
+    global _last_policy_rollup
+    moment = time.monotonic()
+    if moment - _last_policy_rollup < POLICY_ROLLUP_INTERVAL_SECONDS:
+        return
+    _last_policy_rollup = moment
+    from . import policies
+
+    async with get_sessionmaker()() as session:
+        counts["policy_rollups_refreshed"] = await policies.refresh_rollups(session)
+        await session.commit()
+
+
+async def _sweep_capacity(counts: dict[str, int]) -> None:
+    """Record the platform's capacity readings. Under the lock, by its own design:
+    whether a pass is due is read from the table, so four workers record one
+    reading per interval rather than four."""
+    from . import quota
+
+    counts.update(await quota.run_capacity_sweep())
+
+
+async def _sweep_stranded_knowledge_syncs(counts: dict[str, int]) -> None:
+    """Close out syncs a restart orphaned, for the rows nobody is looking at."""
+    from . import knowledge
+
+    counts["knowledge_syncs_failed"] = await knowledge.fail_stranded_syncs()
+
+
+async def _sweep_budgets(counts: dict[str, int], after_lock: AfterLock) -> None:
+    """Re-measure every budget's spend, fire its thresholds, roll its period.
+
+    It waits on the telemetry store, and nothing that waits on another service
+    may run under the scheduler's lock -- a slow store would hold the lock, and
+    the pooled connection beneath it, for as long as it took. So it is only
+    *claimed* here and carried out once the lock has been given back. It gates
+    itself to its own interval and never raises.
+    """
+    from . import quota
+
+    async def measure() -> None:
+        counts.update(await quota.run_budget_sweep())
+
+    after_lock.append(measure)
+
+
 async def run_once() -> dict[str, int]:
     """One tick of the platform clock. Returns what each sweep did."""
     counts: dict[str, int] = {}
@@ -632,6 +693,10 @@ async def run_once() -> dict[str, int]:
             _sweep_secret_statuses,
             _sweep_license_statuses,
             _sweep_stale_runs,
+            _sweep_stranded_knowledge_syncs,
+            _sweep_policy_rollups,
+            _sweep_capacity,
+            functools.partial(_sweep_budgets, after_lock=after_lock),
         ):
             try:
                 await sweep(counts)
@@ -642,7 +707,10 @@ async def run_once() -> dict[str, int]:
         # commits: leaving this block rolls its transaction back, which is what
         # releases the lock and hands the connection back to the pool.
     for deferred in after_lock:
-        await deferred()
+        try:
+            await deferred()
+        except Exception:  # noqa: BLE001 - one deferred job must not cost the others
+            log.exception("scheduler deferred work failed")
     return counts
 
 

@@ -28,6 +28,7 @@ from .core.errors import (
     AppError,
     app_error_handler,
     database_busy_handler,
+    engine_error_handler,
     http_error_handler,
     unhandled_error_handler,
     validation_error_handler,
@@ -38,7 +39,7 @@ from .core.logging import (
     configure_logging,
 )
 from .db import session as db_session
-from .engine import EngineClient, set_engine_client
+from .engine import EngineClient, EngineError, set_engine_client
 
 log = logging.getLogger("fulcrum_ops")
 
@@ -131,6 +132,7 @@ def create_app() -> FastAPI:
     # A full database pool is load, not a bug: 503 "busy" with Retry-After
     # rather than the opaque 500 the catch-all below would make of it.
     app.add_exception_handler(DatabasePoolTimeout, database_busy_handler)
+    app.add_exception_handler(EngineError, engine_error_handler)
     app.add_exception_handler(StarletteHTTPException, http_error_handler)
     app.add_exception_handler(RequestValidationError, validation_error_handler)
     app.add_exception_handler(Exception, unhandled_error_handler)

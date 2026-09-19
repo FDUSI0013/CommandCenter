@@ -177,6 +177,33 @@ async def database_busy_handler(request: Request, exc: Exception) -> JSONRespons
     return await app_error_handler(request, ServiceBusy())
 
 
+async def engine_error_handler(request: Request, exc: Exception) -> JSONResponse:
+    """An engine failure no service translated, answered as what it is.
+
+    Registered for ``EngineError`` in ``main``. Every service is supposed to map
+    the adapter's errors onto this API's own -- most do -- but one that forgets
+    lets the raw exception through, and the catch-all below turns that into a
+    500 "internal error": the store being down reported as *our* bug, with no
+    ``Retry-After``, on a screen that would otherwise have said "telemetry is
+    unavailable, try again". This is the net under all of them.
+
+    Imported here rather than at module top: ``engine`` reads ``core.config``,
+    and this module must stay importable by both.
+    """
+    from ..engine import EngineNotFound, EngineUnavailable
+
+    if isinstance(exc, EngineNotFound):
+        return await app_error_handler(request, NotFound("That item does not exist."))
+    if isinstance(exc, EngineUnavailable):
+        return await app_error_handler(request, TelemetryBackendUnavailable())
+    return await app_error_handler(
+        request,
+        TelemetryBackendUnavailable(
+            "The telemetry store rejected the request.", code="telemetry_rejected"
+        ),
+    )
+
+
 async def http_error_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
     code_map = {
         400: "bad_request",
