@@ -259,6 +259,29 @@ async def wait_for_phase(http, suite_id: str, run_id: str, phase: str) -> dict[s
     raise AssertionError(f"the run never reached {phase}: {progress}")
 
 
+async def wait_for_progress(
+    http, suite_id: str, run_id: str, phase: str, key: str, value: Any
+) -> dict[str, Any]:
+    """Wait for one progress figure to reach ``value`` while in ``phase``.
+
+    Reaching a phase and having counted the work of that phase are two
+    different instants, and on a loaded machine they are far apart: sampling
+    once at the phase boundary reads a counter that is still zero. Waiting for
+    the figure itself keeps what the test is really asserting -- that the
+    counter reports work *judged* rather than work registered -- without
+    depending on how fast the box is.
+    """
+    progress: dict[str, Any] = {}
+    for _ in range(100):
+        progress = (
+            await http.get(f"/api/v1/testing/suites/{suite_id}/runs/{run_id}/progress")
+        ).json()
+        if progress["phase"] == phase and progress[key] == value:
+            return progress
+        await asyncio.sleep(0.1)
+    raise AssertionError(f"{key} never reached {value} during {phase}: {progress}")
+
+
 async def supervisors_gone() -> None:
     """Give finished supervisors a moment to leave the loop before it closes."""
     for _ in range(100):
@@ -329,12 +352,15 @@ async def test_the_wait_settles_once_the_verdict_count_stops_moving(
     started = await admin_client.post(f"/api/v1/testing/suites/{suite_id}/run", json={})
     run_id = started.json()["id"]
 
-    scoring = await wait_for_phase(admin_client, suite_id, run_id, "Scoring")
+    scoring = await wait_for_progress(
+        admin_client, suite_id, run_id, "Scoring", "scored_cases", 1
+    )
     assert scoring["processed_cases"] == 2
     assert scoring["scored_cases"] == 1, (
         "the experiment's trace_count is cases registered, not cases judged: "
         "reading it as 'scored' pinned the bar at 99% from the first poll"
     )
+    assert scoring["scored_cases"] != 2, "the unjudged trace must not be counted"
     assert (scoring["passed"], scoring["failed"]) == (1, 0)
 
     await until_terminal(admin_client, suite_id, run_id, seconds=10.0)
