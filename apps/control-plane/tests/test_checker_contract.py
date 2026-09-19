@@ -137,3 +137,58 @@ async def test_an_unknown_score_source_is_folded_not_fatal(
     scores = stored.get("feedback_scores") or []
     assert scores and scores[0]["source"] == "sdk"
     assert agent.engine_project_name
+
+
+async def test_a_scanner_that_bounced_does_not_stand_its_guardrails_down(
+    ingest_client, factory, workspace, engine
+):
+    """Unreachable is not the same as refused, and only one of them is durable.
+
+    A validation the scanner answers 500 to is asked no more for a while: the
+    answer will not change until somebody installs the model it wants. But a
+    scanner that cannot be reached is usually a scanner that is restarting --
+    which is what deploying one does to it -- and suspending PII scanning for
+    five minutes over that invents a governance gap out of a blip. Found in
+    production: our own deploy bounced the scanner and switched PII off.
+    """
+    from fulcrum_ops_api.services import guardrails as service
+
+    agent = await factory.provisioned_agent(workspace, engine, name="Support Bot")
+    await factory.guardrail(workspace, name="PII shield")
+    service._SUSPENDED.clear()
+
+    def post_a_run():
+        return ingest_client.post(
+            "/api/v1/ingest/traces",
+            json={
+                "agent": "Support Bot",
+                "traces": [
+                    {
+                        "name": "reply",
+                        "start_time": "2026-01-01T00:00:00Z",
+                        "input": {"text": "dana@acme.test"},
+                    }
+                ],
+            },
+        )
+
+    # The scanner is unreachable for one batch.
+    engine.fail_path("guardrails/validations", 503)
+    assert (await post_a_run()).status_code == 200
+    assert service.suspended_validations() == [], (
+        "a scanner that was merely unreachable must be asked again next batch"
+    )
+
+    # It comes back, and the very next batch is evaluated.
+    engine.recover()
+    engine.checker_verdicts = [real_scanner_row()]
+    accepted = await post_a_run()
+    assert accepted.status_code == 200
+    assert accepted.json()["guardrails_evaluated"] is True
+    assert agent.id
+
+    # A validation it actively refuses is stood down until it is worth retrying.
+    engine.fail_path("guardrails/validations", 500)
+    assert (await post_a_run()).status_code == 200
+    assert service.suspended_validations() == ["PII"]
+    service._SUSPENDED.clear()

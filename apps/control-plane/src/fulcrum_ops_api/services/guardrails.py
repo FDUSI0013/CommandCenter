@@ -45,6 +45,7 @@ from ..engine import (
     EngineBadRequest,
     EngineError,
     EngineNotFound,
+    EngineServerError,
     EngineTimeout,
     deadline,
     get_engine_client,
@@ -427,6 +428,11 @@ def _checker_request(guardrail: GuardrailConfig) -> dict[str, Any]:
     return {"type": name, "config": config}
 
 
+#: Scanner failures that mean "not now" rather than "not ever": a gateway in
+#: front of it, a service still warming up, a request that ran out of time.
+#: Only a 500 -- the handler itself raising -- is worth backing off from.
+_RETRY_LATER: Final[frozenset[int]] = frozenset({502, 503, 504})
+
 #: Validation name -> monotonic instant until which the scanner is not asked
 #: for it. Per process: the worst case is each worker discovering the same
 #: broken validation once. A key of the form ``guardrail:<id>`` suspends one
@@ -492,6 +498,35 @@ def _is_suspended(name: str) -> bool:
 
 
 def _suspend(name: str, exc: Exception) -> None:
+    """Back a validation off -- but only one the scanner actually refused.
+
+    Back off when asking again would be futile or expensive, and only then.
+
+    * Futile: the scanner answered 500, its handler having raised. It will
+      raise on the next batch too -- the prompt-injection model is not
+      installed -- so asking costs a round trip for a verdict that never comes.
+    * Expensive: it accepted the request and never answered. Every batch then
+      waits out the whole timeout before giving up, which is the latency this
+      code exists to avoid.
+    * Neither: it could not be reached, or answered 502/503 from in front of
+      itself. That fails in microseconds, and it is what a *restarting*
+      scanner looks like -- which is exactly what deploying one does to it.
+      Standing PII scanning down for five minutes over that invents a
+      governance gap out of a blip. Not evaluated this batch; asked again next.
+
+    Found in production: our own deploy bounced the scanner and switched PII
+    off for five minutes.
+    """
+    futile = isinstance(exc, EngineServerError) and exc.status not in _RETRY_LATER
+    expensive = isinstance(exc, EngineTimeout)
+    if not (futile or expensive):
+        log.warning(
+            "the content scanner could not answer %s checks (%s); this batch was not "
+            "evaluated and the next one will try again",
+            name,
+            exc,
+        )
+        return
     _SUSPENDED[name] = time.monotonic() + settings.guardrail_suspend_seconds
     log.error(
         "the content scanner cannot run %s checks (%s); guardrails of that type are "

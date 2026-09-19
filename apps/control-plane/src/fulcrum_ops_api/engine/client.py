@@ -88,6 +88,23 @@ class EngineUnavailable(EngineError):
     """Unreachable, or still answering 5xx after the last retry."""
 
 
+class EngineServerError(EngineUnavailable):
+    """The engine was reached and answered an error status of its own.
+
+    Distinct from being unreachable, because the two mean opposite things to a
+    caller deciding whether to keep trying. A service that cannot be reached is
+    usually restarting and will answer again in a moment; a service that
+    answers 500 to a particular request will answer 500 to it again. Both are
+    "telemetry is unavailable" to a screen, so this stays an
+    ``EngineUnavailable`` -- only code that backs a feature off needs the
+    difference.
+    """
+
+    def __init__(self, status: int, message: str) -> None:
+        self.status = status
+        super().__init__(message)
+
+
 class EngineTimeout(EngineUnavailable):
     """Connected but did not answer in time.
 
@@ -558,8 +575,9 @@ class EngineClient:
                 )
                 if response.status_code < 500:
                     return self._checked(response)
-                last_error = EngineUnavailable(
-                    f"engine answered {response.status_code} on {method} {path}"
+                last_error = EngineServerError(
+                    response.status_code,
+                    f"engine answered {response.status_code} on {method} {path}",
                 )
                 last_cause = None
 
