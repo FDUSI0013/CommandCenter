@@ -53,7 +53,7 @@ async def upstream() -> AsyncIterator[str]:
     port = _free_port()
     server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error"))
     serving = asyncio.create_task(server.serve())
-    while not server.started:
+    while not server.started:  # noqa: ASYNC110 - uvicorn exposes a flag, not an event
         await asyncio.sleep(0.02)
     try:
         yield f"http://127.0.0.1:{port}"

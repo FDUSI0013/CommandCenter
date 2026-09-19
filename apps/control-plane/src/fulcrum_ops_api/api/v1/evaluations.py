@@ -1,9 +1,10 @@
 """Evaluations routes.
 
-Thirteen endpoints back one screen: the KPI cards, the scored table and its two
-filters, the CSV export, the Run Evaluation modal, the inspector's score
-breakdown and trend, the progress the modal watches while a run is live, the
-Re-run button, the baseline comparison, and the dataset picker behind all of it.
+Fourteen endpoints back one screen: the KPI cards, the scored table and its two
+filters (and the datasets the Dataset filter offers), the CSV export, the Run
+Evaluation modal, the inspector's score breakdown and trend, the progress the
+modal watches while a run is live, the Re-run button, the baseline comparison,
+and the dataset picker behind all of it.
 
 Handlers here only parse, delegate and shape. Workspace scoping, role checks,
 audit writes and every call to the telemetry engine live in
@@ -18,6 +19,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, BackgroundTasks, Depends, Query, Request, status
 from fastapi.responses import StreamingResponse
 
+from ...db.session import commit_then
 from ...models.quality import EvaluationStatus
 from ...schemas.evaluations import (
     EXPORT_COLUMNS,
@@ -57,10 +59,17 @@ async def _start(
     bar until the reaper fails it a quarter of an hour later. Committing here
     closes that window — the same order the export queue uses — and means a
     caller holding a 202 is holding a promise the database has already accepted.
+
+    The reply is built first. What is committed stays committed, and a handler
+    that raises never runs its background tasks — so anything that can still
+    fail has to come before the commit, or a failure there would leave exactly
+    the orphan this function exists to prevent: a durable Queued row with no
+    supervisor.
     """
-    await session.commit()
-    background.add_task(service.execute_evaluation, run.id, principal.workspace_id)
     records = await service.read_many(session, principal, [run])
+    await commit_then(
+        session, background, service.execute_evaluation, run.id, principal.workspace_id
+    )
     return records[0]
 
 
@@ -361,8 +370,10 @@ async def get_progress(
     """Measured progress of a running evaluation.
 
     Counts come from the supervisor driving the run, or — when the run belongs
-    to another worker — from the experiment itself. The percentage is derived
-    from cases registered and cases judged; nothing here is a timer.
+    to another worker — from the evaluation's own row: the phase it has reached
+    and the size of the work. The telemetry store is never read here; the modal
+    polls this every second and a half. The percentage is derived from cases
+    registered and cases judged; nothing here is a timer.
     """
     return await service.get_progress(session, principal, evaluation_id)
 

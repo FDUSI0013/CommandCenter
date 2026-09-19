@@ -13,11 +13,13 @@ from pathlib import Path
 
 import httpx
 import pytest
-from sqlalchemy import event, update
+from sqlalchemy import event, select, update
 
 from conftest import APP_BASE_URL, authorise, error_code
 from fulcrum_ops_api.core.config import settings
+from fulcrum_ops_api.models.governance import AuditEvent
 from fulcrum_ops_api.models.identity import ApiKey, Role, User, Workspace
+from fulcrum_ops_api.models.licensing import SeatAssignment, TenantLicense
 
 STRONG_PASSWORD = "horse-battery-staple-9"
 ATTACKER_PASSWORD = "attacker-chosen-pass-1"
@@ -451,3 +453,203 @@ async def test_a_password_is_verified_off_the_event_loop(client, northwind_owner
     assert signed_in.status_code == 200, signed_in.text
     for job in held:
         job.result(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# #170  The ``read`` scope was never asked for, so an ingest-only key -- the
+#       credential shipped inside a deployed agent -- could read the workspace
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+async def key_client(app, factory, workspace):
+    """An HTTP client per key, minted with exactly the scopes a test names."""
+    opened: list[httpx.AsyncClient] = []
+
+    async def _open(*scopes: str, agent_id: str | None = None) -> httpx.AsyncClient:
+        token, _row = await factory.api_key(
+            workspace, name=f"{'+'.join(scopes)} key", scopes=list(scopes), agent_id=agent_id
+        )
+        http = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=APP_BASE_URL)
+        http.headers["Authorization"] = f"Bearer {token}"
+        opened.append(http)
+        return http
+
+    yield _open
+    for http in opened:
+        await http.aclose()
+
+
+async def test_an_ingest_only_key_cannot_read_the_workspace(
+    key_client, factory, workspace, engine
+):
+    """Extracted from an agent container, it listed every other agent's runs."""
+    agent = await factory.provisioned_agent(workspace, engine, name="Support Bot")
+    http = await key_client("ingest", agent_id=agent.id)
+
+    for path in (
+        "/api/v1/runs",
+        "/api/v1/agents",
+        "/api/v1/prompts",
+        "/api/v1/configurations",
+        "/api/v1/workspaces/current",
+    ):
+        refused = await http.get(path)
+        assert refused.status_code == 403, f"{path}: {refused.text}"
+        assert error_code(refused) == "permission_denied"
+        assert "'read' scope" in refused.json()["error"]["message"]
+
+    # Nor the member-level writes its role would otherwise have let through.
+    written = await http.post("/api/v1/evaluations/datasets", json={"name": "Exfil"})
+    assert written.status_code == 403, written.text
+    assert "'read' scope" in written.json()["error"]["message"]
+
+
+async def test_an_ingest_only_key_still_does_everything_an_agent_needs(
+    key_client, factory, workspace, engine
+):
+    agent = await factory.provisioned_agent(workspace, engine, name="Support Bot")
+    http = await key_client("ingest", agent_id=agent.id)
+
+    assert (await http.get("/api/v1/auth/session")).status_code == 200
+    assert (await http.get("/api/v1/auth/status")).status_code == 204
+    assert (await http.get("/api/v1/ingest/config")).status_code == 200
+
+    reported = await http.post(
+        "/api/v1/ingest/traces",
+        json={
+            "traces": [
+                {"name": "handle", "start_time": "2026-01-01T00:00:00Z", "agent": "Support Bot"}
+            ]
+        },
+    )
+    assert reported.status_code == 200, reported.text
+    assert reported.json()["accepted"] == 1, reported.text
+
+    rated = await http.post("/api/v1/feedback", json={"rating": 5, "body": "Spot on"})
+    assert rated.status_code == 201, rated.text
+
+
+async def test_the_read_scope_is_what_opens_the_read_routes(
+    key_client, factory, workspace, engine
+):
+    await factory.provisioned_agent(workspace, engine, name="Support Bot")
+
+    for scopes in (("read",), ("ingest", "read"), ("admin",)):
+        http = await key_client(*scopes)
+        listed = await http.get("/api/v1/runs")
+        assert listed.status_code == 200, f"{scopes}: {listed.text}"
+
+    # And it opens nothing else: reporting is still ``ingest``'s.
+    reader = await key_client("read")
+    refused = await reader.post("/api/v1/feedback", json={"rating": 5, "body": "Spot on"})
+    assert refused.status_code == 403, refused.text
+    assert "'ingest' scope" in refused.json()["error"]["message"]
+
+
+async def test_a_person_is_not_asked_for_a_scope(as_role):
+    """Scopes are a key's; a signed-in member reads by role, as before."""
+    async with as_role(Role.MEMBER) as http:
+        assert (await http.get("/api/v1/prompts")).status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# #165  Removing (or deactivating) a member left their licensed seat consumed
+# ---------------------------------------------------------------------------
+
+
+async def _seat(http: httpx.AsyncClient, licence_id: str, user_id: str) -> httpx.Response:
+    return await http.post(
+        f"/api/v1/licensing/tenants/{licence_id}/seats", json={"user_id": user_id}
+    )
+
+
+async def test_removing_a_member_gives_their_seat_back(
+    admin_client, db, factory, workspace, member, viewer
+):
+    """A full licence stayed full after the person left, and the replacement got 402."""
+    licence = await factory.license(workspace, seats_purchased=1)
+    assert (await _seat(admin_client, licence.id, member.id)).status_code == 201
+    assert (await _seat(admin_client, licence.id, viewer.id)).status_code == 402
+
+    removed = await admin_client.delete(f"/api/v1/workspaces/users/{member.id}")
+    assert removed.status_code == 204, removed.text
+
+    seats = await db.scalars(select(SeatAssignment).where(SeatAssignment.user_id == member.id))
+    assert [seat.released_at is not None for seat in seats] == [True]
+    assert (await db.get(TenantLicense, licence.id)).seats_assigned == 0
+
+    released = await db.scalars(
+        select(AuditEvent).where(AuditEvent.action == "licensing.seat.released")
+    )
+    assert [row.entity_label for row in released] == [member.email]
+
+    # Which is the point: the replacement now fits.
+    replacement = await _seat(admin_client, licence.id, viewer.id)
+    assert replacement.status_code == 201, replacement.text
+
+
+async def test_deactivating_a_member_gives_their_seat_back(
+    admin_client, factory, workspace, member, viewer
+):
+    licence = await factory.license(workspace, seats_purchased=1)
+    assert (await _seat(admin_client, licence.id, member.id)).status_code == 201
+
+    off = await admin_client.patch(
+        f"/api/v1/workspaces/users/{member.id}", json={"is_active": False}
+    )
+    assert off.status_code == 200, off.text
+
+    replacement = await _seat(admin_client, licence.id, viewer.id)
+    assert replacement.status_code == 201, replacement.text
+
+
+async def test_removing_a_member_leaves_everybody_elses_seat_alone(
+    admin_client, db, factory, workspace, member, viewer
+):
+    licence = await factory.license(workspace, seats_purchased=5)
+    assert (await _seat(admin_client, licence.id, member.id)).status_code == 201
+    assert (await _seat(admin_client, licence.id, viewer.id)).status_code == 201
+
+    removed = await admin_client.delete(f"/api/v1/workspaces/users/{member.id}")
+    assert removed.status_code == 204, removed.text
+
+    held = await db.scalars(select(SeatAssignment).where(SeatAssignment.released_at.is_(None)))
+    assert [seat.user_id for seat in held] == [viewer.id]
+    assert (await db.get(TenantLicense, licence.id)).seats_assigned == 1
+
+
+# ---------------------------------------------------------------------------
+# #168  A key that had reported all day showed "0 ingest calls, 0 records"
+# ---------------------------------------------------------------------------
+
+
+async def test_the_usage_of_a_busy_key_is_unmeasured_not_zero(
+    admin_client, client, factory, workspace, engine
+):
+    """Accepted batches write no audit row, so the trail cannot count them; the
+    panel said nought, which reads as "this agent is not reporting"."""
+    await factory.provisioned_agent(workspace, engine, name="Support Bot")
+    token, row = await factory.api_key(workspace, name="Fleet key")
+
+    reported = await client.post(
+        "/api/v1/ingest/traces",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "traces": [
+                {"name": "handle", "start_time": "2026-01-01T00:00:00Z", "agent": "Support Bot"}
+            ]
+        },
+    )
+    assert reported.status_code == 200, reported.text
+    assert reported.json()["accepted"] == 1, reported.text
+
+    usage = await admin_client.get(f"/api/v1/workspaces/api-keys/{row.id}/usage")
+    assert usage.status_code == 200, usage.text
+    body = usage.json()
+    assert body["last_used_at"] is not None, "the evidence that the key is in use"
+    for field in ("ingest_calls", "ingest_records", "ingest_bytes"):
+        assert body[field] is None, f"{field} is not measured and must not read as {body[field]}"
+    # What the trail does hold is still counted, as what it is.
+    assert body["total_calls"] == 0
+    assert body["by_action"] == []

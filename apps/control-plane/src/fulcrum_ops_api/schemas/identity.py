@@ -601,19 +601,42 @@ class ApiKeyUsageDay(BaseModel):
 
 
 class ApiKeyUsage(BaseModel):
-    """What a key has actually done, read from the audit trail it wrote."""
+    """What a key has actually done, read from the audit trail it wrote.
+
+    The trail holds *audited operations*, which is not the same thing as
+    requests: a telemetry batch that is accepted whole writes no audit row, and
+    that is nearly every request a healthy agent makes. So the two call counts
+    are counts of audited operations, and the ingest figures are ``null`` --
+    "not measured", which the console renders as a dash -- rather than a zero
+    that reads as "this agent is not reporting" beside a ``last_used_at`` of two
+    minutes ago. ``last_used_at`` is the evidence that a key is in use.
+    """
 
     key_id: str
     name: str
     status: ApiKeyStatus
     last_used_at: dt.datetime | None = None
     last_used_ip: str | None = None
-    first_seen_at: dt.datetime | None = None
-    total_calls: int = Field(description="Audited operations attributed to this key, all time")
-    calls_in_window: int
-    ingest_calls: int
-    ingest_records: int = Field(description="Spans, traces and events this key ingested")
-    ingest_bytes: int = 0
+    first_seen_at: dt.datetime | None = Field(
+        None, description="The key's first audited operation; null when it has none"
+    )
+    total_calls: int = Field(
+        description=(
+            "Audited operations attributed to this key, all time. Not requests: accepted "
+            "telemetry batches are not audited"
+        )
+    )
+    calls_in_window: int = Field(description="Audited operations inside the window")
+    ingest_calls: int | None = Field(
+        None, description="Ingest requests made with this key. Null: not metered per key"
+    )
+    ingest_records: int | None = Field(
+        None,
+        description="Spans, traces and events this key ingested. Null: not metered per key",
+    )
+    ingest_bytes: int | None = Field(
+        None, description="Bytes this key ingested. Null: not metered per key"
+    )
     window_days: int
     by_action: list[ApiKeyUsageAction] = Field(default_factory=list)
     daily: list[ApiKeyUsageDay] = Field(default_factory=list)

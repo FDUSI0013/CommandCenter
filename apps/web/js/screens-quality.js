@@ -93,13 +93,20 @@
    * `poll` returns the server's progress record; the bar is drawn from the
    * counts it reports, never from a timer. Polling stops when the record says
    * it is terminal or when the modal closes.
+   *
+   * `cancel`, when the job has a server-side stop, adds a Cancel Run button. It
+   * returns the promise of that request; the terminal record the next poll
+   * brings back is what confirms it, through the same `onDone` as any ending.
    */
   function progressModal(cfg){
-    let timer = null, closed = false;
+    let timer = null, closed = false, seq = 0;
+    const opened = Date.now();
+    const footer = [{ label:'Run in Background', onClick:(close)=>{ close(); stop(); } }];
+    if(cfg.cancel) footer.unshift({ label:'Cancel Run', cls:'ghost-danger', onClick:(close, modal)=>cancelRun(modal) });
     const handle = openModal({
       title: cfg.title, icon: cfg.icon || 'beaker',
       body: `<div id="pgBody"><div class="card-loading" style="height:96px"></div></div>`,
-      footer: [{ label:'Run in Background', onClick:(close)=>{ close(); stop(); } }],
+      footer,
       onOpen(modal){ tick(modal); },
     });
     const overlay = handle.el.closest('.modal-overlay');
@@ -108,11 +115,34 @@
 
     function stop(){ closed = true; if(timer) clearTimeout(timer); timer = null; watcher.disconnect(); }
 
+    async function cancelRun(modal){
+      try {
+        await cfg.cancel();
+      } catch (err) {
+        // A 409 is not a failure: the run ended by itself before the request
+        // landed, and the poll below paints how.
+        if(!(err && err.status === 409)){ toast('error','Could not cancel the run', errText(err)); return; }
+        toast('info','Run already ended','It finished before the cancel reached it.');
+      }
+      // The dialog may have been dismissed while the request was out; the
+      // screen still has to hear how the run ended.
+      if(closed){
+        cfg.poll().then(p => { if(p.is_terminal && cfg.onDone) cfg.onDone(p); }).catch(()=>{});
+        return;
+      }
+      if(timer) clearTimeout(timer);
+      timer = null;
+      tick(modal);
+    }
+
     function tick(modal){
       if(closed) return;
+      // A cancel asks again at once, so an answer still in flight from the
+      // poll before it is dropped rather than ending the run twice.
+      const mine = ++seq;
       cfg.poll()
         .then(p => {
-          if(closed) return;
+          if(closed || mine !== seq) return;
           const body = modal.querySelector('#pgBody');
           if(!body){ stop(); return; }
           body.innerHTML = paint(p);
@@ -122,10 +152,13 @@
             setTimeout(()=>{ if(document.body.contains(modal)) handle.close(); }, 1400);
             return;
           }
-          timer = setTimeout(()=>tick(modal), 1400);
+          // Brisk while a run is likely to finish, then eased off: a run still
+          // going after half a minute is a long one, and every open dialog
+          // polling at full rate is load the run itself has to share.
+          timer = setTimeout(()=>tick(modal), Date.now() - opened < 30000 ? 1400 : 3000);
         })
         .catch(err => {
-          if(closed) return;
+          if(closed || mine !== seq) return;
           stop();
           const body = modal.querySelector('#pgBody');
           if(body){ body.innerHTML = ''; body.appendChild(screenError(err, null, 'the progress of this run')); }
@@ -172,7 +205,7 @@
           <button class="btn primary" id="evNew"${gate('member','Running an evaluation requires the member role.')}>${ICONS.play}Run Evaluation</button>`})}
         <div id="evKpis">${kpiSkeleton(EV_KPIS)}</div>
         <div id="evTrend" class="mt"></div>
-        <div class="with-inspector mt" id="evLayout">
+        <div class="with-inspector mt collapsed" id="evLayout">
           <div id="evTableWrap"></div>
           <div class="inspector" id="evInspector"></div>
         </div>`;
@@ -279,8 +312,13 @@
         ],
         source: (params) => API.evaluations.list(params),
         exportSource: (params) => API.evaluations.export(params),
-        onLoad: (rows) => { loadSummary(); fillJudges(rows); },
-        autoSelectFirst: true,
+        // The KPI cards are workspace-wide — paging, sorting, filtering and
+        // searching do not move them — so the summary is asked for once with
+        // the screen and again when a run is started or ends, not per reload.
+        onLoad: fillJudges,
+        // No row is opened until the reader clicks one: the inspector reads the
+        // per-case scores live from the telemetry store, and a screen visit
+        // should not cost a store read nobody asked for.
         onSelect: showEval,
         rowActions: r => [
           { label:'Re-run Evaluation', icon:'refresh', onClick:()=>rerun(r) },
@@ -296,6 +334,7 @@
       wrap.appendChild(table.el);
       document.getElementById('evSearch').addEventListener('input', e => table.search(e.target.value));
       document.getElementById('evExport').addEventListener('click', () => table.export());
+      loadSummary();
 
       /** The judge list is workspace-specific, so it grows from what came back. */
       function fillJudges(rows){
@@ -312,18 +351,27 @@
         });
       }
 
-      /** The dataset picker is the engine's, so the dropdown waits on it. */
+      /**
+       * The Dataset filter offers the datasets this workspace's evaluations
+       * name — read from the control plane's own rows. The engine's dataset
+       * list is the wrong source for a filter: it is paged (the first 25 only),
+       * costs a store read, and offers datasets no evaluation here has used.
+       */
       function fillDatasets(){
         const sel = table.filterEl && table.filterEl.querySelector('[data-fi="1"]');
         if(!sel) return;
-        API.evaluations.datasets()
-          .then(page => {
-            (page.items || []).forEach(d => {
+        API.evaluations.datasetsInUse()
+          .then(names => {
+            const keep = sel.value;
+            Array.from(sel.options).slice(1).forEach(o => o.remove());
+            (names || []).forEach(name => {
               const o = document.createElement('option');
-              o.textContent = d.name;
+              o.textContent = name;
               sel.appendChild(o);
             });
-            if(!(page.items || []).length) sel.title = 'This workspace has no evaluation datasets yet.';
+            sel.value = keep;
+            if(sel.value !== keep) sel.value = '';
+            sel.title = (names || []).length ? '' : 'No evaluation has been run in this workspace yet.';
           })
           .catch(err => { sel.title = 'Datasets could not be listed: ' + ((err && err.message) || 'unavailable'); });
       }
@@ -343,7 +391,7 @@
           <div class="card-loading" style="height:220px;margin:12px"></div>`;
         insp.querySelector('#evClose').addEventListener('click', ()=>document.getElementById('evLayout').classList.add('collapsed'));
 
-        API.evaluations.detail(row.id, { item_page: 1, item_page_size: 8 })
+        API.evaluations.detail(row.id, { item_page: 1, item_page_size: CASE_PAGE })
           .then(d => { if(selectedId === row.id) paintEval(insp, d); })
           .catch(err => {
             if(selectedId !== row.id) return;
@@ -352,9 +400,82 @@
           });
       }
 
+      const CASE_PAGE = 8;
+      const EV_COLUMNS = { correctness:'Correctness', grounding:'Grounding', faithfulness:'Faithfulness', safety:'Safety' };
+
+      /**
+       * One page of the case breakdown, with the controls to reach the rest.
+       *
+       * `items_unavailable` means the telemetry store did not answer: the empty
+       * list and the zero total are then unknown, not "no cases", so the panel
+       * says that and offers the read again instead of reporting an empty run.
+       */
+      function paintCases(d){
+        const host = document.getElementById('evCases');
+        if(!host) return;
+        // `whole` repaints the inspector, not just this list: after an
+        // unanswered read the case total above was unknown as well.
+        const turn = (page, whole) => {
+          host.innerHTML = '<div class="card-loading" style="height:120px"></div>';
+          API.evaluations.detail(d.id, { item_page: page, item_page_size: CASE_PAGE })
+            .then(next => {
+              if(selectedId !== d.id) return;
+              const insp = document.getElementById('evInspector');
+              if(whole && insp) paintEval(insp, next); else paintCases(next);
+            })
+            .catch(err => {
+              if(selectedId !== d.id) return;
+              const el = document.getElementById('evCases');
+              if(el){ el.innerHTML = ''; el.appendChild(screenError(err, ()=>turn(page, whole), 'the case breakdown')); }
+            });
+        };
+        if(d.items_unavailable){
+          host.innerHTML = `<div class="quote" style="border-color:rgba(217,119,6,.4)"><b>Case breakdown unavailable</b>
+              <div class="small dim" style="margin-top:3px">The telemetry store did not answer, so the cases of this run could not be read. The scores above come from the run's own record and are still valid.</div>
+              <button class="btn sm" id="evCasesRetry" style="margin-top:8px">${ICONS.refresh}Retry</button></div>`;
+          host.querySelector('#evCasesRetry').addEventListener('click', ()=>turn(d.item_page || 1, true));
+          return;
+        }
+        const items = d.items || [];
+        if(!items.length){
+          host.innerHTML = '<div class="faint small">The engine has returned no cases for this run.</div>';
+          return;
+        }
+        const page = d.item_page || 1, size = d.item_page_size || CASE_PAGE;
+        const pages = Math.max(1, Math.ceil((d.item_total || 0) / size));
+        const first = (page - 1) * size + 1;
+        host.innerHTML = items.map(it => {
+          // Every judged score the case carries: the four columns, and a scorer
+          // that reports under its own name, which has no column to appear in.
+          const marks = Object.keys(it.scores || {}).map(k =>
+            `<span class="tag">${esc(EV_COLUMNS[k] || k)} ${Number(it.scores[k]).toFixed(2)}</span>`).join('');
+          return `<div class="quote" style="border-color:${it.passed === false ? 'rgba(239,68,68,.4)' : 'var(--border)'}">
+            <div class="flex between"><b>Case ${it.index}</b>
+              <span>${it.avg_score == null ? dash : score(it.avg_score)} ${it.passed == null ? badge('Unscored','gray') : badge(it.passed ? 'Passed' : 'Failed', it.passed ? 'green' : 'red')}</span></div>
+            <div class="small dim" style="margin-top:4px">${esc((it.input || '').slice(0, 150) || '—')}</div>
+            ${marks ? `<div style="margin-top:4px">${marks}</div>` : ''}</div>`;
+        }).join('')
+          + `<div class="flex between" style="margin-top:6px;align-items:center">
+              <span class="small faint">Cases ${fmtFull(first)}–${fmtFull(first + items.length - 1)} of ${fmtFull(d.item_total)}</span>
+              ${pages > 1 ? `<span><button class="btn sm" id="evCasesPrev"${page <= 1 ? ' disabled' : ''}>Previous</button>
+                <button class="btn sm" id="evCasesNext"${page >= pages ? ' disabled' : ''}>Next</button></span>` : ''}</div>`;
+        const prev = host.querySelector('#evCasesPrev'), next = host.querySelector('#evCasesNext');
+        if(prev) prev.addEventListener('click', ()=>turn(page - 1));
+        if(next) next.addEventListener('click', ()=>turn(page + 1));
+      }
+
       function paintEval(insp, d){
         const metrics = d.metrics || [];
         const trend = (d.trend || []).filter(p => p.avg_score != null);
+        // Scores judged under a name that is not one of the four columns — an
+        // SDK scorer's own function name. They have no table column, so this
+        // is the one place they can be read.
+        const extras = Object.keys(d.extra_scores || {}).sort().map(name => {
+          const v = Number(d.extra_scores[name]);
+          const sw = v < 0 || v > 1 ? '#94A3B8' : v >= 0.9 ? '#16A34A' : '#D97706';
+          return `<div class="legend-item"><span class="sw" style="background:${sw}"></span>
+            <span class="lg-label mono">${esc(name)}</span><span class="lg-val">${v.toFixed(2)}</span></div>`;
+        }).join('');
         insp.innerHTML = `
           <div class="insp-head"><div class="grow">
             <div class="insp-title">${esc(d.agent_name || d.name || 'Evaluation')}</div>
@@ -363,17 +484,19 @@
           ${inspSection('Overall Score','target', d.avg_score == null
             ? emptyBlock('target', d.status === 'Completed' ? 'The judge returned no average for this run' : 'Not scored yet',
                 d.status === 'Running' ? 'Scores appear as the judge works through the cases.' : '')
+              + (extras ? `<div class="legend">${extras}</div>` : '')
             : `<div class="donut-wrap">${gaugeRing(d.avg_score * 100, 'purple', 110, 'Avg Score')}
               <div class="legend grow">${metrics.map(m =>
                 `<div class="legend-item"><span class="sw" style="background:${m.value == null ? '#94A3B8' : m.value >= 0.9 ? '#16A34A' : '#D97706'}"></span>
                   <span class="lg-label">${esc(m.label)}</span>
-                  <span class="lg-val">${m.value == null ? dash : m.value.toFixed(2)}${m.delta == null ? '' : `<br><span class="small">${delta(m.delta)}</span>`}</span></div>`).join('')
+                  <span class="lg-val">${m.value == null ? dash : m.value.toFixed(2)}${m.delta == null ? '' : `<br><span class="small">${delta(m.delta)}</span>`}</span></div>`).join('') + extras
                 || '<span class="faint small">The judge reported no per-metric scores.</span>'}
               </div></div>`)}
           ${inspSection('Run & Baseline','git', kv([
             ['Status', statusText(d.status)],
             ['Judge', d.judge_model ? esc(d.judge_model) : dash],
-            ['Cases Scored', `${fmtFull(d.scored_items)} of ${fmtFull(d.item_total)}`],
+            // With the store unreadable the total is unknown, not zero.
+            ['Cases Scored', `${fmtFull(d.scored_items)} of ${d.items_unavailable ? dash : fmtFull(d.item_total)}`],
             ['Duration', d.duration_seconds == null ? dash : U.fmtDur(d.duration_seconds)],
             ['Started', d.started_at ? fmtDateTime(ts(d.started_at)) : dash],
             ['Finished', d.finished_at ? fmtDateTime(ts(d.finished_at)) : dash],
@@ -386,19 +509,14 @@
             ? lineChart({ series:[{ color:'purple', points: trend.map(p=>p.avg_score), area:true, dots:true }],
                 h:120, min:0, max:1, yFmt:v=>v.toFixed(2), xLabels: trend.map(p=>p.date.slice(5)), maxXLabels:6 })
             : '<div class="faint small">This agent and dataset need a second judged run before a trend can be drawn.</div>')}
-          ${inspSection('Case Breakdown','layers', (d.items || []).length
-            ? (d.items.map(it => `<div class="quote" style="border-color:${it.passed === false ? 'rgba(239,68,68,.4)' : 'var(--border)'}">
-                <div class="flex between"><b>Case ${it.index}</b>
-                  <span>${it.avg_score == null ? dash : score(it.avg_score)} ${it.passed == null ? badge('Unscored','gray') : badge(it.passed ? 'Passed' : 'Failed', it.passed ? 'green' : 'red')}</span></div>
-                <div class="small dim" style="margin-top:4px">${esc((it.input || '').slice(0, 150) || '—')}</div></div>`).join('')
-              + `<div class="small faint" style="margin-top:6px">Showing ${d.items.length} of ${fmtFull(d.item_total)} cases.</div>`)
-            : '<div class="faint small">The engine has returned no cases for this run.</div>')}
+          ${inspSection('Case Breakdown','layers', '<div id="evCases"></div>')}
           <div class="insp-section"><div class="grid g2" style="gap:8px">
             <button class="btn sm primary" id="evRerun"${gate('member','Re-running an evaluation requires the member role.')}>${ICONS.refresh}Re-run</button>
             <button class="btn sm" id="evCompare">${ICONS.git}Compare</button></div></div>`;
         insp.querySelector('#evClose').addEventListener('click', ()=>document.getElementById('evLayout').classList.add('collapsed'));
         insp.querySelector('#evRerun').addEventListener('click', ()=>rerun(d));
         insp.querySelector('#evCompare').addEventListener('click', ()=>openCompare(d));
+        paintCases(d);
       }
 
       // ---- actions ---------------------------------------------------------
@@ -408,6 +526,7 @@
           const started = await Store.mutate(() => API.evaluations.rerun(r.id), { event:'evaluations:changed' });
           toast('success','Evaluation queued', `${r.agent_name || r.dataset} · ${String(started.id).slice(0,12)}…`);
           table.refresh();
+          loadSummary();
           watchEvaluation(started.id, r);
         } catch (err) {
           toast('error','Could not re-run', errText(err));
@@ -420,9 +539,12 @@
           poll: () => API.evaluations.progress(id),
           onDone: (p) => {
             table.refresh(); loadSummary(); loadTrend();
-            toast(p.status === 'Failed' ? 'error' : 'success',
-              p.status === 'Failed' ? 'Evaluation failed' : 'Evaluation complete',
-              `${(label && (label.agent_name || label.dataset)) || 'Run'} — ${fmtFull(p.scored_cases)} of ${fmtFull(p.total_cases)} cases scored.`);
+            const what = (label && (label.agent_name || label.dataset)) || 'Run';
+            // A failed run's note says what to do about it — usually that no
+            // SDK experiment has scored this dataset yet — so the note is the
+            // message, and it stays up long enough to be read.
+            if(p.status === 'Failed') toast('error','Evaluation failed', p.detail ? `${what} — ${p.detail}` : `${what} ended without judged scores.`, 10000);
+            else toast('success','Evaluation complete', `${what} — ${fmtFull(p.scored_cases)} of ${fmtFull(p.total_cases)} cases scored.`);
           },
           onFail: () => table.refresh(),
         }));
@@ -471,14 +593,21 @@
         if(!allowed('member','Running an evaluation requires the member role.')) return;
         let agents = { items: [] }, datasets = null, dsError = null;
         try { agents = await API.agents.list({ page_size: 100, status: 'Active' }); } catch (_) { /* the picker degrades to none */ }
-        try { datasets = await API.evaluations.datasets(); } catch (err) { dsError = err; }
+        // The default page is 25; a picker has to offer every dataset, and 200
+        // is the most the route returns in one call.
+        try { datasets = await API.evaluations.datasets({ page_size: 200 }); } catch (err) { dsError = err; }
 
+        // An evaluation here judges nothing itself: it collects the scores an
+        // SDK experiment already wrote for the dataset. Said where the dataset
+        // is chosen, because a run over a dataset nobody has scored fails.
         const dsField = dsError
           ? `<div class="quote" style="border-color:rgba(239,68,68,.4)"><b style="color:#B91C1C">Datasets unavailable</b>
                <div class="small dim">${esc(dsError.message)}</div></div>`
           : (datasets.items || []).length
             ? `<select class="filter-select w-100" id="neDs" style="height:34px">${datasets.items.map(d =>
-                `<option value="${esc(d.name)}">${esc(d.name)} — ${fmtFull(d.case_count)} cases</option>`).join('')}</select>`
+                `<option value="${esc(d.name)}">${esc(d.name)} — ${fmtFull(d.case_count)} cases</option>`).join('')}</select>
+               <div class="small faint" style="margin-top:4px">An evaluation reads the scores an SDK experiment left on this dataset. Run
+                 <span class="mono">client.evaluate("&lt;dataset&gt;", task, scorers=[...])</span> first; without one the run fails within seconds and says so.</div>`
             : `<div class="quote"><b>No datasets yet</b><div class="small dim">This workspace has no evaluation datasets to run against.</div></div>`;
         const canStart = !dsError && (datasets.items || []).length;
 
@@ -491,7 +620,8 @@
               </select>
               ${(agents.items || []).length ? '' : '<div class="small faint" style="margin-top:4px">No active agents are registered, so only a dataset-level run is possible.</div>'}</div>
             <div class="form-row"><label>DATASET</label>${dsField}</div>
-            <div class="form-row"><label>JUDGE MODEL</label><input class="input" id="neJudge" value="gpt-4o" placeholder="e.g. gpt-4o"></div>
+            <div class="form-row"><label>JUDGE MODEL</label><input class="input" id="neJudge" value="gpt-4o" placeholder="e.g. gpt-4o">
+              <div class="small faint" style="margin-top:4px">Recorded on the run as the model your scorers used. The platform does not call it.</div></div>
             <div class="form-row"><label>NAME (OPTIONAL)</label><input class="input" id="neName" placeholder="e.g. Nightly invoice check"></div>`,
           footer:[
             { label:'Cancel' },
@@ -509,8 +639,10 @@
                 close();
                 try {
                   const started = await Store.mutate(() => API.evaluations.run(body), { event:'evaluations:changed' });
-                  toast('success','Evaluation started', `${esc(started.dataset)} · ${String(started.id).slice(0,12)}…`);
+                  toast('success','Evaluation started', `${started.dataset} · ${String(started.id).slice(0,12)}…`);
                   table.refresh();
+                  loadSummary();
+                  fillDatasets();
                   watchEvaluation(started.id, started);
                 } catch (err) {
                   toast('error','Could not start the evaluation', errText(err));
@@ -1394,6 +1526,7 @@
           source: (params) => API.evaluations.datasets(params),
         });
         host.appendChild(t.el);
+        setActive(t, 'datasets', false);
       }
 
       function tabEvaluations(host){
@@ -1417,6 +1550,7 @@
           onSelect: () => APP.go('evaluations'),
         });
         host.querySelector('#tsEvTbl').appendChild(t.el);
+        setActive(t, 'evaluations', false);
       }
 
       function tabBaselines(host){
@@ -1451,6 +1585,7 @@
           ],
         });
         host.appendChild(t.el);
+        setActive(t, 'baselines', false);
       }
 
       function tabSchedules(host){
@@ -1489,6 +1624,7 @@
         holder.appendChild(t.el);
         const nb = host.querySelector('#tsSchedNew');
         if(nb) nb.addEventListener('click', ()=>newSchedule(()=>t.refresh()));
+        setActive(t, 'schedules', false);
       }
 
       function tabEnvironments(host){
@@ -1689,10 +1825,17 @@
         pollers.push(progressModal({
           title:'Run Progress — ' + r.name, icon:'play',
           poll: () => API.testing.progress(r.id, started.id),
+          // Whoever got this far holds the member role, which is all a cancel asks.
+          cancel: () => Store.mutate(() => API.testing.cancelRun(r.id, started.id), { event:'testing:changed' }),
           onDone: (p) => {
             table.refresh(); loadSummary();
             if(selected && selected.id === r.id) API.testing.get(r.id).then(showSuite).catch(()=>{});
-            toast(p.status === 'Passed' ? 'success' : p.status === 'Running' ? 'info' : 'warn',
+            // A run that was stopped, or that nothing could grade, did not
+            // "finish" with a pass count — its detail says what happened and,
+            // for an ungradable run, what to do about it.
+            if(p.status === 'Cancelled') toast('info','Run cancelled', p.detail || `${r.name} — run ${started.run_ref} was stopped.`);
+            else if(p.status === 'Error') toast('error','Run could not be graded', p.detail || `${r.name} — run ${started.run_ref} ended in an error.`, 8000);
+            else toast(p.status === 'Passed' ? 'success' : 'warn',
               'Suite finished',
               `${r.name} — ${fmtFull(p.passed)} passed, ${fmtFull(p.failed)} failed of ${fmtFull(p.total_cases)} cases.`);
           },
@@ -1715,15 +1858,20 @@
       }
 
       function openCompare(r){
-        if(!r.baseline_run_id || !r.last_run_id){
+        // The candidate is the newest run that reached a verdict. `last_run_id`
+        // is the newest run of any status, and a Queued, Running, Error or
+        // Cancelled run has no case verdicts to set against the baseline — the
+        // server refuses that comparison with a 412.
+        const candidate = r.last_finished_run_id;
+        if(!r.baseline_run_id || !candidate){
           toast('warn','Cannot compare', 'A promoted baseline and a later finished run are both needed before a comparison exists.');
           return;
         }
-        if(r.baseline_run_id === r.last_run_id){
-          toast('info','Nothing to compare', 'The last run is the baseline, so there is no difference to show.');
+        if(r.baseline_run_id === candidate){
+          toast('info','Nothing to compare', 'The last finished run is the baseline, so there is no difference to show.');
           return;
         }
-        openCompareRuns(r.baseline_run_id, r.last_run_id, r.name);
+        openCompareRuns(r.baseline_run_id, candidate, r.name);
       }
 
       function openCompareRuns(baseline, candidate, label){
@@ -1754,7 +1902,13 @@
                       <td>${badge(x.change, x.change === 'Regression' ? 'red' : x.change === 'Fix' ? 'green' : 'gray')}</td></tr>`).join('')}
                     </tbody></table>` : emptyBlock('layers','Neither run recorded per-case verdicts','')}`;
               })
-              .catch(err => { body.innerHTML = ''; body.appendChild(screenError(err, null, 'the run comparison')); });
+              .catch(err => {
+                // A 412 is the server declining to diff a run that never reached
+                // a verdict (still running, errored, cancelled). Nothing failed
+                // to load, so it reads as the reason it is, not as an outage.
+                if(err && err.status === 412){ body.innerHTML = emptyBlock('git','These two runs cannot be compared', errText(err)); return; }
+                body.innerHTML = ''; body.appendChild(screenError(err, null, 'the run comparison'));
+              });
           },
         });
       }
@@ -1763,7 +1917,9 @@
       document.getElementById('tsNew').addEventListener('click', async () => {
         if(!allowed('member','Creating a test suite requires the member role.')) return;
         let datasets = null, dsError = null, agents = { items: [] };
-        try { datasets = await API.evaluations.datasets(); } catch (err) { dsError = err; }
+        // The default page is 25; a picker has to offer every dataset, and 200
+        // is the most the route returns in one call.
+        try { datasets = await API.evaluations.datasets({ page_size: 200 }); } catch (err) { dsError = err; }
         try { agents = await API.agents.list({ page_size: 100 }); } catch (_) { /* optional */ }
 
         const dsField = dsError
@@ -1773,6 +1929,10 @@
             ? `<select class="filter-select w-100" id="ntsDs" style="height:34px">${datasets.items.map(d =>
                 `<option value="${esc(d.name)}">${esc(d.name)} — ${fmtFull(d.case_count)} cases</option>`).join('')}</select>`
             : `<div class="quote"><b>No datasets yet</b><div class="small dim">A suite runs over a dataset, and this workspace has none.</div></div>`;
+        // A schedule is an operator's to set: the server answers 403 to a member
+        // who sends one, so the field is shown to them switched off and nothing
+        // is sent for it, rather than letting the whole create bounce.
+        const canSchedule = Store.session.can('operator');
 
         openModal({
           title:'Create Test Suite', icon:'beaker',
@@ -1785,7 +1945,8 @@
             <div class="form-row"><label>AGENT (OPTIONAL)</label><select class="filter-select w-100" id="ntsAgent" style="height:34px">
               <option value="">Not tied to one agent</option>
               ${(agents.items || []).map(a => `<option value="${esc(a.id)}">${esc(a.name)}</option>`).join('')}</select></div>
-            <div class="form-row"><label>SCHEDULE (CRON, OPTIONAL)</label><input class="input" id="ntsCron" placeholder="e.g. 0 2 * * *"></div>`,
+            <div class="form-row"><label>SCHEDULE (CRON, OPTIONAL)</label><input class="input" id="ntsCron" placeholder="e.g. 0 2 * * *"${gate('operator','Scheduling a suite requires the operator role.')}>
+              ${canSchedule ? '' : '<div class="small faint" style="margin-top:4px">Scheduling a suite requires the operator role. The suite is created unscheduled; an operator can add a cadence from the Schedules tab.</div>'}</div>`,
           footer:[
             { label:'Cancel' },
             { label:'Create Suite', cls:'primary', onClick: async (close, modal) => {
@@ -1800,7 +1961,7 @@
                 };
                 const agentId = modal.querySelector('#ntsAgent').value;
                 if(agentId) body.agent_id = agentId;
-                const cron = modal.querySelector('#ntsCron').value.trim();
+                const cron = canSchedule ? modal.querySelector('#ntsCron').value.trim() : '';
                 if(cron) body.schedule_cron = cron;
                 close();
                 try {
@@ -1837,7 +1998,7 @@
   SCREENS['feedback'] = {
     title:'Feedback & Quality Loop',
     render(main){
-      let mainTable = null, activeTab = 0, summaryCache = null, selectedFbId = null;
+      let mainTable = null, activeTab = 0, summaryP = null, selectedFbId = null;
 
       main.innerHTML = `
         ${pageHead({title:'Feedback & Quality Loop', sub:'Capture feedback, analyze quality signals, prioritize improvements, and drive continuous AI agent excellence.',
@@ -1851,14 +2012,33 @@
 
       const body = document.getElementById('fbBody');
 
+      /**
+       * The window's summary, read once and shared.
+       *
+       * The KPI cards, the sentiment and source charts and both funnel cards
+       * are all drawn from this one answer — it carries the funnel stages too.
+       * The screen used to ask for it twice on load (the cards and the charts
+       * each sent their own, the cache between them being filled only after
+       * the first landed) and then ask /feedback/funnel for stages it already
+       * held. `fresh` starts a new read, which whoever asks next then shares;
+       * a read that failed is dropped so the next caller tries again.
+       */
+      function summary(fresh){
+        if(fresh || !summaryP){
+          const p = API.feedback.summary({ window_days: 30 });
+          summaryP = p;
+          p.catch(() => { if(summaryP === p) summaryP = null; });
+        }
+        return summaryP;
+      }
+
       function loadSummary(then){
         const host = document.getElementById('fbKpis'), host2 = document.getElementById('fbKpis2');
         if(!host) return;
         host.innerHTML = kpiSkeleton(FB_PRIMARY);
         if(host2) host2.innerHTML = kpiSkeleton(FB_SECONDARY, 150);
-        API.feedback.summary({ window_days: 30 })
+        summary(true)
           .then(s => {
-            summaryCache = s;
             if(!document.getElementById('fbKpis')) return;
             const w = `vs previous ${s.window_days} days`;
             host.innerHTML = kpiRow([
@@ -1969,6 +2149,9 @@
             ['Theme', r.theme ? esc(r.theme) : '<span class="faint">not clustered yet</span>'],
             ['Linked Issue', r.issue_ref ? `<span class="mono">${esc(r.issue_ref)}</span> ${esc(r.issue_title || '')}` : '<span class="faint">none</span>'],
             ['Scored on Trace', r.scored_in_telemetry ? '<span class="st-green">Yes</span>' : '<span class="faint">No</span>'],
+            // The kinds of identifier removed from the comment at capture —
+            // never the values, which the platform did not keep.
+            ['PII Scrubbed', r.pii_scrubbed && r.pii_scrubbed.length ? esc(r.pii_scrubbed.join(', ')) : '—'],
           ]))}
           ${inspSection('Feedback','chat', `<div class="quote">${esc(r.body || 'No comment was left.')}</div>
             ${(r.tags || []).length ? `<div style="margin-top:6px">${r.tags.map(t => `<span class="tag">${esc(t)}</span>`).join('')}</div>` : ''}`)}
@@ -2040,10 +2223,9 @@
       function loadOverviewCharts(){
         const host = document.getElementById('fbCharts');
         if(!host) return;
-        Promise.all([API.feedback.insights({ window_days: 30 }), summaryCache ? Promise.resolve(summaryCache) : API.feedback.summary({ window_days: 30 })])
+        Promise.all([API.feedback.insights({ window_days: 30 }), summary()])
           .then(([ins, s]) => {
             if(!document.getElementById('fbCharts')) return;
-            summaryCache = s;
             const daily = ins.daily || [];
             const trendCard = daily.length > 1
               ? `${lineChart({ series:[{ color:'purple', points: daily.map(d=>d.count), area:true }], h:170,
@@ -2078,10 +2260,10 @@
         const host = document.getElementById('fbFunnel');
         if(!host) return;
         host.innerHTML = `<div class="card"><div class="card-loading" style="height:140px"></div></div>`;
-        API.feedback.funnel({ window_days: 30 })
+        summary()
           .then(f => {
             if(!document.getElementById('fbFunnel')) return;
-            const stages = f.stages || [];
+            const stages = f.funnel || [];
             host.innerHTML = `<div class="card">
               <div class="card-head"><div class="card-title">Feedback → Outcome Funnel</div>
                 <div class="faint small">Last ${f.window_days} days</div></div>
@@ -2200,12 +2382,12 @@
                 <div id="fbIns2"><div class="card-loading" style="height:140px"></div></div></div>`;
             const ab = document.getElementById('fbInsAnalyze');
             if(ab) ab.addEventListener('click', ()=>openAnalyze({}));
-            API.feedback.funnel({ window_days: 30 })
+            summary()
               .then(f => {
                 const el = document.getElementById('fbIns2');
                 if(!el) return;
-                el.innerHTML = (f.stages || []).some(s => s.count > 0)
-                  ? hbars(f.stages.map((s, i) => ({ label:s.stage, value:s.count, color: i < 2 ? 'purple' : i < 4 ? 'amber' : 'green',
+                el.innerHTML = (f.funnel || []).some(s => s.count > 0)
+                  ? hbars(f.funnel.map((s, i) => ({ label:s.stage, value:s.count, color: i < 2 ? 'purple' : i < 4 ? 'amber' : 'green',
                       display:fmtFull(s.count), pct: s.percent_of_received.toFixed(0) + '%' })), { labelW:190 })
                   : emptyBlock('chat','Nothing has entered the loop in this window','');
               })
@@ -2360,14 +2542,21 @@
           .then(s => {
             const el = document.getElementById('fbSetCard');
             if(!el) return;
+            // Only PII scrubbing is something the platform does (at capture).
+            // The other switches are a record of how the workspace says it
+            // collects feedback; nothing here prompts a user, ingests a ticket
+            // or samples a run, and the card must not read as if it did.
+            const recorded = ' <span class="faint small">· recorded setting</span>';
             el.innerHTML = `<div class="card-head"><div class="card-title">Collection Settings</div></div>
               ${kv([
-                ['In-app rating prompt', s.in_app_rating_prompt ? `Enabled (${esc(s.in_app_rating_trigger)})` : '<span class="faint">Disabled</span>'],
-                ['Thumbs up/down on responses', s.response_thumbs ? '<span class="st-green">Enabled</span>' : '<span class="faint">Disabled</span>'],
-                ['Support ticket ingestion', s.support_ticket_ingestion ? `Enabled${s.support_ticket_system ? ' (' + esc(s.support_ticket_system) + ')' : ''}` : '<span class="faint">Disabled</span>'],
-                ['Manual review sampling', `${s.manual_review_sample_percent}% of runs`],
-                ['PII scrubbing on feedback', s.pii_scrubbing ? '<span class="st-green">Enabled</span>' : '<span class="st-red">Disabled</span>'],
+                ['PII scrubbing on feedback', (s.pii_scrubbing ? '<span class="st-green">Enabled</span>' : '<span class="st-red">Disabled</span>')
+                  + ' <span class="faint small">· enforced at capture</span>'],
+                ['In-app rating prompt', (s.in_app_rating_prompt ? `Enabled (${esc(s.in_app_rating_trigger)})` : '<span class="faint">Disabled</span>') + recorded],
+                ['Thumbs up/down on responses', (s.response_thumbs ? 'Enabled' : '<span class="faint">Disabled</span>') + recorded],
+                ['Support ticket ingestion', (s.support_ticket_ingestion ? `Enabled${s.support_ticket_system ? ' (' + esc(s.support_ticket_system) + ')' : ''}` : '<span class="faint">Disabled</span>') + recorded],
+                ['Manual review sampling', `${s.manual_review_sample_percent}% of runs` + recorded],
               ])}
+              <div class="small faint" style="margin-top:8px">A recorded setting documents how this workspace collects feedback. The platform does not prompt users, ingest tickets or sample runs for review itself; feedback arrives through the API, the SDK and this screen.</div>
               <button class="btn sm mt" id="fbSetEdit"${gate('admin','Editing collection settings requires the admin role.')}>${ICONS.settings}Edit Settings</button>`;
             document.getElementById('fbSetEdit').addEventListener('click', ()=>editSettings(s));
           })
@@ -2418,7 +2607,7 @@
             close();
             try {
               await Store.mutate(() => API.feedback.saveSettings(b), { event:'feedback:changed' });
-              toast('success','Settings saved','Feedback collection now follows the new rules.');
+              toast('success','Settings saved','PII scrubbing applies to feedback captured from now on; the other switches are recorded settings.');
               loadCollectionSettings();
             } catch (err) { toast('error','Could not save the settings', errText(err)); }
           } }],
@@ -2434,12 +2623,16 @@
             if(!el) return;
             el.innerHTML = `<div class="card-head"><div class="card-title">SLA &amp; Routing</div></div>
               ${kv([
-                ['Negative feedback triage SLA', `${s.triage_sla_hours} ${s.business_hours_only ? 'business' : 'clock'} hours`],
-                ['Business day', s.business_hours_only ? `${s.business_day_start_hour}:00 – ${s.business_day_end_hour}:00` : '<span class="faint">24 hours</span>'],
-                ['Issue creation', `Auto for ≥ ${s.auto_issue_threshold} similar reports`],
-                ['Routing', esc(s.routing) + (s.routing_team ? ` · ${esc(s.routing_team)}` : '')],
-                ['Escalation', `${esc(s.escalation_contact)} after ${s.escalate_after_hours}h`],
+                // Enforced: an issue's due time comes from its severity window,
+                // counted on the business-hours clock when that is on.
                 ['Severity windows', `C ${s.severity_sla.critical}h · H ${s.severity_sla.high}h · M ${s.severity_sla.medium}h · L ${s.severity_sla.low}h`],
+                ['Business day', s.business_hours_only ? `${s.business_day_start_hour}:00 – ${s.business_day_end_hour}:00` : '<span class="faint">24 hours</span>'],
+                ['Issue creation', `Auto-opened at ≥ ${s.auto_issue_threshold} similar negative reports (on Analyze)`],
+                ['Routing', esc(s.routing) + (s.routing_team ? ` · ${esc(s.routing_team)}` : '')],
+                // Recorded targets: nothing measures triage time against the
+                // first, and nothing contacts anyone for the second.
+                ['Triage target', `${s.triage_sla_hours} ${s.business_hours_only ? 'business' : 'clock'} hours <span class="faint small">· recorded target, not enforced</span>`],
+                ['Escalation target', `${esc(s.escalation_contact)} after ${s.escalate_after_hours}h <span class="faint small">· recorded target, nobody is notified automatically</span>`],
               ])}
               <button class="btn sm mt" id="fbSlaEdit"${gate('admin','Editing the SLA rules requires the admin role.')}>${ICONS.edit}Edit SLA Rules</button>`;
             document.getElementById('fbSlaEdit').addEventListener('click', ()=>editSla(s));
@@ -2455,7 +2648,7 @@
         openModal({
           title:'Edit SLA Rules', icon:'edit',
           body:`<div class="grid g2">
-              <div class="form-row"><label>TRIAGE SLA (HOURS)</label><input class="input" id="slHours" type="number" min="1" value="${s.triage_sla_hours}"></div>
+              <div class="form-row"><label>TRIAGE TARGET (HOURS, RECORDED ONLY)</label><input class="input" id="slHours" type="number" min="1" value="${s.triage_sla_hours}"></div>
               <div class="form-row"><label>AUTO-ISSUE THRESHOLD</label><input class="input" id="slThreshold" type="number" min="2" value="${s.auto_issue_threshold}"></div>
             </div>
             <div class="grid g2">
@@ -2471,6 +2664,7 @@
               <div class="form-row"><label>ESCALATION CONTACT</label><input class="input" id="slContact" value="${esc(s.escalation_contact)}"></div>
               <div class="form-row"><label>ESCALATE AFTER (HOURS)</label><input class="input" id="slEsc" type="number" min="1" value="${s.escalate_after_hours}"></div>
             </div>
+            <div class="small faint" style="margin:-2px 0 8px">The triage target and the escalation contact and hours are recorded targets: nobody is notified automatically.</div>
             <div class="small muted" style="font-weight:700;margin:8px 0 4px">SEVERITY WINDOWS (HOURS) — MUST WIDEN AS SEVERITY FALLS</div>
             <div class="grid g4">
               ${[['critical','Critical'],['high','High'],['medium','Medium'],['low','Low']].map(([k, l]) =>
@@ -2497,7 +2691,7 @@
             close();
             try {
               await Store.mutate(() => API.feedback.saveSlaRules(b), { event:'feedback:changed' });
-              toast('success','SLA rules saved','The triage clock now runs on the new windows.');
+              toast('success','SLA rules saved','Severity windows, routing and the auto-issue threshold apply from now; triage and escalation hours are recorded targets.', 7000);
               loadSlaRules();
               loadSummary();
             } catch (err) { toast('error','Could not save the SLA rules', errText(err)); }
@@ -2538,6 +2732,13 @@
               loadSummary();
               if(after) after(issue);
             } catch (err) {
+              // A 409 naming an issue is not a failure: every report of this
+              // theme is already attached to an open issue, so a second one
+              // would be an empty duplicate. Say which issue holds them.
+              if(err && err.status === 409 && err.details && err.details.issue_ref){
+                toast('info','Already tracked', `${err.details.issue_ref} already holds this theme's reports.`);
+                return;
+              }
               toast('error','Could not create the issue', errText(err));
             }
           } }],
@@ -2555,7 +2756,7 @@
               <div class="form-row"><label>EFFORT (OPTIONAL)</label><input class="input" id="abEffort" placeholder="e.g. 3d"></div>
             </div>
             <div class="form-row"><label>TEAM (OPTIONAL)</label><input class="input" id="abTeam"></div>
-            ${r.issue_ref ? `<div class="quote">Linked to issue <b>${esc(r.issue_ref)}</b>.</div>` : `<div class="quote">${ICONS.info} This item has no issue behind it yet, so the backlog entry stands alone.</div>`}`,
+            ${r.issue_ref ? `<div class="quote">Linked to issue <b>${esc(r.issue_ref)}</b>. An issue is planned by one backlog item at a time, so if ${esc(r.issue_ref)} already has one that is not Done, no second item is added and the backlog opens instead.</div>` : `<div class="quote">${ICONS.info} This item has no issue behind it yet, so the backlog entry stands alone.</div>`}`,
           footer:[{ label:'Cancel' }, { label:'Add to Backlog', cls:'primary', onClick: async (close, modal) => {
             const title = modal.querySelector('#abTitle').value.trim();
             if(!title){ toast('error','Title required','Give the backlog item a title.'); return; }
@@ -2571,6 +2772,14 @@
               loadSummary();
               if(activeTab === 4) switchTab(4);
             } catch (err) {
+              // The row's issue already has a backlog item still being planned
+              // or worked. That is where this report's weight already counts,
+              // so take the reader to it rather than report an error.
+              if(err && err.status === 409 && err.details && err.details.backlog_item_id){
+                toast('info','Already on the backlog', `${r.issue_ref ? 'Issue ' + r.issue_ref : 'The issue behind this report'} is already planned — opening the backlog, where its item is listed.`);
+                switchTab(4);
+                return;
+              }
               toast('error','Could not add to the backlog', errText(err));
             }
           } }],
@@ -2672,7 +2881,16 @@
               toast('success','Planned as improvement', `${item.title} · ${item.priority} · ${item.votes} reports behind it.`);
               after();
               loadSummary();
-            } catch (err) { toast('error','Could not plan this issue', errText(err)); }
+            } catch (err) {
+              // A 409 naming a backlog item means the issue is planned already,
+              // so the row on screen is stale rather than the request wrong.
+              if(err && err.status === 409 && err.details && err.details.backlog_item_id){
+                toast('info','Already on the backlog', errText(err));
+                after();
+                return;
+              }
+              toast('error','Could not plan this issue', errText(err));
+            }
           } }],
         });
       }
@@ -2764,25 +2982,31 @@
           title:'Analyze Feedback', icon:'beaker', wide:true,
           body:`<div class="card-loading" style="height:200px"></div>`,
           footer:[{ label:'Close' }],
-          onOpen(modal){
+          onOpen(modal, close){
             const body_ = modal.querySelector('.modal-body');
             API.feedback.analyze(req)
               .then(res => {
                 const clusters = res.clusters || [];
+                // The pass does more than group: it attaches themed reports to
+                // the open issue for their theme and opens an issue itself when
+                // a theme reaches the auto-issue threshold. Both are changes the
+                // reader did not ask for one by one, so both are counted here.
                 body_.innerHTML = `
                   <div class="flex between" style="margin-bottom:10px">
                     <div><b>${fmtFull(res.analysed)} item${res.analysed === 1 ? '' : 's'} analysed</b>
-                      <div class="small dim">${fmtFull(res.clustered)} clustered · ${fmtFull(res.unclustered)} left unclustered · last ${res.window_days} days · similarity ${res.similarity}</div></div>
+                      <div class="small dim">${fmtFull(res.clustered)} clustered · ${fmtFull(res.unclustered)} left unclustered · last ${res.window_days} days · similarity ${res.similarity}${
+                        res.linked_to_issues ? ` · ${fmtFull(res.linked_to_issues)} linked to open issues` : ''}${
+                        res.issues_auto_opened ? ` · ${fmtFull(res.issues_auto_opened)} issue${res.issues_auto_opened === 1 ? '' : 's'} opened automatically` : ''}</div></div>
                     ${badge(`${clusters.length} theme${clusters.length === 1 ? '' : 's'}`, clusters.length ? 'purple' : 'gray')}</div>
                   ${clusters.length ? clusters.map((c, i) => `
                     <div class="card mb" style="padding:12px">
                       <div class="flex between">
                         <div><b>${esc(c.theme)}</b>
-                          <div class="small dim">${fmtFull(c.size)} item${c.size === 1 ? '' : 's'} · ${(c.negative_share * 100).toFixed(0)}% negative
+                          <div class="small dim">${fmtFull(c.size)} item${c.size === 1 ? '' : 's'}${c.new_members == null ? '' : ` (${fmtFull(c.new_members)} new)`} · ${(c.negative_share * 100).toFixed(0)}% negative
                             · avg rating ${c.avg_rating == null ? '—' : c.avg_rating.toFixed(2)}
                             ${c.agents.length ? ' · ' + esc(c.agents.join(', ')) : ''}</div></div>
                         <div class="flex" style="gap:6px">${riskBadge(c.suggested_severity)}
-                          ${c.meets_auto_issue_threshold ? badge('Meets auto-issue threshold','amber') : ''}</div></div>
+                          ${c.issue_auto_opened || c.meets_auto_issue_threshold ? badge('Issue opened automatically','amber') : ''}</div></div>
                       ${c.keywords.length ? `<div style="margin-top:6px">${c.keywords.map(k => `<span class="tag">${esc(k)}</span>`).join('')}</div>` : ''}
                       <div class="small muted" style="font-weight:700;margin:8px 0 3px">SUGGESTED ISSUE</div>
                       <div class="quote">${esc(c.suggested_issue_title)}</div>
@@ -2791,7 +3015,12 @@
                         ${x.rating == null ? '' : ' · ' + x.rating + '★'} · ${esc(x.sentiment)}${x.agent_name ? ' · ' + esc(x.agent_name) : ''}
                         <div class="dim" style="margin-top:3px">${esc(x.body || 'no comment')}</div></div>`).join('')
                         || '<div class="faint small">No example was quoted back.</div>'}
-                      <button class="btn sm primary mt" data-cluster="${i}">${ICONS.bug}Create Issue from this theme</button>
+                      ${c.open_issue_id
+                        // An open issue already holds this theme's reports; a second
+                        // one would be refused (409), so the button is not offered.
+                        ? `<div class="quote mt">Tracked by <b>${esc(c.open_issue_ref || 'an open issue')}</b>${c.issue_auto_opened ? ' · opened automatically by this pass' : ''}
+                            · <button class="link" data-issues>View in Issues ${ICONS.arrowRight}</button></div>`
+                        : `<button class="btn sm primary mt" data-cluster="${i}">${ICONS.bug}Create Issue from this theme</button>`}
                     </div>`).join('')
                     : emptyBlock('layers','The pass found no cluster in this window',
                         `${fmtFull(res.analysed)} item${res.analysed === 1 ? ' was' : 's were'} examined; none were similar enough to group at the current threshold.`)}`;
@@ -2800,6 +3029,9 @@
                     const c = clusters[btn.dataset.cluster];
                     openCreateIssue({ title: c.suggested_issue_title, severity: c.suggested_severity, theme: c.theme, cluster_id: c.cluster_id });
                   });
+                });
+                body_.querySelectorAll('[data-issues]').forEach(btn => {
+                  btn.addEventListener('click', () => { close(); switchTab(3); });
                 });
                 if(mainTable) mainTable.refresh();
                 loadSummary();

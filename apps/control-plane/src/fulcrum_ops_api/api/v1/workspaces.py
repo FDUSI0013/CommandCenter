@@ -483,7 +483,10 @@ async def api_key_usage(
     """What this key has actually done, read back from the audit trail.
 
     Every audited operation performed with a key is attributed to it, so the
-    call counts, the per-action breakdown and the ingest volume are all measured
-    rather than modelled. Requires the operator role.
+    counts and the per-action breakdown are measured rather than modelled -- of
+    audited operations, not of requests: a telemetry batch accepted whole is not
+    audited. Ingest volume is not metered per key, so `ingest_calls`,
+    `ingest_records` and `ingest_bytes` are null rather than zero; `last_used_at`
+    is what says a key is in use. Requires the operator role.
     """
     return await service.api_key_usage(session, principal, key_id, window_days=window_days)

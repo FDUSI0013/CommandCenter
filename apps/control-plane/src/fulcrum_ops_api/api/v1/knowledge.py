@@ -328,6 +328,11 @@ async def get_sync_status(
 
     The number comes from `sync_progress` on the row, which the job writes and
     commits as each stage finishes — it is a report, not an animation.
+
+    A row still Syncing well past the longest a job can live has lost its job
+    to a restart. This poll closes it out — `running` false, `state` Failed,
+    `error` saying it was interrupted — instead of reporting the same
+    percentage for ever; Sync Now, Pause and Delete then work again.
     """
     return await service.sync_status(session, principal, source_id)
 

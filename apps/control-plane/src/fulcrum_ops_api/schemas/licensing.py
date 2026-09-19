@@ -42,8 +42,8 @@ EMAIL_PATTERN = r"^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$"
 PLAN_CODE_PATTERN = r"^[a-z0-9][a-z0-9._-]*$"
 
 #: Licence statuses a client may set directly through create/update. The rest are
-#: platform-owned and reachable only through the suspend/reactivate endpoints or
-#: the renewal sweep.
+#: platform-owned and reachable only through the suspend/reactivate/revoke
+#: endpoints or the renewal sweep.
 SettableLicenseStatus = Literal[LicenseStatus.ACTIVE, LicenseStatus.TRIAL]
 
 #: Datasets ``GET /licensing/export`` can render.
@@ -51,6 +51,22 @@ ExportDataset = Literal["plans", "tenants", "seats", "usage", "invoices"]
 
 #: Seat rows the console's Seats & Assignments tab filters on.
 SeatState = Literal["active", "released"]
+
+
+def _term_is_backwards(starts_at: dt.datetime | None, expires_at: dt.datetime | None) -> bool:
+    """Whether a term ends at or before it starts, when both ends were sent.
+
+    A timestamp without an offset is UTC, as it is everywhere else here. Python
+    refuses to compare one with an offset to one without, and that ``TypeError``
+    is not a validation error: it left the validator as a 500.
+    """
+    if starts_at is None or expires_at is None:
+        return False
+    if starts_at.tzinfo is None:
+        starts_at = starts_at.replace(tzinfo=dt.UTC)
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=dt.UTC)
+    return expires_at <= starts_at
 
 
 # --------------------------------------------------------------------------- #
@@ -244,11 +260,7 @@ class TenantLicenseCreate(BaseModel):
 
     @model_validator(mode="after")
     def _check_term(self) -> TenantLicenseCreate:
-        if (
-            self.starts_at is not None
-            and self.expires_at is not None
-            and self.expires_at <= self.starts_at
-        ):
+        if _term_is_backwards(self.starts_at, self.expires_at):
             raise ValueError("expires_at must be later than starts_at")
         return self
 
@@ -270,11 +282,7 @@ class TenantLicenseUpdate(BaseModel):
 
     @model_validator(mode="after")
     def _check_term(self) -> TenantLicenseUpdate:
-        if (
-            self.starts_at is not None
-            and self.expires_at is not None
-            and self.expires_at <= self.starts_at
-        ):
+        if _term_is_backwards(self.starts_at, self.expires_at):
             raise ValueError("expires_at must be later than starts_at")
         return self
 

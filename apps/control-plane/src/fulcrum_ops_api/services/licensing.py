@@ -844,6 +844,31 @@ async def get_license(
     return items[0]
 
 
+def _feature_keys(plan: LicensePlan) -> list[str]:
+    """The plan's feature bullets that can be entitlement keys, once each.
+
+    A bullet is marketing copy and a key is ``(license_id, key)``-unique and 120
+    characters wide, so not every bullet can be one: two that read the same
+    collide, one named like a ceiling collides with the ceiling's own row, and
+    one past the column's width is refused outright by Postgres. Any of those
+    failed the whole insert with a 500 -- when a licence was issued on the plan
+    and, now that a plan edit re-resolves the licences sold on it, on the edit
+    itself. The plan card still shows every bullet; what is dropped here is only
+    a row nothing could have looked up (``entitlement-check`` caps ``key`` at
+    the same width) or that the ceiling already stands for.
+    """
+    width = Entitlement.key.type.length
+    keys: list[str] = []
+    for feature in plan.features or []:
+        key = str(feature).strip()
+        if not key or key in keys or key in CEILING_KEYS:
+            continue
+        if width is not None and len(key) > width:
+            continue
+        keys.append(key)
+    return keys
+
+
 async def _seed_entitlements(
     session: AsyncSession, license_: TenantLicense, plan: LicensePlan
 ) -> None:
@@ -861,10 +886,7 @@ async def _seed_entitlements(
     """
     rows: list[Entitlement] = []
 
-    for feature in plan.features or []:
-        key = str(feature).strip()
-        if not key:
-            continue
+    for key in _feature_keys(plan):
         rows.append(
             Entitlement(
                 license_id=license_.id,
@@ -916,7 +938,7 @@ async def _reseed_entitlements(
     """
     if not licenses:
         return
-    keys = {str(feature).strip() for feature in plan.features or []} | set(CEILING_KEYS)
+    keys = set(_feature_keys(plan)) | set(CEILING_KEYS)
     await session.execute(
         delete(Entitlement)
         .where(
@@ -1169,7 +1191,7 @@ async def delete_license(
     license_id: str,
     request: Request | None = None,
 ) -> None:
-    """Delete a licence that was never billed; billed ones must be suspended."""
+    """Delete a licence that was never billed; a billed one is suspended or revoked."""
     principal.require(Role.OWNER)
     license_ = await _license_or_404(session, principal, license_id)
 
@@ -1181,7 +1203,7 @@ async def delete_license(
     if invoiced:
         raise Conflict(
             f"This license has {invoiced} invoice(s) and cannot be deleted. "
-            "Suspend it instead so the billing history stays intact."
+            "Suspend or revoke it instead so the billing history stays intact."
         )
 
     plan_id = license_.plan_id

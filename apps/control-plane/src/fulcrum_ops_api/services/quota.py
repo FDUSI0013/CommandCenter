@@ -2638,12 +2638,20 @@ async def attach_team_trends(
     wanted = [row for row in rows if by_team.get(row["team"])]
     if not wanted:
         return
-    series = await asyncio.gather(
-        *(
-            telemetry.cost_points(client, by_team[row["team"]], start, end)
-            for row in wanted
-        )
-    )
+    # One series per team is a fan-out like the one in ``cost_context``, and it
+    # answers inside the same one-request deadline: the reads queue behind the
+    # worker-wide bound, and a queue behind a slow store must cost the page a
+    # typed 503, not the worker for as long as ten reads take to time out.
+    try:
+        async with engine_deadline(what="the team spend trends"):
+            series = await asyncio.gather(
+                *(
+                    telemetry.cost_points(client, by_team[row["team"]], start, end)
+                    for row in wanted
+                )
+            )
+    except EngineError as exc:
+        raise telemetry.telemetry_unavailable(exc) from exc
     for row, points in zip(wanted, series, strict=True):
         row["trend"] = telemetry.fold_sum(points, starts, MetricInterval.DAILY)
 

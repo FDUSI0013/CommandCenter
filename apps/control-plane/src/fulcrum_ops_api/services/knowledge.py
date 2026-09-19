@@ -1442,13 +1442,36 @@ def _stranded(source: KnowledgeSource) -> bool:
     return max(marks) < cutoff
 
 
-async def _close_out_stranded(session: AsyncSession, source: KnowledgeSource) -> None:
+async def _close_out_stranded(session: AsyncSession, source: KnowledgeSource) -> bool:
     """Fail a Syncing row whose job is gone, which gives the row its exits back.
+
+    True when this call closed the row out; False when somebody else got there
+    first.
 
     While a row is Syncing, Sync Now answers 409 and Delete answers 412, and
     only the job ever moves it on. With the job gone that was for ever, short
     of an UPDATE by hand.
+
+    The row is locked and read again before it is judged. Every open screen
+    polls a Syncing row every two seconds, the sweep runs beside them, and Sync
+    Now closes a row out on its way to restarting it. Two of those deciding
+    from the same earlier read would fail the row twice over -- or fail, and
+    write the dead job's sync block back over, the sync an operator started a
+    moment ago. Whoever comes second finds a row that is no longer stranded and
+    leaves it alone; the caller's own check of ``status`` then sees the row as
+    it is now. SQLite has a single writer and ignores the clause.
     """
+    locked = (
+        await session.execute(
+            select(KnowledgeSource)
+            .where(KnowledgeSource.id == source.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    # ``populate_existing`` refreshed ``source`` itself: same session, same row.
+    if locked is None or not _stranded(source):
+        return False
     state = _sync_state(source)
     current = _settings(source)
     _write_blocks(
@@ -1473,6 +1496,7 @@ async def _close_out_stranded(session: AsyncSession, source: KnowledgeSource) ->
         metadata={"job_id": state.job_id, "stranded": True},
     )
     await session.flush()
+    return True
 
 
 async def fail_stranded_syncs() -> int:
@@ -1487,17 +1511,18 @@ async def fail_stranded_syncs() -> int:
         rows = (
             (
                 await session.execute(
-                    select(KnowledgeSource).where(
-                        KnowledgeSource.status == KnowledgeSourceStatus.SYNCING.value
-                    )
+                    select(KnowledgeSource)
+                    .where(KnowledgeSource.status == KnowledgeSourceStatus.SYNCING.value)
+                    # Rows are locked one by one below; a fixed order means two
+                    # sweeps can only queue behind each other, never deadlock.
+                    .order_by(KnowledgeSource.id)
                 )
             )
             .scalars()
             .all()
         )
         for source in rows:
-            if _stranded(source):
-                await _close_out_stranded(session, source)
+            if _stranded(source) and await _close_out_stranded(session, source):
                 closed += 1
         await session.commit()
     return closed

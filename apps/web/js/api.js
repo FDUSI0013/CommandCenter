@@ -323,6 +323,8 @@
     }),
     agents: Object.assign(collection('/agents'), {
       summary: () => get('/agents/summary'),
+      /** Detail with params: the registry inspector passes {include_versions:false} and an abort signal. */
+      get: (id, params, opts) => get(`/agents/${encodeURIComponent(id)}`, params, opts),
       runs: (id, params) => get('/runs', Object.assign({ agent_id: id }, params || {})),
       versions: (id) => get(`/agents/${encodeURIComponent(id)}/versions`),
       /** Commit a new prompt version from the Agent Detail configuration tab. */
@@ -358,6 +360,10 @@
       deactivate: (id, body) => post(`/policies/${encodeURIComponent(id)}/deactivate`, body || {}),
       clone: (id) => post(`/policies/${encodeURIComponent(id)}/clone`, {}),
       violations: (params) => get('/policies/violations', params),
+      /** Explicit agent bindings — a bare array, oldest first. bind/unbind are idempotent and answer 200 with {policy, message, ...}. */
+      bindings: (id) => get(`/policies/${encodeURIComponent(id)}/bindings`),
+      bind: (id, agentId) => post(`/policies/${encodeURIComponent(id)}/bindings/${encodeURIComponent(agentId)}`),
+      unbind: (id, agentId) => del(`/policies/${encodeURIComponent(id)}/bindings/${encodeURIComponent(agentId)}`),
       import: (body) => post('/policies/import', body),
       export: (params) => download('/policies/export', params),
     }),
@@ -390,6 +396,10 @@
       versions: (id) => get(`/configurations/${encodeURIComponent(id)}/versions`),
       newVersion: (id, body) => post(`/configurations/${encodeURIComponent(id)}/versions`, body),
       rollback: (id, body) => post(`/configurations/${encodeURIComponent(id)}/rollback`, body || {}),
+      /** Publish a Draft revision. No body; answers {configuration, message, version, validation}. */
+      activateVersion: (id, version) => post(`/configurations/${encodeURIComponent(id)}/versions/${encodeURIComponent(version)}/activate`, {}),
+      /** Check a body that is not stored yet, or a stored revision by label: {payload?, version?, environment?}. */
+      validateBody: (id, body) => post(`/configurations/${encodeURIComponent(id)}/validate`, body || {}),
       deprecate: (id, body) => post(`/configurations/${encodeURIComponent(id)}/deprecate`, body || {}),
       validate: (id) => post(`/configurations/${encodeURIComponent(id)}/validate`, {}),
       export: (params) => download('/configurations/export', params),
@@ -461,6 +471,8 @@
     // ---- operations ------------------------------------------------------
     quota: {
       summary: (params) => get('/quota/summary', params),
+      /** The KPI row and every cost panel from one measurement: {summary, models, services, drivers, teams, insights}, plain arrays. */
+      overview: (params) => get('/quota/overview', params),
       costBreakdown: (params) => get('/quota/cost-breakdown', params),
       costByService: (params) => get('/quota/cost-by-service', params),
       topDrivers: (params) => get('/quota/top-drivers', params),

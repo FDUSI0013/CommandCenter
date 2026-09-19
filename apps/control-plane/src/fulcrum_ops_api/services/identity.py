@@ -61,7 +61,13 @@ from ..core.security import (
 )
 from ..models.governance import AuditEvent
 from ..models.identity import ApiKey, Membership, Role, User, Workspace
-from ..models.licensing import Entitlement, EntitlementValueType, LicenseStatus, TenantLicense
+from ..models.licensing import (
+    Entitlement,
+    EntitlementValueType,
+    LicenseStatus,
+    SeatAssignment,
+    TenantLicense,
+)
 from ..models.registry import Agent
 from ..schemas.identity import (
     EXPIRING_SOON_DAYS,
@@ -122,13 +128,9 @@ SIGN_IN_FAILED: Final[str] = "Email or password is incorrect."
 EXPORT_LIMIT: Final[int] = 5_000
 
 #: Window the key-usage panel reports over, and the cap on how many audit rows
-#: it reads to build the daily series and the ingest totals.
+#: it reads to build the daily series.
 USAGE_WINDOW_DAYS: Final[int] = 30
 USAGE_DETAIL_LIMIT: Final[int] = 5_000
-
-#: Metadata keys the ingest path records volume under.
-INGEST_RECORD_KEYS: Final[tuple[str, ...]] = ("spans", "traces", "events", "records")
-INGEST_BYTE_KEYS: Final[tuple[str, ...]] = ("bytes", "payload_bytes")
 
 #: Licenses whose entitlements are in force.
 LIVE_LICENSE_STATUSES: Final[tuple[str, ...]] = (
@@ -1231,6 +1233,101 @@ async def _assert_account_is_ours(
     )
 
 
+async def _release_seats(
+    session: AsyncSession,
+    principal: Principal,
+    user: User,
+    *,
+    why: str,
+    request: Request | None = None,
+) -> int:
+    """Release the licensed seats a departing member holds here; returns how many.
+
+    A seat is given to a *member* -- assigning one refuses anybody else, and an
+    inactive account too -- but nothing took it back when the membership went or
+    the account was switched off. The Seats tab went on showing the person
+    Active, "Seats Assigned" stayed at 10 of 10, and their replacement was
+    answered 402. The way out was to know to press Reassign on the row of
+    somebody who no longer worked there.
+
+    The licence row is taken ``FOR UPDATE`` first, as every seat change in
+    :mod:`services.licensing` does, so an assignment running alongside counts
+    this release rather than racing it. The counter is recomputed from the rows,
+    never decremented: it is a denormalised copy, and a copy that has drifted is
+    put right by a recount and made worse by arithmetic.
+    """
+    licences = (
+        (
+            await session.execute(
+                select(TenantLicense)
+                .where(
+                    TenantLicense.tenant_workspace_id == principal.workspace_id,
+                    TenantLicense.id.in_(
+                        select(SeatAssignment.license_id).where(
+                            SeatAssignment.user_id == user.id,
+                            SeatAssignment.released_at.is_(None),
+                        )
+                    ),
+                )
+                .order_by(TenantLicense.id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    released = 0
+    now = _now()
+    for licence in licences:
+        seats = (
+            (
+                await session.execute(
+                    select(SeatAssignment).where(
+                        SeatAssignment.license_id == licence.id,
+                        SeatAssignment.user_id == user.id,
+                        SeatAssignment.released_at.is_(None),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for seat in seats:
+            seat.released_at = now
+        await session.flush()
+        licence.seats_assigned = int(
+            (
+                await session.execute(
+                    select(func.count(SeatAssignment.id)).where(
+                        SeatAssignment.license_id == licence.id,
+                        SeatAssignment.released_at.is_(None),
+                    )
+                )
+            ).scalar_one()
+            or 0
+        )
+        licence.updated_by = principal.actor
+        released += len(seats)
+        await audit.record(
+            session,
+            principal=principal,
+            action="licensing.seat.released",
+            entity_type="seat_assignment",
+            entity_id=seats[0].id if seats else licence.id,
+            entity_label=user.email,
+            source_screen=SOURCE_SCREEN_MEMBERS,
+            detail=f"Seat released: {user.email} {why}.",
+            metadata={
+                "license_id": licence.id,
+                "user_id": user.id,
+                "seats_assigned": licence.seats_assigned,
+            },
+            request=request,
+        )
+    return released
+
+
 async def create_member(
     session: AsyncSession,
     principal: Principal,
@@ -1365,6 +1462,12 @@ async def update_member(
         if user.id == principal.user_id:
             raise PreconditionFailed("You cannot deactivate your own account.")
         await _assert_not_last_owner(session, principal, membership, action="deactivate")
+        if user.is_active:
+            # An account that cannot sign in is not using its seat, and could not
+            # be given one; reactivating it does not take the seat back.
+            await _release_seats(
+                session, principal, user, why="was deactivated", request=request
+            )
 
     for field in ACCOUNT_FIELDS:
         if field in changes:
@@ -1444,8 +1547,9 @@ async def remove_member(
     """Remove someone from this workspace.
 
     The membership goes; the account stays, because it may belong to other
-    workspaces and its audit history must remain attributable. Requires the
-    admin role.
+    workspaces and its audit history must remain attributable. Any licensed seat
+    they held on this workspace's licences is released in the same transaction
+    (:func:`_release_seats`). Requires the admin role.
     """
     principal.require(Role.ADMIN)
     membership, user = await _membership_for(session, principal, user_id)
@@ -1457,6 +1561,9 @@ async def remove_member(
     _assert_may_manage(principal, Role(membership.role), None)
     await _assert_not_last_owner(session, principal, membership, action="remove")
 
+    await _release_seats(
+        session, principal, user, why="was removed from the workspace", request=request
+    )
     await audit.record(
         session,
         principal=principal,
@@ -1981,9 +2088,20 @@ async def api_key_usage(
     """What this key has done, read back from the audit rows it produced.
 
     Every audited operation performed with a key is attributed to
-    ``api-key:<id>``, so the trail is the usage record. Totals come from SQL
-    aggregates; the daily series and ingest volume are folded from at most
+    ``api-key:<id>``, so the trail is the record of those. Totals come from SQL
+    aggregates; the daily series is folded from at most
     :data:`USAGE_DETAIL_LIMIT` rows inside the window.
+
+    The trail is not a record of *traffic*, and this used to answer as though it
+    were. A batch that is accepted whole writes no audit row -- one per batch
+    would be tens of thousands a day per agent -- so a key that had reported all
+    day came back with zero ingest calls and zero records, beside a last-used
+    time of two minutes ago; and the record and byte totals were summed from
+    metadata fields that ingest has never written. Ingest volume is not metered
+    per key anywhere, so it is reported as unmeasured (``None``, a dash in the
+    console) instead of as nought. The audited ingest rows that do exist -- a
+    blocked batch, a guardrail hit, recorded governance events -- are in
+    ``by_action`` under their own names, which is what they are.
     """
     principal.require(Role.OPERATOR)
     key = await _load_key(session, principal, key_id)
@@ -2021,7 +2139,7 @@ async def api_key_usage(
 
     detail_rows = (
         await session.execute(
-            select(AuditEvent.occurred_at, AuditEvent.action, AuditEvent.event_metadata)
+            select(AuditEvent.occurred_at)
             .where(*scope, AuditEvent.occurred_at >= cutoff)
             .order_by(AuditEvent.occurred_at.desc())
             .limit(USAGE_DETAIL_LIMIT)
@@ -2029,24 +2147,9 @@ async def api_key_usage(
     ).all()
 
     daily: dict[dt.date, int] = {}
-    ingest_calls = 0
-    ingest_records = 0
-    ingest_bytes = 0
-    for occurred_at, action, metadata in detail_rows:
+    for (occurred_at,) in detail_rows:
         day = (_as_utc(occurred_at) or _now()).date()
         daily[day] = daily.get(day, 0) + 1
-        if not action.startswith("ingest"):
-            continue
-        ingest_calls += 1
-        payload = metadata if isinstance(metadata, dict) else {}
-        for field in INGEST_RECORD_KEYS:
-            value = payload.get(field)
-            if isinstance(value, int) and not isinstance(value, bool):
-                ingest_records += value
-        for field in INGEST_BYTE_KEYS:
-            value = payload.get(field)
-            if isinstance(value, int) and not isinstance(value, bool):
-                ingest_bytes += value
 
     return ApiKeyUsage(
         key_id=key.id,
@@ -2057,9 +2160,9 @@ async def api_key_usage(
         first_seen_at=_as_utc(totals.first_seen),
         total_calls=int(totals.total or 0),
         calls_in_window=sum(daily.values()),
-        ingest_calls=ingest_calls,
-        ingest_records=ingest_records,
-        ingest_bytes=ingest_bytes,
+        ingest_calls=None,
+        ingest_records=None,
+        ingest_bytes=None,
         window_days=window_days,
         by_action=by_action,
         daily=[ApiKeyUsageDay(date=day, calls=count) for day, count in sorted(daily.items())],

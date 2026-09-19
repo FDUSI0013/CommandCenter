@@ -1119,3 +1119,73 @@ async def test_a_hashed_column_is_cut_before_it_is_hashed(db, workspace, admin, 
     async with sessionmaker() as session:
         outcome = await audit_service.verify_chain(session, workspace.id)
     assert outcome["intact"] is True, outcome
+
+
+# ---------------------------------------------------------------------------
+# 127 (the quota owner's, finished from this side) - an approved increase is applied
+#
+# The quota service files a "Quota Increase" here and owns the write an approval
+# of one asks for; the decision is what has to call it.
+# ---------------------------------------------------------------------------
+
+
+async def test_approving_a_quota_increase_in_the_queue_raises_the_ceiling(
+    as_role, db, factory, workspace
+):
+    """It used to say Approved and leave a Block quota refusing traffic at the old limit."""
+    from fulcrum_ops_api.models.operations import LimitStatus, Quota, QuotaEnforcement
+
+    quota = await factory.quota(
+        workspace,
+        name="Tokens per month",
+        limit_value=1_000_000.0,
+        used_value=1_000_000.0,
+        enforcement=QuotaEnforcement.BLOCK.value,
+        status=LimitStatus.EXCEEDED.value,
+    )
+    async with as_role(Role.MEMBER) as http:
+        asked = await http.post(
+            f"/api/v1/quota/{quota.id}/request-increase",
+            json={"requested_limit": 2_000_000, "reason": "Launch week"},
+        )
+    assert asked.status_code == 200, asked.text
+    filed = asked.json()["data"]
+
+    async with as_role(Role.APPROVER) as http:
+        refused = await http.post(
+            f"/api/v1/approvals/{filed['request_id']}/reject", json={"note": "Not this month"}
+        )
+    assert refused.status_code == 200, refused.text
+    assert (await db.get(Quota, quota.id)).limit_value == 1_000_000.0, "a refusal applies nothing"
+
+    async with as_role(Role.MEMBER) as http:
+        asked = await http.post(
+            f"/api/v1/quota/{quota.id}/request-increase",
+            json={"requested_limit": 2_000_000, "reason": "Launch week, with the forecast"},
+        )
+    assert asked.status_code == 200, asked.text
+    filed = asked.json()["data"]
+
+    async with as_role(Role.APPROVER) as http:
+        approved = await http.post(
+            f"/api/v1/approvals/{filed['request_id']}/approve", json={"note": "Go ahead"}
+        )
+    assert approved.status_code == 200, approved.text
+    assert "now allows 2M tokens" in approved.json()["message"]
+
+    raised = await db.get(Quota, quota.id)
+    assert raised.limit_value == 2_000_000.0
+    assert raised.status == LimitStatus.ACTIVE.value
+
+    actions = [row.action for row in await trail(db, workspace)]
+    assert actions.index("Request approved") < actions.index("quota.increase_applied"), (
+        "the trail reads in the order it happened"
+    )
+
+
+async def test_an_ordinary_approval_says_nothing_about_a_ceiling(as_role, factory, workspace):
+    request_row = await factory.approval(workspace)
+    async with as_role(Role.APPROVER) as http:
+        approved = await http.post(f"/api/v1/approvals/{request_row.id}/approve", json={})
+    assert approved.status_code == 200, approved.text
+    assert approved.json()["message"] == f"Request {request_row.request_ref} approved."

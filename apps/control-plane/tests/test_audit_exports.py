@@ -15,6 +15,8 @@ the answer back off the database and the spool.
   left the row Queued or Generating for ever, with nothing to move it on.
 * A schedule collected recipients, showed them and audited them, and nothing
   ever sent them anything.
+* Generation selected whole entities -- a secret's ciphertext among them -- to
+  keep a dozen attributes, fifty thousand rows in one stretch of the event loop.
 """
 
 from __future__ import annotations
@@ -25,7 +27,7 @@ import os
 from pathlib import Path
 
 import pytest
-from sqlalchemy import select, update
+from sqlalchemy import event, select, update
 
 from conftest import utcnow
 from fulcrum_ops_api.models.governance import Secret
@@ -474,3 +476,53 @@ async def test_two_exports_requested_at_once_both_get_a_reference(admin_client, 
     assert [answer.status_code for answer in answers] == [202] * 4, [a.text for a in answers]
     refs = [job.export_ref for job in await db.scalars(select(ExportJob))]
     assert len(refs) == len(set(refs)) == 4
+
+
+# ---------------------------------------------------------------------------
+# What generation reads
+# ---------------------------------------------------------------------------
+
+
+async def test_generation_reads_only_the_columns_it_exports(
+    admin_client, db_engine, factory, workspace
+):
+    """The whole entity was selected, ciphertext included, to keep twelve attributes."""
+    await factory.secret(workspace, name="Payments signing key")
+    asked: list[str] = []
+
+    def record(_conn, _cursor, statement, _parameters, _context, _many) -> None:
+        if "FROM secrets" in statement:
+            asked.append(statement)
+
+    event.listen(db_engine.sync_engine, "before_cursor_execute", record)
+    try:
+        job = await generate(admin_client, source_screen="Secrets Compliance")
+    finally:
+        event.remove(db_engine.sync_engine, "before_cursor_execute", record)
+
+    assert asked, "the export never read the table it exports"
+    for statement in asked:
+        assert "ciphertext" not in statement, "the ciphertext was loaded to be thrown away"
+        assert "vault_reference" not in statement
+    body = (await admin_client.get(f"/api/v1/exports/{job['id']}/download")).text
+    assert "Payments signing key" in body
+
+
+async def test_rows_gathered_a_chunk_at_a_time_all_arrive_in_order(
+    admin_client, db, factory, workspace, monkeypatch
+):
+    monkeypatch.setattr(exports_service, "_FETCH_CHUNK_ROWS", 2)
+    for index in range(5):
+        alert = await factory.alert(workspace, title=f"Alert number {index}")
+        await db.execute(
+            update(Alert)
+            .where(Alert.id == alert.id)
+            .values(raised_at=utcnow() - dt.timedelta(minutes=index))
+        )
+
+    job = await generate(admin_client, source_screen="Alerts", export_format="JSON")
+
+    assert job["row_count"] == 5
+    document = (await admin_client.get(f"/api/v1/exports/{job['id']}/download")).json()
+    titles = [row["title"] for row in document["rows"]]
+    assert titles == [f"Alert number {index}" for index in range(5)], "newest first, none lost"

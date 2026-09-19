@@ -1919,6 +1919,20 @@ async def create_issue(
         combined = combined | extra
     items = (await session.execute(linked.where(combined))).scalars().all()
 
+    # The clustering pass links a theme's reports to the issue open for it, and
+    # opens that issue itself at the threshold — so a theme can come back from a
+    # pass with nothing left to link. A second issue opened for it then would
+    # start at zero reports and stay there, because new reports go to the first.
+    # That is a fork, not an issue: name the one that holds the reports instead.
+    if theme is not None and not items:
+        tracked = (await _open_issues_by_theme(session, principal)).get(theme)
+        if tracked is not None:
+            raise Conflict(
+                f"Theme '{theme}' is already tracked by open issue {tracked.issue_ref}, "
+                "which holds its reports.",
+                details={"issue_id": tracked.id, "issue_ref": tracked.issue_ref},
+            )
+
     agent_id = payload.agent_id
     if agent_id is None:
         agent_ids = Counter(item.agent_id for item in items if item.agent_id)

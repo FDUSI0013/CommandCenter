@@ -297,6 +297,11 @@ async def create_issue(
     Every matching unlinked item is attached to the new issue, the owning team
     is resolved from the routing rule, and the SLA due date is computed on the
     business-hours clock.
+
+    A theme whose reports are all already behind an open issue — the clustering
+    pass links them, and opens that issue itself at the auto-issue threshold —
+    answers 409 with that issue in `details.issue_id` / `details.issue_ref`
+    rather than opening a second issue with nothing in it.
     """
     return await service.create_issue(session, principal, payload, request=request)
 

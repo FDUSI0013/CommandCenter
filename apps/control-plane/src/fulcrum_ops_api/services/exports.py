@@ -484,12 +484,39 @@ def _cell(value: Any) -> Any:
     return value
 
 
+#: Rows read per round trip while an export is gathered.
+_FETCH_CHUNK_ROWS = 2_000
+
+
 async def _fetch_rows(
     session: AsyncSession, dataset: ExportDataset, workspace_id: str, filters: dict[str, Any]
 ) -> list[dict[str, Any]]:
-    stmt = _dataset_query(dataset, workspace_id, filters).limit(max_rows())
-    rows = (await session.execute(stmt)).scalars().all()
-    return [{key: _cell(getattr(row, key)) for key, _ in dataset.columns} for row in rows]
+    """Read the exported columns, and only those, a chunk at a time.
+
+    This used to select the whole entity and keep the listed attributes, which
+    brought every other column along for up to ``max_rows()`` rows: the audit
+    trail's before-and-after documents, and -- for Secrets Compliance -- the ciphertext
+    and the vault reference, the two things that dataset is defined not to
+    contain. They never reached the file, but they had no business in this
+    process either. "Anything absent never leaves" now holds at the query.
+
+    Generation shares its event loop with the requests the worker is serving.
+    Streaming hands the loop back between chunks, where one ``execute`` built
+    fifty thousand rows in a single uninterrupted stretch.
+    """
+    keys = [key for key, _ in dataset.columns]
+    stmt = (
+        _dataset_query(dataset, workspace_id, filters)
+        .with_only_columns(*[getattr(dataset.model, key) for key in keys])
+        .limit(max_rows())
+    )
+    rows: list[dict[str, Any]] = []
+    result = await session.stream(stmt.execution_options(yield_per=_FETCH_CHUNK_ROWS))
+    async for chunk in result.partitions(_FETCH_CHUNK_ROWS):
+        rows.extend(
+            {key: _cell(value) for key, value in zip(keys, row, strict=True)} for row in chunk
+        )
+    return rows
 
 
 # --------------------------------------------------------------------------- #

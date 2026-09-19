@@ -33,6 +33,19 @@
   const when = (v) => v ? fmtDateTime(ts(v)) : dash;
   const day = (v) => v ? fmtDate(ts(v)) : dash;
 
+  /**
+   * "in 3 days" for a moment still ahead; null once it has passed. relTime only
+   * looks back — it calls every future timestamp "just now".
+   */
+  function until(v){
+    const left = v ? ts(v) - Date.now() : null;
+    if(left == null || isNaN(left) || left <= 0) return null;
+    if(left < 3600000) return 'in under an hour';
+    if(left < 86400000){ const h = Math.round(left / 3600000); return `in ${h} hour${h === 1 ? '' : 's'}`; }
+    const d = Math.round(left / 86400000);
+    return `in ${d} day${d === 1 ? '' : 's'}`;
+  }
+
   /** Up/down only when the server actually reported a movement. */
   function deltaDir(v){ return v == null || v === 0 ? null : (v > 0 ? 'up' : 'down'); }
 
@@ -81,6 +94,19 @@
   }
 
   /**
+   * optionList for a field the record may hold empty, or hold with a value this
+   * list does not carry. Without an option of its own such a value selects
+   * nothing, the browser settles on the first entry, and Save writes that entry
+   * back — a secret stored with no environment became "Production" the first
+   * time anyone edited its risk.
+   */
+  function optionListKeeping(values, selected){
+    const own = (selected == null || selected === '') ? '<option value="" selected>—</option>'
+      : values.indexOf(selected) < 0 ? `<option selected>${esc(selected)}</option>` : '';
+    return own + optionList(values, selected);
+  }
+
+  /**
    * Fill one of a table's filter dropdowns with values the server told us
    * exist. `pairs` may be plain strings or {value,label} — the second form is
    * what the owner filters need, because the server matches a user id while
@@ -116,10 +142,102 @@
     host.appendChild(screenError(err, retry, what));
   }
 
-  /** The server's message, or a last-resort one. */
-  function msgOf(err){ return (err && err.message) || 'The request failed.'; }
+  /**
+   * What a failed call should say. A request the schema rejects answers with
+   * one fixed headline — "One or more fields are invalid." — and puts the real
+   * reasons in `details.fields`, so the field messages win when there are any.
+   * A rule that spans the whole body is filed under "body" and prefixed by the
+   * validator; neither helps the reader, so both are dropped.
+   */
+  function msgOf(err){
+    const fields = (err && err.details && err.details.fields) || [];
+    if(fields.length){
+      return fields.map(f => (f.field && f.field !== 'body' ? f.field + ': ' : '') +
+        String(f.message || '').replace(/^Value error,\s*/, '')).join(' · ');
+    }
+    return (err && err.message) || 'The request failed.';
+  }
 
   const ENVIRONMENTS = ['Production','Staging','UAT','Development','QA','Sandbox','DR'];
+
+  /**
+   * The member list behind one screen's owner pickers and its owner filter.
+   *
+   * The pickers used to be built from whatever had arrived by the time a dialog
+   * opened. When nothing had — the call failed, or was still in flight — the
+   * select held a single empty option and Save sent that emptiness as
+   * `owner_user_id: null`: an operator correcting a description cleared the
+   * owner without a word. The same happened to an owner the list did not
+   * carry (the directory names active members only), because the select fell
+   * back to its first option, "Unassigned".
+   *
+   * So a picker now keeps three promises. The record's current owner is always
+   * one of its options, listed or not. A picker whose list is missing is
+   * disabled, asks for the list again and says so if that fails too. And
+   * `change()` reports an owner only when the reader picked a different one —
+   * a picker that never loaded reports nothing, so nothing is sent.
+   */
+  function ownerDirectory(fetchOwners){
+    let items = [], ready = false, pending = null;
+
+    function load(){
+      if(ready) return Promise.resolve(items);
+      if(!pending){
+        pending = fetchOwners()
+          .then(page => {
+            items = Array.isArray(page) ? page : ((page && page.items) || []);
+            ready = true;
+            return items;
+          })
+          .finally(() => { pending = null; });
+      }
+      return pending;
+    }
+
+    /* `required` leaves "Unassigned" out, for a dialog whose server would not
+       honour it — a secret stored with no owner is given to its creator. */
+    function options(selectedId, selectedName, required){
+      const unlisted = selectedId && !items.some(u => u.id === selectedId);
+      const keep = unlisted
+        ? `<option value="${esc(selectedId)}" selected>${esc(selectedName || 'Current owner')}</option>` : '';
+      if(!ready) return keep || '<option value="">Members not loaded</option>';
+      return (required ? '' : '<option value="">Unassigned</option>') + keep + items.map(u =>
+        `<option value="${esc(u.id)}" ${u.id === selectedId ? 'selected' : ''}>${esc(u.full_name || u.email || u.id)}</option>`).join('');
+    }
+
+    /** Paint a dialog's owner select, and fetch the list again if it is missing. */
+    function attach(select, selectedId, selectedName, required){
+      if(!select) return;
+      const paint = () => {
+        select.innerHTML = options(selectedId, selectedName, required);
+        select.disabled = !ready;
+        select.title = ready ? '' : 'The member list has not loaded, so the owner stays as it is.';
+      };
+      paint();
+      if(ready) return;
+      load()
+        .then(() => { if(select.isConnected) paint(); })
+        .catch(err => {
+          if(select.isConnected) toast('warn','Owner list unavailable', 'The owner stays as it is — ' + msgOf(err));
+        });
+    }
+
+    /**
+     * The owner to send, or `undefined` when there is nothing to send: the
+     * picker never loaded, or it still shows the owner the record already has.
+     * `null` is a deliberate "Unassigned".
+     */
+    function change(select, currentId){
+      if(!select || select.disabled || !ready) return undefined;
+      const picked = select.value || null;
+      return picked === (currentId || null) ? undefined : picked;
+    }
+
+    return { load, options, attach, change };
+  }
+
+  /** The signed-in person, as the default owner of something they are creating. */
+  function me(){ return Store.session.user || {}; }
 
   /* ======================== CONFIGURATION CENTER ======================== */
 
@@ -144,7 +262,8 @@
   SCREENS['configurations'] = {
     title:'Configuration Center',
     render(main){
-      let selectedId = null, owners = [];
+      let selectedId = null;
+      const owners = ownerDirectory(() => API.configurations.owners());
 
       main.innerHTML = `
         ${pageHead({title:'Configuration Center', sub:'Manage and version all configuration assets including models, prompts, tools, guardrails, routing, and quotas.',
@@ -243,23 +362,20 @@
       document.getElementById('cfExport').addEventListener('click', ()=>table.export());
 
       // The owner dropdown lists this workspace's members; the server matches ids.
-      API.configurations.owners({ page_size: 100 })
-        .then(page => {
-          owners = page.items || [];
-          fillOptions(table, 4, owners.map(u=>({ value:u.id, label:u.full_name || u.email })));
-        })
-        .catch(()=>{ /* the filter simply stays at "All Owners" */ });
+      // The names-only directory opens at operator, which is also the lowest
+      // role that can change an owner, so nobody below it is sent to collect a
+      // 403. A failure here leaves the filter at "All Owners"; the dialogs ask
+      // again when they open and say so if the list still will not come.
+      if(Store.session.can('operator')){
+        owners.load()
+          .then(list => fillOptions(table, 4, list.map(u=>({ value:u.id, label:u.full_name || u.email || u.id }))))
+          .catch(()=>{});
+      }
 
       tabBar(document.getElementById('cfTabs'), CFG_TABS.map(t=>({label:t[0]})),
         i => setFilter(table, 0, CFG_TABS[i][1]));
 
       function refreshAll(){ table.refresh(); loadSummary(); }
-
-      function ownerOptions(selectedId_){
-        if(!owners.length) return '<option value="">No members loaded</option>';
-        return '<option value="">Unassigned</option>' + owners.map(u=>
-          `<option value="${esc(u.id)}" ${u.id===selectedId_?'selected':''}>${esc(u.full_name || u.email)}</option>`).join('');
-      }
 
       /* ------------------------------ mutations ------------------------------ */
 
@@ -281,7 +397,7 @@
             </div>
             <div class="grid g2">
               <div class="form-row"><label>IMPACT</label><select class="filter-select w-100" id="ncImpact" style="height:34px">${optionList(IMPACTS,'Low')}</select></div>
-              <div class="form-row"><label>OWNER</label><select class="filter-select w-100" id="ncOwner" style="height:34px">${ownerOptions((Store.session.user||{}).id)}</select></div>
+              <div class="form-row"><label>OWNER</label><select class="filter-select w-100" id="ncOwner" style="height:34px">${owners.options(me().id, me().full_name)}</select></div>
             </div>
             <div class="form-row"><label>DESCRIPTION</label><input class="input" id="ncDesc" placeholder="What does this configuration control?"></div>
             <div class="grid g2">
@@ -320,6 +436,7 @@
             }},
           ],
           onOpen(modal){
+            owners.attach(modal.querySelector('#ncOwner'), me().id, me().full_name);
             const hint = modal.querySelector('#ncSchema');
             const typeSel = modal.querySelector('#ncType');
             function loadSchema(){
@@ -354,10 +471,11 @@
             </div>
             <div class="grid g2">
               <div class="form-row"><label>IMPACT</label><select class="filter-select w-100" id="ecImpact" style="height:34px">${optionList(IMPACTS, r.impact)}</select></div>
-              <div class="form-row"><label>OWNER</label><select class="filter-select w-100" id="ecOwner" style="height:34px">${ownerOptions(r.owner_user_id)}</select></div>
+              <div class="form-row"><label>OWNER</label><select class="filter-select w-100" id="ecOwner" style="height:34px">${owners.options(r.owner_user_id, r.owner_name)}</select></div>
             </div>
             <div class="form-row"><label>DESCRIPTION</label><input class="input" id="ecDesc" value="${esc(r.description || '')}"></div>
-            <div class="quote small">${ICONS.info} Identity fields only. The body is changed by cutting a new version, so every change keeps a revision.</div>`,
+            <div class="quote small">${ICONS.info} Identity fields only. The body is changed by cutting a new version, so every change keeps a revision — but a new type or environment is re-validated against the live body, and a rename is refused while another configuration links to this one by name.</div>
+            <div id="ecProblem"></div>`,
           footer:[
             {label:'Cancel'},
             {label:'Save Changes', cls:'primary', onClick: async (close, modal) => {
@@ -367,9 +485,14 @@
                 environment: modal.querySelector('#ecEnv').value,
                 impact: modal.querySelector('#ecImpact').value,
                 description: (modal.querySelector('#ecDesc').value || '').trim() || null,
-                owner_user_id: modal.querySelector('#ecOwner').value || null,
                 expected_updated_at: r.updated_at || null,
               };
+              // The owner travels only when the reader chose a different one. A
+              // picker that failed to load must never be read as "Unassigned".
+              const owner = owners.change(modal.querySelector('#ecOwner'), r.owner_user_id);
+              if(owner !== undefined) body.owner_user_id = owner;
+              const problem = modal.querySelector('#ecProblem');
+              problem.innerHTML = '';
               try {
                 const saved = await Store.mutate(() => API.configurations.update(r.id, body), { event:'configurations:changed' });
                 close();
@@ -378,9 +501,23 @@
                 showCfg(saved);
               } catch (err) {
                 toast('error','Could not save the configuration', msgOf(err));
+                // Two refusals carry their reasons with them: the findings a
+                // new type or environment raises against the live body, and the
+                // configurations whose links a rename would break.
+                const report = findingsOf(err);
+                const dependents = err && err.status === 409 && err.details && err.details.dependents;
+                if(report){
+                  problem.innerHTML = `<div class="small st-red" style="margin:10px 0 6px">${esc(msgOf(err))}</div>` +
+                    findingsTable(report.findings);
+                } else if(Array.isArray(dependents) && dependents.length){
+                  problem.innerHTML = `<div class="small st-red" style="margin:10px 0 6px">${esc(msgOf(err))}</div>` +
+                    kv(dependents.map(d => [esc(d.name || d.configuration_id || '—'),
+                      d.slot ? `links to it as <span class="mono">${esc(d.slot)}</span>` : dash]));
+                }
               }
             }},
           ],
+          onOpen(modal){ owners.attach(modal.querySelector('#ecOwner'), r.owner_user_id, r.owner_name); },
         });
       }
 
@@ -425,6 +562,19 @@
             <div class="quote small">${ICONS.info} The server validates the body against the declared field contract for this type and returns per-field findings.</div>`,
           footer:[
             {label:'Cancel'},
+            // Checks the body in the box and stores nothing. Without it the only
+            // way to read the findings was to untick Activate and leave a Draft
+            // behind for every attempt.
+            {label:'Validate body', icon:'shieldCheck', close:false, onClick: async (close, modal) => {
+              let payload;
+              try { payload = parsePayload(modal, '#nvBody'); }
+              catch (err) { toast('error','Invalid body', err.message); return; }
+              const check = { payload };
+              const label = (modal.querySelector('#nvVer').value || '').trim();
+              if(label) check.version = label;
+              try { showValidation(r, await API.configurations.validateBody(r.id, check)); }
+              catch (err) { toast('error','Could not validate the body', msgOf(err)); }
+            }},
             {label:'Create & Validate', cls:'primary', onClick: async (close, modal) => {
               const version = (modal.querySelector('#nvVer').value || '').trim();
               if(!version){ toast('error','Version required','Name the revision, e.g. v1.2.0.'); return; }
@@ -448,7 +598,10 @@
                 refreshAll();
                 if(res.configuration) showCfg(res.configuration);
               } catch (err) {
+                // Nothing was stored. The dialog stays open on the body that was
+                // refused, with the fields at fault listed over it.
                 toast('error','Could not create the version', msgOf(err));
+                await explainRefusal(r, err, { payload, version });
               }
             }},
           ],
@@ -497,12 +650,49 @@
             ${kv([['Fields checked', `${report.checked_fields == null ? '—' : report.checked_fields} of ${report.declared_fields == null ? '—' : report.declared_fields}`]])}
           </div>
           ${findings.length
-            ? `<table class="tbl"><thead><tr><th>Field</th><th>Severity</th><th>Code</th><th>Message</th></tr></thead><tbody>
-                ${findings.map(f=>`<tr style="cursor:default"><td class="mono">${esc(f.field || '—')}</td>
-                  <td>${badge(f.severity || 'info', f.severity === 'error' ? 'red' : f.severity === 'warning' ? 'amber' : 'gray')}</td>
-                  <td class="dim">${esc(f.code || '—')}</td><td>${esc(f.message || '')}</td></tr>`).join('')}
-              </tbody></table>`
+            ? findingsTable(findings)
             : EMPTY('checkCircle','No findings','Every declared field checked out.')}`;
+      }
+
+      function findingsTable(findings){
+        return `<table class="tbl"><thead><tr><th>Field</th><th>Severity</th><th>Code</th><th>Message</th></tr></thead><tbody>
+            ${(findings || []).map(f=>`<tr style="cursor:default"><td class="mono">${esc(f.field || '—')}</td>
+              <td>${badge(f.severity || 'info', f.severity === 'error' ? 'red' : f.severity === 'warning' ? 'amber' : 'gray')}</td>
+              <td class="dim">${esc(f.code || '—')}</td><td>${esc(f.message || '')}</td></tr>`).join('')}
+          </tbody></table>`;
+      }
+
+      /**
+       * The per-field findings inside a 422. Activation, rollback, restore and a
+       * re-typed edit are all refused with them attached, and a toast that only
+       * says "failed validation" leaves the reader guessing which field.
+       */
+      function findingsOf(err){
+        const d = err && err.status === 422 && err.details;
+        return d && Array.isArray(d.findings) ? d : null;
+      }
+
+      /**
+       * Open the validation report behind a refusal. The 422 names the fields
+       * at fault but not the type, environment or field counts the report
+       * shows, so /validate is asked for the full report of the same body
+       * (`check` is {payload, version}, {version}, or nothing for the live
+       * body). If that call fails, the findings the refusal carried are shown
+       * on their own. Resolves false when the error was not a validation refusal.
+       */
+      async function explainRefusal(r, err, check){
+        const refused = findingsOf(err);
+        if(!refused) return false;
+        let report = null;
+        try { report = await API.configurations.validateBody(r.id, check || {}); }
+        catch (e) { report = null; }
+        if(!report || report.valid !== false){
+          report = { valid:false, version:(check && check.version) || null,
+            config_type:r.config_type, environment:r.environment, findings:refused.findings,
+            error_count:refused.error_count, warning_count:refused.warning_count };
+        }
+        showValidation(r, report);
+        return true;
       }
 
       function deprecateCfg(r){
@@ -543,7 +733,28 @@
           if(res.configuration) showCfg(res.configuration);
         } catch (err) {
           toast('error','Could not restore', msgOf(err));
+          await explainRefusal(r, err);
         }
+      }
+
+      function activateVersion(r, version){
+        if(!allowed('operator','Activating a version')) return;
+        confirmModal({
+          title:'Activate Version', icon:'checkCircle', confirmLabel:'Activate',
+          body:`<p style="margin-top:0">Publish draft <b class="mono" style="color:var(--text)">${esc(version)}</b> as the live body of <b style="color:var(--text)">${esc(r.name)}</b>?</p>
+            <p class="small">The server validates the draft first and refuses it, with the fields at fault, if it does not pass.</p>`,
+          onConfirm: async () => {
+            try {
+              const res = await Store.mutate(() => API.configurations.activateVersion(r.id, version), { event:'configurations:changed' });
+              toast('success','Version activated', res.message || `${r.name} ${version} is live.`);
+              refreshAll();
+              if(res.configuration){ showCfg(res.configuration); openTab(1); }
+            } catch (err) {
+              toast('error','Could not activate the version', msgOf(err));
+              await explainRefusal(r, err, { version });
+            }
+          },
+        });
       }
 
       function rollbackCfg(r, version){
@@ -566,6 +777,7 @@
                 if(res.configuration) showCfg(res.configuration);
               } catch (err) {
                 toast('error','Could not roll back', msgOf(err));
+                await explainRefusal(r, err, { version });
               }
             }},
           ],
@@ -580,7 +792,7 @@
           title:'Import Configuration Bundle', icon:'upload', wide:true,
           body:`<div class="form-row"><label>BUNDLE (JSON)</label><textarea class="input" id="imBody" rows="12" placeholder='{"items":[…]}'></textarea></div>
             <div class="grid g2">
-              <div class="form-row"><label>ON CONFLICT</label><select class="filter-select w-100" id="imMode" style="height:34px"><option value="new_version">Cut a new version</option><option value="skip">Skip existing</option></select></div>
+              <div class="form-row"><label>ON CONFLICT</label><select class="filter-select w-100" id="imMode" style="height:34px"><option value="skip">Skip existing</option><option value="new_version">Cut a new version</option></select></div>
               <div class="form-row"><label>&nbsp;</label><button class="btn w-100" id="imLoad">${ICONS.download}Load this workspace's bundle</button></div>
             </div>
             <div class="quote small">${ICONS.info} The server validates every item and reports what it created, versioned and skipped.</div>`,
@@ -729,7 +941,10 @@
                     <div class="pipe-sub">${esc(v.status || '')}${v.author_name?' · by '+esc(v.author_name):''}${v.change_note?' · '+esc(clip(v.change_note, 70)):''}</div>
                     <div class="flex" style="gap:6px;margin-top:5px">
                       <button class="btn sm" data-view="${esc(v.version)}">${ICONS.eye}View body</button>
-                      ${v.is_current?'':`<button class="btn sm ghost-danger" data-roll="${esc(v.version)}">${ICONS.replay}Roll back</button>`}
+                      ${v.is_current ? ''
+                        : v.status === 'Draft'
+                          ? `<button class="btn sm" data-activate="${esc(v.version)}">${ICONS.checkCircle}Activate</button>`
+                          : `<button class="btn sm ghost-danger" data-roll="${esc(v.version)}">${ICONS.replay}Roll back</button>`}
                     </div>
                   </div></div>`).join('')}</div>
               <div class="grid g2" style="gap:8px;margin-top:10px">
@@ -743,6 +958,12 @@
             host.querySelectorAll('[data-roll]').forEach(b=>{
               requireRole(b, 'admin', 'Rolling a configuration back');
               b.addEventListener('click', ()=>rollbackCfg(r, b.dataset.roll));
+            });
+            // A Draft was never live, so it is published, not rolled back to —
+            // the server refuses a rollback onto a body that was never current.
+            host.querySelectorAll('[data-activate]').forEach(b=>{
+              requireRole(b, 'operator', 'Activating a version');
+              b.addEventListener('click', ()=>activateVersion(r, b.dataset.activate));
             });
             const go = host.querySelector('#cfDiffGo');
             if(go) go.addEventListener('click', ()=>diffVersions(r,
@@ -798,6 +1019,24 @@
         });
       }
 
+      /**
+       * Why the run figures are dashes. `telemetry_available: false` is not an
+       * outage — a store that does not answer fails the whole call and lands in
+       * the error state below. It means no bound agent's project answered, and
+       * for seven of the nine types that is every time: the registry records
+       * only which model an agent serves and which environment it runs in. The
+       * note used to blame the telemetry engine, and sent people to chase an
+       * outage that was not there.
+       */
+      function noRunsReason(r, u){
+        if(u.used_by_agents > 0){
+          return 'None of the agents bound to this configuration has a telemetry project that answered, so there are no run figures for this window.';
+        }
+        const tracked = r.config_type === 'Model' || r.config_type === 'Environment';
+        return 'No registered agent is bound to this configuration, so there are no runs to attribute.' +
+          (tracked ? '' : ' Agent binding is only tracked for Model and Environment configurations.');
+      }
+
       function usageTab(host, r){
         host.innerHTML = inspSection('Impact & Usage','chart', LOADING(150));
         API.configurations.usage(r.id)
@@ -810,7 +1049,7 @@
                 ['Avg Success Rate', pct(u.success_rate)],
                 [`Errors (${u.window_days || 30}d)`, num(u.error_count_30d)],
               ]) + (u.telemetry_available === false
-                ? `<div class="scan-note" style="margin-top:8px">${ICONS.info} The telemetry engine did not answer, so the run figures above are not available for this window.</div>`
+                ? `<div class="scan-note" style="margin-top:8px">${ICONS.info} ${esc(noRunsReason(r, u))}</div>`
                 : ''))}
               ${inspSection('Linked Configurations','link', (u.links || []).length
                 ? kv(u.links.map(l=>[l.slot, l.configuration_id
@@ -921,9 +1160,9 @@
         autoSelectFirst: true,
         onSelect: showPrompt,
         rowActions: r=>[
-          {label:'Run Prompt', icon:'play', onClick:()=>runPrompt(r)},
+          roleItem('member','Running a prompt', {label:'Run Prompt', icon:'play', onClick:()=>runPrompt(r)}),
           {label:'New Version', icon:'git', onClick:()=>newVersion(r)},
-          {label:'Test Prompt (score a dataset)', icon:'beaker', onClick:()=>testPrompt(r)},
+          roleItem('member','Testing a prompt', {label:'Test Prompt (render a dataset)', icon:'beaker', onClick:()=>testPrompt(r)}),
           {label:'View Diff', icon:'git', onClick:()=>{ showPrompt(r); }},
           {sep:true},
           ...lifecycleItems(r),
@@ -945,17 +1184,26 @@
 
       /* -------- the draft → in_review → approved / blocked lifecycle -------- */
 
+      /* The server's transition table, so the console offers exactly the moves
+         it will accept: Draft → In Review; In Review → Approved or Blocked;
+         Approved → Blocked or back to In Review; Blocked → In Review. Block used
+         to be offered on a Draft, which took a note and then answered 409, and
+         an Approved prompt could not be sent back to review from here at all. */
+      const canSubmit = (status) => status === 'Draft' || status === 'Blocked' || status === 'Approved';
+      const canBlock = (status) => status === 'In Review' || status === 'Approved';
+      const submitLabel = (status) => status === 'Approved' ? 'Re-submit for Review' : 'Submit for Review';
+
       function lifecycleItems(r){
         const items = [];
-        if(r.status === 'Draft' || r.status === 'Blocked'){
+        if(canSubmit(r.status)){
           items.push(roleItem('member','Submitting a prompt for review',
-            {label:'Submit for Review', icon:'send', onClick:()=>lifecycle(r, 'submitReview', 'Submit for Review')}));
+            {label:submitLabel(r.status), icon:'send', onClick:()=>lifecycle(r, 'submitReview', submitLabel(r.status))}));
         }
         if(r.status === 'In Review'){
           items.push(roleItem('operator','Approving a prompt',
             {label:'Approve', icon:'checkCircle', onClick:()=>lifecycle(r, 'approve', 'Approve')}));
         }
-        if(r.status !== 'Blocked'){
+        if(canBlock(r.status)){
           items.push(roleItem('operator','Blocking a prompt',
             {label:'Block', icon:'xCircle', danger:true, onClick:()=>lifecycle(r, 'block', 'Block')}));
         }
@@ -963,6 +1211,7 @@
       }
 
       const LIFECYCLE_ROLE = { submitReview:'member', approve:'operator', block:'operator' };
+      const LIFECYCLE_DONE = { submitReview:'Submitted for review', approve:'Approved', block:'Blocked' };
 
       function lifecycle(r, verb, label){
         const role = LIFECYCLE_ROLE[verb];
@@ -979,7 +1228,7 @@
                 const res = await Store.mutate(() => API.prompts[verb](r.id, { note }), { event:'prompts:changed' });
                 close();
                 const p = res.prompt || {};
-                toast(verb === 'block' ? 'warn' : 'success', label + 'd',
+                toast(verb === 'block' ? 'warn' : 'success', LIFECYCLE_DONE[verb],
                   res.message || `${p.name || r.name}: ${res.previous_status || r.status} → ${p.status || ''}.`);
                 refreshAll();
                 if(res.prompt) showPrompt(res.prompt);
@@ -1080,14 +1329,31 @@
         });
       }
 
-      function restoreVersion(r, version){
+      /**
+       * What a commit is called on screen. A label is optional, and it is not
+       * unique either — a restore re-commits the old label, and the next
+       * auto-increment then mints one that already exists — so the label is
+       * only ever shown. Everything sent to the server is the commit.
+       */
+      function commitLabel(v){
+        return v.version || (v.commit ? String(v.commit).slice(0, 8) : '—');
+      }
+
+      /**
+       * Restore by COMMIT. The button used to send the label, and the server
+       * resolves a label to the newest commit carrying it: with two "v0.2.0" in
+       * the history, Restore on the older row re-committed the head, reported
+       * success and reset the approval — the body asked for never came back.
+       */
+      function restoreVersion(r, commit, label){
         if(!allowed('operator','Restoring a prompt version')) return;
+        const version = label || String(commit).slice(0, 8);
         confirmModal({
           title:'Restore Version', icon:'replay', confirmLabel:'Restore', danger:true,
-          msg:`Re-commit ${version} as the head of ${r.name}? The history is kept — a new commit carries the old body.`,
+          msg:`Re-commit ${version} (commit ${String(commit).slice(0, 8)}) as the head of ${r.name}? The history is kept — a new commit carries the old body.`,
           onConfirm: async () => {
             try {
-              const res = await Store.mutate(() => API.prompts.restore(r.id, version), { event:'prompts:changed' });
+              const res = await Store.mutate(() => API.prompts.restore(r.id, commit), { event:'prompts:changed' });
               toast('success','Version restored', res.message || `${r.name} restored to ${version}.`);
               refreshAll();
               if(res.prompt) showPrompt(res.prompt);
@@ -1106,6 +1372,7 @@
        * did it take, and what did it cost.
        */
       function runPrompt(r){
+        if(!allowed('member','Running a prompt')) return;
         openModal({
           title:'Run Prompt — ' + r.name, icon:'play', wide:true,
           body:`<div class="grid g2">
@@ -1171,11 +1438,12 @@
       }
 
       function testPrompt(r){
+        if(!allowed('member','Testing a prompt')) return;
         openModal({
           title:'Test Prompt — ' + r.name, icon:'beaker', wide:true,
           body:`<div class="form-row"><label>SAMPLE VARIABLE SETS (JSON ARRAY)</label>
               <textarea class="input" id="tpCases" rows="6" placeholder='[{"customer":"Acme"},{"customer":"Globex"}]'>[{}]</textarea></div>
-            <label class="flex small" style="gap:7px;align-items:center"><input type="checkbox" id="tpScore" checked> Record the run against a dataset and score it</label>
+            <label class="flex small" style="gap:7px;align-items:center"><input type="checkbox" id="tpScore" checked> Record the run as a dataset and experiment for evaluation</label>
             <div id="tpResult" style="margin-top:12px"></div>`,
           footer:[
             {label:'Close'},
@@ -1193,7 +1461,8 @@
                     ${kv([['Failed', res.failed ? `<span class="st-red">${res.failed}</span>` : '0']])}
                     ${kv([['Commit', mono(res.commit)]])}
                     ${kv([['Variables', (res.variables || []).length ? esc(res.variables.join(', ')) : '—']])}
-                    ${kv([['Scored', res.scored ? '<span class="st-green">Yes</span>' : 'No']])}
+                    ${kv([['Recorded', res.recorded ? '<span class="st-green">Yes</span>' : 'No']])}
+                    ${res.dataset_name ? kv([['Dataset', esc(res.dataset_name)]]) : ''}
                     ${res.experiment_name ? kv([['Experiment', esc(res.experiment_name)]]) : ''}
                   </div>
                   ${res.detail ? `<div class="quote small">${esc(res.detail)}</div>` : ''}
@@ -1267,7 +1536,7 @@
           <div id="pmVersions">${inspSection('Version History','history', LOADING(120))}</div>
           <div class="insp-section"><div class="insp-section-title">Lifecycle</div>
             <div class="grid g2" style="gap:8px">
-              <button class="btn sm" id="pmSubmit">${ICONS.send}Submit for Review</button>
+              <button class="btn sm" id="pmSubmit">${ICONS.send}${esc(submitLabel(p.status))}</button>
               <button class="btn sm success" id="pmApprove">${ICONS.checkCircle}Approve</button>
               <button class="btn sm ghost-danger" id="pmBlock">${ICONS.xCircle}Block</button>
               <button class="btn sm" id="pmTest">${ICONS.beaker}Test Prompt</button>
@@ -1277,11 +1546,11 @@
 
         const submit = insp.querySelector('#pmSubmit');
         requireRole(submit, 'member', 'Submitting a prompt for review');
-        if(p.status === 'Approved' || p.status === 'In Review'){
+        if(Store.session.can('member') && !canSubmit(p.status)){
           submit.disabled = true;
           submit.title = `${p.name} is already ${p.status}.`;
         }
-        submit.addEventListener('click', ()=>lifecycle(p, 'submitReview', 'Submit for Review'));
+        submit.addEventListener('click', ()=>lifecycle(p, 'submitReview', submitLabel(p.status)));
 
         const approve = insp.querySelector('#pmApprove');
         requireRole(approve, 'operator', 'Approving a prompt');
@@ -1293,13 +1562,15 @@
 
         const block = insp.querySelector('#pmBlock');
         requireRole(block, 'operator', 'Blocking a prompt');
-        if(Store.session.can('operator') && p.status === 'Blocked'){
+        if(Store.session.can('operator') && !canBlock(p.status)){
           block.disabled = true;
-          block.title = 'This prompt is already blocked.';
+          block.title = p.status === 'Blocked' ? 'This prompt is already blocked.'
+            : 'Only a prompt that is in review or approved can be blocked.';
         }
         block.addEventListener('click', ()=>lifecycle(p, 'block', 'Block'));
 
-        insp.querySelector('#pmTest').addEventListener('click', ()=>testPrompt(p));
+        requireRole(insp.querySelector('#pmTest'), 'member', 'Testing a prompt')
+          .addEventListener('click', ()=>testPrompt(p));
         requireRole(insp.querySelector('#pmVersion'), 'member', 'Committing a prompt version');
         insp.querySelector('#pmVersion').addEventListener('click', ()=>newVersion(p));
 
@@ -1319,28 +1590,33 @@
                 EMPTY('history','No commits recorded','This prompt has no version history yet.'));
               return;
             }
+            // Two commits can carry one label; the short commit tells them apart.
+            const carried = {};
+            items.forEach(v => { carried[commitLabel(v)] = (carried[commitLabel(v)] || 0) + 1; });
+            const shown = (v) => carried[commitLabel(v)] > 1 && v.commit
+              ? `${commitLabel(v)} · ${String(v.commit).slice(0, 8)}` : commitLabel(v);
             host.innerHTML = inspSection('Version History','history', `
               <div class="pipe">${items.map(v=>`
                 <div class="pipe-step"><div class="pipe-dot ${v.is_head?'active':'done'}">${v.is_head?ICONS.star:ICONS.check}</div>
                   <div class="pipe-body">
-                    <div class="pipe-title"><span class="mono">${esc(v.version)}${v.is_head?' — Head':''}</span><span class="faint">${rel(v.created_at)}</span></div>
+                    <div class="pipe-title"><span class="mono">${esc(shown(v))}${v.is_head?' — Head':''}</span><span class="faint">${rel(v.created_at)}</span></div>
                     <div class="pipe-sub">${esc(v.status || '')}${v.author?' · by '+esc(v.author):''}${v.change_note?' · '+esc(clip(v.change_note, 70)):''}</div>
                     <div class="flex" style="gap:6px;margin-top:5px">
                       <button class="btn sm" data-pv="${esc(v.commit)}">${ICONS.eye}View</button>
-                      ${v.is_head?'':`<button class="btn sm" data-pr="${esc(v.version)}">${ICONS.replay}Restore</button>`}
+                      ${v.is_head || !v.commit ? '' : `<button class="btn sm" data-pr="${esc(v.commit)}" data-pl="${esc(commitLabel(v))}">${ICONS.replay}Restore</button>`}
                     </div>
                   </div></div>`).join('')}</div>
               <div class="grid g2" style="gap:8px;margin-top:10px">
                 <div class="form-row" style="margin:0"><label>DIFF FROM</label>
-                  <select class="filter-select w-100" id="pmDiffFrom" style="height:30px">${items.map((v,i)=>`<option value="${esc(v.commit)}" ${i===Math.min(1,items.length-1)?'selected':''}>${esc(v.version)}</option>`).join('')}</select></div>
+                  <select class="filter-select w-100" id="pmDiffFrom" style="height:30px">${items.map((v,i)=>`<option value="${esc(v.commit)}" ${i===Math.min(1,items.length-1)?'selected':''}>${esc(shown(v))}</option>`).join('')}</select></div>
                 <div class="form-row" style="margin:0"><label>DIFF TO</label>
-                  <select class="filter-select w-100" id="pmDiffTo" style="height:30px">${items.map((v,i)=>`<option value="${esc(v.commit)}" ${i===0?'selected':''}>${esc(v.version)}</option>`).join('')}</select></div>
+                  <select class="filter-select w-100" id="pmDiffTo" style="height:30px">${items.map((v,i)=>`<option value="${esc(v.commit)}" ${i===0?'selected':''}>${esc(shown(v))}</option>`).join('')}</select></div>
               </div>
               <button class="btn sm" id="pmDiffGo" style="margin-top:8px">${ICONS.git}Compare commits</button>`);
             host.querySelectorAll('[data-pv]').forEach(b=>b.addEventListener('click', ()=>viewCommit(p, b.dataset.pv)));
             host.querySelectorAll('[data-pr]').forEach(b=>{
               requireRole(b, 'operator', 'Restoring a prompt version');
-              b.addEventListener('click', ()=>restoreVersion(p, b.dataset.pr));
+              b.addEventListener('click', ()=>restoreVersion(p, b.dataset.pr, b.dataset.pl));
             });
             const go = host.querySelector('#pmDiffGo');
             if(go) go.addEventListener('click', ()=>diffCommits(p,
@@ -1414,10 +1690,27 @@
     return s === 'Active' ? 'green' : s === 'Syncing' ? 'amber' : (s === 'Failed' || s === 'Error') ? 'red' : 'gray';
   }
 
+  const ACL_ENFORCEMENTS = ['Enforced','Enforced + audit','Not required'];
+
+  /**
+   * A source carries two different counts, and only one of them was on screen.
+   * `document_count` / `chunk_count` are the inventory an indexer REPORTED — 0
+   * until somebody reports one. What a sync actually finds is what retrieval
+   * telemetry saw in its window, kept in settings.observed_*: not the corpus
+   * size, so it is never folded into the reported figure, but after a sync
+   * that announced "42 documents, 310 chunks" it is the number the reader is
+   * looking for. It rides under the reported count as a second line.
+   */
+  function seenLine(r, key){
+    const v = r.settings && r.settings[key];
+    return v == null ? '' : `<div class="cell-sub">${fmtFull(v)} seen in retrieval</div>`;
+  }
+
   SCREENS['knowledge'] = {
     title:'RAG & Knowledge Governance',
     render(main){
-      let current = null, owners = [];
+      let current = null;
+      const owners = ownerDirectory(() => API.knowledge.owners());
       const pollers = Object.create(null);
 
       main.innerHTML = `
@@ -1451,9 +1744,11 @@
               {label:'Active Sources', value:`<span class="st-green">${num(s.active_sources)}</span>`,
                 sub: s.active_percent == null ? null : pct(s.active_percent, 0) + ' of total', icon:'checkCircle', color:'green'},
               {label:'Total Documents', value:compact(s.total_documents), icon:'fileText', color:'blue',
-                sub: s.total_documents == null ? null : fmtFull(s.total_documents) + ' indexed'},
+                sub: s.observed_documents_total != null ? fmtFull(s.observed_documents_total) + ' seen in retrieval'
+                  : s.total_documents == null ? null : 'Inventory reported by the indexers'},
               {label:'Total Chunks', value:compact(s.total_chunks), icon:'layers', color:'cyan',
-                sub: s.total_chunks == null ? null : fmtFull(s.total_chunks) + ' embedded'},
+                sub: s.observed_chunks_total != null ? fmtFull(s.observed_chunks_total) + ' seen in retrieval'
+                  : s.total_chunks == null ? null : 'Inventory reported by the indexers'},
               {label:'Avg. Grounding Score', value:score(s.avg_grounding_score), icon:'trendUp', color:'orange',
                 sub: s.sources_scored == null ? null : `${fmtFull(s.sources_scored)} sources scored`},
               {label:'Sources with ACL', value:num(s.sources_with_acl),
@@ -1475,8 +1770,8 @@
           {key:'source_type', label:'Type', render:r=>r.source_type?badge(r.source_type,'gray'):dash},
           {key:'environment', label:'Environment', render:r=>r.environment?badge(r.environment):dash},
           {key:'status', label:'Status', render:r=>r.status?statusText(r.status, ksStatusColor(r.status)):dash},
-          {key:'document_count', label:'Documents', align:'right', cls:'num', render:r=>num(r.document_count)},
-          {key:'chunk_count', label:'Chunks', align:'right', cls:'num', render:r=>num(r.chunk_count)},
+          {key:'document_count', label:'Documents', align:'right', cls:'num', render:r=>num(r.document_count) + seenLine(r, 'observed_documents')},
+          {key:'chunk_count', label:'Chunks', align:'right', cls:'num', render:r=>num(r.chunk_count) + seenLine(r, 'observed_chunks')},
           {key:'grounding_score', label:'Grounding Score', render:r=>r.grounding_score == null ? dash
             : barPct(r.grounding_score * 100, r.grounding_score >= 0.85 ? 'green' : r.grounding_score >= 0.75 ? 'amber' : 'red', score(r.grounding_score))},
           {key:'sensitivity', label:'Sensitivity', render:r=>r.sensitivity?badge(r.sensitivity):dash},
@@ -1512,9 +1807,9 @@
       document.getElementById('ksSearch').addEventListener('input', e=>table.search(e.target.value));
       document.getElementById('ksExport').addEventListener('click', ()=>table.export());
 
-      API.knowledge.owners({ page_size: 100 })
-        .then(page => { owners = page.items || []; })
-        .catch(()=>{});
+      // Warm the owner pickers for the people who can open them (the directory
+      // opens at operator). A dialog asks again, out loud, if this did not land.
+      if(Store.session.can('operator')) owners.load().catch(()=>{});
 
       function refreshAll(){ table.refresh(); loadSummary(); }
 
@@ -1549,8 +1844,8 @@
             {key:'name', label:'Index Name', render:r=>mono(r.index_name || '—')},
             {key:'source_type', label:'Backend', render:r=>dim(r.source_type)},
             {key:'embedding_model', label:'Embedding Model', sortable:false, render:r=>dim(r.embedding_model)},
-            {key:'chunk_count', label:'Vectors', align:'right', cls:'num', render:r=>num(r.chunk_count)},
-            {key:'document_count', label:'Documents', align:'right', cls:'num', render:r=>num(r.document_count)},
+            {key:'chunk_count', label:'Vectors', align:'right', cls:'num', render:r=>num(r.chunk_count) + seenLine(r, 'observed_chunks')},
+            {key:'document_count', label:'Documents', align:'right', cls:'num', render:r=>num(r.document_count) + seenLine(r, 'observed_documents')},
             {key:'chunk_size', label:'Chunk / Overlap', sortable:false, render:r=>r.chunk_size == null ? dash : `<span class="dim">${r.chunk_size} / ${r.chunk_overlap == null ? '—' : r.chunk_overlap}</span>`},
             {key:'indexing', label:'Freshness', sortable:false, render:r=>r.indexing_status?statusText(r.indexing_status, r.indexing_status === 'Up to date' ? 'green' : r.indexing_status === 'Failed' ? 'red' : 'amber'):dash},
             {key:'status', label:'Status', render:r=>r.status?statusText(r.status, ksStatusColor(r.status)):dash},
@@ -1644,13 +1939,26 @@
        * percentage on screen is the job's percentage — nothing here counts a
        * timer up to 100.
        */
+      /* Each poll is scheduled by the answer to the one before it, so a slow
+         answer cannot overlap the next and announce one completion twice. One
+         failed poll is not the end of the job either: a 429, a timeout or a
+         network blip used to stop the watch for good, and the row then read
+         "Syncing… 40%" until the page was reloaded. Failures back off (4 s, 8 s,
+         16 s) and only the fourth in a row gives up — at once when the answer
+         says the source is gone or the session is. Giving up re-reads the
+         table, which re-arms the watch if the row is still syncing. */
+      const SYNC_POLL_MS = 2000, SYNC_POLL_TRIES = 4;
       function watchSync(id){
         if(pollers[id]) return;
-        pollers[id] = setInterval(()=>{
+        const watch = pollers[id] = { timer: null, failures: 0 };
+        const again = (ms) => { if(pollers[id] === watch) watch.timer = setTimeout(poll, ms); };
+        function poll(){
           API.knowledge.syncStatus(id)
             .then(st => {
+              if(pollers[id] !== watch) return;
+              watch.failures = 0;
               if(current && current.id === id) paintSyncState(st);
-              if(st.running) return;
+              if(st.running){ again(SYNC_POLL_MS); return; }
               stopWatch(id);
               table.refresh();
               loadSummary();
@@ -1662,24 +1970,65 @@
                   `${st.name || 'Source'} — ${fmtFull(st.documents_seen || 0)} documents, ${fmtFull(st.chunks_seen || 0)} chunks.`);
               }
             })
-            .catch(()=>{ stopWatch(id); });
-        }, 2000);
+            .catch(err => {
+              if(pollers[id] !== watch) return;
+              watch.failures += 1;
+              const final = err && (err.status === 401 || err.status === 403 || err.status === 404);
+              if(!final && watch.failures < SYNC_POLL_TRIES){
+                again(SYNC_POLL_MS * Math.pow(2, watch.failures));
+                return;
+              }
+              stopWatch(id);
+              if(current && current.id === id) paintSyncLost(id, err);
+              table.refresh();
+              loadSummary();
+            });
+        }
+        again(SYNC_POLL_MS);
       }
       function stopWatch(id){
-        if(!pollers[id]) return;
-        clearInterval(pollers[id]);
+        const watch = pollers[id];
+        if(!watch) return;
+        clearTimeout(watch.timer);
         delete pollers[id];
       }
       function stopAllWatches(){ Object.keys(pollers).forEach(stopWatch); }
       this.cleanup = () => { stopAllWatches(); clearAlt(); };
 
+      /* The bar owns everything in the inspector that a running job changes.
+         It is rendered hidden for a source that is not syncing, and nothing
+         un-hid it when the sync was started from this screen — the stage and
+         percentage were written into an invisible box, the header went on
+         saying Active, and Sync Now stayed live for a second click to 409. */
       function paintSyncState(st){
         const host = document.getElementById('ksSyncBar');
         if(!host) return;
+        host.style.display = '';
+        if(st.running){
+          const chip = document.getElementById('ksStatus');
+          if(chip) chip.innerHTML = statusText('Syncing', ksStatusColor('Syncing'));
+          const btn = document.getElementById('ksSync');
+          if(btn && !btn.disabled){
+            btn.disabled = true;
+            btn.title = 'A sync is already running for this source.';
+          }
+        }
         const p = st.progress == null ? 0 : st.progress;
         host.innerHTML = `<div class="small" style="margin-bottom:4px">${esc(st.stage || 'Working')} ${st.stage_index != null && st.stage_count ? `(${st.stage_index} of ${st.stage_count})` : ''}</div>
           ${barPct(p, p >= 100 ? 'green' : 'amber', p + '%')}
           <div class="small faint" style="margin-top:4px">${fmtFull(st.documents_seen || 0)} documents · ${fmtFull(st.chunks_seen || 0)} chunks seen${st.error?` · <span class="st-red">${esc(st.error)}</span>`:''}</div>`;
+      }
+
+      function paintSyncLost(id, err){
+        const host = document.getElementById('ksSyncBar');
+        if(!host) return;
+        host.style.display = '';
+        host.innerHTML = `<div class="small st-amber">${ICONS.alert} Lost contact with the sync job — ${esc(msgOf(err))}</div>
+          <button class="btn sm" id="ksSyncRetry" style="margin-top:6px">${ICONS.refresh}Check again</button>`;
+        host.querySelector('#ksSyncRetry').addEventListener('click', ()=>{
+          host.innerHTML = LOADING(50);
+          watchSync(id);
+        });
       }
 
       async function syncSource(r){
@@ -1698,12 +2047,6 @@
 
       /* ------------------------------ mutations ------------------------------ */
 
-      function ownerOptions(selected){
-        if(!owners.length) return '<option value="">No members loaded</option>';
-        return '<option value="">Unassigned</option>' + owners.map(u=>
-          `<option value="${esc(u.id)}" ${u.id===selected?'selected':''}>${esc(u.full_name || u.email)}</option>`).join('');
-      }
-
       document.getElementById('ksAdd').addEventListener('click', ()=>{
         if(!allowed('operator','Adding a knowledge source')) return;
         openModal({
@@ -1715,9 +2058,9 @@
             </div>
             <div class="grid g2">
               <div class="form-row"><label>ENVIRONMENT</label><select class="filter-select w-100" id="asEnv" style="height:34px">${optionList(ENVIRONMENTS,'Production')}</select></div>
-              <div class="form-row"><label>OWNER</label><select class="filter-select w-100" id="asOwner" style="height:34px">${ownerOptions((Store.session.user||{}).id)}</select></div>
+              <div class="form-row"><label>OWNER</label><select class="filter-select w-100" id="asOwner" style="height:34px">${owners.options(me().id, me().full_name)}</select></div>
             </div>
-            <div class="form-row"><label>LOCATION / URL</label><input class="input" id="asLoc" placeholder="https://…"></div>
+            <div class="form-row"><label>LOCATION / URL</label><input class="input" id="asLoc" placeholder="URL or path"></div>
             <div class="form-row"><label>DESCRIPTION</label><input class="input" id="asDesc" placeholder="What does this source contain?"></div>
             <div class="grid g2">
               <div class="form-row"><label>INDEX NAME</label><input class="input" id="asIndex" placeholder="e.g. compliance-hub-v1"></div>
@@ -1727,6 +2070,11 @@
               <div class="form-row"><label>CHUNK SIZE</label><input class="input" id="asChunk" type="number" value="512"></div>
               <div class="form-row"><label>CHUNK OVERLAP</label><input class="input" id="asOverlap" type="number" value="64"></div>
             </div>
+            <div class="grid g2">
+              <div class="form-row"><label>DOCUMENTS (REPORTED BY THE INDEXER)</label><input class="input" id="asDocs" type="number" min="0" placeholder="Leave blank if not known"></div>
+              <div class="form-row"><label>CHUNKS (REPORTED BY THE INDEXER)</label><input class="input" id="asChunks" type="number" min="0" placeholder="Leave blank if not known"></div>
+            </div>
+            <div class="form-row"><label>ACL DETAIL</label><input class="input" id="asAclSum" placeholder="Who may read it, e.g. the reader principal or group"></div>
             <label class="flex small" style="gap:7px;align-items:center"><input type="checkbox" id="asAcl" checked> ACL-aware crawling</label>
             <label class="flex small" style="gap:7px;align-items:center;margin-top:6px"><input type="checkbox" id="asSync" checked> Start the first sync now</label>`,
           footer:[
@@ -1753,6 +2101,14 @@
                 },
                 start_sync: modal.querySelector('#asSync').checked,
               };
+              // A blank inventory is "not reported": the key is left out, never
+              // sent as null — the columns cannot hold one.
+              const docs = parseInt(modal.querySelector('#asDocs').value, 10);
+              const chunks = parseInt(modal.querySelector('#asChunks').value, 10);
+              if(!isNaN(docs)) body.document_count = docs;
+              if(!isNaN(chunks)) body.chunk_count = chunks;
+              const aclDetail = (modal.querySelector('#asAclSum').value || '').trim();
+              if(aclDetail) body.acl_summary = aclDetail;
               try {
                 const res = await Store.mutate(() => API.knowledge.create(body), { event:'knowledge:changed' });
                 close();
@@ -1765,6 +2121,7 @@
               }
             }},
           ],
+          onOpen(modal){ owners.attach(modal.querySelector('#asOwner'), me().id, me().full_name); },
         });
       });
 
@@ -1781,13 +2138,25 @@
             </div>
             <div class="grid g2">
               <div class="form-row"><label>ENVIRONMENT</label><select class="filter-select w-100" id="esEnv" style="height:34px">${optionList(ENVIRONMENTS, r.environment)}</select></div>
-              <div class="form-row"><label>OWNER</label><select class="filter-select w-100" id="esOwner" style="height:34px">${ownerOptions(r.owner_user_id)}</select></div>
+              <div class="form-row"><label>OWNER</label><select class="filter-select w-100" id="esOwner" style="height:34px">${owners.options(r.owner_user_id, r.owner_name)}</select></div>
             </div>
             <div class="form-row"><label>LOCATION / URL</label><input class="input" id="esLoc" value="${esc(st.location || '')}"></div>
             <div class="form-row"><label>DESCRIPTION</label><input class="input" id="esDesc" value="${esc(st.description || '')}"></div>
             <div class="grid g2">
               <div class="form-row"><label>RETRIEVAL TOP-K</label><input class="input" id="esTopK" type="number" value="${rp.top_k == null ? '' : rp.top_k}"></div>
               <div class="form-row"><label>MIN SCORE</label><input class="input" id="esMin" type="number" step="0.01" value="${rp.min_score == null ? '' : rp.min_score}"></div>
+            </div>
+            <div class="grid g2">
+              <div class="form-row"><label>RETRIEVAL POLICY NAME</label><input class="input" id="esPolicy" value="${esc(rp.name || '')}"></div>
+              <div class="form-row"><label>RERANKER</label><input class="input" id="esRerank" value="${esc(rp.reranker || '')}"></div>
+            </div>
+            <div class="grid g2">
+              <div class="form-row"><label>ACL ENFORCEMENT</label><select class="filter-select w-100" id="esAclMode" style="height:34px">${optionListKeeping(ACL_ENFORCEMENTS, rp.acl_enforcement)}</select></div>
+              <div class="form-row"><label>ACL DETAIL</label><input class="input" id="esAclSum" value="${esc(r.acl_summary || '')}"></div>
+            </div>
+            <div class="grid g2">
+              <div class="form-row"><label>DOCUMENTS (REPORTED BY THE INDEXER)</label><input class="input" id="esDocs" type="number" min="0" value="${r.document_count == null ? '' : r.document_count}"></div>
+              <div class="form-row"><label>CHUNKS (REPORTED BY THE INDEXER)</label><input class="input" id="esChunks" type="number" min="0" value="${r.chunk_count == null ? '' : r.chunk_count}"></div>
             </div>
             <label class="flex small" style="gap:7px;align-items:center"><input type="checkbox" id="esAcl" ${r.has_acl?'checked':''}> ACL-aware crawling</label>`,
           footer:[
@@ -1800,7 +2169,6 @@
                 source_type: modal.querySelector('#esType').value,
                 sensitivity: modal.querySelector('#esSens').value,
                 environment: modal.querySelector('#esEnv').value,
-                owner_user_id: modal.querySelector('#esOwner').value || null,
                 has_acl: modal.querySelector('#esAcl').checked,
                 // The server replaces the whole settings block, so overlay the
                 // edits on the loaded values or the unedited keys are wiped.
@@ -1810,12 +2178,32 @@
                 }),
                 expected_updated_at: r.updated_at || null,
               };
-              if(!isNaN(topK) || !isNaN(minScore)){
-                body.retrieval_policy = Object.assign({}, rp, {
-                  top_k: isNaN(topK) ? rp.top_k : topK,
-                  min_score: isNaN(minScore) ? rp.min_score : minScore,
-                });
+              // The server replaces the whole policy block too, so it is sent
+              // only when one of its fields was edited, overlaid on what was
+              // loaded — `filters` and anything else this dialog does not show
+              // must survive the save.
+              const policy = {
+                name: (modal.querySelector('#esPolicy').value || '').trim() || null,
+                top_k: isNaN(topK) ? null : topK,
+                min_score: isNaN(minScore) ? null : minScore,
+                acl_enforcement: modal.querySelector('#esAclMode').value || null,
+                reranker: (modal.querySelector('#esRerank').value || '').trim() || null,
+              };
+              if(Object.keys(policy).some(k => policy[k] !== (rp[k] == null ? null : rp[k]))){
+                body.retrieval_policy = Object.assign({}, rp, policy);
               }
+              // A blank inventory is left out, never sent as null: the columns
+              // cannot hold one, and the refusal reads as a name conflict.
+              const docs = parseInt(modal.querySelector('#esDocs').value, 10);
+              const chunks = parseInt(modal.querySelector('#esChunks').value, 10);
+              if(!isNaN(docs) && docs !== r.document_count) body.document_count = docs;
+              if(!isNaN(chunks) && chunks !== r.chunk_count) body.chunk_count = chunks;
+              const aclDetail = (modal.querySelector('#esAclSum').value || '').trim() || null;
+              if(aclDetail !== (r.acl_summary || null)) body.acl_summary = aclDetail;
+              // The owner travels only when the reader chose a different one. A
+              // picker that failed to load must never be read as "Unassigned".
+              const owner = owners.change(modal.querySelector('#esOwner'), r.owner_user_id);
+              if(owner !== undefined) body.owner_user_id = owner;
               try {
                 const saved = await Store.mutate(() => API.knowledge.update(r.id, body), { event:'knowledge:changed' });
                 close();
@@ -1827,6 +2215,7 @@
               }
             }},
           ],
+          onOpen(modal){ owners.attach(modal.querySelector('#esOwner'), r.owner_user_id, r.owner_name); },
         });
       }
 
@@ -1907,7 +2296,7 @@
           <div class="insp-head">
             <span class="entity-ico" style="width:38px;height:38px;background:var(--panel-3)">${LOGOS[KS_LOGO[s.source_type]] || LOGOS.custom}</span>
             <div class="grow"><div class="insp-title">${esc(s.name)}</div>
-              <div class="flex" style="gap:6px;margin-top:4px">${s.status?statusText(s.status, ksStatusColor(s.status)):''}<span class="insp-sub">${esc(s.source_type || '')}</span></div></div>
+              <div class="flex" style="gap:6px;margin-top:4px"><span id="ksStatus">${s.status?statusText(s.status, ksStatusColor(s.status)):''}</span><span class="insp-sub">${esc(s.source_type || '')}</span></div></div>
             <button class="icon-btn insp-close" id="ksClose">${ICONS.x}</button></div>
           <div id="ksSyncBar" class="insp-section" ${s.status === 'Syncing' ? '' : 'style="display:none"'}></div>
           ${inspSection('Source Summary','info', kv([
@@ -1919,8 +2308,10 @@
             ['Sensitivity', s.sensitivity?badge(s.sensitivity):dash],
             ['ACL', s.has_acl ? '<span class="st-green">Enforced</span>' : '<span class="st-amber">Not enforced</span>'],
             ['ACL Detail', text(s.acl_summary)],
-            ['Documents', num(s.document_count)],
-            ['Chunks', num(s.chunk_count)],
+            ['Documents (reported)', num(s.document_count)],
+            ['Chunks (reported)', num(s.chunk_count)],
+            ['Seen in Retrieval', st.observed_documents == null && st.observed_chunks == null ? dash
+              : `${num(st.observed_documents)} documents · ${num(st.observed_chunks)} chunks`],
             ['Chunk Size', s.chunk_size == null ? dash : `${s.chunk_size} tokens${s.chunk_overlap == null ? '' : ` (overlap ${s.chunk_overlap})`}`],
             ['Indexing Errors', num(st.indexing_errors)],
           ]))}
@@ -1973,12 +2364,18 @@
         loadGroundingSection(s);
       }
 
+      /* The grounding scan is the slowest read on this screen, so its answer can
+         arrive after the reader has moved to another source — and used to paint
+         source A's gauge into source B's panel. Only the answer for the source
+         still on show is kept. */
+      let groundingFor = null;
       function loadGroundingSection(s){
         const host = document.getElementById('ksGrounding');
         if(!host) return;
+        groundingFor = s.id;
         API.knowledge.grounding(s.id)
           .then(g => {
-            if(!document.getElementById('ksGrounding')) return;
+            if(groundingFor !== s.id || !document.getElementById('ksGrounding')) return;
             host.innerHTML = inspSection('Grounding & Quality','target', g.measured
               ? `<div class="donut-wrap">${gaugeRing((g.overall || 0) * 100, 'orange', 96, 'Grounding')}
                   <div class="legend grow">${(g.dimensions || []).map(d=>
@@ -1990,7 +2387,7 @@
                   `No retrieval spans for this source were found in the last ${g.window_days || 30} days.`));
           })
           .catch(err => {
-            if(!document.getElementById('ksGrounding')) return;
+            if(groundingFor !== s.id || !document.getElementById('ksGrounding')) return;
             host.innerHTML = '';
             host.appendChild(screenError(err, ()=>loadGroundingSection(s), 'the grounding breakdown'));
           });
@@ -2020,7 +2417,8 @@
   SCREENS['secrets'] = {
     title:'Secrets & Credentials',
     render(main){
-      let current = null, owners = [], vaults = [];
+      let current = null, vaults = [];
+      const owners = ownerDirectory(() => API.secrets.owners());
 
       main.innerHTML = `
         ${pageHead({title:'Secrets & Credentials', sub:'Manage vaults, API keys, certificates, service principals, and credential rotation across your AI ecosystem.',
@@ -2043,32 +2441,52 @@
 
       requireRole(document.getElementById('scAdd'), 'admin', 'Storing a secret');
 
-      function loadSummary(){
+      /* `panels:false` repaints the KPI row alone. The four panels below cost up
+         to seven list calls, and a reveal moves none of their figures — only
+         Privileged Access (30d). The skeleton is for the first paint; after
+         that the old figures stay up until the new ones land, instead of the
+         row blinking empty after every mutation. */
+      let summaryPainted = false;
+      function loadSummary(opts){
         const host = document.getElementById('scKpis');
         if(!host) return;
-        host.innerHTML = kpiSkeleton(SC_KPIS);
+        const withPanels = !(opts && opts.panels === false);
+        if(!summaryPainted) host.innerHTML = kpiSkeleton(SC_KPIS);
         API.secrets.summary()
           .then(s => {
             if(!document.getElementById('scKpis')) return;
+            summaryPainted = true;
             host.innerHTML = kpiRow([
               {label:'Total Secrets', value:num(s.total), icon:'key', color:'purple',
                 sub: (s.by_type || []).length ? `${s.by_type.length} credential types` : null},
               {label:'Active Vaults', value:num(s.active_vaults), sub:'Holding at least one live secret', icon:'lock', color:'blue'},
               {label:'Expiring Soon', value:`<span class="${s.expiring_soon?'st-amber':''}">${num(s.expiring_soon)}</span>`,
-                sub:'Rotation due inside the warning window', icon:'clock', color:'amber'},
+                sub:'Expires inside the 30-day window', icon:'clock', color:'amber'},
               {label:'Rotation Overdue', value:`<span class="${s.rotation_overdue?'st-red':''}">${num(s.rotation_overdue)}</span>`,
                 sub: s.rotation_overdue ? 'Past the rotation deadline' : 'None', icon:'alert', color:'red'},
-              {label:'Compliance Score', value:pct(s.compliance_score, 0),
-                sub:'Share of secrets inside their rotation policy', icon:'shieldCheck', color:'green'},
+              // The score is taken over the credentials in service. With none, the
+              // server answers 100 by convention — there is nothing to score, so
+              // the card says that rather than showing a perfect mark.
+              {label:'Compliance Score', value: s.in_service === 0 ? dash : pct(s.compliance_score, 0),
+                sub: s.in_service == null ? 'Share of secrets inside their rotation policy'
+                  : s.in_service === 0 ? 'No credential is in service to score'
+                  : `Of the ${fmtFull(s.in_service)} in service, inside their policy`, icon:'shieldCheck', color:'green'},
               {label:'Privileged Access (30d)', value:num(s.privileged_access_30d),
-                sub:'Reveals and rotations recorded', icon:'users', color:'orange'},
+                sub:'Successful reveals and rotations of privileged secrets', icon:'users', color:'orange'},
             ]);
-            paintPanels(s);
+            // Every vault in the workspace, when the summary carries them; the
+            // rows of the pages already viewed (onLoad below) are the fallback.
+            if(Array.isArray(s.vaults)){
+              s.vaults.forEach(v => { if(v && vaults.indexOf(v) < 0) vaults.push(v); });
+              fillOptions(table, 3, vaults);
+            }
+            if(withPanels) paintPanels(s);
           })
           .catch(err => {
-            fail(host, err, loadSummary, 'the secret summary');
+            summaryPainted = false;
+            fail(host, err, ()=>loadSummary(opts), 'the secret summary');
             const panels = document.getElementById('scPanels');
-            if(panels) fail(panels, err, loadSummary, 'the vault panels');
+            if(panels && withPanels) fail(panels, err, ()=>loadSummary(opts), 'the vault panels');
           });
       }
       loadSummary();
@@ -2085,8 +2503,11 @@
           {key:'vault', label:'Vault / Store', render:r=>dim(r.vault)},
           {key:'environment', label:'Environment', render:r=>r.environment?badge(r.environment):dash},
           {key:'status', label:'Status', render:r=>r.status?badge(r.status, secretStatusColor(r.status)):dash},
+          // "Expiring soon" is about expires_at, not the rotation clock, so the
+          // amber badge carries the expiry — it used to show the rotation label
+          // ("83d") in amber, a deadline that was not the one at risk.
           {key:'rotation', label:'Rotation', render:r=>r.is_rotation_overdue ? badge('Overdue','red')
-            : r.is_expiring_soon ? badge(r.rotation_label || 'Due soon','amber')
+            : r.is_expiring_soon ? expiryBadge(r)
             : dim(r.rotation_label)},
           {key:'last_accessed_at', label:'Last Accessed', render:r=>`<span class="dim nowrap">${rel(r.last_accessed_at)}</span>`},
           {key:'owner', label:'Owner', render:r=>r.owner_name?ownerCell(r.owner_name, ''):dash},
@@ -2110,7 +2531,9 @@
           fillOptions(table, 3, vaults);
         },
         rowActions: r=>[
-          roleItem('admin','Rotating a secret', {label:'Rotate Secret', icon:'refresh', onClick:()=>rotate(r)}),
+          // A disabled or revoked credential is not rotated — the server answers 412.
+          ...(r.status === 'Disabled' || r.status === 'Revoked' ? []
+            : [roleItem('admin','Rotating a secret', {label:'Rotate Secret', icon:'refresh', onClick:()=>rotate(r)})]),
           {label:'View Audit Log', icon:'history', onClick:()=>auditLog(r)},
           roleItem('admin','Editing access', {label:'Edit Access', icon:'lock', onClick:()=>editAccess(r)}),
           {sep:true},
@@ -2129,9 +2552,10 @@
       document.getElementById('scSearch').addEventListener('input', e=>table.search(e.target.value));
       document.getElementById('scExport').addEventListener('click', ()=>table.export());
 
-      API.secrets.owners({ page_size: 100 })
-        .then(page => { owners = page.items || []; })
-        .catch(()=>{});
+      // Warm the owner pickers for the people who can open them — every dialog
+      // that carries one is admin-only. A dialog asks again, out loud, if this
+      // did not land.
+      if(Store.session.can('admin')) owners.load().catch(()=>{});
 
       tabBar(document.getElementById('scTabs'), SC_TABS.map(t=>({label:t[0]})),
         i => setFilter(table, 0, SC_TABS[i][1]));
@@ -2158,12 +2582,26 @@
           <div class="card"><div class="card-head"><div class="card-title">Rotation Overdue</div></div>
             <div id="scOverdue">${LOADING(110)}</div></div>`;
 
-        // The donut counts come from the server: one filtered query per status.
+        /* The donut counts come from the server. A summary that carries
+           `by_status` ([{status, count}]) draws it with no further request;
+           until the summary does, it costs one filtered count per status. Five
+           of the seven statuses are asked for — the stored status partitions
+           the total, so what is left over is the other two, shown as one slice
+           rather than bought with two more queries. Without it the arcs did
+           not add up to the number in the middle. */
         const STATUS_COLORS = { 'Active':'green', 'Expiring Soon':'amber', 'Rotation Overdue':'red',
-          'Expired':'red', 'Disabled':'gray', 'Revoked':'red', 'Warning':'amber' };
+          'Expired':'red', 'Disabled':'gray', 'Revoked':'red', 'Warning':'amber', 'Warning / Revoked':'gray' };
         const wanted = ['Active','Expiring Soon','Rotation Overdue','Expired','Disabled'];
-        Promise.all(wanted.map(st => API.secrets.list({ status: st, page_size: 1 })
-          .then(p => ({ status: st, count: p.total || 0 })).catch(()=>({ status: st, count: null }))))
+        const counts = Array.isArray(s.by_status)
+          ? Promise.resolve(s.by_status.map(b => ({ status: b.status, count: b.count })))
+          : Promise.all(wanted.map(st => API.secrets.list({ status: st, page_size: 1 })
+              .then(p => ({ status: st, count: p.total || 0 })).catch(()=>({ status: st, count: null }))))
+              .then(rows => {
+                const rest = s.total == null || rows.some(r=>r.count == null) ? 0
+                  : s.total - rows.reduce((sum, r) => sum + r.count, 0);
+                return rest > 0 ? rows.concat([{ status:'Warning / Revoked', count: rest }]) : rows;
+              });
+        counts
           .then(rows => {
             const body = document.getElementById('scVaultBody');
             if(!body) return;
@@ -2181,13 +2619,20 @@
               <div class="small faint" style="margin-top:6px">${s.active_vaults == null ? '—' : s.active_vaults} active vaults</div>`;
           });
 
-        listInto('#scExpiring', { expiring_within_days: 7, page_size: 5, sort:'next_rotation_at' },
-          'Nothing expires in the next 7 days');
+        listInto('#scExpiring', { expiring_within_days: 7, page_size: 5, sort:'expires_at' },
+          'Nothing expires in the next 7 days', expiryBadge);
         listInto('#scOverdue', { rotation_state:'overdue', page_size: 5, sort:'next_rotation_at' },
-          'No secret is past its rotation deadline');
+          'No secret is past its rotation deadline', () => badge('Overdue','red'));
       }
 
-      function listInto(sel, params, emptyMsg){
+      /** How close a credential is to its expiry: red once past, amber before. */
+      function expiryBadge(x){
+        if(!x.expires_at) return dim(x.rotation_label);
+        const left = until(x.expires_at);
+        return left ? badge('Expires ' + left, 'amber') : badge('Expired', 'red');
+      }
+
+      function listInto(sel, params, emptyMsg, rowBadge){
         const host = document.querySelector(sel);
         if(!host) return;
         API.secrets.list(params)
@@ -2197,7 +2642,7 @@
             const items = page.items || [];
             target.innerHTML = items.length
               ? items.map(x=>`<div class="kv"><span class="k" style="color:var(--text)">${esc(x.name)}</span>
-                  <span class="v">${x.is_rotation_overdue ? badge('Overdue','red') : badge(x.rotation_label || 'Due soon','amber')}</span></div>`).join('')
+                  <span class="v">${rowBadge(x)}</span></div>`).join('')
                 + (page.total > items.length ? `<div class="small faint" style="margin-top:6px">${page.total - items.length} more</div>` : '')
               : `<div class="faint small">${esc(emptyMsg)}</div>`;
           })
@@ -2205,12 +2650,6 @@
             const target = document.querySelector(sel);
             if(target) target.innerHTML = `<div class="small st-red">${esc(msgOf(err))}</div>`;
           });
-      }
-
-      function ownerOptions(selected){
-        if(!owners.length) return '<option value="">No members loaded</option>';
-        return '<option value="">Unassigned</option>' + owners.map(u=>
-          `<option value="${esc(u.id)}" ${u.id===selected?'selected':''}>${esc(u.full_name || u.email)}</option>`).join('');
       }
 
       /* ------------------------------ mutations ------------------------------ */
@@ -2227,9 +2666,9 @@
             </div>
             <div class="grid g2">
               <div class="form-row"><label>ENVIRONMENT</label><select class="filter-select w-100" id="nsEnv" style="height:34px">${optionList(ENVIRONMENTS,'Production')}</select></div>
-              <div class="form-row"><label>OWNER</label><select class="filter-select w-100" id="nsOwner" style="height:34px">${ownerOptions((Store.session.user||{}).id)}</select></div>
+              <div class="form-row"><label>OWNER</label><select class="filter-select w-100" id="nsOwner" style="height:34px">${owners.options(me().id, me().full_name, true)}</select></div>
             </div>
-            <div class="form-row"><label>VALUE</label><input class="input" type="password" id="nsValue" placeholder="Leave blank to store metadata only and reference the vault"></div>
+            <div class="form-row"><label>VALUE</label><input class="input" type="password" id="nsValue" placeholder="Leave blank only if you fill in Vault Reference below"></div>
             <div class="form-row"><label>VAULT REFERENCE</label><input class="input" id="nsRef" placeholder="e.g. @KeyVault(SecretUri=…)"></div>
             <div class="grid g2">
               <div class="form-row"><label>ROTATION PERIOD (DAYS)</label><input class="input" id="nsRot" type="number" value="90"></div>
@@ -2241,6 +2680,15 @@
             {label:'Store in Vault', cls:'primary', onClick: async (close, modal) => {
               const name = (modal.querySelector('#nsName').value || '').trim();
               if(!name){ toast('error','Name required','Give the secret a name.'); return; }
+              // The server requires a vault, and either material to encrypt or a
+              // reference to where the material lives. Say which, here, instead
+              // of sending a body it can only refuse.
+              if(!(modal.querySelector('#nsVault').value || '').trim()){
+                toast('error','Vault required','Name the vault or store that holds this credential.'); return;
+              }
+              if(!modal.querySelector('#nsValue').value && !(modal.querySelector('#nsRef').value || '').trim()){
+                toast('error','Value or reference required','Provide a value to encrypt, or a vault reference for a credential managed elsewhere.'); return;
+              }
               const rot = parseInt(modal.querySelector('#nsRot').value, 10);
               const body = {
                 name,
@@ -2264,6 +2712,7 @@
               }
             }},
           ],
+          onOpen(modal){ owners.attach(modal.querySelector('#nsOwner'), me().id, me().full_name, true); },
         });
       });
 
@@ -2272,11 +2721,11 @@
         openModal({
           title:'Edit Access — ' + r.name, icon:'lock',
           body:`<div class="grid g2">
-              <div class="form-row"><label>OWNER</label><select class="filter-select w-100" id="eaOwner" style="height:34px">${ownerOptions(r.owner_user_id)}</select></div>
-              <div class="form-row"><label>ENVIRONMENT</label><select class="filter-select w-100" id="eaEnv" style="height:34px">${optionList(ENVIRONMENTS, r.environment)}</select></div>
+              <div class="form-row"><label>OWNER</label><select class="filter-select w-100" id="eaOwner" style="height:34px">${owners.options(r.owner_user_id, r.owner_name)}</select></div>
+              <div class="form-row"><label>ENVIRONMENT</label><select class="filter-select w-100" id="eaEnv" style="height:34px">${optionListKeeping(ENVIRONMENTS, r.environment)}</select></div>
             </div>
             <div class="grid g2">
-              <div class="form-row"><label>RISK</label><select class="filter-select w-100" id="eaRisk" style="height:34px">${optionList(SECRET_RISKS, r.risk)}</select></div>
+              <div class="form-row"><label>RISK</label><select class="filter-select w-100" id="eaRisk" style="height:34px">${optionListKeeping(SECRET_RISKS, r.risk)}</select></div>
               <div class="form-row"><label>ROTATION PERIOD (DAYS)</label><input class="input" id="eaRot" type="number" value="${r.rotation_period_days == null ? '' : r.rotation_period_days}"></div>
             </div>
             <div class="form-row"><label>VAULT REFERENCE</label><input class="input" id="eaRef" value="${esc(r.vault_reference || '')}"></div>
@@ -2286,15 +2735,26 @@
             {label:'Cancel'},
             {label:'Save Access', cls:'primary', onClick: async (close, modal) => {
               const rot = parseInt(modal.querySelector('#eaRot').value, 10);
-              const body = {
-                owner_user_id: modal.querySelector('#eaOwner').value || null,
-                environment: modal.querySelector('#eaEnv').value,
-                risk: modal.querySelector('#eaRisk').value,
-                rotation_period_days: isNaN(rot) ? null : rot,
-                vault_reference: (modal.querySelector('#eaRef').value || '').trim() || null,
-                privileged: modal.querySelector('#eaPriv').checked,
-                expected_updated_at: r.updated_at || null,
-              };
+              /* Only what the reader changed is sent. The dialog used to PATCH
+                 all six fields on every save, so a select that could not show
+                 the stored value wrote its first entry back, a picker that had
+                 not loaded cleared the owner, and the audit row claimed six
+                 changes for an edit to one. */
+              const body = {};
+              const put = (key, value, was) => { if(value !== was) body[key] = value; };
+              const owner = owners.change(modal.querySelector('#eaOwner'), r.owner_user_id);
+              if(owner !== undefined) body.owner_user_id = owner;
+              put('environment', modal.querySelector('#eaEnv').value || null, r.environment || null);
+              put('risk', modal.querySelector('#eaRisk').value || null, r.risk || null);
+              put('rotation_period_days', isNaN(rot) ? null : rot, r.rotation_period_days == null ? null : r.rotation_period_days);
+              put('vault_reference', (modal.querySelector('#eaRef').value || '').trim() || null, r.vault_reference || null);
+              put('privileged', modal.querySelector('#eaPriv').checked, Boolean(r.privileged));
+              if(!Object.keys(body).length){
+                close();
+                toast('info','Nothing to save','No access setting was changed.');
+                return;
+              }
+              body.expected_updated_at = r.updated_at || null;
               try {
                 const saved = await Store.mutate(() => API.secrets.update(r.id, body), { event:'secrets:changed' });
                 close();
@@ -2302,10 +2762,23 @@
                 refreshAll();
                 showSecret(saved);
               } catch (err) {
-                toast('error','Could not update access', msgOf(err));
+                if(!(err && err.isConflict)){ toast('error','Could not update access', msgOf(err)); return; }
+                /* The row moved under this dialog — a reveal, a rotation and the
+                   status sweep all do that. Saving again from here can only be
+                   refused again, so reopen on the row as it stands now. */
+                try {
+                  const fresh = await API.secrets.get(r.id);
+                  close();
+                  toast('warn','This secret changed while the dialog was open', 'It has been reloaded — reapply your edit and save again.', 6000);
+                  showSecret(fresh);
+                  editAccess(fresh);
+                } catch (again) {
+                  toast('error','Could not update access', msgOf(err));
+                }
               }
             }},
           ],
+          onOpen(modal){ owners.attach(modal.querySelector('#eaOwner'), r.owner_user_id, r.owner_name); },
         });
       }
 
@@ -2334,7 +2807,12 @@
                 if(copyBtn) copyBtn.addEventListener('click', ()=>copyText(res.value, 'Secret value copied'));
                 toast('warn','Secret revealed','The reveal is recorded in this secret’s access log.');
                 table.refresh();
-                loadSummary();
+                loadSummary({ panels: false });
+                // A reveal moves the row's updated_at and adds an access-log
+                // entry. The inspector behind this dialog still held the row as
+                // it was, so its Edit Access was refused as a conflict and its
+                // Recent Access did not show the reveal that had just happened.
+                if(current && current.id === r.id) showSecret(r);
               } catch (err) {
                 fail(out, err, null, 'the secret value');
                 toast('error','Could not reveal', msgOf(err));
@@ -2344,29 +2822,45 @@
         });
       }
 
-      /** Rotation is a real multi-step flow: choose, confirm, then read the result. */
+      /**
+       * Rotation is a real multi-step flow: choose, confirm, then read the result.
+       *
+       * Two kinds of credential pass through it, and the dialog used to describe
+       * neither. Where the control plane holds the material, IT mints the new
+       * value and stores it encrypted — no vault generates anything, and nothing
+       * is pushed to the systems that use it. Where only a reference is held
+       * (has_material false), a blank value records a rotation that was carried
+       * out in the vault itself: the clock restarts and nothing is generated.
+       */
       function rotate(r){
         if(!allowed('admin','Rotating a secret')) return;
+        const held = Boolean(r.has_material);
+        const vault = r.vault || 'the vault';
         openModal({
           title:'Rotate Secret — ' + r.name, icon:'refresh', wide:true,
           body:`<div id="rtStep1">
               <div class="pipe" style="margin-bottom:12px">
                 <div class="pipe-step"><div class="pipe-dot active">1</div><div class="pipe-body">
                   <div class="pipe-title"><span>Choose the new material</span></div>
-                  <div class="pipe-sub">Supply a value, or let the vault generate one.</div></div></div>
+                  <div class="pipe-sub">${held ? 'Supply a value, or let the control plane generate one.'
+                    : `Rotate it in ${esc(vault)} first, then record it here — or supply a value to store one.`}</div></div></div>
                 <div class="pipe-step"><div class="pipe-dot">2</div><div class="pipe-body">
                   <div class="pipe-title"><span>Rotate</span></div>
                   <div class="pipe-sub">The server writes the new version and restarts the rotation clock.</div></div></div>
                 <div class="pipe-step"><div class="pipe-dot">3</div><div class="pipe-body">
                   <div class="pipe-title"><span>Hand the value over</span></div>
-                  <div class="pipe-sub">A generated value is shown once, here, and never again.</div></div></div>
+                  <div class="pipe-sub">${held ? 'A generated value is shown once, here, and never again.'
+                    : 'Nothing is generated for a reference-only credential.'}</div></div></div>
               </div>
-              <div class="form-row"><label>NEW VALUE</label><input class="input" type="password" id="rtValue" placeholder="Leave blank to have the vault generate one"></div>
+              <div class="form-row"><label>NEW VALUE</label><input class="input" type="password" id="rtValue" placeholder="${held ? 'Leave blank to have the control plane generate one'
+                : esc('Leave blank to record a rotation performed in ' + vault)}"></div>
               <div class="grid g2">
                 <div class="form-row"><label>ROTATION PERIOD (DAYS)</label><input class="input" id="rtDays" type="number" value="${r.rotation_period_days == null ? '' : r.rotation_period_days}"></div>
                 <div class="form-row"><label>REASON</label><input class="input" id="rtReason" placeholder="Recorded in the access log"></div>
               </div>
-              <div class="quote small">${ICONS.info} ${esc(r.vault || 'The vault')} holds the material. Linked systems pick the new value up through the vault reference.</div>
+              <div class="quote small">${ICONS.info} ${held
+                ? 'The new value is stored encrypted here. Nothing is pushed anywhere: hand it to the systems that use this credential.'
+                : esc(`${r.vault || 'The vault'} holds the material. Rotate it there, then record it here; nothing is generated or pushed by the control plane.`)}</div>
             </div>
             <div id="rtStep2"></div>`,
           footer:[
@@ -2385,20 +2879,22 @@
                 modal.querySelector('#rtStep1').style.display = 'none';
                 if(btns[1]) btns[1].style.display = 'none';
                 out.innerHTML = `<div class="pipe" style="margin-bottom:12px">
-                    ${['Choose the new material','Rotate','Hand the value over'].map(s=>
+                    ${['Choose the new material','Rotate', res.recorded_upstream ? 'Rotation recorded' : 'Hand the value over'].map(s=>
                       `<div class="pipe-step"><div class="pipe-dot done">${ICONS.check}</div><div class="pipe-body">
                         <div class="pipe-title"><span>${esc(s)}</span><span class="st-green small">Done</span></div></div></div>`).join('')}
                   </div>
                   ${kv([
                     ['Rotated at', when(res.rotated_at)],
                     ['Next rotation', when(res.next_rotation_at)],
-                    ['Generated by the vault', res.generated ? '<span class="st-green">Yes</span>' : 'No'],
+                    ['Generated by the control plane', res.generated ? '<span class="st-green">Yes</span>' : 'No'],
                     ['Status', res.secret && res.secret.status ? badge(res.secret.status, secretStatusColor(res.secret.status)) : dash],
                   ])}
                   ${res.value ? `<div class="small muted" style="font-weight:700;margin:10px 0 4px">NEW VALUE (SHOWN ONCE)</div>
                     <div class="secret-val"><span class="sv" style="user-select:all">${esc(res.value)}</span>
                       <button class="icon-btn" id="rtCopy" title="Copy">${ICONS.copy}</button></div>`
-                    : '<div class="small faint" style="margin-top:10px">You supplied the material, so there is nothing new to hand back.</div>'}`;
+                    : `<div class="small faint" style="margin-top:10px">${res.recorded_upstream
+                        ? esc(`Recorded — the material stays in ${vault}; nothing was generated.`)
+                        : 'You supplied the material, so there is nothing new to hand back.'}</div>`}`;
                 const cb = out.querySelector('#rtCopy');
                 if(cb) cb.addEventListener('click', ()=>copyText(res.value, 'New secret value copied'));
                 toast('success','Secret rotated', `${r.name} — next rotation ${res.next_rotation_at ? relTime(ts(res.next_rotation_at)) : 'not scheduled'}.`);
@@ -2565,7 +3061,7 @@
               : s.next_rotation_at ? `${s.is_expiring_soon?'<span class="st-amber">':''}${when(s.next_rotation_at)}${s.is_expiring_soon?'</span>':''}` : dash],
             ['Rotation Label', text(s.rotation_label)],
             ['Expires', when(s.expires_at)],
-            ['Compliance', s.compliance ? badge(s.compliance, s.compliance === 'Compliant' ? 'green' : 'red') : dash],
+            ['Compliance', s.compliance ? badge(s.compliance, s.compliance === 'Compliant' ? 'green' : s.compliance === 'N/A' ? 'gray' : 'red') : dash],
             ['Material Stored', s.has_material ? '<span class="st-green">Yes</span>' : '<span class="faint">No — reference only</span>'],
           ]))}
           ${inspSection('Access & Usage','users', kv([
@@ -2581,7 +3077,9 @@
               <button class="btn sm" id="qaAccess">${ICONS.lock}Edit Access</button>
               ${s.status === 'Disabled'
                 ? `<button class="btn sm success" id="qaEnable">${ICONS.checkCircle}Enable Secret</button>`
-                : `<button class="btn sm ghost-danger" id="qaDisable">${ICONS.xCircle}Disable Secret</button>`}
+                : s.status === 'Revoked'
+                  ? `<button class="btn sm" disabled title="A revoked credential cannot be enabled or disabled again.">${ICONS.xCircle}Revoked — final</button>`
+                  : `<button class="btn sm ghost-danger" id="qaDisable">${ICONS.xCircle}Disable Secret</button>`}
             </div></div>`;
         insp.querySelector('#scClose').addEventListener('click', ()=>document.getElementById('scLayout').classList.add('collapsed'));
 
@@ -2593,8 +3091,14 @@
         eye.addEventListener('click', ()=>reveal(s));
         insp.querySelector('#svCopy').addEventListener('click', ()=>
           copyText(s.vault_reference, 'Vault reference copied'));
-        requireRole(insp.querySelector('#qaRotate'), 'admin', 'Rotating a secret')
-          .addEventListener('click', ()=>rotate(s));
+        const rot = requireRole(insp.querySelector('#qaRotate'), 'admin', 'Rotating a secret');
+        if((s.status === 'Disabled' || s.status === 'Revoked') && !rot.disabled){
+          // The server answers 412: a credential out of service is not rotated.
+          rot.disabled = true;
+          rot.title = s.status === 'Disabled' ? 'Enable this secret before rotating it.'
+            : 'A revoked credential cannot be rotated.';
+        }
+        rot.addEventListener('click', ()=>rotate(s));
         insp.querySelector('#qaAudit').addEventListener('click', ()=>auditLog(s));
         requireRole(insp.querySelector('#qaAccess'), 'admin', 'Editing secret access')
           .addEventListener('click', ()=>editAccess(s));

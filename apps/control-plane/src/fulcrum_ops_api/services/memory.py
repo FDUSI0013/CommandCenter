@@ -8,12 +8,18 @@ audited against. Nothing about that lives anywhere else, so it is queried,
 mutated and audited like any other governance row.
 
 *Theirs* is the telemetry engine, which holds the conversation and session
-records themselves as trace threads. Every session, conversation, record and
-backup payload on this screen is read live from the engine through the adapter;
-none of it is cached, estimated or reconstructed. Where the engine reports
-nothing — a store type it does not hold, a usage figure it does not track — the
-field is null and the operation is refused with a precondition rather than
-answered with a plausible number.
+records themselves as trace threads. Every session, conversation and record on
+this screen is read live from the engine through the adapter; none of it is
+estimated or reconstructed. The one thing remembered is a project's thread
+*count*, for ``settings.memory_counts_cache_seconds``, because the KPI row and
+every store row ask for it on every load; a purge forgets the counts of the
+projects it swept. Where the engine reports nothing — a store type it does not
+hold, a usage figure it does not track — the field is null and the operation is
+refused with a precondition rather than answered with a plausible number.
+
+A store owns the threads of the agents whose memory policy names it, and
+nothing else: that binding is the whole scope of its records, its purge and its
+backup count. A backup holds the store's governed state and never its threads.
 
 Two structural notes:
 

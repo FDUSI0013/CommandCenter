@@ -27,7 +27,11 @@ the caller's address from; HTTP concerns live in ``api.v1.alerts``.
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
+import hashlib
+import logging
+import time
 from collections.abc import Sequence
 from typing import Any
 
@@ -56,6 +60,8 @@ from ..schemas.alerts import (
     AlertUpdate,
 )
 from . import audit
+
+log = logging.getLogger(__name__)
 
 SCREEN = "Alerts"
 
@@ -92,6 +98,18 @@ _RULE_MUTE_KEYS: tuple[str, ...] = (RULE_MUTE_KEY, "muted_by", "mute_reason")
 #: How many times a raise reads the next reference again after another raise
 #: took it between the read and the insert, before settling for an opaque one.
 REF_ALLOCATION_ATTEMPTS = 5
+
+#: First key of the two-int advisory lock the raises of one condition take turns
+#: on. The audit chain and the memory purge use namespaces of their own, and the
+#: scheduler's tick lock is the single-bigint form, so none of them can collide.
+CONDITION_LOCK_NAMESPACE = 0x414C5254  # "ALRT"
+
+#: How long a raise waits for its turn before it goes ahead without one. The
+#: lock is held until the holder commits, and the holder can be a screen's whole
+#: edit; giving up costs at worst a second live row for the condition, which the
+#: dedupe lookup tolerates. An alert that is late is worth more than none.
+CONDITION_LOCK_WAIT_SECONDS = 3.0
+CONDITION_LOCK_POLL_SECONDS = 0.025
 
 #: Hard ceiling on a CSV export so one click cannot pull an unbounded table.
 MAX_EXPORT_ROWS = 10_000
@@ -219,20 +237,88 @@ def _opaque_alert_ref() -> str:
     return f"al-{new_id()[-8:]}"
 
 
-async def _live_alert(session: AsyncSession, workspace_id: str, dedupe_key: str) -> Alert | None:
-    """The alert a recurrence of ``dedupe_key`` lands on, if one is still live."""
+async def _live_alert(
+    session: AsyncSession,
+    workspace_id: str,
+    dedupe_key: str,
+    *,
+    other_than: str | None = None,
+) -> Alert | None:
+    """The alert a recurrence of ``dedupe_key`` lands on, if one is still live.
+
+    ``other_than`` leaves one alert out: the row a raise has just inserted, when
+    it looks again for a twin that got there first.
+    """
+    stmt = select(Alert).where(
+        Alert.workspace_id == workspace_id,
+        Alert.dedupe_key == dedupe_key,
+        Alert.status.in_(LIVE_STATUSES),
+    )
+    if other_than is not None:
+        stmt = stmt.where(Alert.id != other_than)
     return (
-        await session.execute(
-            select(Alert)
-            .where(
-                Alert.workspace_id == workspace_id,
-                Alert.dedupe_key == dedupe_key,
-                Alert.status.in_(LIVE_STATUSES),
-            )
-            .order_by(Alert.raised_at.desc())
-            .limit(1)
-        )
+        await session.execute(stmt.order_by(Alert.raised_at.desc()).limit(1))
     ).scalar_one_or_none()
+
+
+class _ConditionAlreadyLive(Exception):
+    """Raised inside the insert's savepoint to take the insert back."""
+
+
+def _condition_lock_key(workspace_id: str, dedupe_key: str) -> int:
+    """The condition's half of the lock key: a stable signed 32-bit number.
+
+    Derived here rather than by a database hash function so every worker, and
+    every database version, agrees on it.
+    """
+    digest = hashlib.sha256(f"{workspace_id}\x00{dedupe_key}".encode()).digest()
+    return int.from_bytes(digest[:4], "big", signed=True)
+
+
+async def _take_condition(session: AsyncSession, workspace_id: str, dedupe_key: str) -> None:
+    """Make the raises of one condition take turns until the transaction ends.
+
+    The dedupe lookup is a check and the insert an act, and between the two a
+    second worker raising the same condition finds nothing either: two live rows
+    for one condition, which is the flood the key exists to prevent. A unique
+    index on the live key would refuse the second; until the schema has one,
+    this lock is what stands in for it. It is keyed on the condition, not the
+    workspace, so nothing waits here that the index would not also make wait.
+
+    Transaction-scoped, so there is no unlock for a cancelled request to skip,
+    and re-entrant. Under READ COMMITTED the lookup that follows takes a fresh
+    snapshot, so it sees the row the previous holder has just committed.
+
+    Polled with the try- form and bounded, the way the audit chain takes its
+    turn and for the same reasons: a blocking wait needs ``lock_timeout`` to be
+    bounded, and a statement that times out aborts the caller's transaction —
+    the alert would be failing the edit that raised it. Polling also cannot
+    deadlock two sweeps that raise the same conditions in a different order.
+
+    SQLite has one writer at a time and no advisory locks; there, the second
+    look :func:`raise_alert` takes after its insert is what finds the twin.
+    """
+    if _dialect(session) != "postgresql":
+        return
+    statement = select(
+        func.pg_try_advisory_xact_lock(
+            CONDITION_LOCK_NAMESPACE, _condition_lock_key(workspace_id, dedupe_key)
+        )
+    )
+    deadline = time.monotonic() + CONDITION_LOCK_WAIT_SECONDS
+    while True:
+        if (await session.execute(statement)).scalar():
+            return
+        if time.monotonic() >= deadline:
+            log.warning(
+                "alert condition %r in workspace %s still being raised elsewhere after "
+                "%.1fs; raising without the lock (a duplicate live row is tolerated)",
+                dedupe_key,
+                workspace_id,
+                CONDITION_LOCK_WAIT_SECONDS,
+            )
+            return
+        await asyncio.sleep(CONDITION_LOCK_POLL_SECONDS)
 
 
 async def _absorb(
@@ -432,17 +518,22 @@ async def raise_alert(
     payload = metadata or {}
 
     if dedupe_key:
+        await _take_condition(session, workspace_id, dedupe_key)
         existing = await _live_alert(session, workspace_id, dedupe_key)
         if existing is not None:
             return await _absorb(session, existing, occurred, payload), False
 
+    # What the rule writes goes on the alert that is born here and nowhere else:
+    # a raise that loses the race below lands on somebody else's row, which was
+    # put to the rules when *it* was born and may be a person's, never silenced.
     status = AlertStatus.OPEN.value
+    born_with = payload
     rule = await _rule_covering(session, workspace_id, source, severity_value)
     if rule is not None and rule.enabled:
-        payload = {**payload, "alert_rule": rule.name, "alert_rule_id": rule.id}
+        born_with = {**payload, "alert_rule": rule.name, "alert_rule_id": rule.id}
     elif rule is not None and principal is None:
         status = AlertStatus.MUTED.value
-        payload = {
+        born_with = {
             **payload,
             "alert_rule": rule.name,
             RULE_MUTE_KEY: rule.id,
@@ -470,7 +561,7 @@ async def raise_alert(
             occurrence_count=1,
             last_occurred_at=occurred,
             engine_alert_id=engine_alert_id,
-            event_metadata=payload,
+            event_metadata=born_with,
         )
 
     # The reference is read without a lock, so raises that land together — the
@@ -481,10 +572,15 @@ async def raise_alert(
     # reference, and of the dedupe key too, because the raise that won may have
     # been this very condition, and then this one is its second occurrence.
     #
-    # Two raises of one key that read *different* tables (a third alert was
-    # committed between them) choose different references and both insert; only
-    # a unique index on the live key can refuse that, and the lookup above
-    # tolerates it by landing on the newest.
+    # Two raises of one key need not collide on the reference at all: the second
+    # looks for the key before the first commits and reads the reference after,
+    # so it takes the next one and inserts a second live row for the condition.
+    # The turn taken above keeps them apart where the database has such a lock;
+    # everywhere, the raise looks once more from inside the savepoint, and takes
+    # its insert back if a twin has been committed in the meantime. What is left
+    # is two raises that both went ahead without the lock and neither of which
+    # has committed; only a unique index on the live key can refuse that, and
+    # the lookup above tolerates it by landing on the newest.
     #
     # A screen's evaluator calls this with its own edit still pending (the quota
     # it has just restated, say). That is written first, in the caller's
@@ -500,7 +596,11 @@ async def raise_alert(
             async with session.begin_nested():
                 session.add(candidate)
                 await session.flush()
-        except IntegrityError:
+                if dedupe_key and await _live_alert(
+                    session, workspace_id, dedupe_key, other_than=candidate.id
+                ):
+                    raise _ConditionAlreadyLive
+        except (IntegrityError, _ConditionAlreadyLive):
             if dedupe_key:
                 existing = await _live_alert(session, workspace_id, dedupe_key)
                 if existing is not None:

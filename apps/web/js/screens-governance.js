@@ -31,6 +31,17 @@
   const text = (v) => (v == null || v === '') ? dash : esc(v);
   const dim = (v) => (v == null || v === '') ? dash : `<span class="dim">${esc(v)}</span>`;
 
+  /**
+   * What a failed call should say. A 422 answers with a generic headline ("One
+   * or more fields are invalid.") and puts the real reason in `details.fields`,
+   * so the field messages win when the server sent any.
+   */
+  function errText(err){
+    const fields = (err && err.details && err.details.fields) || [];
+    if(fields.length) return fields.map(f => String(f.message || '').replace(/^Value error,\s*/, '')).join(' · ');
+    return (err && err.message) || 'The request failed.';
+  }
+
   /** Up/down only when the server actually reported a movement. */
   function deltaDir(v){ return v == null || v === 0 ? null : (v > 0 ? 'up' : 'down'); }
 
@@ -73,6 +84,22 @@
     `<div class="empty-state">${ICONS[icon] || ICONS.search}<div class="es-title">${esc(title)}</div><div>${body || ''}</div></div>`;
 
   function logoFor(key){ return LOGOS[key] || LOGOS.custom; }
+
+  /** Policy Status as the server derived it; a "Warned" says which enforcement earned it. */
+  function policyStatusBadge(a){
+    const html = badge(a.policy_status);
+    return a.strongest_enforcement_30d
+      ? `<span title="Strongest enforcement in the last 30 days: ${esc(a.strongest_enforcement_30d)}">${html}</span>` : html;
+  }
+
+  /** After a 409 on an agent save: the row's current concurrency token, so the
+   *  dialog that is still open can be saved again without retyping anything. */
+  async function freshToken(agentId, fallback){
+    try {
+      const d = await API.agents.get(agentId, { include_versions: false });
+      return (d && d.agent && d.agent.updated_at) || fallback;
+    } catch (_) { return fallback; }
+  }
 
   /** A connection's kind decides its mark when the server did not name one. */
   const KIND_LOGO = { 'Azure AI Foundry':'foundry', 'Copilot Studio':'copilot', 'M365 Copilot':'m365',
@@ -251,7 +278,10 @@
       function tile(c){
         return `<div class="conn-card" data-conn="${esc(c.id)}">
           <div class="cc-head"><span class="cc-logo" style="background:var(--panel-3)">${logoFor(c.logo_key || KIND_LOGO[c.kind])}</span>
-            <div class="grow"><div class="cc-name">${esc(c.name)}</div><div style="margin-top:3px">${badge(c.status, null, true)}</div></div>
+            <div class="grow"><div class="cc-name">${esc(c.name)}</div><div style="margin-top:3px">${
+              // A disabled tile kept its green "Connected" badge and a live Test
+              // button that could only answer 412.
+              c.enabled === false ? badge('Disabled', 'gray', true) : badge(c.status, null, true)}</div></div>
             <button class="icon-btn" data-connmenu>${ICONS.dots}</button></div>
           <div>
             ${(c.metadata_pairs||[]).map(m=>`<div class="cc-kv"><span class="k">${esc(m[0])}</span><span class="v">${esc(m[1])}</span></div>`).join('')}
@@ -271,19 +301,28 @@
           const cn = tiles.find(c=>c.id === card.dataset.conn);
           if(!cn) return;
           card.querySelector('[data-details]').addEventListener('click', ()=>showDetails(cn));
-          requireRole(card.querySelector('[data-test]'), 'operator', 'Testing a connection')
-            .addEventListener('click', ()=>testConn(cn));
+          const testBtn = card.querySelector('[data-test]');
+          if(cn.enabled === false){
+            card.style.opacity = '.72';
+            testBtn.disabled = true;
+            testBtn.title = 'This connection is disabled. Enable it before testing.';
+          } else {
+            requireRole(testBtn, 'operator', 'Testing a connection').addEventListener('click', ()=>testConn(cn));
+          }
           card.querySelector('[data-connmenu]').addEventListener('click', e=>{
             C.openMenu(e.currentTarget, [
               {label:'View Details', icon:'eye', onClick:()=>showDetails(cn)},
               {label:'Tool Calls & Data', icon:'link', onClick:()=>showTraffic(cn)},
-              {label:'Test Connection', icon:'activity', onClick:()=>testConn(cn)},
-              {label:'Sync Now', icon:'refresh', onClick:()=>syncConn(cn)},
+              // Test and Sync answer 412 for a disabled tile, so they are not offered.
+              ...(cn.enabled === false ? [] : [
+                {label:'Test Connection', icon:'activity', onClick:()=>testConn(cn)},
+                {label:'Sync Now', icon:'refresh', onClick:()=>syncConn(cn)}]),
               {label:'Configure', icon:'settings', onClick:()=>configure(cn)},
               {sep:true},
               cn.enabled
                 ? {label:'Disable Connection', icon:'xCircle', danger:true, onClick:()=>setEnabled(cn, false)}
                 : {label:'Enable Connection', icon:'checkCircle', onClick:()=>setEnabled(cn, true)},
+              {label:'Delete Connection', icon:'trash', danger:true, onClick:()=>deleteConn(cn)},
             ]);
           });
         });
@@ -338,10 +377,17 @@
           onOpen(modal){
             const host = modal.querySelector('#ctBody');
             const picker = modal.querySelector('#ctWindow');
+            // A 30-day read can take ~20 s; without the ticket its late answer
+            // painted over the 7-day one the user had since asked for.
+            let seq = 0;
             const load = () => {
+              const mine = ++seq;
+              picker.disabled = true;
               host.innerHTML = '<div class="card-loading" style="height:200px"></div>';
               API.connections.traffic(cn.id, { window_days: picker.value })
                 .then(t => {
+                  if(mine !== seq) return;
+                  picker.disabled = false;
                   const tools = t.tool_calls || [];
                   const flows = t.data_flows || [];
                   host.innerHTML = `
@@ -351,7 +397,8 @@
                       ${kv([['Distinct tools', String(tools.length)]])}
                       ${kv([['Data operations', String(flows.length)]])}
                     </div>
-                    ${t.truncated ? `<div class="quote small">${ICONS.info} The span scan hit its cap, so these totals are a floor rather than a complete count.</div>` : ''}
+                    ${t.truncated ? `<div class="quote small">${ICONS.info} ${esc(t.attributable !== false && t.note ? t.note
+                      : 'The span scan hit its cap, so these totals are a floor rather than a complete count.')}</div>` : ''}
                     ${t.attributable === false ? `<div class="empty-state">${ICONS.link}
                         <div class="es-title">Traffic cannot be attributed to this connection</div>
                         <div>${esc(t.note || '')}</div></div>`
@@ -378,7 +425,11 @@
                           <td class="dim">${x.last_seen_at ? relTime(ts(x.last_seen_at)) : dash}</td></tr>`).join('')}
                         </tbody></table>` : ''}`}`;
                 })
-                .catch(err => { host.innerHTML = ''; host.appendChild(screenError(err, load, 'this connection traffic')); });
+                .catch(err => {
+                  if(mine !== seq) return;
+                  picker.disabled = false;
+                  host.innerHTML = ''; host.appendChild(screenError(err, load, 'this connection traffic'));
+                });
             };
             picker.addEventListener('change', load);
             load();
@@ -391,11 +442,40 @@
         toast('info','Testing '+cn.name+'…','Probing the endpoint.');
         try {
           const res = await Store.mutate(()=>API.connections.test(cn.id), { event:'connections:changed' });
-          toast(res.ok ? 'success' : 'warn', res.ok ? cn.name+' responded' : cn.name+' — warning', res.message);
+          probeToast(cn.name, res);
         } catch (err) {
           toast('error','Test failed', err.message);
         }
         reloadAll();
+      }
+
+      /* `ok` only says the endpoint answered — also true of an HTTP 503 — so the
+         toast was green for a tile that had just turned amber, and amber for one
+         that had just gone red. It follows the status the probe left behind. */
+      function probeToast(name, res){
+        const status = (res.data || {}).status;
+        if(status === 'Connected') toast('success', name+' responded', res.message);
+        else if(status === 'Warning') toast('warn', name+' answered with a warning', res.message);
+        else if(status === 'Disconnected') toast('error', name+' is unreachable', res.message);
+        else toast(res.ok ? 'success' : 'warn', res.ok ? name+' responded' : name+' — warning', res.message);
+      }
+
+      /* A tile could be added here but never removed: a typo, or the default
+         "<kind> — New" name, stayed in the grid and in the KPI counts for good.
+         The server keeps the one rule that matters — the last connection of a
+         kind cannot go while agents still run on that platform — and says so. */
+      function deleteConn(cn){
+        if(!allowed('admin','Deleting a connection')) return;
+        confirmModal({ title:'Delete Connection', danger:true, confirmLabel:'Delete',
+          body:`<p style="margin-top:0">You are about to delete <b style="color:var(--text)">${esc(cn.name)}</b>.</p>
+            <p>The tile and its activity history leave this screen. Agents are not touched — but the last ${esc(cn.kind || '')} connection cannot be deleted while agents still run on that platform. This is recorded in the audit trail.</p>`,
+          onConfirm: async ()=>{
+            try {
+              await Store.mutate(()=>API.connections.remove(cn.id), { event:'connections:changed' });
+              toast('success','Connection deleted', `${cn.name} was removed.`);
+              reloadAll();
+            } catch (err) { toast('error','Could not delete the connection', errText(err)); }
+          }});
       }
 
       async function syncConn(cn){
@@ -432,9 +512,12 @@
           footer:[{label:'Cancel'},{label:'Save Changes', cls:'primary', onClick: async (close, modal)=>{
             const endpoint = modal.querySelector('#cfgEndpoint').value.trim();
             if(endpoint && !/^https?:\/\//i.test(endpoint)){ toast('error','Check the endpoint','The endpoint must be an absolute http(s) URL.'); return; }
+            /* Secret values arrive as the '***redacted***' marker and are sent
+               back as they came: the server reads the marker as "unchanged, keep
+               what is stored". It also replaces config wholesale from the keys it
+               is sent, so deleting the marked keys here — as this used to — erased
+               the stored credential whenever anyone edited the note. */
             const config = Object.assign({}, cn.config || {}, { endpoint_url: endpoint || null });
-            // The server redacts secret values on read — echoing the markers back would store them.
-            Object.keys(config).forEach(k=>{ if(config[k] === '***redacted***') delete config[k]; });
             const body = {
               name: modal.querySelector('#cfgName').value.trim() || cn.name,
               kind: modal.querySelector('#cfgKind').value.trim() || cn.kind,
@@ -462,6 +545,11 @@
             const body = modal.querySelector('.modal-body');
             API.connections.get(cn.id)
               .then(c => {
+                const footTest = modal.querySelector('[data-mbtn="0"]');
+                if(footTest && c.enabled === false){
+                  footTest.disabled = true;
+                  footTest.title = 'This connection is disabled. Enable it before testing.';
+                }
                 body.innerHTML = `<div class="grid g2">
                   <div>${inspSection('Connection Details','info', kv([
                     ['Status', badge(c.status, null, true)],
@@ -473,7 +561,8 @@
                     ['Syncs Today', num(c.syncs_today)],
                     ['Agents Using', num(c.linked_agent_count)],
                     ['Enabled', c.enabled ? '<span class="st-green">Yes</span>' : '<span class="st-red">No</span>'],
-                    ...(c.note ? [['Note', `<span class="st-amber">${esc(c.note)}</span>`]] : []),
+                    ...(c.status_detail ? [['Last probe', `<span class="st-amber">${esc(c.status_detail)}</span>`]] : []),
+                    ...(c.note ? [['Note', esc(c.note)]] : []),
                   ]))}</div>
                   <div>${inspSection('Endpoint & Credentials','lock', kv([
                     ['Endpoint', (c.config||{}).endpoint_url ? `<span class="mono small">${esc(c.config.endpoint_url)}</span>` : dash],
@@ -522,7 +611,7 @@
         btn.disabled = true; btn.innerHTML = `<span class="spin">${ICONS.refresh}</span>Syncing…`;
         try {
           const res = await Store.mutate(()=>API.connections.syncAll(), { event:'connections:changed' });
-          toast(res.ok ? 'success' : 'warn','Sync complete', res.message);
+          toast(res.ok ? 'success' : 'warn', res.ok ? 'Sync complete' : 'Sync finished with warnings', res.message);
         } catch (err) { toast('error','Could not sync', err.message); }
         btn.disabled = false; btn.innerHTML = orig;
         reloadAll();
@@ -543,19 +632,49 @@
             const name = modal.querySelector('#ncName').value.trim() || (kind + ' — New');
             const endpoint = modal.querySelector('#ncUri').value.trim();
             if(endpoint && !/^https?:\/\//i.test(endpoint)){ toast('error','Check the endpoint','The endpoint must be an absolute http(s) URL.'); return; }
+            /* Only a probe can move a tile off Disconnected, and a probe needs an
+               endpoint. An agent platform may honestly have none (SDK agents push
+               their telemetry), so that is allowed and said plainly below; any
+               other kind without one is a tile that can never be tested. */
+            if(!endpoint && !PLATFORMS.includes(kind)){
+              toast('error','Endpoint required', `A ${kind} connection is only ever validated by probing its endpoint, so it needs one.`);
+              return;
+            }
             const body = {
               name, kind, logo_key: KIND_LOGO[kind] || 'custom',
               metadata_pairs: [['Environment', modal.querySelector('#ncEnv').value], ['Authentication', modal.querySelector('#ncAuth').value]],
               config: { endpoint_url: endpoint || null },
               enabled: true,
             };
+            let created;
             try {
-              const created = await Store.mutate(()=>API.connections.create(body), { event:'connections:changed' });
-              close();
-              toast('success','Connection added', `${created.name} registered — test it to confirm the endpoint answers.`);
+              created = await Store.mutate(()=>API.connections.create(body), { event:'connections:changed' });
+            } catch (err) { toast('error','Could not add the connection', errText(err)); return; }
+            close();
+            if(!endpoint){
+              toast('warn','Connection added without an endpoint',
+                `${created.name} is registered and counts the agents on ${kind}, but with nothing to probe it cannot be tested or synced and shows Disconnected. Add an endpoint under Configure to validate it.`);
               reloadAll();
-            } catch (err) { toast('error','Could not add the connection', err.message); }
+              return;
+            }
+            // The button promises validation, so validate: the first probe runs now
+            // instead of leaving a red tile until someone finds Test. Its own
+            // try/catch — a failed probe is not a failed create.
+            try {
+              const res = await Store.mutate(()=>API.connections.test(created.id), { event:'connections:changed' });
+              probeToast(created.name, res);
+            } catch (err) {
+              toast('warn','Connection added, not yet validated', `${created.name} was registered, but the first test could not run: ${errText(err)}`);
+            }
+            reloadAll();
           }}],
+          onOpen(modal){
+            // The button says what it will do: no endpoint, no validation.
+            const uri = modal.querySelector('#ncUri'), go = modal.querySelector('[data-mbtn="1"]');
+            const label = () => { if(go) go.textContent = uri.value.trim() ? 'Connect & Validate' : 'Add Connection'; };
+            uri.addEventListener('input', label);
+            label();
+          },
         });
       });
 
@@ -592,7 +711,7 @@
   SCREENS['agents'] = {
     title:'Agent Registry',
     render(main){
-      let currentAgentId = null;
+      let currentAgentId = null, inspAbort = null, inspSeq = 0;
 
       main.innerHTML = `
         ${pageHead({title:'Agent Registry', sub:'View and manage all AI agents across your organization.',
@@ -646,7 +765,7 @@
         { key:'environment', label:'Environment', render:r=>r.environment?badge(r.environment):dash },
         { key:'status', label:'Status', render:r=>statusText(r.status, r.status==='Active'?'green':r.status==='Inactive'?'gray':'purple') },
         { key:'risk', label:'Risk', render:r=>r.risk?riskBadge(r.risk):dash },
-        { key:'policy_status', label:'Policy Status', render:r=>r.policy_status?badge(r.policy_status):dash },
+        { key:'policy_status', label:'Policy Status', render:r=>r.policy_status?policyStatusBadge(r):dash },
         { key:'owner_name', label:'Owner', sortable:false, render:r=>r.owner_name?ownerCell(r.owner_name, r.team||''):dash },
         { key:'last_used_at', label:'Last Used', render:r=>`<span class="dim nowrap">${r.last_used_at?esc(relTime(ts(r.last_used_at))):'—'}</span>` },
       ];
@@ -757,6 +876,7 @@
 
       function editAgent(r){
         if(!allowed('admin','Editing an agent')) return;
+        let expected = r.updated_at || null;
         openModal({
           title:'Edit Agent — '+r.name, icon:'edit',
           body:`<div class="form-row"><label>AGENT NAME</label><input class="input" id="edName" value="${esc(r.name)}"></div>
@@ -787,13 +907,21 @@
             };
             const owner = modal.querySelector('#edOwner').value;
             if(owner) body.owner_user_id = owner;
-            close();
+            // The token only moves on a human edit now, so sending it is safe
+            // and catches the one case that matters: two people editing at once.
+            if(expected) body.expected_updated_at = expected;
             try {
               const saved = await Store.mutate(()=>API.agents.update(r.id, body), { event:'agents:changed' });
+              close();
               toast('success','Agent updated', `${saved.name} saved.`);
               table.refresh(); loadSummary();
               if(currentAgentId === r.id) showAgent(saved);
-            } catch (err) { toast('error','Could not save the agent', err.message); }
+            } catch (err) {
+              // The dialog stays open with what was typed. On a conflict, adopt
+              // the row's current token so a second Save goes through.
+              toast('error','Could not save the agent', errText(err));
+              if(err && err.status === 409) expected = await freshToken(r.id, expected);
+            }
           }}],
           onOpen(modal){ fillOwners(modal.querySelector('#edOwner'), r.owner_user_id); },
         });
@@ -863,17 +991,25 @@
           <div class="card-loading" style="height:240px;margin:12px"></div>`;
         insp.querySelector('#agInspClose').addEventListener('click', ()=>document.getElementById('agLayout').classList.add('collapsed'));
 
-        API.agents.get(row.id)
-          .then(detail => { if(currentAgentId === row.id) paintAgent(insp, detail); })
+        /* One detail read per selected row. Arrowing down the table used to
+           leave a request in flight for every row passed, and each made the
+           server read a prompt history this panel never shows — so the read is
+           asked for without versions and the one it replaces is abandoned. */
+        if(inspAbort) inspAbort.abort();
+        inspAbort = new AbortController();
+        const mine = ++inspSeq;
+        API.agents.get(row.id, { include_versions: false }, { signal: inspAbort.signal })
+          .then(detail => { if(mine === inspSeq) paintAgent(insp, detail); })
           .catch(err => {
-            if(currentAgentId !== row.id) return;
+            if(mine !== inspSeq) return;
             const holder = insp.querySelector('.card-loading');
             if(holder) holder.replaceWith(screenError(err, ()=>showAgent(row), 'this agent'));
           });
       }
 
       function paintAgent(insp, detail){
-        const a = detail.agent || {}, m = a.metrics || {}, stats = detail.stats || {};
+        const a = detail.agent || {}, m = a.metrics || {};
+        const connectors = detail.connectors || [], policies = detail.policies || [];
         insp.innerHTML = `
           <div class="insp-head">
             <span class="entity-ico" style="width:38px;height:38px;background:var(--purple-dim);color:var(--purple-bright)">${ICONS.bot}</span>
@@ -882,7 +1018,8 @@
             <button class="icon-btn insp-close" id="agInspClose">${ICONS.x}</button></div>
           <div class="flex" style="gap:8px;margin:12px 0 2px">
             <button class="btn sm grow" style="justify-content:center" data-nav="agent/${esc(a.id)}">View Details</button>
-            <button class="btn sm grow" style="justify-content:center" id="agInspEdit">Edit Agent</button></div>
+            <button class="btn sm grow" style="justify-content:center" id="agInspEdit">Edit Agent</button>
+            ${a.status === 'Active' ? '' : `<button class="btn sm success grow" style="justify-content:center" id="agInspActivate">${ICONS.checkCircle}Activate</button>`}</div>
           ${inspSection('Overview','info', kv([
             ['Status', statusText(a.status, a.status==='Active'?'green':a.status==='Inactive'?'gray':'purple')],
             ['Type', text(a.agent_type)],
@@ -894,26 +1031,31 @@
           ${inspSection('Configuration','settings', kv([
             ['Model', text(a.model)],
             ['Prompt Version', text(a.prompt_version)],
-            ['Tools', `${num(a.tools_enabled)} enabled · ${detail.connectors.length} granted`],
-            ['Policies', `${num(a.policies_applied)} applied · ${detail.policies.length} bound`],
+            ['Tools', `${num(a.tools_enabled)} enabled · ${connectors.length} granted`],
+            ['Policies', `${num(a.policies_applied)} applied · ${policies.length} bound`],
             ['Memory Policy', text(a.memory_policy)],
             ['Retry Policy', a.retries == null ? dash : a.retries + ' retries'],
             ['Access Scope', text(a.access_scope)],
           ]))}
           ${inspSection('Status','gauge', kv([
             ['Risk Level', a.risk?riskBadge(a.risk):dash],
-            ['Policy Status', a.policy_status?badge(a.policy_status):dash],
+            ['Policy Status', a.policy_status ? policyStatusBadge(a) : dash],
             ['Last Used', rel(a.last_used_at)],
             ['Total Runs (30d)', num(m.runs_30d)],
             ['Success Rate (30d)', pct(m.success_rate_30d)],
             ['Eval Score', m.eval_score == null ? dash : Number(m.eval_score).toFixed(2)],
-            ['Telemetry', detail.telemetry_available ? '<span class="st-green">Reporting</span>' : '<span class="faint">No telemetry yet</span>'],
-            ['Runs In Window', num(stats.run_count)],
+            // A project that exists but could not be read is an outage, not "no telemetry".
+            ['Telemetry', detail.telemetry_error
+              ? `<span class="st-amber" title="${esc(detail.telemetry_error)}">Unavailable just now</span>`
+              : detail.telemetry_available ? '<span class="st-green">Reporting</span>' : '<span class="faint">No telemetry yet</span>'],
           ]))}
           <div class="insp-section"><button class="link" data-nav="agent/${esc(a.id)}">View Full Agent Details ${ICONS.arrowRight}</button></div>`;
         insp.querySelector('#agInspClose').addEventListener('click', ()=>document.getElementById('agLayout').classList.add('collapsed'));
         requireRole(insp.querySelector('#agInspEdit'), 'admin', 'Editing an agent')
           .addEventListener('click', ()=>editAgent(a));
+        // A Pending Review agent could only be activated from the row's dots menu.
+        const act = insp.querySelector('#agInspActivate');
+        if(act) requireRole(act, 'operator', 'Activating an agent').addEventListener('click', ()=>activate(a));
       }
 
       loadSummary();
@@ -932,7 +1074,7 @@
     title:'Agent Detail',
     render(main, param){
       const agentId = param;
-      let detail = null, tabsEl = null, activeTab = 0;
+      let detail = null, tabsEl = null, activeTab = 0, runsMode = 'history';
 
       if(!agentId){
         main.innerHTML = pageHead({title:'Agent Detail', sub:'No agent was named in the link.'});
@@ -1001,15 +1143,23 @@
           <div class="card" style="padding:11px 16px;margin-bottom:16px">
             <div class="flex flex-wrap" style="gap:26px">
               <div><div class="small faint" style="font-weight:700">RISK LEVEL</div><div style="margin-top:3px">${a.risk?riskBadge(a.risk):dash}</div></div>
-              <div><div class="small faint" style="font-weight:700">POLICY STATUS</div><div style="margin-top:3px">${a.policy_status?badge(a.policy_status):dash}</div></div>
+              <div><div class="small faint" style="font-weight:700">POLICY STATUS</div><div style="margin-top:3px">${a.policy_status?policyStatusBadge(a):dash}</div></div>
               <div><div class="small faint" style="font-weight:700">LAST USED</div><div style="margin-top:3px;font-weight:700">${rel(a.last_used_at)}</div></div>
               <div><div class="small faint" style="font-weight:700">TOTAL RUNS (30D)</div><div style="margin-top:3px;font-weight:700">${num(m.runs_30d)}</div></div>
               <div><div class="small faint" style="font-weight:700">EVAL SCORE</div><div style="margin-top:3px;font-weight:700">${m.eval_score == null ? dash : Number(m.eval_score).toFixed(2)}</div></div>
               <div><div class="small faint" style="font-weight:700">TELEMETRY</div><div style="margin-top:3px;font-weight:700">${
-                d.telemetry_available ? '<span class="st-green">Reporting</span>' : '<span class="faint">Not provisioned</span>'}</div></div>
+                d.telemetry_error ? '<span class="st-amber">Unavailable just now</span>'
+                : d.telemetry_available ? '<span class="st-green">Reporting</span>' : '<span class="faint">Not provisioned</span>'}</div></div>
             </div>
           </div>
-          ${d.telemetry_available ? '' : `<div class="scan-note">${ICONS.info} This agent has no telemetry project yet, so run counters, prompt versions and latency are not available. Everything below is registry state.</div>`}`;
+          ${/* The project exists but could not be read: an outage, which is a
+               different statement from "no telemetry project". The registry half
+               of the page is complete and every action still works. */
+            d.telemetry_error
+            ? `<div class="scan-note" style="margin:0 0 16px">${ICONS.alert}<span>${esc(d.telemetry_error)} Run counters show the last measured figures or a dash, and prompt history may be missing until the telemetry store answers. <button class="link" id="adTelemetryRetry">Try again</button></span></div>`
+            : d.telemetry_available ? '' : `<div class="scan-note">${ICONS.info} This agent has no telemetry project yet, so run counters, prompt versions and latency are not available. Everything below is registry state.</div>`}`;
+        const retry = document.getElementById('adTelemetryRetry');
+        if(retry) retry.addEventListener('click', load);
 
         requireRole(document.getElementById('adRun'), 'operator', 'Running an agent');
         document.getElementById('adRun').addEventListener('click', runAgent);
@@ -1043,18 +1193,35 @@
         openModal({
           title:'Run '+detail.agent.name, icon:'play',
           body:`<div class="form-row"><label>INPUT</label><input class="input" id="adRunInput" placeholder="What should the agent be asked?"></div>
-            <p class="small muted" style="margin:0">The run opens immediately on Live Runs and is completed by the agent's runtime through the ingest API.</p>`,
-          footer:[{label:'Cancel'},{label:'Start Run', cls:'orange', onClick: async (close, modal)=>{
+            <p class="small muted" style="margin:0">This records a run request and returns its run ID. The control plane does not call the agent: hand the run ID to the agent's runtime, which reports the run under it. Until it does, the request shows on Live Runs as Running.</p>`,
+          footer:[{label:'Cancel'},{label:'Request Run', cls:'orange', onClick: async (close, modal)=>{
             const input = modal.querySelector('#adRunInput').value.trim();
-            close();
             try {
               const started = await Store.mutate(()=>API.agents.run(detail.agent.id, input ? { input } : {}),
                 { event:'runs:changed' });
-              const data = started.data || {};
-              toast('success','Run started', `${esc(String(data.run_id || started.entity_id || '').slice(0,14))}… — follow it on Live Runs.`);
+              close();
+              const runId = String((started.data || {}).run_id || started.entity_id || '');
+              showRunId(runId);
               load();
-            } catch (err) { toast('error','Could not start the run', err.message); }
+            } catch (err) { toast('error','Could not record the run request', errText(err)); }
           }}],
+        });
+      }
+
+      /** The whole run ID, selectable and copyable. A toast cut it to 14
+       *  characters, and the runtime needs all of it to report under this request. */
+      function showRunId(runId){
+        openModal({
+          title:'Run request recorded', icon:'play',
+          body:`<p style="margin-top:0">Hand this run ID to the agent's runtime so the run it reports lands under this request. It is listed on Live Runs now.</p>
+            <div class="quote mono" style="word-break:break-all;user-select:all">${esc(runId || '—')}</div>`,
+          footer:[{label:'Copy Run ID', close:false, onClick:()=>{
+            if(runId && navigator.clipboard && navigator.clipboard.writeText){
+              navigator.clipboard.writeText(runId)
+                .then(()=>toast('success','Copied to clipboard','The run ID is on your clipboard.'))
+                .catch(err=>toast('error','Could not copy', err.message || 'The browser refused clipboard access.'));
+            } else toast('error','Could not copy','This browser does not expose the clipboard to the page — select the ID above instead.');
+          }},{label:'Close', cls:'primary'}],
         });
       }
 
@@ -1110,6 +1277,7 @@
       function editAgent(){
         if(!allowed('admin','Editing an agent')) return;
         const a = detail.agent;
+        let expected = a.updated_at;
         openModal({
           title:'Edit Agent — '+a.name, icon:'edit',
           body:`<div class="form-row"><label>AGENT NAME</label><input class="input" id="adEdName" value="${esc(a.name)}"></div>
@@ -1142,14 +1310,20 @@
               memory_policy: modal.querySelector('#adEdMem').value.trim() || null,
               access_scope: modal.querySelector('#adEdScope').value.trim() || null,
               description: modal.querySelector('#adEdDesc').value.trim() || null,
-              expected_updated_at: a.updated_at,
+              expected_updated_at: expected,
             };
-            close();
             try {
               const saved = await Store.mutate(()=>API.agents.update(a.id, body), { event:'agents:changed' });
+              close();
               toast('success','Agent updated', `${saved.name} saved.`);
               load();
-            } catch (err) { toast('error','Could not save the agent', err.message); }
+            } catch (err) {
+              // The dialog used to close before the request, so a refusal threw
+              // away everything typed. It stays open; on a conflict it adopts the
+              // row's current token so Save Changes works the second time.
+              toast('error','Could not save the agent', errText(err));
+              if(err && err.status === 409) expected = await freshToken(a.id, expected);
+            }
           }}],
         });
       }
@@ -1207,10 +1381,12 @@
       /* ---- 1. Overview ---- */
       function tabOverview(body){
         const a = detail.agent, m = a.metrics || {};
+        // Ingest evaluates Active policies only, so only those count as governing.
+        const activePolicies = (detail.policies || []).filter(p=>p.status === 'Active');
         const checks = [
           ['Telemetry project provisioned', detail.telemetry_available],
           ['No policy violations in 30 days', (m.violations_30d || 0) === 0],
-          [`${detail.policies.length} ${detail.policies.length === 1 ? 'policy' : 'policies'} bound`, detail.policies.length > 0],
+          [`${activePolicies.length} active ${activePolicies.length === 1 ? 'policy' : 'policies'} bound`, activePolicies.length > 0],
           [`${detail.connectors.filter(c=>c.is_blocked).length} blocked connector grants`, detail.connectors.every(c=>!c.is_blocked)],
           ['Approved by governance review', a.status === 'Active'],
         ];
@@ -1233,7 +1409,7 @@
                 <div class="card"><div class="card-head"><div class="card-title">Recent Activity <span class="muted">(Last 30 Days)</span></div></div>
                   <div class="grid g2" style="gap:9px">
                     ${[['Runs', num(m.runs_30d)], ['Success Rate', pct(m.success_rate_30d)],
-                       ['Avg Latency', secs(m.avg_latency_seconds)], ['Policy Violations', num(m.violations_30d)],
+                       ['p50 Latency', secs(m.p50_latency_seconds != null ? m.p50_latency_seconds : m.avg_latency_seconds)], ['Policy Violations', num(m.violations_30d)],
                        ['Tokens', num(m.tokens_30d)], ['Cost', m.cost_30d == null ? dash : fmtMoney(m.cost_30d, 2)]].map(x=>
                       `<div style="background:var(--panel-2);border:1px solid var(--border-soft);border-radius:9px;padding:9px 11px">
                         <div class="small muted">${x[0]}</div><div style="font-size:17px;font-weight:700;margin-top:2px">${x[1]}</div></div>`).join('')}
@@ -1258,8 +1434,9 @@
                 <div style="margin-top:8px">${(a.tags||[]).map(t=>`<span class="tag">${esc(t)}</span>`).join('') || '<span class="faint small">No tags</span>'}</div></div>
                 <div class="card">${inspSection('Risk & Policy Summary','shield', kv([
                   ['Risk Level', a.risk?riskBadge(a.risk):dash],
-                  ['Policy Status', a.policy_status?badge(a.policy_status):dash],
-                  ['Policies Bound', String(detail.policies.length)],
+                  ['Policy Status', a.policy_status?policyStatusBadge(a):dash],
+                  ['Policies Bound', `${activePolicies.length} active${detail.policies.length > activePolicies.length
+                    ? ` <span class="faint">· ${detail.policies.length - activePolicies.length} not active</span>` : ''}`],
                   ['Policies Applied', num(a.policies_applied)],
                   ['Violations (30d)', num(m.violations_30d)],
                   ['Escalations (30d)', num(m.escalations_30d)],
@@ -1270,15 +1447,15 @@
                 <button class="link" data-nav="policies" style="margin-top:6px">View Policy Details ${ICONS.arrowRight}</button></div>
               </div>
               <div class="card pad-0" style="padding:16px 16px 0">
-                <div class="card-head" style="margin-bottom:6px"><div class="card-title">Recent Runs</div>
-                  <button class="link" data-nav="live-runs">View All Runs ${ICONS.arrowRight}</button></div>
+                <div class="card-head" style="margin-bottom:6px"><div class="card-title">Most Recent Runs</div>
+                  <button class="link" id="adAllRuns">View All Runs ${ICONS.arrowRight}</button></div>
                 <div id="adRecentRuns"></div>
               </div>
             </div>
             <div style="display:flex;flex-direction:column;gap:14px">
               <div class="card"><div class="card-head"><div class="card-title">Model & Prompt</div></div>
                 ${kv([['Model', text(a.model)], ['Prompt Version', text(a.prompt_version)],
-                      ['Versions Committed', String(detail.versions.length)],
+                      ['Versions Committed', detail.telemetry_error && !detail.versions.length ? dash : String(detail.versions.length)],
                       ['Current Commit', currentVersion() ? `<span class="mono small">${esc(String(currentVersion().commit||'').slice(0,10) || '—')}</span>` : dash]])}
                 <button class="link" id="adGoPrompt" style="margin-top:6px">Open the Model & Prompt tab ${ICONS.arrowRight}</button></div>
               <div class="card"><div class="card-head"><div class="card-title">Tools & Connectors</div></div>
@@ -1297,20 +1474,27 @@
                   <button class="btn block" id="adQaEdit">${ICONS.edit}Edit Agent</button>
                   <button class="btn block" id="adQaClone">${ICONS.copy}Clone Agent</button>
                   <button class="btn block" id="adQaExport">${ICONS.download}Export Configuration</button>
-                  <button class="btn block ghost-danger" id="adQaDeact">${ICONS.xCircle}${a.status==='Active'?'Deactivate Agent':'Activate Agent'}</button>
+                  ${a.status==='Active'
+                    ? `<button class="btn block ghost-danger" id="adQaDeact">${ICONS.xCircle}Deactivate Agent</button>`
+                    : `<button class="btn block success" id="adQaDeact">${ICONS.checkCircle}Activate Agent</button>`}
                 </div></div>
             </div>
           </div>`;
 
+        /* The run table's widest window is 24 hours, which sat beside 30-day
+           counters: an agent that last ran two days ago showed "412 runs" and an
+           empty card. The history read has no time floor and costs one small
+           engine page, so the card asks that instead. It is newest-first by
+           construction, hence no sortable headers. */
         const rt = dataTable({
-          columns: runCols, rowId:'id', pageSize:5, pageSizes:[5,10], itemName:'runs',
-          emptyText: detail.telemetry_available ? 'No runs reported in this window' : 'No telemetry project, so no runs',
-          defaultSort:{key:'occurred_at', dir:-1},
-          extraParams:{ agent_id: a.id },
-          source:(params)=>API.agents.runs(a.id, params),
+          columns: runCols.map(c=>Object.assign({}, c, { sortable:false })),
+          rowId:'id', pageSize:5, pageSizes:[5,10], itemName:'runs',
+          emptyText: detail.telemetry_available ? 'No runs recorded for this agent' : 'No telemetry project, so no runs',
+          source:(params)=>API.runs.history({ agent_id: a.id, limit: params.page_size }),
           rowActions: runActions,
         });
         document.getElementById('adRecentRuns').appendChild(rt.el);
+        document.getElementById('adAllRuns').addEventListener('click', ()=>selectTab(1));
 
         requireRole(document.getElementById('adQaEdit'), 'admin', 'Editing an agent')
           .addEventListener('click', editAgent);
@@ -1364,12 +1548,82 @@
       /* ---- 2. Runs ---- */
       function tabRuns(body){
         const a = detail.agent;
-        body.innerHTML = `<div id="adRunsTbl"></div>`;
+        body.innerHTML = `
+          <div class="flex" style="gap:8px;align-items:center;margin-bottom:10px">
+            <label class="small dim" for="adRunsMode">Showing</label>
+            <select class="filter-select" id="adRunsMode" style="height:30px">
+              <option value="history">Run history — newest first, no time limit</option>
+              <option value="window">Last 24 hours — filter, search and export</option>
+            </select></div>
+          <div id="adRunsTbl"></div>`;
+        const w = document.getElementById('adRunsTbl');
+        const mode = document.getElementById('adRunsMode');
+        mode.value = runsMode;
+        const draw = () => { w.innerHTML = ''; if(mode.value === 'window') windowRuns(w, a); else historyRuns(w, a); };
+        mode.addEventListener('change', ()=>{ runsMode = mode.value; draw(); });
+        draw();
+      }
+
+      /* Every run the store still holds for this agent. The filterable run table
+         cannot look further back than 24 hours, so on its own this tab was empty
+         for any agent that last ran yesterday. The history is cursor-paged (a
+         total would mean scanning the whole project), so older pages are
+         appended on demand and the table sorts and pages what has been loaded. */
+      function historyRuns(host, a){
+        let rows = [], cursor = null;
+        host.innerHTML = `<div class="card card-loading" style="height:220px"></div>`;
+        const ht = dataTable({
+          columns: runCols, rows: [], rowId:'id', pageSize:10, pageSizes:[10,25,50], itemName:'runs',
+          defaultSort:{key:'occurred_at', dir:-1},
+          exportName:(a.name||'agent').replace(/\s+/g,'-').toLowerCase()+'-run-history',
+          emptyText: detail.telemetry_available ? 'No runs recorded for this agent' : 'No telemetry project, so no runs',
+          rowActions: runActions,
+        });
+        const foot = C.elem(`<div class="flex" style="gap:10px;align-items:center;margin-top:10px">
+          <button class="btn sm" data-older>Load older runs</button><span class="small faint" data-note></span></div>`);
+        const btn = foot.querySelector('[data-older]'), note = foot.querySelector('[data-note]');
+        let mounted = false;
+        function mount(){
+          if(mounted) return;
+          mounted = true;
+          host.innerHTML = '';
+          host.appendChild(ht.el);
+          host.appendChild(foot);
+        }
+        function more(){
+          btn.disabled = true;
+          note.textContent = 'Loading…';
+          API.runs.history({ agent_id: a.id, limit: 50, cursor: cursor || undefined })
+            .then(page => {
+              if(!host.isConnected) return;
+              rows = rows.concat(page.items || []);
+              cursor = page.next_cursor || null;
+              mount();
+              ht.setRows(rows);
+              btn.disabled = false;
+              btn.textContent = 'Load older runs';
+              btn.style.display = cursor ? '' : 'none';
+              note.textContent = !rows.length ? ''
+                : `${fmtFull(rows.length)} ${rows.length === 1 ? 'run' : 'runs'} loaded — ${cursor ? 'older runs load on demand.' : 'that is every run the store still holds.'}`;
+            })
+            .catch(err => {
+              if(!host.isConnected) return;
+              if(!mounted){ host.innerHTML = ''; host.appendChild(screenError(err, ()=>historyRuns(host, a), 'the run history')); return; }
+              btn.disabled = false;
+              btn.textContent = 'Try again';
+              note.textContent = 'Older runs could not be loaded — ' + ((err && err.message) || 'the request failed') + '.';
+            });
+        }
+        btn.addEventListener('click', more);
+        more();
+      }
+
+      function windowRuns(w, a){
         const rt = dataTable({
           columns: runCols, rowId:'id', pageSize:10, pageSizes:[10,25,50], itemName:'runs',
           searchPlaceholder:'Search this agent’s runs…',
           defaultSort:{key:'occurred_at', dir:-1},
-          emptyText: detail.telemetry_available ? 'No runs in this window' : 'No telemetry project, so no runs',
+          emptyText: detail.telemetry_available ? 'No runs in the last 24 hours — switch to Run history for older ones' : 'No telemetry project, so no runs',
           filters:[
             {key:'status', label:'Status', param:'status', options:['Completed','Warned','Failed','Running'], allLabel:'All Status'},
             {key:'policy', label:'Policy', param:'policy', options:['Allowed','Warned','Blocked'], allLabel:'All'},
@@ -1381,7 +1635,6 @@
           exportSource:(params)=>API.runs.export(Object.assign({ agent_id: a.id }, params)),
           rowActions: runActions,
         });
-        const w = document.getElementById('adRunsTbl');
         w.appendChild(rt.filterEl);
         w.appendChild(rt.el);
       }
@@ -1393,8 +1646,11 @@
           <div class="card"><div class="card-head"><div class="card-title">System Prompt ${cur?badge(cur.status):''}</div>
             <span class="small faint">${cur?esc(cur.version):esc(a.prompt_version||'—')}${cur && cur.token_count!=null?' · '+fmtFull(cur.token_count)+' tokens':''}</span></div>
             ${cur && cur.template_preview
-              ? `<div class="quote" style="font-size:12.5px;line-height:1.7;white-space:pre-wrap">${esc(cur.template_preview)}</div>`
-              : EMPTY('pen','No prompt committed','Commit a version to keep this agent’s system prompt under review.')}
+              ? `<div class="quote" style="font-size:12.5px;line-height:1.7;white-space:pre-wrap">${esc(cur.template_preview)}${previewIsPartial(cur) ? '…' : ''}</div>
+                ${previewIsPartial(cur) ? `<div class="faint small" style="margin-top:6px">Preview — the first ${PREVIEW_CHARS} characters. The committed prompt continues beyond this.</div>` : ''}`
+              : EMPTY('pen','No prompt committed', detail.telemetry_error
+                  ? 'The prompt history could not be read just now.'
+                  : 'Commit a version to keep this agent’s system prompt under review.')}
             <div class="flex" style="gap:8px;margin-top:10px">
               <button class="btn sm" data-nav="prompts">${ICONS.edit}Open in Prompt Manager</button>
               <button class="btn sm" id="adDiff" ${versions.length < 2 ? 'disabled title="Two committed versions are needed to compare"' : ''}>${ICONS.git}Compare Versions</button>
@@ -1415,7 +1671,9 @@
                 <div class="pipe-step"><div class="pipe-dot ${v.is_current?'active':'done'}">${v.is_current?ICONS.star:ICONS.check}</div>
                 <div class="pipe-body"><div class="pipe-title"><span>${esc(v.version)} — ${esc(v.status)}</span><span class="faint">${esc(rel(v.created_at))}</span></div>
                 <div class="pipe-sub">${esc(v.change_description || 'No description recorded')}${v.author?' · by '+esc(v.author):''}</div></div></div>`).join('')}</div>`
-                : EMPTY('history','No version history', detail.telemetry_available
+                : detail.telemetry_error
+                  ? EMPTY('history','Version history unavailable','The prompt history lives in the telemetry store, which could not be read just now. Nothing has been lost — try again shortly.')
+                  : EMPTY('history','No version history', detail.telemetry_available
                     ? 'Commit a prompt version and it appears here.'
                     : 'Versions live with the telemetry project, which this agent does not have yet.')}</div>
           </div></div>`;
@@ -1470,27 +1728,100 @@
         });
       }
 
+      /* The version list carries only the first PREVIEW_CHARS characters of each
+         prompt body (the server's TEMPLATE_PREVIEW_CHARS). A preview that fills
+         that allowance is, as far as this page can tell, a cut-off prompt: fine
+         to read, never the text to edit. The editor used to be seeded with it,
+         so fixing a typo and committing replaced a 3,000-character system
+         prompt with its first 400 characters, silently, as the current version. */
+      const PREVIEW_CHARS = 400;
+      function previewIsPartial(v){
+        return Boolean(v && typeof v.template !== 'string' && v.template_preview
+          && v.template_preview.length >= PREVIEW_CHARS);
+      }
+
+      /** The whole body of a version — or null when this page has no way to read it. */
+      async function fullTemplate(v){
+        if(!v) return '';
+        if(typeof v.template === 'string') return v.template;
+        if(!previewIsPartial(v)) return v.template_preview || '';
+        // Read-one-version is not served by every control plane build; without
+        // it the honest answer is "unknown", not the preview.
+        if(typeof API.agents.version === 'function' && (v.commit || v.version)){
+          const full = await API.agents.version(detail.agent.id, v.commit || v.version);
+          if(full && typeof full.template === 'string') return full.template;
+        }
+        return null;
+      }
+
       function newVersion(){
         if(!allowed('admin','Committing a prompt version')) return;
         const cur = currentVersion();
+        // True once the editor could NOT be loaded with the whole current prompt,
+        // which is when a short commit is most likely a pasted preview.
+        let unloaded = false, shortConfirmed = false;
         openModal({
           title:'Create New Version', icon:'git', wide:true,
-          body:`<div class="form-row"><label>SYSTEM PROMPT</label>
-              <textarea class="input" id="adVerText" rows="10" placeholder="The full system prompt for this agent…">${esc(cur && cur.template_preview ? cur.template_preview : '')}</textarea></div>
+          body:`<div id="adVerNotice"></div>
+            <div class="form-row"><label>SYSTEM PROMPT</label>
+              <textarea class="input" id="adVerText" rows="10" disabled placeholder="Loading the current prompt…"></textarea></div>
             <div class="form-row"><label>WHAT CHANGED</label><input class="input" id="adVerNote" placeholder="e.g. Tightened the discrepancy threshold to 2%"></div>
             <label class="flex" style="gap:8px;font-size:12.5px"><input type="checkbox" id="adVerCurrent" checked> Make this the agent’s current version</label>`,
           footer:[{label:'Cancel'},{label:'Commit Version', cls:'primary', onClick: async (close, modal)=>{
             const template = modal.querySelector('#adVerText').value;
             if(!template.trim()){ toast('error','Prompt required','A version needs a prompt body before it can be committed.'); return; }
+            if(unloaded && !shortConfirmed && template.length <= PREVIEW_CHARS * 1.25){
+              shortConfirmed = true;
+              toast('warn','Shorter than the current prompt',
+                `The current prompt is longer than ${PREVIEW_CHARS} characters and this text is ${fmtFull(template.length)}. If it is the complete prompt, choose Commit Version again.`);
+              return;
+            }
             const body = { template, change_description: modal.querySelector('#adVerNote').value.trim() || null,
               make_current: modal.querySelector('#adVerCurrent').checked };
-            close();
             try {
               const v = await Store.mutate(()=>API.agents.createVersion(detail.agent.id, body), { event:'agents:changed' });
+              close();
               toast('success','Version committed', `${v.version} recorded${v.is_current?' and set as current':''}.`);
               load();
-            } catch (err) { toast('error','Could not commit the version', err.message); }
+            } catch (err) { toast('error','Could not commit the version', errText(err)); }
           }}],
+          onOpen(modal){
+            const area = modal.querySelector('#adVerText');
+            const notice = modal.querySelector('#adVerNotice');
+            const commit = modal.querySelector('[data-mbtn="1"]');
+            if(commit) commit.disabled = true;
+            const ready = (value) => {
+              area.value = value;
+              area.disabled = false;
+              area.placeholder = 'The full system prompt for this agent…';
+              if(commit) commit.disabled = false;
+            };
+            fullTemplate(cur)
+              .then(full => {
+                if(!area.isConnected) return;
+                if(full != null){
+                  ready(full);
+                  // No version to show because the history could not be read is
+                  // not the same as no version existing: say so, and treat a short
+                  // commit with the same suspicion as an unloaded prompt.
+                  if(!cur && detail.telemetry_error){
+                    unloaded = true;
+                    notice.innerHTML = `<div class="scan-note">${ICONS.alert} The prompt history could not be read just now, so the current prompt is not shown here. A version committed now goes on top of whatever is current.</div>`;
+                  }
+                  return;
+                }
+                unloaded = true;
+                notice.innerHTML = `<div class="scan-note">${ICONS.info} The current prompt is longer than the ${PREVIEW_CHARS}-character preview this page receives, so it is not loaded into the editor — committing the preview would cut the prompt short. Paste the complete prompt, with your change, below.</div>`;
+                ready('');
+              })
+              .catch(err => {
+                if(!area.isConnected) return;
+                // Never fall back to the preview: an empty editor cannot truncate anything.
+                unloaded = previewIsPartial(cur);
+                notice.innerHTML = `<div class="scan-note">${ICONS.alert} The current prompt could not be loaded (${esc(errText(err))}), so the editor starts empty. Paste the complete prompt to commit a new version.</div>`;
+                ready('');
+              });
+          },
         });
       }
 
@@ -1919,6 +2250,7 @@
         rowActions: r=>[
           {label:'View Details', icon:'eye', onClick:()=>showConn(r)},
           {label:'Test Connection', icon:'activity', onClick:()=>testConn(r)},
+          {label:'Edit Connector', icon:'edit', onClick:()=>editConnector(r)},
           {label:'Edit Permissions', icon:'lock', onClick:()=>editPermissions(r)},
           // A blocked connector fails closed, so a fresh grant would be dead on arrival.
           ...(r.status !== 'Blocked' ? [{label:'Grant to Agent…', icon:'bot', onClick:()=>grantToAgent(r)}] : []),
@@ -1926,6 +2258,7 @@
           r.status !== 'Blocked'
             ? {label:'Block Connector', icon:'xCircle', danger:true, onClick:()=>blockConn(r)}
             : {label:'Unblock Connector', icon:'checkCircle', onClick:()=>unblockConn(r)},
+          {label:'Delete Connector', icon:'trash', danger:true, onClick:()=>deleteConnector(r)},
         ],
       });
 
@@ -1962,12 +2295,17 @@
           footer:[{label:'Cancel'},{label:'Block Connector', cls:'danger', onClick: async (close, modal)=>{
             const reason = modal.querySelector('#cnBlockReason').value.trim();
             if(reason.length < 3){ toast('error','Reason required','A block is recorded with who, when and why.'); return; }
-            close();
             try {
               const res = await Store.mutate(()=>API.connectors.block(r.id, { reason }), { event:'connectors:changed' });
+              close();
               toast('warn','Connector blocked', res.message);
               refreshAll();
-            } catch (err) { toast('error','Could not block the connector', err.message); }
+              /* The table reload re-selects only when the row left the page, so
+                 the open inspector kept saying Active — and its Edit Permissions
+                 then sent the pre-block updated_at and earned a 409 for a change
+                 "by someone else" that was this very click. */
+              if(currentId === r.id) showConn(r);
+            } catch (err) { toast('error','Could not block the connector', errText(err)); }
           }}],
         });
       }
@@ -1978,7 +2316,79 @@
           const res = await Store.mutate(()=>API.connectors.unblock(r.id), { event:'connectors:changed' });
           toast('success','Connector unblocked', res.message);
           refreshAll();
-        } catch (err) { toast('error','Could not unblock the connector', err.message); }
+          if(currentId === r.id) showConn(r);
+        } catch (err) { toast('error','Could not unblock the connector', errText(err)); }
+      }
+
+      /* Identity and lifecycle. Permissions had the only edit dialog, so a
+         mistyped name or endpoint was permanent, a connector could be retired
+         only by blocking it, and Deprecated / Warning / Inactive were statuses
+         the filter offered and nothing could set. Blocked keeps its own verb —
+         the server refuses it here, and refuses any status change out of it. */
+      function editConnector(r){
+        if(!allowed('operator','Editing a connector')) return;
+        const blocked = r.status === 'Blocked';
+        let expected = r.updated_at;
+        openModal({
+          title:'Edit Connector — '+r.name, icon:'edit',
+          body:`<div class="form-row"><label>NAME</label><input class="input" id="ecnName" value="${esc(r.name)}"></div>
+            <div class="grid g2">
+              <div class="form-row"><label>TYPE</label><select class="filter-select w-100" id="ecnType" style="height:34px">${optionList(CONNECTOR_TYPES, r.connector_type)}</select></div>
+              <div class="form-row"><label>STATUS</label><select class="filter-select w-100" id="ecnStatus" style="height:34px" ${
+                blocked ? 'disabled title="A blocked connector changes status only through Unblock."' : ''}>${
+                blocked ? '<option>Blocked</option>' : optionList(CONNECTOR_STATUSES.filter(s=>s !== 'Blocked'), r.status)}</select></div>
+            </div>
+            <div class="form-row"><label>PROVIDER</label><input class="input" id="ecnProv" value="${esc(r.provider||'')}" placeholder="e.g. Oracle NetSuite"></div>
+            <div class="form-row"><label>ENDPOINT URL</label><input class="input" id="ecnUrl" value="${esc(r.endpoint_url||'')}" placeholder="https://host/path"></div>`,
+          footer:[{label:'Cancel'},{label:'Save Changes', cls:'primary', onClick: async (close, modal)=>{
+            const name = modal.querySelector('#ecnName').value.trim();
+            if(!name){ toast('error','Name required','A connector needs a name.'); return; }
+            const url = modal.querySelector('#ecnUrl').value.trim();
+            if(url && !validHttpUrl(url)){ toast('error','Check the endpoint','The endpoint must be a complete http:// or https:// URL.'); return; }
+            // Only what changed is sent, so an untouched field can never trip a validator.
+            const next = { name, connector_type: modal.querySelector('#ecnType').value,
+              provider: modal.querySelector('#ecnProv').value.trim() || null, endpoint_url: url || null };
+            if(!blocked) next.status = modal.querySelector('#ecnStatus').value;
+            const body = {};
+            Object.keys(next).forEach(k=>{ if((next[k] == null ? null : next[k]) !== (r[k] == null || r[k] === '' ? null : r[k])) body[k] = next[k]; });
+            if(!Object.keys(body).length){ close(); toast('info','Nothing to save','No field was changed.'); return; }
+            body.expected_updated_at = expected;
+            try {
+              const saved = await Store.mutate(()=>API.connectors.update(r.id, body), { event:'connectors:changed' });
+              close();
+              toast('success','Connector updated', `${saved.name} saved.`);
+              refreshAll();
+              if(currentId === r.id) showConn(saved);
+            } catch (err) {
+              toast('error','Could not save the connector', errText(err));
+              if(err && err.status === 409){
+                // Someone else saved first: adopt their token so a second Save goes through.
+                try { expected = (await API.connectors.get(r.id)).updated_at || expected; } catch (_) { /* keep the old token */ }
+              }
+            }
+          }}],
+        });
+      }
+
+      function deleteConnector(r){
+        if(!allowed('admin','Deleting a connector')) return;
+        confirmModal({ title:'Delete Connector', danger:true, confirmLabel:'Delete',
+          body:`<p style="margin-top:0">You are about to delete <b style="color:var(--text)">${esc(r.name)}</b> from the registry.</p>
+            <p>A connector that agents still hold grants on cannot be deleted — revoke the grants first. The deletion is recorded in the audit trail.</p>`,
+          onConfirm: async ()=>{
+            try {
+              await Store.mutate(()=>API.connectors.remove(r.id), { event:'connectors:changed' });
+              toast('success','Connector deleted', `${r.name} was removed from the registry.`);
+              if(currentId === r.id) currentId = null;
+              refreshAll();
+            } catch (err) { toast('error','Could not delete the connector', errText(err)); }
+          }});
+      }
+
+      /** A URL the server will accept: http(s), parseable, with a host. */
+      function validHttpUrl(value){
+        if(!/^https?:\/\//i.test(value)) return false;
+        try { return Boolean(new URL(value).hostname); } catch (_) { return false; }
       }
 
       function editPermissions(r){
@@ -2004,13 +2414,15 @@
               scopes: modal.querySelector('#cnScopes').value.split('\n').map(s=>s.trim()).filter(Boolean),
               expected_updated_at: r.updated_at,
             };
-            close();
+            // The dialog used to close before the request left, so a 422 threw
+            // away the scopes that had been typed and named no field.
             try {
               const saved = await Store.mutate(()=>API.connectors.update(r.id, body), { event:'connectors:changed' });
+              close();
               toast('success','Permissions updated', `${saved.name} now grants ${saved.access} on ${saved.data_classification} data.`);
               refreshAll();
               if(currentId === r.id) showConn(saved);
-            } catch (err) { toast('error','Could not save the permissions', err.message); }
+            } catch (err) { toast('error','Could not save the permissions', errText(err)); }
           }}],
         });
       }
@@ -2020,31 +2432,65 @@
         openModal({
           title:'Grant to Agent — '+r.name, icon:'bot',
           body:`<p style="margin-top:0">The agent can call <b style="color:var(--text)">${esc(r.name)}</b> at its recorded access level the moment the grant is recorded.</p>
+            <div class="form-row" id="cnGrantFind" style="display:none"><label>FIND AN AGENT</label>
+              <input class="input" id="cnGrantQ" placeholder="Type part of the agent’s name…"></div>
             <div class="form-row"><label>AGENT</label>
-              <select class="filter-select w-100" id="cnGrantAgent" style="height:34px"><option value="">Loading agents…</option></select></div>`,
+              <select class="filter-select w-100" id="cnGrantAgent" style="height:34px"><option value="">Loading agents…</option></select></div>
+            <div class="faint small" id="cnGrantNote"></div>`,
           footer:[{label:'Cancel'},{label:'Grant Access', cls:'primary', onClick: async (close, modal)=>{
             const select = modal.querySelector('#cnGrantAgent');
             const agentId = select.value;
             if(!agentId){ toast('error','Agent required','Pick the agent that receives this grant.'); return; }
-            const agentName = select.options[select.selectedIndex] ? select.options[select.selectedIndex].textContent : 'The agent';
-            close();
+            const picked = select.options[select.selectedIndex];
+            const agentName = (picked && picked.dataset.name) || 'The agent';
             try {
               await Store.mutate(()=>API.connectors.grant(r.id, { agent_id: agentId }), { event:'connectors:changed' });
+              close();
               toast('success','Grant recorded', `${agentName} now holds a grant on ${r.name}.`);
               refreshAll();
               if(currentId === r.id) showConn(r);
-            } catch (err) { toast('error','Could not record the grant', err.message); }
+            } catch (err) { toast('error','Could not record the grant', errText(err)); }
           }}],
+          /* The server grants to any agent in the workspace. This picker offered
+             only Active ones, and every SDK agent auto-registers as Pending Review
+             — so the agents that most need a connector-scoped policy could never
+             be granted one from here. Every agent is listed with its status; a
+             fleet larger than one page gets a search box rather than a silent cut. */
           onOpen(modal){
             const select = modal.querySelector('#cnGrantAgent');
-            API.agents.list({ status:'Active', page_size:100 })
-              .then(page => {
-                const items = page.items || [];
-                select.innerHTML = items.length
-                  ? items.map(a=>`<option value="${esc(a.id)}">${esc(a.name)}</option>`).join('')
-                  : '<option value="">No active agents to grant to</option>';
-              })
-              .catch(err => { select.innerHTML = `<option value="">Agents unavailable — ${esc(err.message)}</option>`; });
+            const find = modal.querySelector('#cnGrantFind'), q = modal.querySelector('#cnGrantQ');
+            const note = modal.querySelector('#cnGrantNote');
+            let held = new Set(), seq = 0, timer = null;
+            const hint = () => {
+              const o = select.options[select.selectedIndex], st = o && o.dataset.status;
+              note.textContent = st && st !== 'Active'
+                ? `This agent is ${st}. The grant is recorded now and governs whatever the agent reports; activating it is a separate step.` : '';
+            };
+            const fill = (query) => {
+              const mine = ++seq;
+              API.agents.list({ q: query || undefined, sort:'name', page_size: query ? 50 : 200 })
+                .then(page => {
+                  if(mine !== seq || !select.isConnected) return;
+                  const all = page.items || [];
+                  const items = all.filter(a=>!held.has(a.id));
+                  select.innerHTML = items.length
+                    ? items.map(a=>`<option value="${esc(a.id)}" data-name="${esc(a.name)}" data-status="${esc(a.status||'')}">${esc(a.name)} — ${esc(a.status || 'status not recorded')}</option>`).join('')
+                    : `<option value="">${all.length ? 'Every listed agent already holds this grant' : query ? 'No agent matches that name' : 'No agents registered'}</option>`;
+                  if(!query && page.total > all.length) find.style.display = '';
+                  hint();
+                })
+                .catch(err => {
+                  if(mine !== seq || !select.isConnected) return;
+                  select.innerHTML = `<option value="">Agents unavailable — ${esc(err.message)}</option>`;
+                });
+            };
+            select.addEventListener('change', hint);
+            q.addEventListener('input', ()=>{ clearTimeout(timer); timer = setTimeout(()=>fill(q.value.trim()), 250); });
+            // Agents that already hold the grant are left out; if that read fails
+            // the server's own 409 still stops a duplicate.
+            API.connectors.get(r.id)
+              .then(c => { held = new Set((c.agents || []).map(a=>a.id)); }, () => {})
+              .then(() => fill(''));
           },
         });
       }
@@ -2066,11 +2512,17 @@
               <div class="form-row"><label>CLASSIFICATION</label><select class="filter-select w-100" id="ncnClass" style="height:34px">${optionList(CLASSIFICATIONS,'Internal')}</select></div>
               <div class="form-row"><label>AUTHENTICATION</label><select class="filter-select w-100" id="ncnAuth" style="height:34px">${optionList(AUTH_MODES)}</select></div>
             </div>
-            <div class="form-row"><label>ENDPOINT URL</label><input class="input" id="ncnUrl" placeholder="https://…"></div>
+            <div class="form-row"><label>ENDPOINT URL</label><input class="input" id="ncnUrl" placeholder="https://host/path"></div>
             <div class="form-row"><label>SCOPES (ONE PER LINE)</label><textarea class="input" id="ncnScopes" rows="3" placeholder="e.g. Sites.Read.All"></textarea></div>`,
           footer:[{label:'Cancel'},{label:'Add & Review', cls:'primary', onClick: async (close, modal)=>{
             const name = modal.querySelector('#ncnName').value.trim();
             if(!name){ toast('error','Name required','A connector needs a name before it can be governed.'); return; }
+            const url = modal.querySelector('#ncnUrl').value.trim();
+            if(url && !validHttpUrl(url)){
+              toast('error','Check the endpoint','The endpoint must be a complete http:// or https:// URL, e.g. https://erp.example.com/api.');
+              modal.querySelector('#ncnUrl').focus();
+              return;
+            }
             const body = {
               name,
               connector_type: modal.querySelector('#ncnType').value,
@@ -2079,15 +2531,22 @@
               access: modal.querySelector('#ncnAccess').value,
               data_classification: modal.querySelector('#ncnClass').value,
               auth_mode: modal.querySelector('#ncnAuth').value,
-              endpoint_url: modal.querySelector('#ncnUrl').value.trim() || null,
+              endpoint_url: url || null,
               scopes: modal.querySelector('#ncnScopes').value.split('\n').map(s=>s.trim()).filter(Boolean),
             };
-            close();
+            // Closed only on success: a 422 or a duplicate name used to cost the
+            // operator all eight fields, with a toast that named none of them.
             try {
               const created = await Store.mutate(()=>API.connectors.create(body), { event:'connectors:changed' });
+              close();
               toast('success','Connector registered', `${created.name} added — no agent holds a grant on it yet.`);
               refreshAll();
-            } catch (err) { toast('error','Could not register the connector', err.message); }
+            } catch (err) {
+              toast('error','Could not register the connector', errText(err));
+              const bad = err && err.fieldErrors ? Object.keys(err.fieldErrors)[0] : null;
+              const field = bad && modal.querySelector({ endpoint_url:'#ncnUrl', name:'#ncnName', scopes:'#ncnScopes', provider:'#ncnProv' }[bad.replace(/^body\./, '')] || '#none');
+              if(field) field.focus();
+            }
           }}],
         });
       });
@@ -2161,7 +2620,14 @@
                 + `<button class="link" data-nav="agents" style="margin-top:6px">View all agents ${ICONS.arrowRight}</button>`)}
               <div class="insp-section"><div class="flex" style="gap:8px">
                 <button class="btn sm grow" style="justify-content:center" id="cnEditBtn">Edit Permissions</button>
-                <button class="btn sm grow" style="justify-content:center" id="cnTestBtn">Test Connection</button></div></div>`;
+                <button class="btn sm grow" style="justify-content:center" id="cnTestBtn">Test Connection</button></div>
+                <div class="flex" style="gap:8px;margin-top:8px">
+                <button class="btn sm grow" style="justify-content:center" id="cnEditConnBtn">Edit Connector</button>
+                <button class="btn sm grow ghost-danger" style="justify-content:center" id="cnDeleteBtn">Delete</button></div></div>`;
+            requireRole(bodyEl.querySelector('#cnEditConnBtn'), 'operator', 'Editing a connector')
+              .addEventListener('click', ()=>editConnector(c));
+            requireRole(bodyEl.querySelector('#cnDeleteBtn'), 'admin', 'Deleting a connector')
+              .addEventListener('click', ()=>deleteConnector(c));
             requireRole(bodyEl.querySelector('#cnEditBtn'), 'operator', 'Editing connector permissions')
               .addEventListener('click', ()=>editPermissions(c));
             requireRole(bodyEl.querySelector('#cnTestBtn'), 'member', 'Testing a connector')
@@ -2222,7 +2688,8 @@
               try {
                 const res = await API.connectors.test(c.id);
                 out.innerHTML = kv([
-                  ['Result', res.ok ? '<span class="st-green">Reachable</span>' : '<span class="st-red">'+esc(res.status)+'</span>'],
+                  ['Result', res.ok ? '<span class="st-green">Reachable</span>'
+                    : `<span class="${res.status === 'Warning' ? 'st-amber' : 'st-red'}">${esc(res.status)}</span>`],
                   ['Latency', res.latency_ms == null ? dash : res.latency_ms + ' ms'],
                   ['HTTP Status', res.http_status == null ? dash : String(res.http_status)],
                   ['Checked', when(res.checked_at)],
@@ -2398,11 +2865,38 @@
           toast('success','Policy activated', res.message);
           refreshAll();
           if(currentId === r.id) showPolicy(res.policy);
-        } catch (err) { toast('error','Could not activate', err.message); }
+        } catch (err) {
+          // A rule with no conditions, or one naming a signal nothing produces,
+          // is refused (412) rather than switched on to match nothing. Long
+          // enough on screen to read, and the Rules tab is where it is fixed.
+          toast('error','Could not activate', policyErrText(err), 9000);
+          if(err && err.status === 412 && currentId === r.id) showPolicy(r, 1);
+        }
       }
 
-      function deactivatePolicy(r){
+      /** A policy refusal, with the signals the server named and the ones it accepts. */
+      function policyErrText(err){
+        const d = (err && err.details) || {};
+        let msg = errText(err);
+        if(Array.isArray(d.unknown_signals) && d.unknown_signals.length){
+          msg += ` Unknown signal${d.unknown_signals.length === 1 ? '' : 's'}: ${d.unknown_signals.join(', ')}.`;
+          if(Array.isArray(d.allowed) && d.allowed.length) msg += ` A condition may read: ${d.allowed.join(', ')} — or a feedback score written score:<name>.`;
+        }
+        return msg;
+      }
+
+      /** Put a refusal beside the rule textarea, where it can be read while fixing it. */
+      function showRuleError(modal, err){
+        const host = modal.querySelector('#pfRulesErr');
+        if(host) host.innerHTML = `<div class="scan-note" style="margin:0 0 10px">${ICONS.alert}<span>${esc(policyErrText(err))}</span></div>`;
+      }
+
+      async function deactivatePolicy(row){
         if(!allowed('admin','Deactivating a policy')) return;
+        // The reach quoted below decides whether someone clicks Deactivate, so it
+        // is read now; if that read fails the sentence simply carries no number.
+        let r = row;
+        try { r = await API.policies.get(row.id); } catch (_) { r = Object.assign({}, row, { applies_agents: null }); }
         confirmModal({ title:'Deactivate Policy', danger:true, confirmLabel:'Deactivate',
           body:`<p style="margin-top:0">Enforcement of <b style="color:var(--text)">${esc(r.name)}</b> stops immediately${
             r.applies_agents ? ` for <b style="color:var(--text)">${r.applies_agents}</b> agent(s)` : ''}.</p>
@@ -2440,12 +2934,14 @@
           </div>
           <div class="grid g2">
             <div class="form-row"><label>RISK LEVEL</label><select class="filter-select w-100" id="pfRisk" style="height:34px">${optionList(RISKS, p ? p.risk_level : 'Medium')}</select></div>
-            <div class="form-row"><label>STATUS</label><select class="filter-select w-100" id="pfStatus" style="height:34px">${optionList(POLICY_STATES, p ? p.status : 'Active')}</select></div>
+            <div class="form-row"><label>STATUS</label><select class="filter-select w-100" id="pfStatus" style="height:34px">${optionList(POLICY_STATES, p ? p.status : 'Inactive')}</select></div>
           </div>
           <div class="form-row"><label>DESCRIPTION</label><textarea class="input" id="pfDesc" rows="2" placeholder="What does this policy enforce?">${esc(p ? (p.description||'') : '')}</textarea></div>
           <div class="form-row"><label>RULE BODY (JSON — ${p ? 'LEAVE BLANK TO KEEP THE CURRENT RULES' : 'LEAVE BLANK TO DERIVE ONE'})</label>
             <textarea class="input" id="pfRules" rows="6" style="font-family:Consolas,monospace;font-size:11.5px">${
-              p && p.rules && Object.keys(p.rules).length ? esc(JSON.stringify(p.rules, null, 2)) : ''}</textarea></div>`;
+              p && p.rules && Object.keys(p.rules).length ? esc(JSON.stringify(p.rules, null, 2)) : ''}</textarea></div>
+          <div id="pfRulesErr"></div>
+          ${p ? '' : `<div class="faint small">A policy saved without a rule body gets a starter rule derived from its category and is kept <b>Inactive</b> until you have reviewed that rule — activate it from the inspector.</div>`}`;
       }
 
       /** Read the shared policy form, or throw a message a person can act on. */
@@ -2457,7 +2953,10 @@
         if(scopeVal !== 'Global' && !scopeRef) throw new Error(`A ${scopeVal} scope needs a target — the agent, connector or environment it applies to.`);
         const rulesText = modal.querySelector('#pfRules').value.trim();
         let rules = null;
-        if(rulesText){
+        /* Enforcement and rules.action.mode are one setting. Resending the body
+           exactly as it was loaded, beside a changed dropdown, put two answers
+           in one request; leaving it out lets the dropdown rewrite the mode. */
+        if(rulesText && rulesText !== (modal.dataset.rulesAsLoaded || '')){
           try { rules = JSON.parse(rulesText); }
           catch (e) { throw new Error('The rule body is not valid JSON: ' + e.message); }
         }
@@ -2487,9 +2986,14 @@
             try {
               const created = await Store.mutate(()=>API.policies.create(body), { event:'policies:changed' });
               close();
-              toast('success','Policy created', `${created.name} is ${created.status === 'Active' ? 'now enforced' : 'saved as ' + created.status}.`);
+              toast(created.status === 'Active' ? 'success' : 'info', 'Policy created', created.status === 'Active'
+                ? `${created.name} is now enforced.`
+                : `${created.name} is saved as ${created.status}. Review its rule, then activate it.`);
               refreshAll();
-            } catch (err) { toast('error','Could not create the policy', err.message); }
+              // Straight to the rule that was stored — derived or typed — so it is
+              // read before anyone is offered Activate.
+              showPolicy(created, 1);
+            } catch (err) { toast('error','Could not create the policy', errText(err)); showRuleError(modal, err); }
           }}],
         });
       });
@@ -2510,12 +3014,16 @@
               toast('success','Policy updated', `${saved.name} saved as ${saved.version}.`);
               refreshAll();
               if(currentId === r.id) showPolicy(saved);
-            } catch (err) { toast('error','Could not save the policy', err.message); }
+            } catch (err) { toast('error','Could not save the policy', errText(err)); showRuleError(modal, err); }
           }}],
           onOpen(modal){
             const body = modal.querySelector('.modal-body');
             API.policies.get(r.id)
-              .then(p => { body.innerHTML = policyForm(p); modal.dataset.updatedAt = p.updated_at; })
+              .then(p => {
+                body.innerHTML = policyForm(p);
+                modal.dataset.updatedAt = p.updated_at;
+                modal.dataset.rulesAsLoaded = modal.querySelector('#pfRules').value.trim();
+              })
               .catch(err => { body.innerHTML = ''; body.appendChild(screenError(err, null, 'this policy')); });
           },
         });
@@ -2527,7 +3035,7 @@
           title:'Import Policy Definitions', icon:'upload', wide:true,
           body:`<p style="margin-top:0" class="small muted">Paste a policy definition file, or choose one — a JSON array of policies, or an object with a <span class="mono">policies</span> array.</p>
             <div class="form-row"><label>FILE</label><input type="file" id="plImpFile" accept=".json,application/json"></div>
-            <div class="form-row"><label>DEFINITIONS</label><textarea class="input" id="plImpText" rows="10" style="font-family:Consolas,monospace;font-size:11.5px" placeholder='[{"name":"Block External File Sharing","category":"Data Protection","enforcement":"Block"}]'></textarea></div>
+            <div class="form-row"><label>DEFINITIONS</label><textarea class="input" id="plImpText" rows="10" style="font-family:Consolas,monospace;font-size:11.5px" placeholder='[{"name":"Block External File Sharing","category":"Data Protection","enforcement":"Block","status":"Inactive"}]'></textarea></div>
             <div class="grid g2">
               <div class="form-row"><label>ON CONFLICT</label><select class="filter-select w-100" id="plImpConflict" style="height:34px">${optionList(['skip','replace','fail'],'skip')}</select></div>
               <label class="flex" style="gap:8px;font-size:12.5px;align-items:center"><input type="checkbox" id="plImpActivate"> Activate every imported policy</label>
@@ -2552,9 +3060,12 @@
               const issues = res.issues || [];
               toast(issues.length ? 'warn' : 'success', 'Import complete',
                 `${res.created} created, ${res.replaced} replaced, ${res.skipped} skipped of ${res.submitted}.`);
+              // An issue no longer means "skipped": a definition with no rule body is
+              // imported, left Inactive, and listed here so someone reviews its rule.
               if(issues.length) openModal({ title:'Import Issues', icon:'alert',
-                body:`<p style="margin-top:0">${issues.length} definition(s) were not imported:</p>` +
-                  kv(issues.map(i=>[`#${i.index + 1} ${i.name}`, esc(i.reason)])),
+                body:`<p style="margin-top:0">${issues.length} definition(s) need attention${res.skipped
+                  ? ` — ${res.skipped} of them ${res.skipped === 1 ? 'was' : 'were'} not imported` : ''}. A definition imported without a rule body is kept Inactive until its derived rule has been reviewed.</p>` +
+                  kv(issues.map(i=>[`#${i.index + 1} ${esc(i.name || '')}`, esc(i.reason)])),
                 footer:[{label:'Close'}] });
               refreshAll();
             } catch (err) { toast('error','Could not import', err.message); }
@@ -2572,6 +3083,58 @@
           },
         });
       });
+
+      /* Explicit bindings: agents this policy governs on top of whatever its
+         scope reaches. The API could always hold them; the console had no way to
+         create or remove one. Admin-only on the server, so only drawn for admins. */
+      function paintBindings(p, stillOpen){
+        const host = document.getElementById('plBindings');
+        if(!host) return;
+        API.policies.bindings(p.id)
+          .then(rows => {
+            if(!stillOpen() || currentId !== p.id || !host.isConnected) return;
+            const bound = rows || [];
+            host.innerHTML = (bound.length
+              ? bound.map(b=>`<div class="flex" style="gap:8px;padding:4px 0">
+                  <span class="link grow" data-nav="agent/${esc(b.agent_id)}" style="font-size:12px">${esc(b.agent_name || b.agent_id)}${b.agent_name ? '' : ' <span class="faint">(agent no longer registered)</span>'}</span>
+                  <span class="faint small">${esc(rel(b.bound_at))}</span>
+                  <button class="btn sm" data-unbind="${esc(b.agent_id)}">Unbind</button></div>`).join('')
+              : '<span class="faint small">No agent is bound explicitly — this policy reaches agents through its scope only.</span>')
+              + `<div class="flex" style="gap:8px;margin-top:8px">
+                  <select class="filter-select grow" id="plBindAgent" style="height:30px"><option value="">Loading agents…</option></select>
+                  <button class="btn sm" id="plBindBtn">Bind</button></div>`;
+            const select = host.querySelector('#plBindAgent');
+            const held = new Set(bound.map(b=>b.agent_id));
+            API.agents.list({ sort:'name', page_size: 200 })
+              .then(page => {
+                if(!select.isConnected) return;
+                const items = (page.items || []).filter(a=>!held.has(a.id));
+                select.innerHTML = items.length
+                  ? '<option value="">Choose an agent to bind…</option>' + items.map(a=>`<option value="${esc(a.id)}">${esc(a.name)} — ${esc(a.status || '')}</option>`).join('')
+                  : '<option value="">No further agents to bind</option>';
+              })
+              .catch(err => { if(select.isConnected) select.innerHTML = `<option value="">Agents unavailable — ${esc(err.message)}</option>`; });
+            const change = async (call, done) => {
+              try {
+                const res = await Store.mutate(call, { event:'policies:changed' });
+                toast('success', done, res && res.message);
+                refreshAll();
+                paintBindings(p, stillOpen);
+              } catch (err) { toast('error','Could not change the binding', errText(err)); }
+            };
+            host.querySelector('#plBindBtn').addEventListener('click', ()=>{
+              if(!select.value){ toast('error','Agent required','Choose the agent this policy should be bound to.'); return; }
+              change(()=>API.policies.bind(p.id, select.value), 'Agent bound');
+            });
+            host.querySelectorAll('[data-unbind]').forEach(btn=>btn.addEventListener('click', ()=>
+              change(()=>API.policies.unbind(p.id, btn.dataset.unbind), 'Agent unbound')));
+          })
+          .catch(err => {
+            if(!host.isConnected) return;
+            host.innerHTML = '';
+            host.appendChild(screenError(err, ()=>paintBindings(p, stillOpen), 'the bound agents'));
+          });
+      }
 
       /* ---- inspector: five tabs ---- */
       function showPolicy(row, openTab){
@@ -2621,11 +3184,10 @@
                 ['Last Modified', `${when(p.updated_at)}${p.updated_by?' · '+esc(p.updated_by):''}`],
                 ['Enforcement Mode', badge(p.enforcement, ENF_COLORS[p.enforcement]||'gray')],
                 ['Risk Level', p.risk_level?riskBadge(p.risk_level):dash],
-                ['Last Evaluated', rel(p.last_evaluated_at)],
                 ['Last Triggered', rel(p.last_triggered_at)],
               ]) + `<div style="margin-top:8px"><span class="tag">${esc(p.risk_level)} Risk</span><span class="tag">${esc(p.category)}</span><span class="tag">${esc(p.scope_label || p.scope)}</span></div>`)}
-              ${inspSection('Applies To','target', `<div class="grid g4" style="gap:8px;text-align:center">
-                ${[['Agents',p.applies_agents,'bot'],['Tools',p.applies_tools,'tool'],['Connectors',p.applies_connectors,'link'],['Environments',p.applies_envs,'layers']].map(x=>
+              ${inspSection('Applies To','target', `<div class="grid g3" style="gap:8px;text-align:center">
+                ${[['Agents',p.applies_agents,'bot'],['Connectors',p.applies_connectors,'link'],['Environments',p.applies_envs,'layers']].map(x=>
                   `<div style="background:var(--panel-2);border:1px solid var(--border-soft);border-radius:9px;padding:9px 4px">
                     <span style="width:15px;display:inline-flex;color:var(--purple-bright)">${ICONS[x[2]]}</span>
                     <div style="font-size:16px;font-weight:700;margin-top:3px">${x[1] == null ? '—' : x[1]}</div>
@@ -2675,12 +3237,15 @@
                 ['Scope Label', text(p.scope_label)],
                 ['Scope Target', p.scope_ref ? `<span class="mono small">${esc(p.scope_ref)}</span>` : dash],
                 ['Agents In Scope', num(p.applies_agents)],
-                ['Tools In Scope', num(p.applies_tools)],
                 ['Connectors In Scope', num(p.applies_connectors)],
                 ['Environments', num(p.applies_envs)],
               ]) + (p.scope === 'Agent' && p.scope_ref
                 ? `<button class="link" data-nav="agent/${esc(p.scope_ref)}" style="margin-top:8px">Open the agent this binds to ${ICONS.arrowRight}</button>`
-                : `<button class="link" data-nav="agents" style="margin-top:8px">Open the Agent Registry ${ICONS.arrowRight}</button>`));
+                : `<button class="link" data-nav="agents" style="margin-top:8px">Open the Agent Registry ${ICONS.arrowRight}</button>`))
+              + (Store.session.can('admin')
+                ? inspSection('Bound Agents','bot', '<div id="plBindings"><div class="card-loading" style="height:70px"></div></div>')
+                : '');
+            if(Store.session.can('admin')) paintBindings(p, ()=>tab === 2);
           }
           else if(i === 3){
             bodyEl.innerHTML = inspSection('Violations','flag','<div class="card-loading" style="height:120px"></div>');
@@ -2743,9 +3308,13 @@
   SCREENS['approvals'] = {
     title:'Approvals & Audit',
     render(main){
-      const STATUS_TABS = ['Pending','Approved','Rejected','Escalated'];
+      // Expired is a real end state — the sweeper sets it when an SLA lapses with
+      // no decision — and had no tab, so those requests could not be found at all.
+      const STATUS_TABS = ['Pending','Approved','Rejected','Escalated','Expired'];
+      const AUDIT_TAB = STATUS_TABS.length, RULES_TAB = STATUS_TABS.length + 1;
       const scope = { status: 'Pending' };   // the queue tab, read on every request
       let currentTab = 0, tabsEl = null, currentId = null, auditTable = null, auditHost = null;
+      let rulesTable = null, rulesHost = null;
       const seenActions = new Set(), seenAgents = new Set();
 
       main.innerHTML = `
@@ -2789,7 +3358,8 @@
         if(!host) return;
         host.innerHTML = '';
         tabsEl = tabBar(host,
-          [{label:'Pending', count: pending == null ? null : pending},{label:'Approved'},{label:'Rejected'},{label:'Escalated'},{label:'Audit Trail'}],
+          [{label:'Pending', count: pending == null ? null : pending},{label:'Approved'},{label:'Rejected'},{label:'Escalated'},
+           {label:'Expired'},{label:'Audit Trail'},{label:'Rules'}],
           setTab, currentTab);
       }
       paintTabs(null);
@@ -2832,7 +3402,7 @@
           rows.forEach(r=>{ if(r.action) seenActions.add(r.action); if(r.agent_name) seenAgents.add(r.agent_name); });
           fillFilter(table, 0, Array.from(seenAgents).sort());
           fillFilter(table, 2, Array.from(seenActions).sort());
-          if(currentTab === 4) return;
+          if(currentTab >= AUDIT_TAB) return;
           if(!rows.length){ currentId = null; emptyInspector(); return; }
           if(!currentId || !rows.some(r=>r.id === currentId)) table.selectFirst();
         },
@@ -2843,7 +3413,7 @@
           {label:'Escalate', icon:'users', onClick:()=>decide(r,'escalate')},
         ] : [
           {label:'View Details', icon:'eye', onClick:()=>showRequest(r)},
-          {label:'View Audit Trail', icon:'history', onClick:()=>setTab(4)},
+          {label:'View Audit Trail', icon:'history', onClick:()=>setTab(AUDIT_TAB)},
         ],
       });
 
@@ -2853,7 +3423,9 @@
 
       document.getElementById('apSearch').addEventListener('input', e=>table.search(e.target.value));
       document.getElementById('apExport').addEventListener('click', ()=>{
-        if(currentTab === 4 && auditTable) auditTable.export(); else table.export();
+        if(currentTab === AUDIT_TAB && auditTable) auditTable.export();
+        else if(currentTab === RULES_TAB && rulesTable) rulesTable.export();
+        else table.export();
       });
 
       function slaCell(r){
@@ -2869,16 +3441,19 @@
           `No ${STATUS_TABS[currentTab] ? STATUS_TABS[currentTab].toLowerCase() : ''} requests right now.`);
       }
 
-      /* ---- tabs: four queues plus the audit trail ---- */
+      /* ---- tabs: five queues, the audit trail, and the rules ---- */
       function setTab(i){
         currentTab = i;
         if(tabsEl) tabsEl.querySelectorAll('.tab').forEach((t,ti)=>t.classList.toggle('active', ti===i));
-        if(i === 4){
+        if(i === AUDIT_TAB || i === RULES_TAB){
           table.el.style.display = 'none';
           table.filterEl.style.display = 'none';
-          showAudit();
+          if(auditHost) auditHost.style.display = 'none';
+          if(rulesHost) rulesHost.style.display = 'none';
+          if(i === AUDIT_TAB) showAudit(); else showRules();
         } else {
           if(auditHost) auditHost.style.display = 'none';
+          if(rulesHost) rulesHost.style.display = 'none';
           table.el.style.display = '';
           table.filterEl.style.display = '';
           scope.status = STATUS_TABS[i];
@@ -2896,7 +3471,7 @@
           wrap.appendChild(auditHost);
         }
         auditHost.style.display = '';
-        if(auditTable){ auditTable.refresh(); paintAuditInspector(); return; }
+        if(auditTable){ auditTable.refresh(); loadVerify(); paintAuditInspector(); return; }
 
         auditHost.innerHTML = `<div id="apVerify"></div>`;
         const seenActors = new Set(), seenScreens = new Set();
@@ -2934,23 +3509,48 @@
         paintAuditInspector();
       }
 
+      /* One chain verification feeds both the banner and the inspector. Each used
+         to ask for its own, and closing an event's inspector asked a third time —
+         every one a replay of the workspace's whole audit history. The server
+         shares its answer for a minute, so this holds it for as long: re-verified
+         on an explicit retry, or on coming back to the tab after that minute. */
+      const VERIFY_MAX_AGE_MS = 60000;
+      let verifyState = null;   // { at, promise }
+      function verifyChain(force){
+        if(force || !verifyState || Date.now() - verifyState.at > VERIFY_MAX_AGE_MS){
+          const state = { at: Date.now(), promise: API.audit.verify() };
+          state.promise.catch(()=>{ if(verifyState === state) verifyState = null; });
+          verifyState = state;
+        }
+        return verifyState.promise;
+      }
+      function reverify(){ verifyChain(true); loadVerify(); paintAuditInspector(); }
+
+      /** Forks are history, not tampering: rows two writers chained to the same
+       *  parent before writers were serialised. The chain still reconciles. */
+      function forkNote(v){
+        return v.intact && v.forks > 0
+          ? `${fmtFull(v.forks)} concurrent-write fork${v.forks === 1 ? '' : 's'} recorded before writers were serialised` : '';
+      }
+
       /** The banner over the trail: the server replays the hash chain for us. */
       function loadVerify(){
         const host = document.getElementById('apVerify');
         if(!host) return;
         host.innerHTML = `<div class="scan-note">${ICONS.refresh} Verifying the audit hash chain…</div>`;
-        API.audit.verify()
+        verifyChain()
           .then(v => {
             if(!document.getElementById('apVerify')) return;
             host.innerHTML = v.intact
-              ? `<div class="scan-note">${ICONS.shieldCheck} Hash chain verified — ${fmtFull(v.checked)} event(s) reconcile, newest first. Every row is chained to the one before it.</div>`
+              ? `<div class="scan-note">${ICONS.shieldCheck} Hash chain verified — ${fmtFull(v.checked)} event(s) reconcile, newest first. ${
+                  forkNote(v) ? esc(forkNote(v)) + '; every row still reconciles with its parent.' : 'Every row is chained to the one before it.'}</div>`
               : `<div class="scan-note" style="border-color:var(--red-dim);color:#B91C1C">${ICONS.alert} The hash chain does not reconcile. ${fmtFull(v.checked)} event(s) verified before the break${
                   v.broken_at_event_id ? ` at <span class="mono">${esc(v.broken_at_event_id)}</span>` : ''}${v.broken_at ? ` (${esc(when(v.broken_at))})` : ''}.</div>`;
           })
           .catch(err => {
             if(!document.getElementById('apVerify')) return;
             host.innerHTML = '';
-            host.appendChild(screenError(err, loadVerify, 'the chain verification'));
+            host.appendChild(screenError(err, reverify, 'the chain verification'));
           });
       }
 
@@ -2961,15 +3561,16 @@
             <div class="insp-sub">Immutable record of every administrative and agent decision</div></div></div>
           <div id="apAuditMeta"><div class="card-loading" style="height:150px"></div></div>`;
         const meta = insp.querySelector('#apAuditMeta');
-        API.audit.verify()
+        verifyChain()
           .then(v => {
             if(!document.getElementById('apAuditMeta')) return;
             meta.innerHTML = inspSection('Integrity','shieldCheck', kv([
                 ['Events Verified', fmtFull(v.checked)],
                 ['Hash Chain', v.intact ? '<span class="st-green">Verified</span>' : '<span class="st-red">Broken</span>'],
+                ...(forkNote(v) ? [['Forks', `<span class="small dim right">${esc(forkNote(v))}</span>`]] : []),
                 ...(v.broken_at_event_id ? [['First Break', `<span class="mono small">${esc(v.broken_at_event_id)}</span>`]] : []),
                 ...(v.broken_at ? [['Broken At', when(v.broken_at)]] : []),
-                ['Checked', 'just now'],
+                ['Checked', verifyState ? esc(relTime(verifyState.at)) : dash],
               ]))
               + inspSection('Retention','database', kv([
                 ['Write Path', 'Append-only — the API exposes no update or delete'],
@@ -2983,8 +3584,94 @@
           .catch(err => {
             if(!document.getElementById('apAuditMeta')) return;
             meta.innerHTML = '';
-            meta.appendChild(screenError(err, paintAuditInspector, 'the chain status'));
+            meta.appendChild(screenError(err, reverify, 'the chain status'));
           });
+      }
+
+      /* ---- the rules tab ---- */
+      /* Rules could be created from this screen and then never seen again: no
+         list, no edit, no delete. They are listed here with what they have
+         actually done — the 30-day counters are written by the server now. */
+      function showRules(){
+        if(!rulesHost){
+          rulesHost = document.createElement('div');
+          rulesHost.id = 'apRules';
+          wrap.appendChild(rulesHost);
+        }
+        rulesHost.style.display = '';
+        paintRulesInspector();
+        if(rulesTable){ rulesTable.refresh(); return; }
+        rulesTable = dataTable({
+          columns:[
+            {key:'name', label:'Rule', render:r=>`<div><div class="cell-main">${esc(r.name)}</div>
+              <div class="cell-sub">${esc(r.description || '—')}</div></div>`},
+            {key:'trigger', label:'Trigger', sortable:false, render:r=>dim(r.trigger)},
+            {key:'approvers', label:'Approvers', sortable:false, render:r=>(r.approvers||[]).length
+              ? `<span class="dim" style="font-size:11.5px">${esc(r.approvers.join(', '))}</span>` : dash},
+            {key:'sla_minutes', label:'SLA', sortable:false, render:r=>r.sla_minutes == null ? dash : esc(duration(r.sla_minutes * 60))},
+            {key:'threshold_amount', label:'Threshold', sortable:false, align:'right', cls:'num', render:r=>r.threshold_amount == null ? dash : fmtFull(r.threshold_amount)},
+            {key:'status', label:'Status', render:r=>statusText(r.status, r.status==='Active'?'green':r.status==='Warning'?'amber':r.status==='Inactive'?'gray':'purple')},
+            {key:'requests_30d', label:'Requests (30d)', sortable:false, align:'right', cls:'num', render:r=>num(r.requests_30d)},
+            {key:'approved_pct', label:'Approved', sortable:false, align:'right', cls:'num', render:r=>r.requests_30d ? pct(r.approved_pct, 0) : dash},
+            {key:'last_triggered_at', label:'Last Triggered', sortable:false, render:r=>`<span class="dim nowrap">${rel(r.last_triggered_at)}</span>`},
+          ],
+          rowId:'id', pageSize:10, pageSizes:[10,25,50], itemName:'approval rules',
+          searchPlaceholder:'Search approval rules…',
+          emptyText:'No approval rules yet — create one with New Approval Rule',
+          exportName:'approval-rules',
+          filters:[
+            {key:'status', label:'Status', param:'status', options:POLICY_STATES, allLabel:'All Status'},
+            {key:'trigger', label:'Trigger', param:'trigger', options:APPROVAL_TRIGGERS, allLabel:'All Triggers'},
+          ],
+          source:(params)=>API.approvals.rules.list(params),
+          rowActions: r=>[
+            {label:'Edit Rule', icon:'edit', onClick:()=>ruleModal(r)},
+            r.status === 'Inactive'
+              ? {label:'Enable Rule', icon:'checkCircle', onClick:()=>setRuleStatus(r, 'Active')}
+              : {label:'Disable Rule', icon:'xCircle', onClick:()=>setRuleStatus(r, 'Inactive')},
+            {sep:true},
+            {label:'Delete Rule', icon:'trash', danger:true, onClick:()=>deleteRule(r)},
+          ],
+        });
+        rulesHost.appendChild(rulesTable.filterEl);
+        rulesHost.appendChild(rulesTable.el);
+      }
+
+      function paintRulesInspector(){
+        const insp = document.getElementById('apInspector');
+        if(!insp) return;
+        insp.innerHTML = `<div class="insp-head"><div><div class="insp-title">Approval Rules</div>
+            <div class="insp-sub">What a matching request inherits</div></div></div>
+          ${inspSection('What a rule does','info', `<div class="small dim" style="line-height:1.6">A rule does not route or hold anything by itself. When a request is raised and an Active rule matches, the request carries the rule's name, its SLA (unless the caller set one) and the approvers it names.</div>`)}
+          ${inspSection('When a rule matches','filter', kv([
+            ['By name', 'The request names the rule as its policy'],
+            ['By amount', 'payload.amount (or impact.financial) reaches the threshold'],
+            ['By trigger', 'The request’s action or payload.trigger equals the rule’s trigger'],
+          ]))}`;
+      }
+
+      async function setRuleStatus(r, status){
+        if(!allowed('admin','Changing an approval rule')) return;
+        try {
+          const saved = await Store.mutate(()=>API.approvals.rules.update(r.id, { status, expected_updated_at: r.updated_at }), { event:'approvals:changed' });
+          toast(status === 'Active' ? 'success' : 'warn', status === 'Active' ? 'Rule enabled' : 'Rule disabled',
+            `${saved.name} is now ${saved.status}.`);
+          if(rulesTable) rulesTable.refresh();
+        } catch (err) { toast('error','Could not change the rule', errText(err)); }
+      }
+
+      function deleteRule(r){
+        if(!allowed('admin','Deleting an approval rule')) return;
+        confirmModal({ title:'Delete Approval Rule', danger:true, confirmLabel:'Delete',
+          body:`<p style="margin-top:0">You are about to delete <b style="color:var(--text)">${esc(r.name)}</b>.</p>
+            <p>Requests already raised keep the SLA and approvers they inherited; new requests stop matching this rule. The deletion is recorded in the audit trail.</p>`,
+          onConfirm: async ()=>{
+            try {
+              await Store.mutate(()=>API.approvals.rules.remove(r.id), { event:'approvals:changed' });
+              toast('success','Rule deleted', `${r.name} was removed.`);
+              if(rulesTable) rulesTable.refresh();
+            } catch (err) { toast('error','Could not delete the rule', errText(err)); }
+          }});
       }
 
       function showAuditEvent(r){
@@ -3015,6 +3702,7 @@
           ${inspSection('Integrity','shieldCheck', kv([
             ['Event Hash', r.checksum?`<span class="mono small">sha256:${esc(String(r.checksum).slice(0,16))}…</span>`:dash],
           ]))}`;
+        // Back to the chain summary — painted from the verification already held.
         const close = insp.querySelector('#apAudClose');
         if(close) close.addEventListener('click', paintAuditInspector);
       }
@@ -3045,9 +3733,9 @@
               const to = modal.querySelector('#apEscTo').value;
               if(to) body.escalate_to_user_id = to;
             }
-            close();
             try {
               const res = await Store.mutate(()=>API.approvals[verb](r.id, body), { event:'approvals:changed' });
+              close();
               toast(verb === 'approve' ? 'success' : verb === 'reject' ? 'error' : 'warn',
                 `Request ${res.request.status.toLowerCase()}`, res.message);
               if(res.follow_on) openModal({ title:'Follow-on Action', icon:'zap',
@@ -3060,7 +3748,10 @@
               Store.refreshBadges();
               if(currentId === r.id) showRequest(res.request);
             } catch (err) {
-              toast('error','Could not record the decision', err.message);
+              // The note stays on screen. A 409 means someone else decided first,
+              // so the queue and the card are re-read rather than left stale.
+              toast('error','Could not record the decision', errText(err), 7000);
+              if(err && err.status === 409){ close(); table.refresh(); loadSummary(); if(currentId === r.id) showRequest(r); }
             }
           }}],
           onOpen(modal){
@@ -3145,6 +3836,7 @@
             ['Requested', `${when(r.requested_at)} (${esc(rel(r.requested_at))})`],
             ['Risk Level', r.risk?riskBadge(r.risk):dash],
             ['Policy', text(r.policy_name)],
+            ...((r.approvers || []).length ? [['Rule Names', `<span class="small dim right">${esc(r.approvers.join(', '))}</span>`]] : []),
             r.is_open
               ? ['SLA', r.sla_due_at
                   ? `${slaCell(r)} <span class="faint small">due ${esc(when(r.sla_due_at))}</span>`
@@ -3196,26 +3888,30 @@
           .addEventListener('click', ()=>addComment(r));
       }
 
-      /* ---- approval rules ---- */
-      document.getElementById('apNewRule').addEventListener('click', ()=>{
-        if(!allowed('admin','Creating an approval rule')) return;
+      /* ---- approval rules: one dialog creates and edits ---- */
+      document.getElementById('apNewRule').addEventListener('click', ()=>ruleModal(null));
+
+      function ruleModal(rule){
+        if(!allowed('admin', rule ? 'Editing an approval rule' : 'Creating an approval rule')) return;
+        const slaChoices = [[15,'15 minutes'],[60,'1 hour'],[240,'4 hours'],[1440,'24 hours']];
+        const sla = rule && rule.sla_minutes != null ? rule.sla_minutes : 240;
+        if(!slaChoices.some(c=>c[0] === sla)) slaChoices.push([sla, duration(sla * 60)]);
         openModal({
-          title:'New Approval Rule', icon:'stamp',
-          body:`<div class="form-row"><label>RULE NAME</label><input class="input" id="arName" placeholder="e.g. Payments above $5,000"></div>
+          title: rule ? 'Edit Approval Rule — ' + rule.name : 'New Approval Rule', icon:'stamp',
+          body:`<div class="form-row"><label>RULE NAME</label><input class="input" id="arName" value="${esc(rule ? rule.name : '')}" placeholder="e.g. Payments above $5,000"></div>
             <div class="grid g2">
-              <div class="form-row"><label>TRIGGER</label><select class="filter-select w-100" id="arTrigger" style="height:34px">${optionList(APPROVAL_TRIGGERS)}</select></div>
-              <div class="form-row"><label>SLA</label><select class="filter-select w-100" id="arSla" style="height:34px">
-                <option value="15">15 minutes</option><option value="60">1 hour</option>
-                <option value="240" selected>4 hours</option><option value="1440">24 hours</option></select></div>
+              <div class="form-row"><label>TRIGGER</label><select class="filter-select w-100" id="arTrigger" style="height:34px">${optionList(APPROVAL_TRIGGERS, rule ? rule.trigger : null)}</select></div>
+              <div class="form-row"><label>SLA</label><select class="filter-select w-100" id="arSla" style="height:34px">${
+                slaChoices.map(c=>`<option value="${c[0]}" ${c[0] === sla ? 'selected' : ''}>${esc(c[1])}</option>`).join('')}</select></div>
             </div>
             <div class="grid g2">
-              <div class="form-row"><label>RISK LEVEL</label><select class="filter-select w-100" id="arRisk" style="height:34px">${optionList(RISKS,'Medium')}</select></div>
-              <div class="form-row"><label>THRESHOLD AMOUNT</label><input class="input" id="arThreshold" type="number" min="0" placeholder="e.g. 5000"></div>
+              <div class="form-row"><label>RISK LEVEL</label><select class="filter-select w-100" id="arRisk" style="height:34px">${optionList(RISKS, rule ? rule.risk_level : 'Medium')}</select></div>
+              <div class="form-row"><label>THRESHOLD AMOUNT</label><input class="input" id="arThreshold" type="number" min="0" value="${rule && rule.threshold_amount != null ? esc(String(rule.threshold_amount)) : ''}" placeholder="e.g. 5000"></div>
             </div>
             <div class="form-row"><label>APPROVERS (SELECT ONE OR MORE)</label>
               <select class="filter-select w-100" id="arApprovers" multiple size="5" style="height:auto"><option>Loading members…</option></select></div>
-            <div class="form-row"><label>DESCRIPTION</label><textarea class="input" id="arDesc" rows="2" placeholder="What does this rule stop?"></textarea></div>`,
-          footer:[{label:'Cancel'},{label:'Create Rule', cls:'primary', onClick: async (close, modal)=>{
+            <div class="form-row"><label>DESCRIPTION</label><textarea class="input" id="arDesc" rows="2" placeholder="What does this rule stop?">${esc(rule ? (rule.description || '') : '')}</textarea></div>`,
+          footer:[{label:'Cancel'},{label: rule ? 'Save Rule' : 'Create Rule', cls:'primary', onClick: async (close, modal)=>{
             const name = modal.querySelector('#arName').value.trim();
             if(name.length < 2){ toast('error','Name required','An approval rule needs a name.'); return; }
             const approvers = Array.from(modal.querySelector('#arApprovers').selectedOptions).map(o=>o.value).filter(Boolean);
@@ -3230,26 +3926,36 @@
               risk_level: modal.querySelector('#arRisk').value,
             };
             if(threshold !== '') body.threshold_amount = Number(threshold);
-            close();
+            if(rule) body.expected_updated_at = rule.updated_at;
             try {
-              const rule = await Store.mutate(()=>API.approvals.rules.create(body), { event:'approvals:changed' });
-              toast('success','Approval rule created', `${rule.name} routes to ${rule.approvers.join(', ')} within ${rule.sla_minutes} minutes.`);
+              const saved = await Store.mutate(()=>rule ? API.approvals.rules.update(rule.id, body) : API.approvals.rules.create(body),
+                { event:'approvals:changed' });
+              close();
+              // Said as it is: a rule names an SLA and approvers on the requests it
+              // matches. It used to claim it "routes" them, which nothing does.
+              toast('success', rule ? 'Rule saved' : 'Approval rule created',
+                `Rule saved — requests matching '${saved.trigger}' will carry a ${saved.sla_minutes}-minute SLA and name ${(saved.approvers || []).join(', ')}.`, 7000);
               loadSummary();
-            } catch (err) { toast('error','Could not create the rule', err.message); }
+              if(rulesTable) rulesTable.refresh();
+            } catch (err) { toast('error', rule ? 'Could not save the rule' : 'Could not create the rule', errText(err)); }
           }}],
           onOpen(modal){
             const select = modal.querySelector('#arApprovers');
+            const chosen = new Set(rule ? (rule.approvers || []) : []);
             API.approvals.approvers({ page_size: 100, sort:'full_name' })
               .then(page => {
-                const members = page.items || [];
-                select.innerHTML = members.length
-                  ? members.map(m=>`<option value="${esc(m.full_name || m.email)}">${esc(m.full_name || m.email)}${m.role?' — '+esc(m.role):''}</option>`).join('')
+                const names = (page.items || []).map(m=>({ value: m.full_name || m.email, label: (m.full_name || m.email) + (m.role ? ' — ' + m.role : '') }));
+                // An approver the rule already names stays selectable even if that
+                // person has since left the roster, so saving does not drop them.
+                chosen.forEach(n=>{ if(!names.some(x=>x.value === n)) names.push({ value:n, label:n }); });
+                select.innerHTML = names.length
+                  ? names.map(n=>`<option value="${esc(n.value)}" ${chosen.has(n.value) ? 'selected' : ''}>${esc(n.label)}</option>`).join('')
                   : '<option value="">No workspace members found</option>';
               })
               .catch(err => { select.innerHTML = `<option value="">Members unavailable — ${esc(err.message)}</option>`; });
           },
         });
-      });
+      }
 
       loadSummary();
     },

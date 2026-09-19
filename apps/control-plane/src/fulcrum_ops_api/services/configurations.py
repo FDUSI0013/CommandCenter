@@ -1843,7 +1843,16 @@ async def rollback(
             ConfigurationVersion.created_at.desc(), ConfigurationVersion.id.desc()
         )
         history = list((await session.execute(stmt)).scalars().all())
-        previous = [row for row in history if current is None or row.id != current.id]
+        # "Previous" is the revision that was live before this one. A Draft has
+        # never been live: with one on file it was the newest other row, and an
+        # unnamed rollback published a body nobody had ever run. A draft goes
+        # live through ``activate_version``, or by naming it here.
+        previous = [
+            row
+            for row in history
+            if (current is None or row.id != current.id)
+            and row.status != ConfigurationStatus.DRAFT.value
+        ]
         if not previous:
             raise PreconditionFailed(
                 f"'{configuration.name}' has no earlier version to roll back to."

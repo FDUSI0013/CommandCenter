@@ -508,6 +508,44 @@ async def test_a_theme_at_the_auto_issue_threshold_gets_its_issue_opened(
     assert await db.count(FeedbackIssue) == 1
 
 
+async def test_create_issue_on_a_theme_the_pass_already_opened_names_that_issue(
+    admin_client, factory, workspace, db
+):
+    """The Analyze card's Create Issue button must not fork an empty second issue."""
+    await _auto_issue_at(admin_client, 3)
+    for body in INVOICE_REPORTS:
+        await _report(factory, workspace, body)
+    (cluster,) = (await admin_client.post(f"{FEEDBACK}/analyze", json={})).json()["clusters"]
+    assert cluster["issue_auto_opened"] is True
+
+    forked = await admin_client.post(
+        f"{FEEDBACK}/issues",
+        json={
+            "title": cluster["suggested_issue_title"],
+            "theme": cluster["theme"],
+            "cluster_id": cluster["cluster_id"],
+        },
+    )
+    assert forked.status_code == 409, forked.text
+    details = forked.json()["error"]["details"]
+    assert details["issue_id"] == cluster["open_issue_id"]
+    assert details["issue_ref"] == cluster["open_issue_ref"]
+    assert await db.count(FeedbackIssue) == 1
+
+    # Once that issue is closed the theme is nobody's, and may be opened again.
+    resolved = await admin_client.patch(
+        f"{FEEDBACK}/issues/{cluster['open_issue_id']}", json={"status": "Resolved"}
+    )
+    assert resolved.status_code == 200, resolved.text
+    await _report(factory, workspace, "Invoice total extraction failed for my supplier")
+    await admin_client.post(f"{FEEDBACK}/analyze", json={})
+    reopened = await admin_client.post(
+        f"{FEEDBACK}/issues", json={"title": "Totals, again", "theme": cluster["theme"]}
+    )
+    assert reopened.status_code == 201, reopened.text
+    assert reopened.json()["feedback_count"] == 1
+
+
 async def test_praise_and_small_themes_do_not_open_issues(admin_client, factory, workspace, db):
     await _auto_issue_at(admin_client, 3)
     for body in (

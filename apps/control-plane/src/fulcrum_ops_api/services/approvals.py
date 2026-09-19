@@ -1123,6 +1123,38 @@ async def update_request(
     return (await _hydrate_requests(session, [row]))[0]
 
 
+#: The quota service owns the ceiling an approved "Quota Increase" asks for, and
+#: this is the coroutine it exposes for it. Looked up by name at call time, as
+#: ``GATE_HOOK`` is: that module imports this one to file its requests.
+QUOTA_HOOK = "apply_approved_increase"
+
+
+async def _carry_out(
+    session: AsyncSession,
+    principal: Principal,
+    row: ApprovalRequest,
+    *,
+    request: Request | None = None,
+) -> str | None:
+    """Apply what an approved request asked for, where this platform owns the change.
+
+    Most approvals unlock something the *caller* then does (the follow-on
+    action). A quota increase is different: the quota lives here, so approving
+    one and leaving the old ceiling in force -- a ``Block`` quota still refusing
+    traffic under a request that says Approved -- is the queue contradicting
+    itself. The hook runs in the decision's transaction, so the approval and its
+    effect land together or not at all. It answers None for a request that is
+    not its kind, and otherwise the sentence to add to the decision's message.
+    """
+    # Imported here so the quota service stays free to import this module.
+    from . import quota as quota_service
+
+    hook = getattr(quota_service, QUOTA_HOOK, None)
+    if hook is None:
+        return None
+    return await hook(session=session, principal=principal, approval_request=row, request=request)
+
+
 async def _decide(
     session: AsyncSession,
     principal: Principal,
@@ -1213,6 +1245,12 @@ async def _decide(
         request=request,
     )
 
+    # After the decision's own audit row, so the trail reads in the order it
+    # happened: approved, then applied under that approval.
+    carried_out = None
+    if target is ApprovalStatus.APPROVED:
+        carried_out = await _carry_out(session, principal, row, request=request)
+
     # An escalation leaves the request open, so the release it gates keeps waiting.
     resume_deployment_id = None
     if target is not ApprovalStatus.ESCALATED:
@@ -1233,6 +1271,8 @@ async def _decide(
     message = f"Request {row.request_ref} {verb}."
     if follow_on is not None:
         message = f"{message} Carry out '{follow_on.action}' under this approval."
+    if carried_out:
+        message = f"{message} {carried_out}"
     decision = ApprovalDecisionResponse(message=message, request=hydrated, follow_on=follow_on)
     return decision, resume_deployment_id
 

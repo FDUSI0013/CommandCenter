@@ -235,6 +235,20 @@ async def test_a_partly_judged_run_reports_the_cases_it_judged(
     assert summary["cases_run"] == 1
 
 
+async def test_a_run_the_sweep_failed_does_not_show_its_datasets_size_as_cases_run(
+    admin_client, factory, workspace, engine
+):
+    """The stale-run sweep fails a run without touching the count the bar was using."""
+    run = await factory.evaluation_run(
+        workspace, status="Failed", case_count=25, notes="Interrupted before it finished."
+    )
+
+    listed = (await admin_client.get("/api/v1/evaluations")).json()["items"]
+    assert listed[0]["cases"] == 0, "a failed run judged nothing"
+    detail = (await admin_client.get(f"/api/v1/evaluations/{run.id}")).json()
+    assert detail["cases"] == 0 and detail["scored_items"] == 0
+
+
 # ---------------------------------------------------------------------------
 # A scorer's verdict counts whatever the scorer is called
 # ---------------------------------------------------------------------------

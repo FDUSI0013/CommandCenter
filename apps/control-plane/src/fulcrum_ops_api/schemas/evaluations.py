@@ -1,11 +1,11 @@
 """Wire contracts for the Evaluations screen.
 
 An evaluation is one judged scoring pass over a dataset: the control plane
-creates an experiment in the telemetry engine, registers the dataset's cases
-against it, and reads the judged scores back. Four metrics have columns of their
-own — correctness, grounding, faithfulness and safety — because those are the
-four the console renders. A score under any other name (an SDK scorer is named
-after its function) is reported as ``extra_scores`` rather than dropped.
+creates an experiment in the telemetry engine, links the cases an SDK experiment
+already ran to it, and reads the judged scores back. Four metrics have columns
+of their own — correctness, grounding, faithfulness and safety — because those
+are the four the console renders. A score under any other name (an SDK scorer is
+named after its function) is reported as ``extra_scores`` rather than dropped.
 
 Nothing in this module invents a score. When the engine has not judged a case
 or a metric yet the field is ``None`` and the table shows a dash; a missing
@@ -227,7 +227,13 @@ class EvaluationRead(BaseModel):
     dataset: str
     judge_model: str
     status: EvaluationStatus
-    cases: int = Field(0, description="Dataset cases the run covered")
+    cases: int = Field(
+        0,
+        description=(
+            "Cases the run judged once it has completed (0 for a failed run). While "
+            "the run is live this is the size of its dataset, for the progress bar"
+        ),
+    )
 
     correctness: float | None = None
     grounding: float | None = None

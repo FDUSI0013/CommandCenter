@@ -20,12 +20,13 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import inspect
+import json
 
 import httpx
 import pytest
 from sqlalchemy import event, select, update
 
-from conftest import APP_BASE_URL, error_code, principal_for
+from conftest import APP_BASE_URL, error_code, principal_for, session_token
 from fulcrum_ops_api.models.governance import ApprovalRequest, ApprovalStatus, AuditEvent
 from fulcrum_ops_api.models.identity import Role
 from fulcrum_ops_api.models.operations import (

@@ -10,7 +10,12 @@ Two things the screen promised and did not do:
 * **A burst of raises is a burst of alerts.** The reference ``al-N`` is counted
   and then probed, without a lock, so raises that landed together chose the
   same one and all but the first answered 500. That is exactly the flood the
-  dedupe key exists for.
+  dedupe key exists for. The dedupe lookup had the same gap: a raise that looked
+  for its key before the first one committed, and read the references after,
+  collided with nothing and inserted a second live row for the one condition.
+
+The bursts find those races by luck, which is how the second one was found; the
+tests built on ``_lands_meanwhile`` land the rival at the exact statement.
 
 Everything here goes through the real request path. The machine raise is the
 quota evaluator's, reached the way an admin reaches it: by lowering a ceiling
@@ -20,9 +25,11 @@ below the usage already counted.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import datetime as dt
 
-from sqlalchemy import select
+import sqlalchemy as sa
+from sqlalchemy import event, insert, select
 
 from fulcrum_ops_api.models.identity import Role
 from fulcrum_ops_api.models.operations import Alert, AlertSeverity, AlertStatus
@@ -246,51 +253,144 @@ async def test_a_burst_of_one_condition_is_one_alert_that_counts_every_occurrenc
     assert {response.json()["id"] for response in responses} == {row.id}
 
 
-async def test_a_quota_edit_that_loses_the_race_for_a_reference_keeps_the_edit(
+async def test_edits_that_breach_together_all_keep_the_edit_and_the_alert(
     admin_client, factory, workspace, db
 ):
     """A screen's evaluator raises inside the transaction of the edit behind it.
 
-    Losing the reference to another raise used to abort that transaction: the
-    admin's PATCH answered 500 and the ceiling stayed where it was.
+    Every edit in the burst read the same table and reached for ``al-1``. All
+    but one used to lose it, and lost the transaction with it: the admin's PATCH
+    answered 500 and the ceiling stayed where it was.
     """
-    quota = await factory.quota(workspace, name="Monthly tokens", used_value=500_000.0)
+    quotas = [
+        await factory.quota(workspace, name=f"Monthly tokens {n}", used_value=500_000.0)
+        for n in range(BURST)
+    ]
 
-    async with db.session() as rival:
-        # Another raise, caught between its insert and its commit. Nobody else
-        # can see its row yet, so the quota's evaluator counts none and reaches
-        # for ``al-1`` as well.
-        rival.add(
-            Alert(
-                workspace_id=workspace.id,
-                alert_ref="al-1",
-                title="Vector store unreachable",
-                source="Connection Center",
-                severity=AlertSeverity.CRITICAL.value,
-                status=AlertStatus.OPEN.value,
-                raised_at=dt.datetime.now(dt.UTC),
-            )
-        )
-        await rival.flush()
-        edit = asyncio.create_task(
+    responses = await asyncio.gather(
+        *[
             admin_client.patch(f"/api/v1/quota/{quota.id}", json={"limit_value": 400_000.0})
-        )
-        # The edit cannot finish before the rival does; this is time for it to
-        # get as far as it can, which is past reading the references.
-        finished, _ = await asyncio.wait({edit}, timeout=1.5)
-        assert not finished
-        await rival.commit()
+            for quota in quotas
+        ]
+    )
 
-    response = await edit
-    assert response.status_code == 200, response.text
-    assert response.json()["limit_value"] == 400_000.0
-    stored = await db.get(type(quota), quota.id)
-    assert (stored.limit_value, stored.status) == (400_000.0, "Exceeded")
+    assert [response.status_code for response in responses] == [200] * BURST, [
+        response.text for response in responses if response.status_code != 200
+    ]
+    for quota in quotas:
+        stored = await db.get(type(quota), quota.id)
+        assert (stored.limit_value, stored.status) == (400_000.0, "Exceeded")
+    rows = await _quota_alerts(db, workspace)
+    assert {row.source_entity_id for row in rows} == {quota.id for quota in quotas}
+    assert len({row.alert_ref for row in rows}) == BURST
+
+
+@contextlib.contextmanager
+def _lands_meanwhile(db_engine, *, before: str | None = None, after: str | None = None, **alert):
+    """Commit an alert from another connection at one exact point in a request.
+
+    A burst finds these races by luck. This finds them on purpose: the first
+    time the application is about to run (``before``) or has just run
+    (``after``) a statement containing the given text, the alert is written and
+    committed on a connection of its own, the way another worker's raise would
+    land. Holding a write open across the request cannot do it here: SQLite
+    makes the request wait to *connect*, so it starts after the rival is done.
+    """
+    writer = sa.create_engine(f"sqlite:///{db_engine.url.database}")
+    landed: list[str] = []
+
+    def _land(_conn, _cursor, statement, _parameters, _context, _executemany):
+        if landed or (before or after) not in statement:
+            return
+        landed.append(statement)
+        with writer.begin() as connection:
+            connection.execute(insert(Alert).values(raised_at=dt.datetime.now(dt.UTC), **alert))
+
+    hook = "before_cursor_execute" if before else "after_cursor_execute"
+    event.listen(db_engine.sync_engine, hook, _land)
+    try:
+        yield landed
+    finally:
+        event.remove(db_engine.sync_engine, hook, _land)
+        writer.dispose()
+
+
+async def test_a_reference_taken_between_the_read_and_the_insert_costs_a_second_read(
+    as_role, workspace, db, db_engine
+):
+    async with as_role(Role.OPERATOR) as http:
+        with _lands_meanwhile(
+            db_engine,
+            # The probe has just found ``al-1`` free.
+            after="alerts.alert_ref = ?",
+            workspace_id=workspace.id,
+            alert_ref="al-1",
+            title="Vector store unreachable",
+            source="Connection Center",
+        ) as landed:
+            response = await http.post(
+                "/api/v1/alerts", json={"title": "Policy drift", "source": "Policy Center"}
+            )
+
+    assert landed
+    assert response.status_code == 201, response.text
+    assert response.json()["alert_ref"] == "al-2"
     rows = await db.scalars(select(Alert).where(Alert.workspace_id == workspace.id))
     assert {row.alert_ref: row.source for row in rows} == {
         "al-1": "Connection Center",
-        "al-2": QUOTA_SCREEN,
+        "al-2": "Policy Center",
     }
+
+
+async def test_a_condition_raised_elsewhere_between_the_lookup_and_the_insert_is_not_raised_twice(
+    admin_client, factory, workspace, db, db_engine
+):
+    """The second raise looked for the key before the first committed, and found nothing.
+
+    It reads the references afterwards, so it does not even collide: it takes
+    ``al-2`` and used to insert a second live row for the one condition. It now
+    looks again from inside its savepoint, takes the insert back, and becomes
+    the second occurrence of the row that got there first.
+
+    That row was put to the rules when it was born. Here it is a person's, which
+    a switched-off rule never silences, so what the rule would have written on
+    the screen's own alert must not be folded onto it: an Open alert carrying a
+    mute reason tells the triager two things at once.
+    """
+    await factory.alert_rule(
+        workspace,
+        name="Quota exceeded",
+        source=QUOTA_SCREEN,
+        severity=AlertSeverity.HIGH.value,
+        enabled=False,
+    )
+    quota = await factory.quota(workspace, name="Monthly tokens", used_value=500_000.0)
+
+    with _lands_meanwhile(
+        db_engine,
+        # The raise has looked for the key and is about to ask the rules.
+        before="FROM alert_rules",
+        workspace_id=workspace.id,
+        alert_ref="al-1",
+        title="Quota exceeded: Monthly tokens",
+        source=QUOTA_SCREEN,
+        severity=AlertSeverity.HIGH.value,
+        dedupe_key=f"quota:{quota.id}:Exceeded",
+        occurrence_count=1,
+        event_metadata={"posted_by": "external-monitor"},
+    ) as landed:
+        await _breach(admin_client, quota, limit_value=400_000.0)
+
+    assert landed
+    [alert] = await _quota_alerts(db, workspace)
+    assert (alert.alert_ref, alert.status, alert.occurrence_count) == ("al-1", "Open", 2)
+    # The evaluator's own payload is folded in; the rule's mute is not.
+    assert alert.event_metadata["posted_by"] == "external-monitor"
+    assert alert.event_metadata["limit_value"] == 400_000.0
+    assert not {"silenced_by_rule_id", "mute_reason", "muted_by"} & set(alert.event_metadata)
+    # The edit the raise was part of is untouched by the insert it took back.
+    stored = await db.get(type(quota), quota.id)
+    assert (stored.limit_value, stored.status) == (400_000.0, "Exceeded")
 
 
 async def test_two_raises_that_both_settle_for_an_opaque_reference_do_not_collide(

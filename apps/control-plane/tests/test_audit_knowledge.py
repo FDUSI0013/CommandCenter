@@ -456,6 +456,56 @@ async def test_the_sweep_closes_out_stranded_syncs_nobody_is_looking_at(
     assert by_id[live.id]["status"] == KnowledgeSourceStatus.SYNCING.value
 
 
+async def test_a_close_out_decided_on_an_earlier_read_leaves_a_restarted_sync_alone(
+    admin_client, factory, workspace, admin, engine, db, sessionmaker
+):
+    """Every open screen polls a Syncing row, and Sync Now closes a stranded row
+    out on its way to restarting it. A poll that read the row a moment before
+    the restart must not then fail the new sync from what it read."""
+    from conftest import principal_for
+    from fulcrum_ops_api.models.identity import Role
+    from fulcrum_ops_api.services import knowledge as service
+
+    agent = await factory.provisioned_agent(workspace, engine, name="Support Bot")
+    retrieval_span(
+        engine,
+        agent.engine_project_name,
+        "policies-v1",
+        documents=[{"document_id": "doc-1", "title": "Refund policy", "chunk_id": "c1"}],
+    )
+    source = await stranded_source(factory, db, workspace, minutes_ago=30)
+
+    async with sessionmaker() as poll:
+        # The poll's read: Syncing at 40%, job gone.
+        seen = await poll.get(KnowledgeSource, source.id)
+        assert seen.status == KnowledgeSourceStatus.SYNCING.value
+
+        # Before it writes anything, an operator restarts the sync and it finishes.
+        started = await admin_client.post(f"/api/v1/knowledge/{source.id}/sync")
+        assert started.status_code == 202, started.text
+        finished = await wait_for_sync(admin_client, source.id)
+        assert finished["state"] == "Completed", finished
+
+        polled = await service.sync_status(
+            poll, principal_for(workspace, admin, Role.ADMIN), source.id
+        )
+        await poll.commit()
+
+    assert polled.status == KnowledgeSourceStatus.ACTIVE
+    row = await db.get(KnowledgeSource, source.id)
+    assert row.status == KnowledgeSourceStatus.ACTIVE.value
+    assert row.retrieval_policy["sync"]["state"] == "Completed"
+    assert row.retrieval_policy["sync"]["job_id"] != "job-that-died"
+    failures = await db.scalars(
+        select(AuditEvent).where(
+            AuditEvent.entity_id == source.id,
+            AuditEvent.action == "knowledge_source.sync_failed",
+        )
+    )
+    # Closed out once, by Sync Now, and not a second time by the late poll.
+    assert len(failures) == 1
+
+
 async def test_a_sync_the_store_never_answers_fails_instead_of_syncing_for_ever(
     admin_client, factory, workspace, engine, monkeypatch
 ):

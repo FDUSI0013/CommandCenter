@@ -544,3 +544,66 @@ async def test_a_user_left_holding_two_active_seats_can_still_be_managed(
     assert [seat.user_id for seat in active] == [admin.id], "the duplicate was not cleared"
     stored = await db.get(TenantLicense, held.id)
     assert stored.seats_assigned == 1
+
+
+async def test_a_plan_whose_bullets_cannot_all_be_keys_still_resolves(owner_client, db):
+    # Feature bullets are marketing copy: nothing stops two of them reading the
+    # same, one being named like a ceiling, or one running past the 120
+    # characters an entitlement key can hold. Each of those broke the insert --
+    # at issue, and, now that a plan edit re-resolves its licences, on the edit.
+    plan = await _plan(owner_client, "team", included_tokens=1_000_000, features=["Tracing"])
+    held = await _license(owner_client, plan)
+
+    long_bullet = "Dedicated success manager " + "x" * 120
+    edited = await owner_client.patch(
+        f"/api/v1/licensing/plans/{plan['id']}",
+        json={"features": ["SSO", " SSO ", "included_tokens", long_bullet, "Tracing"]},
+    )
+    assert edited.status_code == 200, edited.text
+    assert edited.json()["features"][-2] == long_bullet, "the plan card keeps every bullet"
+
+    rows = await _resolved(owner_client, held["id"])
+    assert sorted(rows) == ["SSO", "Tracing", "included_tokens"]
+    # The ceiling is the enforceable row under that key, not the bullet.
+    assert rows["included_tokens"]["value_type"] == "int"
+    assert rows["included_tokens"]["int_value"] == 1_000_000
+
+    # And a licence can still be issued on it.
+    revoked = await owner_client.post(f"/api/v1/licensing/tenants/{held['id']}/revoke", json={})
+    assert revoked.status_code == 200, revoked.text
+    again = await _license(owner_client, plan)
+    assert sorted(await _resolved(owner_client, again["id"])) == [
+        "SSO",
+        "Tracing",
+        "included_tokens",
+    ]
+
+
+async def test_a_term_sent_half_with_an_offset_and_half_without_is_judged_not_crashed(
+    owner_client,
+):
+    # A date picker sends "2027-01-01T00:00:00"; an SDK sends "...+00:00". Python
+    # will not compare the two, and the TypeError left the validator as a 500.
+    plan = await _plan(owner_client, "starter")
+    backwards = await owner_client.post(
+        "/api/v1/licensing/tenants",
+        json={
+            "plan_id": plan["id"],
+            "seats_purchased": 5,
+            "starts_at": "2027-06-01T00:00:00+00:00",
+            "expires_at": "2027-01-01T00:00:00",
+        },
+    )
+    assert backwards.status_code == 422, backwards.text
+
+    held = await _license(
+        owner_client,
+        plan,
+        starts_at="2027-01-01T00:00:00",
+        expires_at="2028-01-01T00:00:00+00:00",
+    )
+    amended = await owner_client.patch(
+        f"/api/v1/licensing/tenants/{held['id']}",
+        json={"starts_at": "2027-02-01T00:00:00+00:00", "expires_at": "2027-01-15T00:00:00"},
+    )
+    assert amended.status_code == 422, amended.text

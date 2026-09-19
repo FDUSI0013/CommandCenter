@@ -18,6 +18,13 @@
   const ts = (v) => v ? new Date(v).getTime() : null;
   const when = (v) => v ? relTime(ts(v)) : dash;
   const healthColor = (h) => h === 'Critical' ? 'red' : h === 'Watch' ? 'amber' : 'green';
+  /** A byte count. U.fmtBytes takes gigabytes, so handed bytes it called 250 KB "244.14 TB". */
+  const byteSize = (n) => {
+    const units = ['B','KB','MB','GB','TB'];
+    let v = Number(n), u = 0;
+    while(v >= 1024 && u < units.length - 1){ v /= 1024; u += 1; }
+    return (u === 0 ? String(Math.round(v)) : v.toFixed(v < 10 ? 2 : 1).replace(/\.?0+$/, '')) + ' ' + units[u];
+  };
 
   /** A KPI card from the server's MetricKpi, which carries its own display strings. */
   function serverKpi(k){
@@ -50,6 +57,66 @@
   const emptyCard = (title, message) =>
     card(title, `<div class="empty-state">${ICONS.search}<div class="es-title">${esc(message)}</div></div>`);
 
+  /**
+   * A line chart that leaves a gap where there is no value.
+   *
+   * U.lineChart draws one unbroken polyline per series and reads a null as 0.
+   * That is wrong for a series that is only partly there — the forecast, where
+   * each day carries a measured value or a projected one and never both: the
+   * Actual line fell to $0 for every day still to come and the Forecast line lay
+   * along the axis for every day already gone, so the chart said "spend stops
+   * tomorrow" beside a badge projecting the opposite. Here a series is drawn in
+   * runs of consecutive values, each at its own place on the date axis; a run of
+   * one day is a dot, since a one-point line draws nothing. Zero-based, same
+   * frame and classes as U.lineChart.
+   *
+   * cfg: {series:[{color, points:[number|null], dashed, area}], xLabels, h, yFmt}
+   */
+  function gapLineChart(cfg){
+    const w = 560, h = cfg.h || 200, padL = 46, padR = 12, padT = 12, padB = 24;
+    const iw = w - padL - padR, ih = h - padT - padB;
+    const has = v => v != null && isFinite(v);
+    const values = cfg.series.reduce((all, s) => all.concat(s.points.filter(has)), []);
+    // Math.max() of nothing is -Infinity, and an all-zero month still needs a scale.
+    const max = ((values.length ? Math.max(...values) : 0) || 1) * 1.08;
+    const n = Math.max(...cfg.series.map(s => s.points.length));
+    const x = i => padL + (n > 1 ? i / (n - 1) : 0.5) * iw;
+    const y = v => padT + ih - (v / max) * ih;
+    const yFmt = cfg.yFmt || (v => fmtNum(Math.round(v)));
+    let frame = '';
+    for(let t = 0; t <= 4; t++){
+      const v = (max / 4) * t, yy = y(v);
+      frame += `<line x1="${padL}" y1="${yy}" x2="${w-padR}" y2="${yy}" stroke="#E6EAF2" stroke-width="1"/>
+        <text x="${padL-7}" y="${yy+3.5}" text-anchor="end" class="axis-label">${esc(yFmt(v))}</text>`;
+    }
+    const labels = cfg.xLabels || [];
+    const every = Math.ceil(labels.length / 7) || 1;
+    labels.forEach((label, i) => {
+      if(i % every === 0 || i === labels.length - 1){
+        frame += `<text x="${x(i)}" y="${h-6}" text-anchor="middle" class="axis-label">${esc(label)}</text>`;
+      }
+    });
+    const marks = cfg.series.map(s => {
+      const col = U.cc(s.color);
+      const runs = [];
+      let run = [];
+      s.points.forEach((v, i) => {
+        if(has(v)){ run.push([i, v]); return; }
+        if(run.length) runs.push(run);
+        run = [];
+      });
+      if(run.length) runs.push(run);
+      return runs.map(r => {
+        if(r.length === 1) return `<circle cx="${x(r[0][0]).toFixed(1)}" cy="${y(r[0][1]).toFixed(1)}" r="2.6" fill="${col}"/>`;
+        const pts = r.map(([i, v]) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(' ');
+        const under = s.area
+          ? `<polygon points="${x(r[0][0]).toFixed(1)},${y(0)} ${pts} ${x(r[r.length-1][0]).toFixed(1)},${y(0)}" fill="${col}" opacity="0.10"/>` : '';
+        return `${under}<polyline points="${pts}" fill="none" stroke="${col}" stroke-width="2" ${s.dashed?'stroke-dasharray="5 4"':''} stroke-linejoin="round" stroke-linecap="round"/>`;
+      }).join('');
+    }).join('');
+    return `<div class="chart-box"><svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="xMidYMid meet">${frame}${marks}</svg></div>`;
+  }
+
   /* ================= QUOTA, COST & CAPACITY ================= */
   SCREENS['quota'] = {
     title:'Quota, Cost & Capacity',
@@ -66,13 +133,31 @@
       const body = document.getElementById('qcBody');
       let searchTerm = '';
 
+      /* The KPI row, the Overview cards and the Costs tab are views of one
+         measurement of the period. Asked for separately they were seven reads of
+         the telemetry store per visit, each measuring the same month again. The
+         answer is held so a tab switch re-reads nothing; a failed read is let go
+         of so "Try again" really asks again; and loadKpis — which every write on
+         this screen already calls — asks afresh. */
+      let overviewAsk = null;
+      function overview(fresh){
+        if(fresh) overviewAsk = null;
+        if(!overviewAsk){
+          const ask = API.quota.overview();
+          overviewAsk = ask;
+          ask.catch(() => { if(overviewAsk === ask) overviewAsk = null; });
+        }
+        return overviewAsk;
+      }
+
       loadKpis();
       function loadKpis(){
         const host = document.getElementById('qcKpis');
         if(!host) return;
-        API.quota.summary()
-          .then(s => {
+        overview(true)
+          .then(res => {
             if(!host.isConnected) return;
+            const s = res.summary;
             host.innerHTML = kpiRow([
               serverKpi(s.spend), serverKpi(s.budget), serverKpi(s.tokens),
               serverKpi(s.api_calls), serverKpi(s.cost_per_1k_tokens), serverKpi(s.capacity),
@@ -133,14 +218,17 @@
           }, 'the spend chart');
 
         section(document.getElementById('qcServices'),
-          () => API.quota.costByService({ page_size: 8 }),
-          page => {
-            if(!page.items.length) return emptyCard('Cost by Service','No service costs recorded');
-            const total = page.items.reduce((a,r)=>a + (r.cost_usd||0), 0);
+          () => overview(),
+          res => {
+            // The donut's centre is the whole spend, so it sums every slice, not the eight listed.
+            const services = res.services || [];
+            if(!services.length) return emptyCard('Cost by Service','No service costs recorded');
+            const total = services.reduce((a,r)=>a + (r.cost_usd||0), 0);
+            const shown = services.slice(0, 8);
             return card('Cost by Service',
-              `<div class="donut-wrap">${donut({ segments: page.items.map(r=>({value:r.cost_usd||0, color:r.color})),
+              `<div class="donut-wrap">${donut({ segments: services.map(r=>({value:r.cost_usd||0, color:r.color})),
                 size:140, thickness:16, centerVal: money(total), centerLabel:'Total Spend' })}
-              <div class="legend grow">${page.items.map(r=>`<div class="legend-item">
+              <div class="legend grow">${shown.map(r=>`<div class="legend-item">
                 <span class="sw" style="background:${U.cc(r.color)}"></span>
                 <span class="lg-label" style="font-size:11.5px">${esc(r.label)}</span>
                 <span class="lg-val">${esc(r.cost_display)}</span>
@@ -177,12 +265,14 @@
           }, 'capacity');
 
         section(document.getElementById('qcTeams'),
-          () => API.quota.teamAllocation({ page_size: 10 }),
-          page => {
-            if(!page.items.length) return emptyCard('Cost & Usage by Team','No team allocation yet — assign owners to agents to see this');
+          () => overview(),
+          res => {
+            // The first ten, which are also the ten the server drew a sparkline for.
+            const teams = (res.teams || []).slice(0, 10);
+            if(!teams.length) return emptyCard('Cost & Usage by Team','No team allocation yet — assign owners to agents to see this');
             return card('Cost & Usage by Team',
               `<table class="tbl"><thead><tr><th>Team</th><th>Agents</th><th>Spend</th><th>% of Total</th><th>Tokens</th><th>API Calls</th><th>Avg / 1K</th><th>Trend</th></tr></thead><tbody>
-                ${page.items.map(t=>`<tr style="cursor:default">
+                ${teams.map(t=>`<tr style="cursor:default">
                   <td><span class="flex" style="gap:8px">${avatarHtml(t.team,true)}<b style="font-size:12.5px">${esc(t.team)}</b></span></td>
                   <td class="num">${fmtFull(t.agent_count)}</td>
                   <td class="num">${esc(t.spend_display)}</td>
@@ -194,11 +284,12 @@
           }, 'team allocation');
 
         section(document.getElementById('qcInsights'),
-          () => API.quota.insights({ page_size: 6 }),
-          page => {
-            if(!page.items.length) return emptyCard('Insights','Nothing needs attention right now');
+          () => overview(),
+          res => {
+            const insights = (res.insights || []).slice(0, 6);
+            if(!insights.length) return emptyCard('Insights','Nothing needs attention right now');
             return card('Insights',
-              `<div class="insight-grid">${page.items.map(x=>`
+              `<div class="insight-grid">${insights.map(x=>`
                 <div class="insight ${esc(x.severity.toLowerCase())}">
                   <span class="insight-ico" style="color:var(--${esc(x.color)})">${ICONS[x.icon]||ICONS.info}</span>
                   <div><div class="insight-title">${esc(x.title)}</div>
@@ -207,16 +298,18 @@
                   ${(x.recommendations||[]).length ? `<ul class="insight-recs">${x.recommendations.map(r=>`<li>${esc(r)}</li>`).join('')}</ul>` : ''}
                   </div></div>`).join('')}</div>`);
           }, 'insights');
-
-        body.addEventListener('click', e => {
-          const link = e.target.closest('[data-gotab]');
-          if(link){
-            const idx = Number(link.dataset.gotab);
-            const tab = document.querySelectorAll('#qcTabs .tab')[idx];
-            if(tab) tab.click(); else renderTab(idx);
-          }
-        });
       }
+
+      // Once per screen, not once per visit to the tab: `body` outlives the tab, so
+      // a listener added in overviewTab() stacked up and one click switched tabs N times.
+      body.addEventListener('click', e => {
+        const link = e.target.closest('[data-gotab]');
+        if(link){
+          const idx = Number(link.dataset.gotab);
+          const tab = document.querySelectorAll('#qcTabs .tab')[idx];
+          if(tab) tab.click(); else renderTab(idx);
+        }
+      });
 
       // ---- Quotas -------------------------------------------------------
       function quotasTab(){
@@ -266,7 +359,7 @@
               close();
               try {
                 await API.quota.requestIncrease(r.id, { requested_limit: limit, reason });
-                toast('success','Request submitted','It is waiting in Approvals & Audit.');
+                toast('success','Request submitted','It is waiting in Approvals & Audit. Once approved, the new limit is applied automatically.');
                 Store.refreshBadges();
               } catch (err) { toast('error','Could not submit', err.message); }
             }},
@@ -386,35 +479,52 @@
           <div class="grid g2"><div id="qcCostBreak"></div><div id="qcDrivers"></div></div>
           <div id="qcCostService"></div></div>`;
 
+        // Spend going up is the bad direction here, so a rise is the red one.
+        const change = (v) => v == null ? dash
+          : `<span class="${v > 0 ? 'st-red' : v < 0 ? 'st-green' : 'dim'}">${v > 0 ? '+' : ''}${Number(v).toFixed(1)}%</span>`;
+        // The lists arrive whole and heaviest first; a card shows the top of one and says so.
+        const topOf = (rows, n) => rows.length > n ? `<span class="faint small">Top ${n} of ${fmtFull(rows.length)}</span>` : '';
+
         section(document.getElementById('qcCostBreak'),
-          () => API.quota.costBreakdown({ page_size: 10 }),
-          page => {
-            const rows = page.items || page;
+          () => overview(),
+          res => {
+            const rows = res.models || [];
             if(!rows.length) return emptyCard('Cost by Model','No model costs recorded');
+            /* The row's name is `model`. This read label/key — fields of the service
+               and driver rows — so the first column was blank and no cost could be
+               put to a model. Tokens, unit cost and the movement against the prior
+               period are what this breakdown has that Top Cost Drivers does not. */
             return card('Cost by Model',
-              `<table class="tbl"><thead><tr><th>Model</th><th>Cost</th><th>Share</th></tr></thead><tbody>
-                ${rows.map(r=>`<tr style="cursor:default"><td class="cell-main">${esc(r.label||r.key)}</td>
-                  <td class="num">${esc(r.cost_display||money(r.cost_usd))}</td>
-                  <td style="min-width:120px">${r.share_percent==null?dash:barPct(r.share_percent,'orange')}</td></tr>`).join('')}</tbody></table>`);
+              `<table class="tbl"><thead><tr><th>Model</th><th>Tokens</th><th>Cost</th><th>Per 1K</th><th>vs Prior</th><th>Share</th></tr></thead><tbody>
+                ${rows.slice(0, 10).map(r=>`<tr style="cursor:default"><td class="cell-main">${esc(r.model)}</td>
+                  <td class="num dim">${esc(r.tokens_display)}</td>
+                  <td class="num">${r.cost_usd==null?dash:esc(r.cost_display)}</td>
+                  <td class="num dim">${r.cost_per_1k_tokens==null?dash:money(r.cost_per_1k_tokens,3)}</td>
+                  <td class="num">${change(r.cost_delta_percent)}</td>
+                  <td style="min-width:110px">${r.share_percent==null?dash:barPct(r.share_percent,'orange')}</td></tr>`).join('')}</tbody></table>`,
+              topOf(rows, 10));
           }, 'the cost breakdown');
 
         section(document.getElementById('qcDrivers'),
-          () => API.quota.topDrivers({ page_size: 8 }),
-          page => {
-            if(!page.items.length) return emptyCard('Top Cost Drivers','Nothing to rank yet');
+          () => overview(),
+          res => {
+            const rows = res.drivers || [];
+            if(!rows.length) return emptyCard('Top Cost Drivers','Nothing to rank yet');
             return card('Top Cost Drivers',
               `<table class="tbl"><thead><tr><th>Driver</th><th>Cost</th><th>Share</th></tr></thead><tbody>
-                ${page.items.map(r=>`<tr style="cursor:default"><td class="cell-main">${esc(r.label)}</td>
-                  <td class="num">${esc(r.cost_display)}</td><td class="num dim">${esc(r.share_display)}</td></tr>`).join('')}</tbody></table>`);
+                ${rows.slice(0, 8).map(r=>`<tr style="cursor:default"><td class="cell-main">${esc(r.label)}</td>
+                  <td class="num">${esc(r.cost_display)}</td><td class="num dim">${esc(r.share_display)}</td></tr>`).join('')}</tbody></table>`,
+              topOf(rows, 8));
           }, 'cost drivers');
 
         section(document.getElementById('qcCostService'),
-          () => API.quota.costByService({ page_size: 20 }),
-          page => {
-            if(!page.items.length) return emptyCard('Cost by Service','No service costs recorded');
+          () => overview(),
+          res => {
+            const rows = res.services || [];
+            if(!rows.length) return emptyCard('Cost by Service','No service costs recorded');
             return card('Cost by Service',
               `<table class="tbl"><thead><tr><th>Service</th><th>Models</th><th>Cost</th><th>Share</th></tr></thead><tbody>
-                ${page.items.map(r=>`<tr style="cursor:default"><td class="cell-main">${esc(r.label)}</td>
+                ${rows.map(r=>`<tr style="cursor:default"><td class="cell-main">${esc(r.label)}</td>
                   <td class="num dim">${fmtFull(r.model_count)}</td>
                   <td class="num">${esc(r.cost_display)}</td>
                   <td style="min-width:120px">${r.share_percent==null?dash:barPct(r.share_percent, 'purple')}</td></tr>`).join('')}</tbody></table>`);
@@ -476,7 +586,10 @@
             { key:'projected_spend_usd', label:'Projected', align:'right', cls:'num', sortable:false, render:r=>r.projected_spend_usd==null?dash:`${money(r.projected_spend_usd)}${r.on_pace_to_breach?' <span class="st-red">over</span>':''}` },
             { key:'warn_threshold_percent', label:'Thresholds', sortable:false, render:r=>`<span class="faint">${r.warn_threshold_percent}% / ${r.hard_threshold_percent}%</span>` },
             { key:'resets_label', label:'Resets', sortable:false, render:r=>r.resets_label?esc(r.resets_label):dash },
-            { key:'health', label:'Status', sortable:false, render:r=>statusText(r.health, healthColor(r.health)) },
+            // Health is measured against a live period. A budget whose period has lapsed,
+            // or that is switched off, is not "Healthy" — it is not being held to anything.
+            { key:'health', label:'Status', sortable:false, render:r=>(r.status === 'Expired' || r.status === 'Disabled')
+                ? statusText(r.status, 'gray') : statusText(r.health, healthColor(r.health)) },
           ],
           rowId:'id', itemName:'budgets', pageSize:10, emptyText:'No budgets set',
           extraParams: searchTerm ? { q: searchTerm } : null,
@@ -544,8 +657,13 @@
                 };
                 close();
                 try {
-                  await API.quota.budgets.create(payload);
-                  toast('success','Budget created', `${payload.name} is now tracked.`);
+                  // The 201 is already measured: a budget set below what has been spent
+                  // opens past its threshold, with the alert raised, and should say so.
+                  const created = await API.quota.budgets.create(payload);
+                  const breached = created && (created.status === 'Warning' || created.status === 'Exceeded');
+                  toast(breached ? 'warn' : 'success', 'Budget created', breached
+                    ? `${payload.name} opens at ${created.spent_display} of ${created.amount_display} — ${created.status.toLowerCase()} already, and an alert has been raised.`
+                    : `${payload.name} is now tracked.`);
                   table.refresh(); loadKpis();
                 } catch (err) { toast('error','Could not create budget', err.message); }
               }},
@@ -587,19 +705,27 @@
       function forecastTab(){
         body.innerHTML = `<div id="qcForecast"></div>`;
         section(document.getElementById('qcForecast'), () => API.quota.forecast(), f => {
+          /* One list, and each day carries a measured value or a projected one,
+             never both — so each series is mostly nulls, which have to stay gaps
+             (see gapLineChart). The projection picks up where measurement stops:
+             the dashed line is started on the last measured day so it continues
+             the solid one instead of floating beside it. With nothing projected
+             there is no Forecast series to draw, and no legend entry for one. */
           const points = f.points || [];
-          const chart = points.length ? lineChart({
-            series:[
-              { name:'Actual', color:'purple', points: points.map(p=>p.actual_usd == null ? null : p.actual_usd), area:true },
-              { name:'Forecast', color:'purple', dashed:true, points: points.map(p=>p.forecast_usd == null ? null : p.forecast_usd) },
-            ],
-            xLabels: points.map(p=>p.label), h:230, zeroBase:true, yFmt:v=>'$'+fmtNum(v),
-          }) : `<div class="empty-state">${ICONS.chart}<div class="es-title">Not enough history to forecast yet</div></div>`;
+          const actual = points.map(p => p.actual_usd);
+          const forecast = points.map(p => p.forecast_usd);
+          const firstProjected = forecast.findIndex(v => v != null);
+          if(firstProjected > 0 && actual[firstProjected - 1] != null) forecast[firstProjected - 1] = actual[firstProjected - 1];
+          const series = [{ name:'Actual', color:'purple', points: actual, area:true }];
+          if(firstProjected >= 0) series.push({ name:'Forecast', color:'gray', dashed:true, points: forecast });
+          const measured = actual.some(v => v != null) || firstProjected >= 0;
+          const chart = measured
+            ? gapLineChart({ series, xLabels: points.map(p=>p.label), h:230, yFmt:v=>'$'+fmtNum(v) })
+            : `<div class="empty-state">${ICONS.chart}<div class="es-title">Not enough history to forecast yet</div></div>`;
 
           return card('Spend Forecast', `${chart}
-            <div class="legend inline" style="margin-top:6px">
-              <span class="legend-item"><span class="sw" style="background:#6D4AEF"></span><span class="lg-label">Actual</span></span>
-              <span class="legend-item"><span class="sw" style="background:#6D4AEF;opacity:.5"></span><span class="lg-label">Forecast</span></span>
+            <div class="legend inline" style="margin-top:6px">${measured ? series.map(s=>
+              `<span class="legend-item"><span class="sw" style="background:${U.cc(s.color)}"></span><span class="lg-label">${s.name}</span></span>`).join('') : ''}
             </div>
             <div class="grid g3" style="margin-top:14px">
               ${kv([['Method', esc(f.method)],['Days elapsed', String(f.days_elapsed)],['Days remaining', String(f.days_remaining)]])}
@@ -613,6 +739,17 @@
             `<span class="badge bg-purple">Projected ${f.projected_spend_usd==null?'—':esc(money(f.projected_spend_usd))}</span>`);
         }, 'the forecast');
       }
+
+      // tabBar only reports clicks. Without this the screen opened on its KPI row
+      // and a tab bar with nothing under them until a tab was clicked.
+      renderTab(0);
+
+      // Approving an increase raises the quota's ceiling on the server. When that
+      // decision lands while this screen is up, re-read the table rather than go
+      // on showing the old limit.
+      const onApproval = () => { if(currentTab === 1 && body._table) body._table.refresh(); };
+      Store.on('approvals:changed', onApproval);
+      this.cleanup = () => Store.off('approvals:changed', onApproval);
     },
   };
 
@@ -661,12 +798,18 @@
 
       document.getElementById('msSearch').addEventListener('input', e => { if(table) table.search(e.target.value); });
       document.getElementById('msExport').addEventListener('click', async () => {
-        try { await API.memory.export(table ? table.params() : {}); toast('success','Export complete','Memory stores exported to CSV.'); }
+        /* The file is always the stores list, so only the Memory Stores tab's
+           query belongs to it. Another tab's sort key (agent_name, last_activity_at)
+           is one the export refuses with 422, and its search text — typed about
+           sessions or backups — would silently filter the stores. */
+        try { await API.memory.export(currentTab === 0 && table ? table.params() : {}); toast('success','Export complete','Memory stores exported to CSV.'); }
         catch (err) { toast('error','Export failed', err.message); }
       });
       document.getElementById('msCreate').addEventListener('click', createStore);
 
+      let currentTab = 0;
       function renderTab(i){
+        currentTab = i;
         body.innerHTML = '';
         table = null;
         if(i === 0) return storesTab();
@@ -685,9 +828,14 @@
                 r.store_type==='Vector'?'purple':r.store_type==='Session'?'cyan':'blue') },
             { key:'store_type', label:'Type', render:r=>badge(r.store_type) },
             { key:'environment', label:'Environment', render:r=>badge(r.environment) },
-            { key:'record_count', label:'Records', align:'right', cls:'num', render:r=>fmtNum(r.record_count) },
-            { key:'usage_percent', label:'Usage', render:r=>barPct(r.usage_percent, r.usage_percent>=85?'red':r.usage_percent>=70?'amber':'green') },
-            { key:'active_session_count', label:'Sessions', align:'right', cls:'num', render:r=>fmtFull(r.active_session_count) },
+            /* Nullable, all three. A thread-backed store's records and sessions are
+               counted live and are null when telemetry cannot answer; its usage is
+               always null, because nothing reports a capacity for it. Null is a
+               dash — a 0% bar would be a measurement nobody took (and barPct(null)
+               throws, which took the whole table down with it). */
+            { key:'record_count', label:'Records', align:'right', cls:'num', render:r=>r.record_count==null?dash:fmtNum(r.record_count) },
+            { key:'usage_percent', label:'Usage', render:r=>usageBar(r.usage_percent) },
+            { key:'active_session_count', label:'Sessions', align:'right', cls:'num', render:r=>r.active_session_count==null?dash:fmtFull(r.active_session_count) },
             { key:'avg_retrieval_latency_ms', label:'Latency', align:'right', cls:'num', render:r=>r.avg_retrieval_latency_ms==null?dash:Math.round(r.avg_retrieval_latency_ms)+'ms' },
             { key:'retention_policy', label:'Retention', render:r=>r.retention_policy?esc(r.retention_policy):dash },
             { key:'status', label:'Status', render:r=>statusText(r.status) },
@@ -704,16 +852,96 @@
           onSelect: showStore,
           rowActions: r => [
             {label:'View Records', icon:'database', onClick:()=>viewRecords(r)},
+            {label:'Edit Store', icon:'pen', onClick:()=>editStore(r)},
+            {label: r.status === 'Paused' ? 'Resume Store' : 'Pause Store', icon: r.status === 'Paused' ? 'play' : 'pause', onClick:()=>togglePause(r)},
             {label:'Update Retention Policy', icon:'settings', onClick:()=>updateRetention(r)},
-            {label:'Create Backup', icon:'save', onClick:()=>createBackup(r)},
+            {label:'Create Backup', icon:'history', onClick:()=>createBackup(r)},
             {label:'Restore from Backup', icon:'refresh', onClick:()=>restoreBackup(r)},
             {sep:true},
             {label:'Purge Data', icon:'trash', danger:true, onClick:()=>purgeStore(r)},
+            {label:'Delete Store', icon:'trash', danger:true, onClick:()=>deleteStore(r)},
           ],
         });
         const wrap = document.getElementById('msTableWrap');
         wrap.appendChild(table.filterEl);
         wrap.appendChild(table.el);
+      }
+
+      const usageBar = (v) => v == null ? dash : barPct(v, v>=85?'red':v>=70?'amber':'green');
+
+      function editStore(r){
+        if(!Store.session.can('operator')){
+          toast('error','Not permitted','Editing a memory store requires the operator role.');
+          return;
+        }
+        openModal({
+          title:'Edit Store — ' + r.name, icon:'pen',
+          body:`<label class="auth-field"><span>Name</span><input type="text" id="edName" maxlength="160" value="${esc(r.name)}"></label>
+            <div class="grid g2" style="margin-top:10px">
+              <label class="auth-field"><span>Backend</span><input type="text" id="edBackend" maxlength="80" value="${esc(r.backend||'')}" placeholder="e.g. Redis, pgvector"></label>
+              <label class="auth-field"><span>Environment</span><select class="filter-select" id="edEnv" style="height:34px">
+                ${['Production','Staging','UAT','Development','QA','Sandbox','DR'].map(o=>`<option ${o===r.environment?'selected':''}>${o}</option>`).join('')}</select></label>
+            </div>
+            ${r.thread_backed ? `<div class="small muted" style="margin-top:8px">Agents are bound to this store by its name. Renaming it moves the ${r.bound_agents == null ? '' : fmtFull(r.bound_agents) + ' '}agent(s) bound to it along, so their name has to fit an agent's memory policy (48 characters).</div>` : ''}`,
+          footer:[
+            {label:'Save', cls:'primary', onClick: async (close, modal) => {
+              const name = modal.querySelector('#edName').value.trim();
+              if(!name){ toast('error','Name required','Give the store a name.'); return; }
+              // Only what changed, under the version that was read: someone else's edit is a 409, not an overwrite.
+              const payload = { expected_updated_at: r.updated_at };
+              if(name !== r.name) payload.name = name;
+              const backend = modal.querySelector('#edBackend').value.trim();
+              if(backend && backend !== (r.backend || '')) payload.backend = backend;
+              const environment = modal.querySelector('#edEnv').value;
+              if(environment !== r.environment) payload.environment = environment;
+              if(Object.keys(payload).length === 1){ close(); return; }
+              try {
+                await API.memory.update(r.id, payload);
+                close();
+                toast('success','Store updated', name + ' saved.');
+                if(table) table.refresh();
+              } catch (err) { toast('error','Could not update store', err.message); }
+            }},
+            {label:'Cancel'},
+          ],
+        });
+      }
+
+      async function togglePause(r){
+        if(!Store.session.can('operator')){
+          toast('error','Not permitted','Pausing a memory store requires the operator role.');
+          return;
+        }
+        const pausing = r.status !== 'Paused';
+        try {
+          await API.memory.update(r.id, { status: pausing ? 'Paused' : 'Active', expected_updated_at: r.updated_at });
+          toast('success', pausing ? 'Store paused' : 'Store resumed',
+            pausing ? `${r.name} is paused; it cannot be purged until it is resumed.` : `${r.name} is active again.`);
+          if(table) table.refresh();
+          loadKpis();
+        } catch (err) { toast('error', pausing ? 'Could not pause' : 'Could not resume', err.message); }
+      }
+
+      function deleteStore(r){
+        if(!Store.session.can('admin')){
+          toast('error','Not permitted','Deleting a memory store requires the admin role.');
+          return;
+        }
+        confirmModal({
+          title:'Delete Memory Store', confirmLabel:'Delete', danger:true,
+          msg:`Delete “${r.name}”? This removes the store from the registry. It deletes no conversation records — purge first if they should go.`,
+          onConfirm: async () => {
+            try {
+              await API.memory.remove(r.id);
+              toast('success','Store deleted', r.name + ' removed.');
+              renderTab(0);
+              loadKpis();
+            } catch (err) {
+              // 412 names the agents still bound to it; 409 means a purge of it is running.
+              toast('error','Could not delete store', err.message);
+            }
+          },
+        });
       }
 
       function showStore(r){
@@ -727,12 +955,15 @@
           ${inspSection('Store','database', kv([
             ['Status', statusText(r.status)],
             ['Backend', r.backend?esc(r.backend):dash],
-            ['Records', fmtNum(r.record_count)],
-            ['Usage', barPct(r.usage_percent, r.usage_percent>=85?'red':'green')],
+            ['Records', r.record_count==null?dash:fmtNum(r.record_count)],
+            ['Usage', usageBar(r.usage_percent)],
             ['Thread-backed', r.thread_backed?'<span class="st-green">Yes</span>':'No'],
+            // What a thread-backed store governs is exactly the agents that name it.
+            r.thread_backed ? ['Bound agents', r.bound_agents==null?dash:fmtFull(r.bound_agents)] : null,
           ]))}
+          ${r.thread_backed && r.bound_agents === 0 ? `<div class="scan-note" style="margin:0 0 12px">${ICONS.info} No agent is bound to this store, so it has no records to list, count or purge. Set an agent's Memory Policy to this store's name to bind it.</div>` : ''}
           ${inspSection('Activity','activity', kv([
-            ['Active sessions', fmtFull(r.active_session_count)],
+            ['Active sessions', r.active_session_count==null?dash:fmtFull(r.active_session_count)],
             ['Avg retrieval latency', r.avg_retrieval_latency_ms==null?dash:Math.round(r.avg_retrieval_latency_ms)+'ms'],
             ['Last updated', when(r.last_updated_at)],
           ]))}
@@ -821,8 +1052,12 @@
             { key:'created_at', label:'Taken', sortable:false, render:r=>`<span class="dim nowrap">${when(r.created_at)}</span>` },
             { key:'store_name', label:'Store', sortable:false, render:r=>esc(r.store_name||'—') },
             { key:'kind', label:'Kind', sortable:false, render:r=>badge(r.kind) },
-            { key:'record_count', label:'Records', align:'right', cls:'num', sortable:false, render:r=>fmtNum(r.record_count) },
-            { key:'payload_bytes', label:'Size', align:'right', cls:'num', sortable:false, render:r=>r.payload_bytes==null?dash:U.fmtBytes(r.payload_bytes) },
+            // Counted when the snapshot was taken — not held by it, which the next column says.
+            { key:'record_count', label:'Threads Counted', align:'right', cls:'num', sortable:false, render:r=>fmtNum(r.record_count) },
+            { key:'threads_captured', label:'Threads Captured', sortable:false, render:r=>r.threads_captured?'<span class="st-green">Yes</span>':'No' },
+            { key:'captured', label:'Holds', sortable:false, render:r=>(r.captured||[]).length?`<span class="dim">${r.captured.map(f=>esc(String(f).replace(/_/g,' '))).join(', ')}</span>`:dash },
+            // Null on every new row: a snapshot exports nothing, so there is nothing to size.
+            { key:'payload_bytes', label:'Size', align:'right', cls:'num', sortable:false, render:r=>r.payload_bytes==null?dash:byteSize(r.payload_bytes) },
             { key:'created_by', label:'By', sortable:false, render:r=>r.created_by?esc(r.created_by):dash },
             { key:'status', label:'Status', sortable:false, render:r=>statusText(r.status) },
           ],
@@ -865,24 +1100,34 @@
           toast('error','Not permitted','Updating a retention policy requires the admin role.');
           return;
         }
+        /* A store made from this console is labelled from its days ("90 days"), and
+           the server only derives that label when none is sent. Pre-filled and
+           sent back, the old label was stored beside the new number: the table,
+           the Retention Policies tab and the CSV went on reading "90 days" while
+           the purge enforced 7. A label that is just a day count is therefore
+           never sent — the server writes the one that matches the days — and the
+           field is kept for a name someone actually chose ("Legal hold"). */
+        const dayCount = /^\d+\s*days?$/i;
+        const custom = r.retention_policy && !dayCount.test(r.retention_policy.trim()) ? r.retention_policy : '';
         openModal({
           title:'Update Retention Policy — ' + r.name, icon:'settings',
-          body:`<label class="auth-field"><span>Policy name</span><input type="text" id="urPolicy" value="${esc(r.retention_policy||'')}" placeholder="e.g. 90-day rolling"></label>
-            <label class="auth-field" style="margin-top:10px"><span>Retention (days)</span>
+          body:`<label class="auth-field"><span>Retention (days)</span>
               <input type="number" id="urDays" value="${r.retention_days == null ? '' : r.retention_days}" min="1" placeholder="e.g. 90"></label>
+            <label class="auth-field" style="margin-top:10px"><span>Policy name (optional)</span><input type="text" id="urPolicy" maxlength="48" value="${esc(custom)}" placeholder="Blank: named after the days, e.g. “90 days”"></label>
             <div class="small muted" style="margin-top:8px">Records older than the retention window become eligible for purge. Changing this does not delete anything on its own.</div>`,
           footer:[
             {label:'Save Policy', cls:'primary', onClick: async (close, modal) => {
               const days = Number(modal.querySelector('#urDays').value);
               if(!Number.isInteger(days) || days < 1){ toast('error','Retention required','Retention is a whole number of days, at least 1.'); return; }
-              const payload = { retention_policy: modal.querySelector('#urPolicy').value.trim() || null,
+              const label = modal.querySelector('#urPolicy').value.trim();
+              const payload = { retention_policy: label && !dayCount.test(label) ? label : null,
                                 retention_days: days };
               close();
               try {
+                // Counts do not move with a policy, so the KPI row is left alone.
                 await API.memory.retention(r.id, payload);
-                toast('success','Retention updated', r.name + ' saved.');
+                toast('success','Retention updated', `${r.name} now keeps records for ${days} day${days === 1 ? '' : 's'}.`);
                 if(table) table.refresh();
-                loadKpis();
               } catch (err) { toast('error','Could not update retention', err.message); }
             }},
             {label:'Cancel'},
@@ -890,22 +1135,61 @@
         });
       }
 
-      function purgeStore(r){
+      /* A purge cannot be undone, so it is two calls. The dry run deletes nothing
+         and answers with what would go and whose it is — that is what the dialog
+         shows, rather than a sentence the browser made up. The real call has to
+         carry the store's exact name (the API refuses an empty body with 422),
+         and the operator types it, so the name is a decision and not a default. */
+      async function purgeStore(r){
         if(!Store.session.can('operator')){
           toast('error','Not permitted','Purging a store requires the operator role.');
           return;
         }
-        confirmModal({
-          title:'Purge Data', confirmLabel:'Purge', danger:true,
-          msg:`Purge expired records from “${r.name}”? This deletes data permanently and is written to the audit trail.`,
-          onConfirm: async () => {
-            try {
-              const res = await API.memory.purge(r.id, {});
-              toast('success','Purge complete', res && res.message ? res.message : 'Expired records removed.');
-              if(table) table.refresh();
-              loadKpis();
-            } catch (err) { toast('error','Could not purge', err.message); }
-          },
+        let preview;
+        try { preview = await API.memory.purge(r.id, { dry_run: true }); }
+        catch (err) {
+          // 412 is the store saying why it cannot be purged: no retention policy,
+          // paused, or no agent names it as its memory policy. Its message says which.
+          toast(err.status === 412 ? 'warn' : 'error', 'Cannot purge', err.message);
+          return;
+        }
+        const count = preview.candidate_records || 0;
+        if(!count && !preview.capped){
+          toast('info','Nothing to purge', `No record of “${r.name}” is past its ${preview.retention_days}-day retention.`);
+          return;
+        }
+        const agents = (preview.agents || []).map(esc).join(', ') || '—';
+        openModal({
+          title:'Purge Data — ' + r.name, icon:'alert',
+          body:`<p style="margin:0">Permanently delete <b>${fmtFull(count)}</b> expired conversation record(s) held by: ${agents}.
+              Runs outside a conversation are not touched.</p>
+            <div class="small muted" style="margin-top:8px">In scope: records last active before ${esc(fmtDateTime(ts(preview.cutoff)))}
+              (${esc(String(preview.retention_days))}-day retention)${preview.capped ? '. The count stopped at the limit, so there may be more' : ''}.
+              A backup does not hold records, so this cannot be undone. It is written to the audit trail.</div>
+            <label class="auth-field" style="margin-top:12px"><span>Type the store's name to confirm</span>
+              <input type="text" id="pgConfirm" autocomplete="off" placeholder="${esc(r.name)}"></label>`,
+          footer:[
+            {label:'Cancel'},
+            {label:'Purge', cls:'danger', onClick: async (close, modal) => {
+              if(modal.querySelector('#pgConfirm').value.trim() !== r.name){
+                toast('error','Name does not match', `Type “${r.name}” exactly to purge it.`);
+                return;
+              }
+              close();
+              try {
+                const res = await API.memory.purge(r.id, { confirm: r.name });
+                // Partial or capped: what was deleted is deleted, and more is waiting.
+                const again = res && (res.partial || res.capped);
+                toast(again ? 'warn' : 'success', again ? 'Purge incomplete — run it again' : 'Purge complete',
+                  res && res.message ? res.message : `${fmtFull(res ? res.purged_records : null)} record(s) removed.`);
+                if(table) table.refresh();
+                loadKpis();
+              } catch (err) {
+                // 409: another purge of this store is still running; the message says so.
+                toast(err.status === 409 ? 'warn' : 'error', 'Could not purge', err.message);
+              }
+            }},
+          ],
         });
       }
 
@@ -914,18 +1198,22 @@
           toast('error','Not permitted','Creating a backup requires the operator role.');
           return;
         }
+        /* Said plainly, because the old copy promised the opposite: a backup is a
+           snapshot of how the store is governed. No conversation is copied
+           anywhere, so nobody should run a purge believing this can undo it. */
         openModal({
-          title:'Create Backup — ' + r.name, icon:'save',
-          body:`<div class="small muted">A backup captures the store's current records and metadata. It can be restored from the Backups tab.</div>`,
+          title:'Create Backup — ' + r.name, icon:'history',
+          body:`<div class="small muted">A backup is a snapshot of the store's governance: its retention policy and its status, with a count of the conversation threads its agents hold right now.
+            <b>Threads are counted, not copied</b> — a purge cannot be undone from a backup. Restore puts the policy and status back.</div>`,
           footer:[
             {label:'Create Backup', cls:'primary', onClick: async (close) => {
               close();
               try {
                 const res = await API.memory.backup(r.id);
-                toast('success','Backup created', res && res.record_count != null
-                  ? `${fmtNum(res.record_count)} record(s) captured.` : 'Backup captured.');
+                toast('success','Snapshot saved', res && res.notice ? res.notice
+                  : res && res.record_count != null ? `${fmtNum(res.record_count)} thread(s) counted, none copied.` : 'Retention policy and status captured.');
+                // A snapshot moves no count, so the KPI row — a read of the telemetry store — is left alone.
                 if(table) table.refresh();
-                loadKpis();
               } catch (err) { toast('error','Could not create backup', err.message); }
             }},
             {label:'Cancel'},
@@ -948,13 +1236,13 @@
               .then(page => {
                 const rows = page.items || page;
                 if(!rows.length){
-                  host.innerHTML = `<div class="empty-state">${ICONS.save}<div class="es-title">No backups for this store</div><div>Create one first.</div></div>`;
+                  host.innerHTML = `<div class="empty-state">${ICONS.history}<div class="es-title">No backups for this store</div><div>Create one first.</div></div>`;
                   return;
                 }
                 host.innerHTML = `<label class="auth-field"><span>Backup to restore</span>
                   <select class="filter-select" id="rbPick" style="height:34px">${rows.map(b=>
-                    `<option value="${esc(b.id)}">${esc(fmtDateTime(ts(b.created_at)))} — ${fmtNum(b.record_count)} records (${esc(b.kind)})</option>`).join('')}</select></label>
-                  <div class="small muted" style="margin-top:10px">Restoring replaces the store's current contents with the backup's.</div>`;
+                    `<option value="${esc(b.id)}">${esc(fmtDateTime(ts(b.created_at)))} — ${fmtNum(b.record_count)} threads counted (${esc(b.kind)})</option>`).join('')}</select></label>
+                  <div class="small muted" style="margin-top:10px">Restoring puts back the retention policy and status only. Conversation records are never restored: a backup does not hold them.</div>`;
                 const foot = modal.querySelector('.modal-foot');
                 const btn = document.createElement('button');
                 btn.className = 'btn primary';
@@ -963,10 +1251,18 @@
                   const backupId = modal.querySelector('#rbPick').value;
                   modal.querySelector('[data-mclose]').click();
                   try {
-                    await API.memory.restore(r.id, { backup_id: backupId });
-                    toast('success','Restore complete', r.name + ' restored from backup.');
+                    const res = await API.memory.restore(r.id, { backup_id: backupId });
+                    // What actually came back, in the server's words — which may be nothing,
+                    // when the store already matched the snapshot.
+                    const fields = ((res && res.fields_restored) || []).map(f => f.replace(/_/g, ' '));
+                    toast('success','Restore complete', [
+                      fields.length ? `Restored: ${fields.join(', ')}.` : 'Nothing differed from the snapshot.',
+                      res && res.notice ? res.notice : '',
+                    ].filter(Boolean).join(' '), 6000);
+                    // No count moves on a restore, so the KPI row — a read of the telemetry
+                    // store — is re-asked only when a status came back, which its sub-line shows.
                     if(table) table.refresh();
-                    loadKpis();
+                    if(fields.includes('status')) loadKpis();
                   } catch (err) { toast('error','Could not restore', err.message); }
                 });
                 foot.insertBefore(btn, foot.firstChild);
@@ -1014,6 +1310,9 @@
           ],
         });
       }
+
+      // tabBar only reports clicks; the first tab has to be asked for.
+      renderTab(0);
     },
   };
 
@@ -1062,12 +1361,19 @@
 
       document.getElementById('dpSearch').addEventListener('input', e => { if(table) table.search(e.target.value); });
       document.getElementById('dpExport').addEventListener('click', async () => {
-        try { await API.deployments.export(table ? table.params() : {}); toast('success','Export complete','Deployments exported to CSV.'); }
+        /* The file is always the deployments list. Only the two deployment tabs
+           hold a query that means anything to it: from Environments or Approvals
+           the table's sort key ("name", "request_ref") is one the export refuses
+           with 422, and its search text was typed about something else. */
+        const onDeployments = currentTab === 1 || currentTab === 3;
+        try { await API.deployments.export(onDeployments && table ? table.params() : {}); toast('success','Export complete','Deployments exported to CSV.'); }
         catch (err) { toast('error','Export failed', err.message); }
       });
       document.getElementById('dpCreate').addEventListener('click', createDeployment);
 
+      let currentTab = 0;
       function renderTab(i){
+        currentTab = i;
         body.innerHTML = '';
         table = null;
         if(i === 0) return environmentsTab();
@@ -1077,6 +1383,12 @@
       }
 
       function environmentsTab(){
+        /* Nothing seeds an environment, so without this button a new workspace
+           had an empty table, a Create Deployment that answered "No
+           environments", and nowhere to register one short of curl. */
+        body.innerHTML = `<div class="flex" style="justify-content:flex-end;gap:8px;margin-bottom:12px">
+            <button class="btn primary" id="dpAddEnv">${ICONS.plus}Add Environment</button>
+          </div><div id="dpEnvTable"></div>`;
         table = dataTable({
           columns:[
             { key:'name', label:'Environment', render:r=>entityCell(r.name, r.description || r.env_type, 'layers',
@@ -1084,18 +1396,113 @@
             { key:'env_type', label:'Type', render:r=>badge(r.env_type) },
             { key:'region', label:'Region', render:r=>r.region?esc(r.region):dash },
             { key:'status', label:'Status', render:r=>statusText(r.status) },
-            { key:'active_deployment_count', label:'Active Deployments', align:'right', cls:'num', render:r=>fmtFull(r.active_deployment_count) },
+            // Releases the environment is serving now, not every success it ever had.
+            { key:'active_deployment_count', label:'Live Releases', align:'right', cls:'num', render:r=>fmtFull(r.active_deployment_count) },
             { key:'health', label:'Health', render:r=>r.health==null?dash:barPct(r.health, r.health>=90?'green':r.health>=70?'amber':'red') },
-            { key:'last_deployment_at', label:'Last Deployment', render:r=>`<span class="dim nowrap">${when(r.last_deployment_at)}</span>` },
+            // Joined in from the deployment history; the server cannot order by it.
+            { key:'last_deployment_at', label:'Last Deployment', sortable:false, render:r=>`<span class="dim nowrap">${when(r.last_deployment_at)}</span>` },
           ],
-          rowId:'id', itemName:'environments', pageSize:10, emptyText:'No environments registered yet',
-          source: (p) => API.deployments.environments(p),
+          rowId:'id', itemName:'environments', pageSize:10,
+          emptyText:'No environments registered yet — add one to deploy into',
+          source: (p) => API.environments.list(p),
           rowActions: r => [
             {label:'Restart Services', icon:'refresh', onClick:()=>restartEnvironment(r)},
             {label:'Environment Settings', icon:'settings', onClick:()=>environmentSettings(r)},
+            {sep:true},
+            {label:'Delete Environment', icon:'trash', danger:true, onClick:()=>deleteEnvironment(r)},
           ],
         });
-        body.appendChild(table.el);
+        document.getElementById('dpEnvTable').appendChild(table.el);
+        document.getElementById('dpAddEnv').addEventListener('click', addEnvironment);
+      }
+
+      const ENV_TYPES = ['Production','Staging','UAT','Development','QA','Sandbox','DR'];
+      const ENV_STATUSES = ['Healthy','Degraded','Standby','Offline'];
+
+      /** The fields an environment is made of. Adding one and editing one share them. */
+      function environmentForm(r){
+        r = r || {};
+        const options = (list, picked) => list.map(o=>`<option ${o===picked?'selected':''}>${o}</option>`).join('');
+        return `<label class="auth-field"><span>Name</span><input type="text" id="enName" maxlength="80" value="${esc(r.name||'')}" placeholder="e.g. Production EU"></label>
+          <div class="grid g2" style="margin-top:10px">
+            <label class="auth-field"><span>Type</span><select class="filter-select" id="enType" style="height:34px">${options(ENV_TYPES, r.env_type)}</select></label>
+            <label class="auth-field"><span>Status</span><select class="filter-select" id="enStatus" style="height:34px">${options(ENV_STATUSES, r.status || 'Healthy')}</select></label>
+          </div>
+          <div class="grid g2" style="margin-top:10px">
+            <label class="auth-field"><span>Region</span><input type="text" id="enRegion" maxlength="60" value="${esc(r.region||'')}" placeholder="e.g. eu-west-1"></label>
+            <label class="auth-field"><span>Reported health (%)</span><input type="number" id="enHealth" min="0" max="100" step="0.1" value="${r.health==null?'':esc(String(r.health))}" placeholder="Not reported"></label>
+          </div>
+          <label class="auth-field" style="margin-top:10px"><span>Description</span><input type="text" id="enDesc" maxlength="2000" value="${esc(r.description||'')}"></label>
+          <div class="small muted" style="margin-top:8px">Health is the uptime figure your monitoring reports for this environment. Nothing probes it for you: left blank, the Health column shows a dash rather than a guess.</div>`;
+      }
+
+      /** The form as a request body, or null (after saying why) when it cannot be sent. */
+      function readEnvironmentForm(modal){
+        const name = modal.querySelector('#enName').value.trim();
+        if(!name){ toast('error','Name required','Give the environment a name.'); return null; }
+        const reported = modal.querySelector('#enHealth').value.trim();
+        const health = reported === '' ? null : Number(reported);
+        if(health != null && !(health >= 0 && health <= 100)){
+          toast('error','Health out of range','Reported health is a percentage between 0 and 100.');
+          return null;
+        }
+        return {
+          name,
+          env_type: modal.querySelector('#enType').value,
+          status: modal.querySelector('#enStatus').value,
+          region: modal.querySelector('#enRegion').value.trim() || null,
+          health,
+          description: modal.querySelector('#enDesc').value.trim() || null,
+        };
+      }
+
+      function addEnvironment(){
+        if(!Store.session.can('admin')){
+          toast('error','Not permitted','Adding an environment requires the admin role.');
+          return;
+        }
+        openModal({
+          title:'Add Environment', icon:'layers',
+          body: environmentForm(),
+          footer:[
+            {label:'Add Environment', cls:'primary', onClick: async (close, modal) => {
+              const payload = readEnvironmentForm(modal);
+              if(!payload) return;
+              try {
+                // Left open on failure: a 409 is a name already taken, which is fixed in this form.
+                const created = await API.environments.create(payload);
+                close();
+                toast('success','Environment added', `${created.name} can now be deployed into.`);
+                if(table) table.refresh();
+                loadKpis();
+              } catch (err) { toast('error','Could not add environment', err.message); }
+            }},
+            {label:'Cancel'},
+          ],
+        });
+      }
+
+      function deleteEnvironment(r){
+        if(!Store.session.can('admin')){
+          toast('error','Not permitted','Deleting an environment requires the admin role.');
+          return;
+        }
+        confirmModal({
+          title:'Delete Environment', confirmLabel:'Delete', danger:true,
+          msg:`Delete “${r.name}”? Its deployment history stays, but nothing can be released into it again.`,
+          onConfirm: async () => {
+            try {
+              await API.environments.remove(r.id);
+              toast('success','Environment deleted', r.name + ' removed.');
+              if(table) table.refresh();
+              loadKpis();
+            } catch (err) {
+              // 409 names what is in the way: releases in flight, or live ones — for
+              // those the message says to take the environment Offline first.
+              toast('error','Could not delete environment', err.message);
+            }
+          },
+        });
       }
 
       function restartEnvironment(r){
@@ -1108,7 +1515,7 @@
           msg:`Restart every service in “${r.name}”? In-flight requests to agents in this environment will fail.`,
           onConfirm: async () => {
             try {
-              const res = await API.post(`/environments/${encodeURIComponent(r.id)}/restart`, {});
+              const res = await API.environments.restart(r.id);
               toast('success','Restart requested', res && res.message ? res.message : `${r.name} is restarting.`);
               if(table) table.refresh();
             } catch (err) { toast('error','Could not restart', err.message); }
@@ -1123,21 +1530,16 @@
         }
         openModal({
           title:'Environment Settings — ' + r.name, icon:'settings',
-          body:`<div class="grid g2">
-              <label class="auth-field"><span>Region</span><input type="text" id="esRegion" value="${esc(r.region||'')}"></label>
-              <label class="auth-field"><span>Status</span><select class="filter-select" id="esStatus" style="height:34px">
-                ${['Healthy','Degraded','Standby','Offline'].map(o=>`<option ${o===r.status?'selected':''}>${o}</option>`).join('')}</select></label>
-            </div>
-            <label class="auth-field" style="margin-top:10px"><span>Description</span><input type="text" id="esDesc" value="${esc(r.description||'')}"></label>`,
+          body: environmentForm(r),
           footer:[
             {label:'Save', cls:'primary', onClick: async (close, modal) => {
-              const payload = { region: modal.querySelector('#esRegion').value.trim() || null,
-                                status: modal.querySelector('#esStatus').value,
-                                description: modal.querySelector('#esDesc').value.trim() || null };
-              close();
+              const payload = readEnvironmentForm(modal);
+              if(!payload) return;
               try {
-                await API.patch(`/environments/${encodeURIComponent(r.id)}`, payload);
-                toast('success','Environment updated', r.name + ' saved.');
+                // The server writes only what differs, so sending the whole form is safe.
+                const saved = await API.environments.update(r.id, payload);
+                close();
+                toast('success','Environment updated', saved.name + ' saved.');
                 if(table) table.refresh();
                 loadKpis();
               } catch (err) { toast('error','Could not update environment', err.message); }
@@ -1153,11 +1555,13 @@
           columns:[
             { key:'deployment_ref', label:'Deployment', render:r=>entityCell(r.deployment_ref, r.agent_name || '—', 'rocket', 'purple') },
             { key:'version', label:'Version', render:r=>`<span class="mono">${esc(r.version)}</span>` },
-            { key:'environment_name', label:'Environment', render:r=>r.environment_name?badge(r.environment_name):dash },
+            // A label joined in by the server, which can order by the id behind it but not by the name.
+            { key:'environment_name', label:'Environment', sortable:false, render:r=>r.environment_name?badge(r.environment_name):dash },
             { key:'strategy', label:'Strategy', render:r=>badge(r.strategy) },
             { key:'status', label:'Status', render:r=>statusText(r.status) },
             { key:'health', label:'Health', render:r=>r.health==null?dash:barPct(r.health, r.health>=90?'green':'amber') },
-            { key:'duration_label', label:'Duration', align:'right', cls:'num', render:r=>r.duration_label?esc(r.duration_label):dash },
+            // Keyed by the seconds the server orders by; the label is only how they read.
+            { key:'duration_seconds', label:'Duration', align:'right', cls:'num', render:r=>r.duration_label?esc(r.duration_label):dash },
             { key:'started_at', label:'Started', render:r=>`<span class="dim nowrap">${when(r.started_at)}</span>` },
           ],
           rowId:'id', itemName:'deployments', pageSize:12,
@@ -1174,11 +1578,20 @@
           rowActions: r => {
             const actions = [];
             if(!r.is_terminal){
-              actions.push({label:'Halt Deployment', icon:'pause', danger:true, onClick:()=>act(r,'halt','Halted')});
-              actions.push({label:'Approve', icon:'stamp', onClick:()=>act(r,'approve','Approved')});
+              actions.push({label:'Watch Pipeline', icon:'activity', onClick:()=>watchDeployment(r)});
+              /* Four eyes: the server refuses an approval from whoever started the
+                 release, so that person is not offered one — they can still halt
+                 it. Only a release that has raised its gate has anything to approve. */
+              const mine = r.triggered_by_user_id && r.triggered_by_user_id === (Store.session.user || {}).id;
+              if(r.approval_request_id && !mine) actions.push({label:'Approve', icon:'stamp', onClick:()=>decideGate(r)});
+              actions.push({label:'Halt Deployment', icon:'pause', danger:true, onClick:()=>halt(r)});
             }
-            if(r.status === 'Succeeded') actions.push({label:'Promote', icon:'trendUp', onClick:()=>promote(r)});
-            if(r.is_terminal && r.status !== 'RolledBack') actions.push({label:'Roll Back', icon:'refresh', danger:true, onClick:()=>act(r,'rollback','Rolled back')});
+            if(r.status === 'Succeeded'){
+              actions.push({label:'Promote', icon:'trendUp', onClick:()=>promote(r)});
+              // Only a release that is being served can be undone. One that failed or
+              // was halted never went live, and a rolled-back one is already undone.
+              actions.push({label:'Roll Back', icon:'refresh', danger:true, onClick:()=>rollBack(r)});
+            }
             return actions;
           },
         });
@@ -1187,19 +1600,88 @@
         wrap.appendChild(table.el);
       }
 
-      async function act(r, verb, past){
-        // Approval closes a gate on someone else's release, so it takes its own role.
-        const role = verb === 'approve' ? 'approver' : 'operator';
-        if(!Store.session.can(role)){
-          toast('error','Not permitted', `The ${verb} action requires the ${role} role.`);
+      async function halt(r){
+        if(!Store.session.can('operator')){
+          toast('error','Not permitted','Halting a deployment requires the operator role.');
           return;
         }
         try {
-          await API.deployments[verb](r.id, {});
-          toast('success', past, `${r.deployment_ref} ${past.toLowerCase()}.`);
+          const res = await API.deployments.halt(r.id, {});
+          toast('success','Halted', res && res.message ? res.message : `${r.deployment_ref} halted.`);
           if(table) table.refresh();
           loadKpis();
-        } catch (err) { toast('error', `Could not ${verb}`, err.message); }
+        } catch (err) { toast('error','Could not halt', err.message); }
+      }
+
+      /** Decide the approval gate. It closes a gate on someone else's release, so it takes its own role. */
+      function decideGate(r){
+        if(!Store.session.can('approver')){
+          toast('error','Not permitted','Approving a release requires the approver role.');
+          return;
+        }
+        const decide = (approved) => async (close, modal) => {
+          const note = modal.querySelector('#dgNote').value.trim() || null;
+          close();
+          try {
+            const res = await API.deployments.approve(r.id, { approved, note });
+            toast('success', approved ? 'Approved' : 'Rejected',
+              res && res.message ? res.message : `${r.deployment_ref} ${approved ? 'approved' : 'rejected'}.`);
+          } catch (err) {
+            // 403 says who has to approve instead; 409 that the request was already
+            // decided in Approvals & Audit, and what to do about it. Both read as written.
+            toast('error', approved ? 'Could not approve' : 'Could not reject', err.message);
+          }
+          // Either way the row may have moved: the other screen can decide the same gate.
+          if(table) table.refresh();
+          loadKpis();
+          Store.refreshBadges();
+        };
+        openModal({
+          title:'Approve ' + r.deployment_ref, icon:'stamp',
+          body:`<div class="small muted" style="margin-bottom:10px">${esc(r.version)} → ${esc(r.environment_name || 'environment')}. Approving lets the pipeline continue to Deploy; rejecting halts the release and frees the environment.</div>
+            <label class="auth-field"><span>Note</span><input type="text" id="dgNote" maxlength="1000" placeholder="Recorded with the decision (optional)"></label>`,
+          footer:[
+            {label:'Approve', cls:'primary', onClick: decide(true)},
+            {label:'Reject', cls:'danger', onClick: decide(false)},
+            {label:'Cancel'},
+          ],
+        });
+      }
+
+      function rollBack(r){
+        if(!Store.session.can('operator')){
+          toast('error','Not permitted','Rolling back a deployment requires the operator role.');
+          return;
+        }
+        openModal({
+          title:'Roll Back ' + r.deployment_ref, icon:'refresh',
+          body:`<div class="small muted" style="margin-bottom:10px">A rollback is a new deployment with its own pipeline and gate. ${esc(r.deployment_ref)} keeps serving — and keeps reading Succeeded — until that rollback lands.</div>
+            <label class="auth-field"><span>Version to go back to</span><input type="text" id="rbVersion" maxlength="40" placeholder="Blank: the release that was live before ${esc(r.version)}"></label>
+            <label class="auth-field" style="margin-top:10px"><span>Reason</span><input type="text" id="rbReason" maxlength="1000" placeholder="Why is this release being undone?"></label>`,
+          footer:[
+            {label:'Roll Back', cls:'danger', onClick: async (close, modal) => {
+              const payload = {
+                target_version: modal.querySelector('#rbVersion').value.trim() || null,
+                reason: modal.querySelector('#rbReason').value.trim() || null,
+              };
+              try {
+                const res = await API.deployments.rollback(r.id, payload);
+                close();
+                const ref = res && res.data && res.data.deployment_ref;
+                toast('success', ref ? `Rollback queued as ${ref}` : 'Rollback queued',
+                  res && res.message ? res.message : `${r.deployment_ref} stays live until the rollback lands.`);
+                if(table) table.refresh();
+                loadKpis();
+              } catch (err) {
+                // Left open: a 412 means there is no earlier release here to fall back
+                // to, so the version has to be named in this form.
+                toast('error','Could not roll back', err.message);
+                if(err.status === 412){ const v = modal.querySelector('#rbVersion'); if(v) v.focus(); }
+              }
+            }},
+            {label:'Cancel'},
+          ],
+        });
       }
 
       async function promote(r){
@@ -1208,7 +1690,7 @@
           return;
         }
         let envs;
-        try { envs = await API.deployments.environments({ page_size: 50 }); }
+        try { envs = await API.environments.list({ page_size: 50 }); }
         catch (err) { toast('error','Could not load environments', err.message); return; }
         openModal({
           title:'Promote ' + r.deployment_ref, icon:'trendUp',
@@ -1279,12 +1761,14 @@
       function approvalsTab(){
         table = dataTable({
           columns:[
-            { key:'id', label:'Request', render:r=>`<span class="mono">${esc(String(r.id).slice(0,10))}…</span>` },
+            // Keyed by what the approvals list orders by: the reference people quote
+            // (REQ-1042), not a slice of the row id, and the time the request was raised.
+            { key:'request_ref', label:'Request', render:r=>`<span class="mono">${esc(r.request_ref || String(r.id).slice(0,10)+'…')}</span>` },
             { key:'resource', label:'Resource', render:r=>esc(r.resource||'—') },
-            { key:'requested_by', label:'Requested By', render:r=>esc(r.requested_by||'—') },
+            { key:'requested_by_name', label:'Requested By', sortable:false, render:r=>r.requested_by_name?esc(r.requested_by_name):dash },
             { key:'risk', label:'Risk', render:r=>r.risk?C.riskBadge(r.risk):dash },
             { key:'status', label:'Status', render:r=>statusText(r.status) },
-            { key:'created_at', label:'Raised', render:r=>`<span class="dim nowrap">${when(r.created_at)}</span>` },
+            { key:'requested_at', label:'Raised', render:r=>`<span class="dim nowrap">${when(r.requested_at)}</span>` },
           ],
           rowId:'id', itemName:'approval requests', pageSize:10,
           emptyText:'No deployment approvals raised',
@@ -1302,12 +1786,12 @@
         let envs, agents;
         try {
           [envs, agents] = await Promise.all([
-            API.deployments.environments({ page_size: 50 }),
+            API.environments.list({ page_size: 50 }),
             API.deployments.agents({ page_size: 50 }),
           ]);
         } catch (err) { toast('error','Could not load targets', err.message); return; }
 
-        if(!envs.items.length){ toast('warn','No environments','Register an environment before deploying.'); return; }
+        if(!envs.items.length){ toast('warn','No environments','Add one on the Environments tab first — a release needs somewhere to go.'); return; }
         if(!agents.items.length){ toast('warn','No agents','Register an agent before deploying.'); return; }
 
         openModal({
@@ -1339,6 +1823,11 @@
                 const created = await API.deployments.create(payload);
                 close();
                 toast('success','Deployment started', `${created.deployment_ref} is running.`);
+                // Every pipeline parks at its approval gate, which is not a terminal
+                // frame — so waiting for one left the new row off the table, with
+                // nothing to approve, until the tab was switched.
+                if(table) table.refresh();
+                loadKpis();
                 watchDeployment(created);
               } catch (err) { toast('error','Could not start deployment', err.message); }
             }},
@@ -1349,12 +1838,13 @@
 
       /** Follow the server's pipeline. The stages are its, not ours. */
       function watchDeployment(deployment){
-        openModal({
+        const opened = openModal({
           title:`Deploying ${deployment.version} → ${deployment.environment_name || 'environment'}`, icon:'rocket',
-          body:`<div id="dpLive"><div class="card-loading" style="height:160px"></div></div>`,
+          body:`<div id="dpGate"></div><div id="dpLive"><div class="card-loading" style="height:160px"></div></div>`,
           footer:[{label:'Close'}],
         });
-        const host = document.getElementById('dpLive');
+        const host = opened.el.querySelector('#dpLive');
+        const gate = opened.el.querySelector('#dpGate');
 
         function paint(stages){
           if(!host || !host.isConnected) return;
@@ -1364,15 +1854,39 @@
         }
 
         if(liveStream) liveStream.close();
+        let mine = null, lastStatus = deployment.status;
+        // Only ever our own stream: a second watch opened since owns `liveStream` now.
+        function stop(){
+          if(!mine) return;
+          mine.close();
+          if(liveStream === mine) liveStream = null;
+          mine = null;
+        }
+
         // The stream's frames are unnamed: each is a full pipeline snapshot, and
         // the server closes after the terminal one — we must close our end too,
         // or the EventSource would reconnect against a finished deployment forever.
-        liveStream = API.deployments.stream(deployment.id, {
+        mine = liveStream = API.deployments.stream(deployment.id, {
           onMessage: (frame) => {
             if(!frame) return;
             if(frame.stages) paint(frame.stages);
+            const moved = frame.status !== lastStatus;
+            lastStatus = frame.status;
+            if(moved && !frame.awaiting_approval && !frame.is_terminal && table) table.refresh();
+            if(frame.awaiting_approval){
+              /* Parked at the gate, where a release can sit for hours waiting on a
+                 person. Say so and hang up rather than hold a connection open on a
+                 bar that will not move; Watch Pipeline picks it up again. The row is
+                 re-read because it has only now raised the request Approve needs. */
+              if(gate && gate.isConnected){
+                gate.innerHTML = `<div class="scan-note" style="margin-bottom:12px">${ICONS.clock} Waiting for approval — decide it here from the row's menu, or in Approvals &amp; Audit. Whoever started the release cannot approve it.</div>`;
+              }
+              stop();
+              if(table) table.refresh();
+              return;
+            }
             if(!frame.is_terminal) return;
-            if(liveStream){ liveStream.close(); liveStream = null; }
+            stop();
             if(table) table.refresh();
             loadKpis();
             const ok = frame.status === 'Succeeded';
@@ -1382,6 +1896,20 @@
           onError: () => refreshStages(),
         });
 
+        /* The dialog has four ways out — Close, the ×, Escape, a click outside —
+           and none of them told the stream, which api.js then kept reconnecting
+           for as long as the tab lived. openModal has no close hook, so watch for
+           the dialog leaving the page instead; that covers all four. */
+        const overlay = opened.el.parentElement;
+        if(overlay && overlay.parentElement){
+          const gone = new MutationObserver(() => {
+            if(overlay.isConnected) return;
+            gone.disconnect();
+            stop();
+          });
+          gone.observe(overlay.parentElement, { childList: true });
+        }
+
         function refreshStages(){
           API.deployments.stages(deployment.id)
             .then(s => paint(s.items || s))
@@ -1389,6 +1917,9 @@
         }
         refreshStages();
       }
+
+      // tabBar only reports clicks; the first tab has to be asked for.
+      renderTab(0);
 
       this.cleanup = () => { if(liveStream){ liveStream.close(); liveStream = null; } };
     },

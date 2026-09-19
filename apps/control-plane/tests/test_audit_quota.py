@@ -20,11 +20,15 @@ double behind a real adapter, and the database the handlers themselves use.
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 
+import pytest
 from sqlalchemy import select
 
 from conftest import principal_for
+from engine_double import EngineDouble
+from fulcrum_ops_api.core.config import settings
 from fulcrum_ops_api.models.governance import ApprovalRequest, AuditEvent
 from fulcrum_ops_api.models.identity import Role
 from fulcrum_ops_api.models.operations import (
@@ -43,6 +47,29 @@ from fulcrum_ops_api.services import quota as quota_service
 
 def _now() -> dt.datetime:
     return dt.datetime.now(dt.UTC)
+
+
+class HeldEngine(EngineDouble):
+    """The double, able to hold one kind of read open.
+
+    ``hold`` is ``(path suffix, seconds)``: a request whose path ends with the
+    suffix waits that long before it is answered, and every other read is as
+    quick as ever. Unset, this is the double exactly as every other test has it.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.hold: tuple[str, float] | None = None
+
+    async def __call__(self, scope, receive, send) -> None:
+        if self.hold and scope["type"] == "http" and scope["path"].endswith(self.hold[0]):
+            await asyncio.sleep(self.hold[1])
+        await super().__call__(scope, receive, send)
+
+
+@pytest.fixture
+def engine() -> HeldEngine:
+    return HeldEngine()
 
 
 async def _spending_agent(factory, workspace, engine, *, name, model, team, cost):
@@ -132,6 +159,25 @@ async def test_the_overview_fails_closed_when_the_store_is_down(
     response = await admin_client.get("/api/v1/quota/overview")
 
     assert response.status_code == 503
+    assert response.json()["error"]["code"] == "telemetry_unavailable"
+
+
+async def test_the_team_sparklines_answer_inside_the_request_deadline(
+    admin_client, factory, workspace, engine, monkeypatch
+):
+    """One cost series per team is a fan-out too, and nothing bounded it."""
+    await _spending_agent(
+        factory, workspace, engine, name="Support Bot", model="gpt-4o", team="Support", cost=2.5
+    )
+    monkeypatch.setattr(settings, "engine_fanout_deadline_seconds", 0.5)
+    # Only the per-team series is slow; the period's measurement answers at once.
+    engine.hold = ("/workspaces/costs", 2.0)
+
+    response = await admin_client.get("/api/v1/quota/team-allocation")
+
+    # It used to wait the store out -- the table arrived, seconds later, however
+    # long that was -- holding the worker and its database connection meanwhile.
+    assert response.status_code == 503, response.text
     assert response.json()["error"]["code"] == "telemetry_unavailable"
 
 

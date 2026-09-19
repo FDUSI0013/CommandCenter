@@ -98,6 +98,35 @@ async def test_rollback_still_works_after_someone_drafted_the_next_label(
     assert labels == ["v1.0.0", "v1.1.0", "v1.2.0", "v1.3.0"], "the draft is untouched"
 
 
+async def test_an_unnamed_rollback_goes_to_what_was_live_not_to_a_draft(
+    admin_client, factory, workspace
+):
+    """With no version named, Roll Back means "the body that ran before this one".
+    A draft on file was the newest other row, so its body -- which had never been
+    live -- is what an unnamed rollback used to publish."""
+    configuration = await factory.configuration(
+        workspace, name="Router settings", current_version="v1.0.0", payload=model_body()
+    )
+    live = await admin_client.post(
+        f"/api/v1/configurations/{configuration.id}/versions",
+        json={"version": "v1.1.0", "payload": model_body(temperature=0.9)},
+    )
+    assert live.status_code == 201, live.text
+    await draft(
+        admin_client, configuration.id, version="v1.2.0", payload=model_body(temperature=1.7)
+    )
+
+    rolled = await admin_client.post(
+        f"/api/v1/configurations/{configuration.id}/rollback", json={}
+    )
+
+    assert rolled.status_code == 200, rolled.text
+    body = await admin_client.get(
+        f"/api/v1/configurations/{configuration.id}/versions/{rolled.json()['version']['version']}"
+    )
+    assert body.json()["payload"]["temperature"] == 0.2, "v1.0.0's body, not the draft's"
+
+
 async def test_a_version_cut_without_a_label_steps_over_a_draft(
     admin_client, factory, workspace
 ):

@@ -1212,6 +1212,11 @@ def _read(
     avg = average_score(dict(scores))
     baseline_avg = average_score(metric_values(baseline.scores)) if baseline else None
     delta = None if avg is None or baseline_avg is None else round(avg - baseline_avg, 4)
+    # A failed run judged nothing. The supervisor zeroes the column when it fails
+    # a run itself, but a run the stale-run sweep failed for it (restart,
+    # timeout) is left holding its dataset's size, which the table would show as
+    # cases run.
+    failed = run.status == EvaluationStatus.FAILED.value
     return EvaluationRead(
         id=run.id,
         name=run.name,
@@ -1221,7 +1226,7 @@ def _read(
         dataset=run.dataset_ref,
         judge_model=run.judge_model,
         status=EvaluationStatus(run.status),
-        cases=run.case_count,
+        cases=0 if failed else run.case_count,
         correctness=scores.get("correctness"),
         grounding=scores.get("grounding"),
         faithfulness=scores.get("faithfulness"),
@@ -1377,7 +1382,7 @@ async def get_detail(
     # registrations.
     terminal = run.status in TERMINAL_STATUSES
     state = None if terminal else supervisor.progress(evaluation_id)
-    scored = run.case_count if terminal else (state.scored if state is not None else 0)
+    scored = record.cases if terminal else (state.scored if state is not None else 0)
 
     async def _live_scores() -> dict[str, float]:
         if terminal or not run.engine_experiment_id:

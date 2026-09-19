@@ -21,6 +21,7 @@ from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..core import ratelimit
+from ..core.config import settings
 from ..core.errors import PermissionDenied, Unauthenticated
 from ..core.security import (
     SessionTokenError,
@@ -111,6 +112,46 @@ async def _note_key_used(session: AsyncSession, key: ApiKey, request: Request) -
         last_used_at=now,
         last_used_ip=request.client.host if request.client else None,
     )
+
+
+#: Routes any live key may call whatever it carries: they say who the key is and
+#: nothing about the workspace, and an SDK calls them to verify its credential.
+KEY_SELF_ROUTES = frozenset({"/auth/session", "/auth/me", "/auth/status"})
+
+
+def _scope_needed(request: Request) -> str | None:
+    """The scope an API key must carry for this request; ``None`` when any key may.
+
+    Scopes used to be checked in two places, both of them ``ingest``. Nothing
+    ever asked for ``read``, so it opened nothing and its absence closed
+    nothing: a key minted with ``ingest`` alone -- the least-privilege credential
+    that gets baked into a customer-side agent container -- still authenticated
+    as a member and could list every agent's runs, read their prompts and
+    outputs, and make member-level writes. The mint dialog says otherwise
+    ("ingest writes telemetry, read queries it"), and an operator is entitled to
+    believe it.
+
+    The rule is stated once, here, so that a route added later is covered
+    without its author remembering to ask. Reporting -- the ingest API, the
+    OpenTelemetry receiver and the SDK's feedback submission -- needs
+    ``ingest``. Everything else needs ``read``, writes included: the role a key
+    maps to still decides *which* writes, and the SDK's dataset and evaluation
+    calls are made with the default ``ingest`` + ``read`` key, so asking for
+    more than ``read`` there would break the documented set-up. ``admin``
+    implies both, as it always has.
+    """
+    path = request.url.path
+    prefix = settings.api_prefix.rstrip("/")
+    relative = path[len(prefix) :] if path.startswith(f"{prefix}/") else path
+    relative = relative.rstrip("/")
+
+    if relative in KEY_SELF_ROUTES:
+        return None
+    if relative == "/ingest" or relative.startswith("/ingest/") or relative == "/v1/traces":
+        return "ingest"
+    if request.method == "POST" and relative == "/feedback":
+        return "ingest"
+    return "read"
 
 
 async def _principal_from_api_key(
@@ -220,6 +261,11 @@ async def get_principal(
         if principal is not None:
             request.state.principal = principal
             ratelimit.check(principal.api_key_id or "api-key", request.url.path)
+            # After the limiter, so a key hammering a door that is closed to it
+            # is still counted.
+            needed = _scope_needed(request)
+            if needed is not None:
+                principal.require_scope(needed)
             return principal
 
     token = bearer or request.cookies.get(SESSION_COOKIE) or ""

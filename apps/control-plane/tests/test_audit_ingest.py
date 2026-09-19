@@ -20,6 +20,7 @@ from conftest import APP_BASE_URL, error_code
 from fulcrum_ops_api.core.config import settings
 from fulcrum_ops_api.db.base import new_id
 from fulcrum_ops_api.models.governance import Policy, PolicyEnforcement, PolicyStatus
+from fulcrum_ops_api.models.identity import ApiKey
 from fulcrum_ops_api.models.operations import (
     Alert,
     LimitScope,
@@ -497,11 +498,26 @@ async def test_a_masked_run_keeps_everything_but_what_the_guardrail_found(
 # ===========================================================================
 
 
+async def key_seen_a_moment_ago(db, ingest_key) -> None:
+    """Leave the request nothing to write before it reaches the store.
+
+    A key is noted as used at most once a minute, and the first note is an
+    UPDATE the request holds open until it commits. SQLite has one writer, so
+    the "other worker" these tests run in the middle of the round trip would
+    queue behind it; Postgres locks the key's row and nothing else.
+    """
+    _token, key = ingest_key
+    await db.execute(
+        update(ApiKey).where(ApiKey.id == key.id).values(last_used_at=dt.datetime.now(dt.UTC))
+    )
+
+
 async def test_usage_another_worker_counted_meanwhile_is_not_overwritten(
-    ingest_client, factory, workspace, engine, db
+    ingest_client, ingest_key, factory, workspace, engine, db
 ):
     """The counter was read before the store round trip and written back after it."""
     await factory.provisioned_agent(workspace, engine, name="Support Bot")
+    await key_seen_a_moment_ago(db, ingest_key)
     quota = await factory.quota(
         workspace, resource=QuotaResource.REQUESTS.value, limit_value=1_000_000, used_value=900
     )
@@ -526,10 +542,11 @@ async def test_usage_another_worker_counted_meanwhile_is_not_overwritten(
 
 
 async def test_a_quota_somebody_disabled_meanwhile_is_not_switched_back_on(
-    ingest_client, factory, workspace, engine, db
+    ingest_client, ingest_key, factory, workspace, engine, db
 ):
     """The status was written from what the request had loaded before the round trip."""
     await factory.provisioned_agent(workspace, engine, name="Support Bot")
+    await key_seen_a_moment_ago(db, ingest_key)
     quota = await factory.quota(
         workspace, resource=QuotaResource.REQUESTS.value, limit_value=100, used_value=60
     )
