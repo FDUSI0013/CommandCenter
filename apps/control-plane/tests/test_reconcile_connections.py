@@ -12,9 +12,11 @@ from __future__ import annotations
 import socket
 
 import pytest
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 
-from fulcrum_ops_api.models.registry import Connection, ConnectionActivity, Platform
+from fulcrum_ops_api.models.operations import Alert
+from fulcrum_ops_api.models.registry import Agent, Connection, ConnectionActivity, Platform
+from fulcrum_ops_api.services import connections as service
 
 
 def _free_port() -> int:
@@ -235,3 +237,130 @@ async def test_test_all_reads_every_such_platform_tile_with_one_count_and_skips_
     assert [(row["name"][0], row["status"]) for row in body["results"]] == [
         ("A", "Connected"), ("B", "Connected"), ("C", "Warning"), ("D", "Disconnected"),
     ]
+
+
+# ---------------------------------------------------------------------------
+# A tile that falls over says so on the alert board
+# ---------------------------------------------------------------------------
+
+
+async def _connection_alerts(db, workspace) -> list[Alert]:
+    return list(
+        await db.scalars(
+            select(Alert)
+            .where(Alert.workspace_id == workspace.id, Alert.source == "Hosting & Deployment")
+            .order_by(Alert.raised_at.asc(), Alert.alert_ref.asc())
+        )
+    )
+
+
+async def test_a_tile_going_down_or_degraded_raises_an_alert_once(
+    admin_client, db, factory, workspace, engine
+):
+    """The registry verdict moves the tile without a socket, so the walk is exact."""
+    agent = await factory.provisioned_agent(workspace, engine, name="Orders Bot")
+    tile = await _connection(admin_client, name="SDK agents", kind=CUSTOM_AGENT)
+
+    healthy = (await admin_client.post(f"/api/v1/connections/{tile['id']}/test")).json()
+    assert healthy["data"]["status"] == "Connected"
+    assert await _connection_alerts(db, workspace) == [], "coming up is not news"
+
+    # Its telemetry project goes away: registered, reporting nothing.
+    await db.execute(update(Agent).where(Agent.id == agent.id).values(engine_project_id=None))
+    degraded = (await admin_client.post(f"/api/v1/connections/{tile['id']}/test")).json()
+    assert degraded["data"]["status"] == "Warning"
+
+    raised = await _connection_alerts(db, workspace)
+    assert [(row.severity, row.title) for row in raised] == [
+        ("Medium", "Connection degraded: SDK agents")
+    ], "the tile degraded between two looks at it and nothing was raised"
+    assert raised[0].dedupe_key == f"connection:{tile['id']}:Warning"
+    assert (raised[0].source_entity_type, raised[0].source_entity_id) == (
+        "connection",
+        tile["id"],
+    ), "the alert has to deep-link back to the tile that raised it"
+
+    # And then the agent itself goes: nothing left on the platform at all.
+    await db.execute(delete(Agent).where(Agent.id == agent.id))
+    down = (await admin_client.post(f"/api/v1/connections/{tile['id']}/test")).json()
+    assert down["data"]["status"] == "Disconnected"
+    assert [row.severity for row in await _connection_alerts(db, workspace)] == [
+        "Medium",
+        "Critical",
+    ]
+
+    # Staying down is not a transition, and an operator who resolved the first
+    # one must not have it reopened by the next Test All.
+    await db.execute(update(Alert).values(status="Resolved"))
+    await admin_client.post(f"/api/v1/connections/{tile['id']}/test")
+    await admin_client.post("/api/v1/connections/test-all")
+    assert len(await _connection_alerts(db, workspace)) == 2, (
+        "a tile that was already down raised the same alert again on every probe"
+    )
+
+
+async def test_a_sync_that_finds_the_endpoint_gone_raises_the_alert_too(
+    admin_client, db, workspace
+):
+    """Sync is the probe nobody is watching, so it is the one that has to speak."""
+    port = _free_port()
+    tile = await _connection(
+        admin_client, name="Warehouse REST", config={"endpoint_url": f"http://127.0.0.1:{port}/"}
+    )
+    # Connected is the state a sync is allowed from; a test cannot reach the
+    # closed port, so the tile is put there the way the seed data puts it there.
+    await db.execute(
+        update(Connection)
+        .where(Connection.id == tile["id"])
+        .values(status="Connected", health="Healthy")
+    )
+
+    synced = await admin_client.post(f"/api/v1/connections/{tile['id']}/sync")
+
+    assert synced.status_code == 200, synced.text
+    assert synced.json()["ok"] is False
+    raised = await _connection_alerts(db, workspace)
+    assert [(row.severity, row.title) for row in raised] == [
+        ("Critical", "Connection down: Warehouse REST")
+    ], "a scheduled sync found the integration gone and told nobody"
+    assert "Connected to Disconnected" in (raised[0].description or "")
+
+
+# ---------------------------------------------------------------------------
+# The metadata address behind a name
+# ---------------------------------------------------------------------------
+
+
+async def test_a_host_name_that_resolves_to_the_metadata_address_is_refused(
+    admin_client, monkeypatch
+):
+    """DNS is stood in for: no name can be relied on to answer 169.254.169.254."""
+    answers = {"metadata.example.test": ["169.254.169.254"], "erp.example.test": ["10.0.4.12"]}
+
+    async def resolver(host: str, port: int) -> list[str]:
+        return answers.get(host, [])
+
+    monkeypatch.setattr(service, "_resolve", resolver)
+
+    metadata = await _connection(
+        admin_client,
+        name="Metadata by name",
+        config={"endpoint_url": "http://metadata.example.test/latest/meta-data/"},
+    )
+
+    tested = (await admin_client.post(f"/api/v1/connections/{metadata['id']}/test")).json()
+
+    assert tested["ok"] is False
+    assert tested["data"]["detail"] == (
+        "Endpoint is, or redirects to, a link-local (instance metadata) address"
+    ), "a DNS record in front of the metadata address walked through the literal check"
+
+    # A name for an ordinary host on the same network is still called: private
+    # ranges are deliberately allowed, and only the metadata range is not.
+    internal = await _connection(
+        admin_client,
+        name="Internal MCP",
+        config={"endpoint_url": "http://erp.example.test:8080/health"},
+    )
+    answered = (await admin_client.post(f"/api/v1/connections/{internal['id']}/test")).json()
+    assert "link-local" not in answered["data"]["detail"], answered["data"]["detail"]

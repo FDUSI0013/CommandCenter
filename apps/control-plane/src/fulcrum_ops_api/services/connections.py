@@ -19,7 +19,9 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import datetime as dt
+import ipaddress
 import re
+import socket
 import time
 from collections.abc import Sequence
 from typing import Any, Final
@@ -38,6 +40,7 @@ from ..core.ttlcache import SingleFlightCache
 from ..db.base import stamp
 from ..engine import EngineError, get_engine_client
 from ..models.identity import Role
+from ..models.operations import AlertSeverity
 from ..models.registry import (
     Agent,
     Connection,
@@ -62,7 +65,7 @@ from ..schemas.connections import (
     ConnectionUpdate,
     is_link_local_host,
 )
-from . import audit
+from . import alerts, audit
 from . import metrics as telemetry
 
 SOURCE_SCREEN: Final[str] = "Hosting & Deployment"
@@ -153,11 +156,58 @@ class _RefusedTarget(Exception):
     """The probe was pointed, directly or by a redirect, somewhere it will not go."""
 
 
+def _is_address_literal(host: str | None) -> bool:
+    """True when ``host`` is already a number, so there is nothing to look up."""
+    try:
+        ipaddress.ip_address((host or "").strip("[]"))
+    except ValueError:
+        return False
+    return True
+
+
+async def _resolve(host: str, port: int) -> list[str]:
+    """The addresses ``host`` answers with, or none when it does not resolve.
+
+    Its own function because it is the one thing here a test cannot arrange:
+    no name that can be relied on to answer with a link-local address exists to
+    point a test at, and asking the real DNS for one would be a call out of the
+    suite. A name that does not resolve is not this check's business -- the
+    transport is about to fail on it and will say so in the operator's words.
+    """
+    try:
+        found = await asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except (OSError, UnicodeError):
+        return []
+    # sockaddr[0] may carry a zone ("fe80::1%eth0"); the address is the part before it.
+    return [str(info[4][0]).partition("%")[0] for info in found]
+
+
 async def _refuse_link_local(request: httpx.Request) -> None:
     # Runs for every hop, so an outside URL that redirects to the instance
     # metadata address is refused just as the address itself is on write.
-    if is_link_local_host(request.url.host):
-        raise _RefusedTarget(request.url.host)
+    host = request.url.host
+    if is_link_local_host(host):
+        raise _RefusedTarget(host)
+    if _is_address_literal(host):
+        return
+    # A *name* is the same address with a DNS record in front of it. The check
+    # above only parses, so "metadata.google.internal" -- or any name an
+    # operator can point at 169.254.169.254 -- walked straight through the one
+    # thing this probe refuses. Only the metadata range is looked for: a name
+    # for a host on the same network stays an ordinary thing to connect, as a
+    # private address literal is.
+    #
+    # This closes the name. It does not close a resolver that answers with a
+    # public address here and the metadata address on the second lookup the
+    # transport makes: pinning the connection to the address vetted here is
+    # what would, and that costs the redirect and virtual-host handling this
+    # probe gets from the library. Deliberately not paid for yet.
+    port = request.url.port or (443 if request.url.scheme == "https" else 80)
+    # The ASCII form: what the transport is about to ask DNS for. Asking for the
+    # unicode one would be asking about a different name.
+    asked = request.url.raw_host.decode("ascii")
+    if any(is_link_local_host(found) for found in await _resolve(asked, port)):
+        raise _RefusedTarget(host)
 
 
 def _probe_client() -> httpx.AsyncClient:
@@ -288,6 +338,60 @@ def _activity_row(
     )
 
 
+#: What a tile *entering* each status is worth raising. Connected is absent:
+#: coming back up is good news, and the alert it answers is closed by whoever
+#: triages it, not silently by the next probe.
+_ALERT_SEVERITY: Final[dict[ConnectionStatus, AlertSeverity]] = {
+    ConnectionStatus.DISCONNECTED: AlertSeverity.CRITICAL,
+    ConnectionStatus.WARNING: AlertSeverity.MEDIUM,
+}
+
+
+async def _alert_on_status_change(
+    session: AsyncSession,
+    connection: Connection,
+    *,
+    was: str,
+    status: ConnectionStatus,
+    detail: str,
+) -> None:
+    """Raise the alert for a tile that has just *entered* Disconnected or Warning.
+
+    Nobody sits watching the Connection Center. An integration falls over
+    between two looks at it and the only trace is a feed row under a tile that
+    nobody has open, so the screen that noticed says so on the alert board, the
+    way Deployments and Quota do.
+
+    Only the transition is news. A tile that was already down and is tested
+    again has not changed: the dedupe key would collapse that raise while the
+    alert is live, but not once a triager has resolved it, and an alert that
+    reopens itself on every Test All is how an alert board stops being read.
+    """
+    severity = _ALERT_SEVERITY.get(status)
+    if severity is None or was == status.value:
+        return
+    down = status is ConnectionStatus.DISCONNECTED
+    await alerts.raise_alert(
+        session,
+        workspace_id=connection.workspace_id,
+        title=(
+            f"Connection down: {connection.name}"
+            if down
+            else f"Connection degraded: {connection.name}"
+        ),
+        description=(
+            f"The {connection.kind} integration '{connection.name}' went from {was} to "
+            f"{status.value}: {detail}."
+        ),
+        source=SOURCE_SCREEN,
+        severity=severity,
+        dedupe_key=f"connection:{connection.id}:{status.value}",
+        source_entity_type=ENTITY_TYPE,
+        source_entity_id=connection.id,
+        metadata={"kind": connection.kind, "from": was, "to": status.value, "detail": detail},
+    )
+
+
 #: The three vocabularies one test result is rendered in.
 _Verdict = tuple[ConnectionStatus, HealthState, ActivityStatus]
 
@@ -355,7 +459,7 @@ def _registry_reading(kind: str, registered: int, reporting: int) -> tuple[Probe
     )
 
 
-def _record_probe(
+async def _record_probe(
     session: AsyncSession,
     connection: Connection,
     probe: ProbeResult,
@@ -379,7 +483,8 @@ def _record_probe(
     as ``status_detail``. The one exception is a note the old probe itself left
     behind, which is cleared.
     """
-    was_connected = connection.status == ConnectionStatus.CONNECTED.value
+    was = connection.status
+    was_connected = was == ConnectionStatus.CONNECTED.value
     status, health, activity_status = verdict or _verdict(probe)
 
     connection.status = status.value
@@ -406,6 +511,9 @@ def _record_probe(
             details=probe.detail,
             occurred_at=dt.datetime.now(dt.UTC),
         )
+    )
+    await _alert_on_status_change(
+        session, connection, was=was, status=status, detail=probe.detail
     )
 
     return ConnectionTestOutcome(
@@ -441,6 +549,7 @@ async def _record_sync(
     now = dt.datetime.now(dt.UTC)
     agents = connection.linked_agent_count
     counted = f"{agents} agent(s) on this platform"
+    was = connection.status
 
     if probe is None:
         activity_status = ActivityStatus.SUCCESS
@@ -459,6 +568,11 @@ async def _record_sync(
             latency_ms=probe.latency_ms,
         )
         detail = f"{counted}, {probe.detail}"
+        # A sync is the other way a tile changes status, and it is the one that
+        # runs without anybody having asked to see the tile.
+        await _alert_on_status_change(
+            session, connection, was=was, status=status, detail=probe.detail
+        )
 
     synced = probe is None or probe.reachable
     syncs_today = connection.syncs_today
@@ -1051,7 +1165,7 @@ async def test_connection(
     if endpoint is None:
         counted = await _platform_agents(session, principal, {connection.kind})
         probe, verdict = _registry_reading(connection.kind, *counted.get(connection.kind, (0, 0)))
-        outcome = _record_probe(session, connection, probe, principal, verdict=verdict)
+        outcome = await _record_probe(session, connection, probe, principal, verdict=verdict)
     else:
         # The probe is a network wait of up to PROBE_TIMEOUT_SECONDS. End the read
         # transaction first so the pooled connection is not held, idle, across it;
@@ -1059,7 +1173,7 @@ async def test_connection(
         await session.commit()
         async with _probe_client() as client:
             probe = await _probe(client, endpoint)
-        outcome = _record_probe(session, connection, probe, principal)
+        outcome = await _record_probe(session, connection, probe, principal)
 
     await audit.record(
         session,
@@ -1162,10 +1276,12 @@ async def test_all(
         async with _probe_client() as client:
             probes = await asyncio.gather(*(_probe(client, url) for _, url in targets))
         for (connection, _), probe in zip(targets, probes, strict=True):
-            recorded[connection.id] = _record_probe(session, connection, probe, principal)
+            recorded[connection.id] = await _record_probe(
+                session, connection, probe, principal
+            )
     for connection in pushed:
         probe, verdict = _registry_reading(connection.kind, *counted.get(connection.kind, (0, 0)))
-        recorded[connection.id] = _record_probe(
+        recorded[connection.id] = await _record_probe(
             session, connection, probe, principal, verdict=verdict
         )
 

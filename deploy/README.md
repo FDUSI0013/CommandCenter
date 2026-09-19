@@ -131,6 +131,16 @@ and the file explains each where it is set:
 A 10 MB `request_body` ceiling sits just above the API's own 8 MiB ingest limit,
 for every route that has no limit of its own.
 
+The console's files are served `no-cache` — revalidate before reuse — because
+they have fixed names and a browser could otherwise run a previous deploy's
+JavaScript against this one's HTML. The exception is a URL carrying a build
+stamp: `publish-console.sh` rewrites the published `index.html` so each asset it
+references becomes `js/app.js?v=<digest>`, and the edge serves those with a
+year-long `immutable` max-age. Only `index.html` is then revalidated on a
+reload, and it is what hands out the new stamps after a deploy. Republishing
+without redeploying the Caddyfile is safe in either order: an unstamped URL
+still revalidates, and a stamped one is only ever produced by a publish.
+
 Check an edited file before it goes live — a typo is otherwise found by the
 reload failing on the production host:
 

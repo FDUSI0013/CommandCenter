@@ -181,6 +181,10 @@
     render(main){
       // `painted` is the alert the inspector last drew, kept so a repaint needs no request.
       let selectedId = null, selectedRow = null, painted = null;
+      /* The open-alert count as this screen last saw it, and a flag saying the
+         screen is already reading the queue for a change of its own. Both are
+         read by the badge subscription set up at the foot of render(). */
+      let lastOpenCount = Store.badges.alerts, selfRefreshing = true;
       const members = memberDirectory();
 
       /* The subtitle names only what raises an alert today: quota and budget
@@ -205,6 +209,10 @@
         host.innerHTML = kpiSkeleton(AL_KPIS);
         API.alerts.summary()
           .then(s => {
+            // The queue and the cards are now as fresh as this number: the badge
+            // subscription has nothing left to chase until it moves again.
+            lastOpenCount = s.open;
+            selfRefreshing = false;
             if(!document.getElementById('alKpis')) return;
             host.innerHTML = kpiRow([
               { label:'Open Alerts', value:fmtFull(s.open), icon:'bell', color:'red',
@@ -225,7 +233,11 @@
             ]);
             fillSources(s.sources || []);
           })
-          .catch(err => { host.innerHTML = ''; host.appendChild(screenError(err, loadSummary, 'the alert summary')); });
+          .catch(err => {
+            selfRefreshing = false;
+            host.innerHTML = '';
+            host.appendChild(screenError(err, loadSummary, 'the alert summary'));
+          });
       }
 
       /** The Source dropdown lists the screens that actually raised something. */
@@ -317,6 +329,10 @@
        * /approvals/summary reads.
        */
       function afterChange(){
+        // Tell the badge subscription this screen is already on it, so the
+        // badge refresh the mutation triggers does not read the same two
+        // endpoints a second time.
+        selfRefreshing = true;
         table.refresh();
         loadSummary();
       }
@@ -740,6 +756,20 @@
           },
         });
       }
+
+      /* The shell re-reads the sidebar counts every minute, on navigation and
+         when the tab comes back to the front. An alert raised by a sweep, or
+         triaged by somebody else, moves that count while this screen is up —
+         so the queue and the cards follow it rather than sitting on what they
+         loaded until the page is reloaded. Only a change is chased, and only
+         one this screen did not cause itself (see afterChange). */
+      this.cleanup = Store.on('badges', b => {
+        if(b.alerts === lastOpenCount) return;
+        lastOpenCount = b.alerts;
+        if(selfRefreshing) return;
+        table.refresh();
+        loadSummary();
+      });
     },
   };
 
@@ -1420,6 +1450,11 @@
     : s === 'Suspended' ? 'red' : s === 'Revoked' ? 'red' : 'gray';
   const planColor = (s) => s === 'Active' ? 'green' : s === 'Draft' ? 'amber' : 'gray';
   const invColor = (s) => s === 'Paid' ? 'green' : s === 'Overdue' ? 'red' : s === 'Issued' ? 'amber' : 'gray';
+  /* days_until_expiry counts down and then keeps going: a term that ran out a
+     fortnight ago reports -14, and the sweep moves the licence to Expired on
+     its next tick. "-14d" and "-14 days away" read as a date in the future to
+     nobody, so a term that has run out says so in words instead. */
+  const isLapsed = (d) => d != null && d < 0;
 
   const LI_TABS = ['Plans & Tiers','Tenants & Licenses','Seats & Assignments','Usage & Limits','Billing & Renewals','Audit Log'];
   const LI_DATASETS = ['plans','tenants','seats','usage','invoices'];
@@ -1726,7 +1761,8 @@
             { key:'runs', label:'Run Capacity', align:'right', cls:'num', sortable:false, render:r => num(r.included_runs) },
             { key:'status', label:'Status', render:r => statusText(r.status, licColor(r.status)) },
             { key:'expires_at', label:'Renewal', render:r => r.expires_at
-                ? `<span class="dim nowrap">${day(r.expires_at)}${r.days_until_expiry == null ? '' : ` · ${r.days_until_expiry}d`}</span>`
+                ? `<span class="dim nowrap">${day(r.expires_at)}${r.days_until_expiry == null ? ''
+                    : isLapsed(r.days_until_expiry) ? ' · lapsed' : ` · ${r.days_until_expiry}d`}</span>`
                 : '<span class="faint">no end date</span>' },
             { key:'manage', label:'', sortable:false, render:r => `<button class="btn sm" data-ten="${esc(r.id)}">Manage</button>` },
           ],
@@ -1863,7 +1899,9 @@
             ['Token Capacity', num(l.included_tokens)],
             ['Run Capacity', num(l.included_runs)],
             ['Term', `${day(l.starts_at)} → ${l.expires_at ? day(l.expires_at) : 'open-ended'}`],
-            ['Days to Renewal', l.days_until_expiry == null ? dash : String(l.days_until_expiry)],
+            ['Days to Renewal', l.days_until_expiry == null ? dash
+              : isLapsed(l.days_until_expiry) ? `<span class="st-red">lapsed ${Math.abs(l.days_until_expiry)} day(s) ago</span>`
+              : String(l.days_until_expiry)],
             ['Auto Renew', l.auto_renew ? badge('Yes','green') : badge('No','gray')],
             ['Billing Contact', l.billing_contact_email ? esc(l.billing_contact_email) : dash],
             ['Purchase Order', l.purchase_order_ref ? `<span class="mono">${esc(l.purchase_order_ref)}</span>` : dash],
@@ -2349,7 +2387,8 @@
             el.innerHTML = `<div class="grid g3">${rows.slice(0,3).map(l => `<div class="card">
                 <div class="small faint" style="font-weight:700">${esc(('Renewal — ' + (l.plan_name || l.tenant_name || 'Licence')).toUpperCase())}</div>
                 <div style="font-size:18px;font-weight:700;margin-top:4px">${day(l.expires_at)}</div>
-                <div class="small dim">${l.days_until_expiry == null ? '—' : `${l.days_until_expiry} days away`} · ${esc(l.status)}</div></div>`).join('')}</div>`;
+                <div class="small dim">${l.days_until_expiry == null ? '—'
+                  : isLapsed(l.days_until_expiry) ? 'lapsed' : `${l.days_until_expiry} days away`} · ${esc(l.status)}</div></div>`).join('')}</div>`;
           })
           .catch(err => {
             const el = document.getElementById('liRenew');

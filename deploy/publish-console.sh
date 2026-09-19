@@ -33,6 +33,38 @@ else
   cp -r "$SOURCE"/. "$DOCROOT"/
 fi
 
+# Stamp the PUBLISHED index.html — not the one in the repository. The console
+# has no build step, so its files keep fixed names (js/app.js, not
+# js/app.<hash>.js) and a browser cannot tell a cached copy from the current one
+# by URL. Appending ?v=<build> is what actually invalidates a cache; the edge
+# then serves the stamped URLs with a year-long max-age and index.html itself
+# with no-cache, so one revalidated page hands out the new stamps for everything
+# else. The control plane does the same rewrite in main.py when it is the one
+# serving the console, and the regex here is the same.
+#
+# The build id is a digest of what is being served, so it moves when an asset
+# changes and only then. A stamp that moved on every publish would throw a warm
+# cache away each deploy; one that did NOT move when a file did — a commit id
+# published from a dirty tree — would pin a year-long cache to stale JavaScript.
+# index.html is left out of the digest: it is the file being rewritten, and it
+# is always revalidated anyway.
+BUILD=""
+if command -v sha256sum >/dev/null 2>&1; then
+  BUILD="$(find "$DOCROOT" -type f ! -name index.html -print0 \
+             | sort -z | xargs -0 sha256sum | sha256sum | cut -c1-12)" || BUILD=""
+fi
+# No digest tool (or a sort without -z): fall back to a stamp that is at least
+# never wrong, only pessimistic — every publish looks like new assets.
+[ -n "$BUILD" ] || BUILD="$(date -u +%Y%m%d%H%M%S)"
+
+# Written through a temporary file rather than `sed -i`, which is GNU-only and
+# this also runs on a workstation. `[^"?]+` skips a URL that already carries a
+# query, so publishing twice cannot stamp twice.
+sed -E 's/((src|href)="(js|css)\/[^"?]+)"/\1?v='"$BUILD"'"/g' \
+  "$DOCROOT/index.html" > "$DOCROOT/index.html.stamping"
+mv "$DOCROOT/index.html.stamping" "$DOCROOT/index.html"
+echo "stamped the assets index.html references with ?v=$BUILD"
+
 echo "published $(find "$DOCROOT" -type f | wc -l) files to $DOCROOT"
 
 # Anything the repository no longer ships must no longer be served. This is the

@@ -1548,12 +1548,32 @@ async def _current_license(
 ) -> TenantLicense | None:
     """The single licence a workspace currently holds, if it holds one."""
     statuses = CURRENT_STATUSES if include_suspended else LIVE_STATUSES
+    where = [
+        TenantLicense.tenant_workspace_id == workspace_id,
+        TenantLicense.status.in_(statuses),
+    ]
+    if not include_suspended:
+        # Expired is written by the renewal sweep on the platform clock, so for
+        # up to one tick a term that has ended still reads Active or Trial.
+        # Entitlements are access, and access must not outlive the term: a row
+        # past its date that will not renew itself is not the current licence,
+        # whatever the stored status has not caught up to saying. A term with
+        # auto-renew on is still current -- the sweep rolls it forward, it does
+        # not expire it.
+        #
+        # The suspended-inclusive readers are deliberately left on the stored
+        # status: enforcement refuses and metering counts, and dropping the row
+        # out from under either would loosen the first and lose the second.
+        where.append(
+            or_(
+                TenantLicense.expires_at.is_(None),
+                TenantLicense.expires_at > _now(),
+                TenantLicense.auto_renew.is_(True),
+            )
+        )
     stmt = (
         select(TenantLicense)
-        .where(
-            TenantLicense.tenant_workspace_id == workspace_id,
-            TenantLicense.status.in_(statuses),
-        )
+        .where(*where)
         .order_by(TenantLicense.created_at.desc())
         .limit(1)
     )

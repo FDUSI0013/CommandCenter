@@ -45,7 +45,7 @@
     sourceRoute(source){
       // Legacy labels stay: alert rows raised before the screens were renamed still carry them.
       const map = { 'Connection Center':'connections','Hosting & Deployment':'connections','Quota, Cost & Capacity':'quota','Policy Center':'policies',
-        'Secrets & Credentials':'secrets','Testing & Regression':'testing','RAG & Knowledge Governance':'knowledge',
+        'Secrets & Credentials':'secrets','Testing & Regression':'testing','Testing & Regression Suite':'testing','RAG & Knowledge Governance':'knowledge',
         'Deployment & Environment':'deployments','Environments & Releases':'deployments','Live Runs':'live-runs','Agent Registry':'agents','Approvals & Audit':'approvals',
         'Guardrails':'guardrails','Metrics':'metrics','Evaluations':'evaluations','Configuration Center':'configurations',
         'Prompt Studio':'prompts','Prompt Manager':'prompts','Connector & MCP Governance':'connectors',

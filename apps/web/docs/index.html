@@ -479,8 +479,10 @@ with client.span("generate", type="llm") as span:
   <p class="note-t">Getting cost to resolve</p>
   <p>Cost is computed from <em>model plus provider</em>. If either is missing or spelled in a
   vocabulary the price table does not use, cost comes back zero. Azure-served OpenAI models want
-  provider <code>azure</code>, not <code>azure-openai</code>. A span with no open trace opens one
-  around itself, so a stray <code>client.span(...)</code> still produces a valid run.</p>
+  provider <code>azure</code>, not <code>azure-openai</code>, and the real model name rather than
+  a deployment alias — this is yours to get right on a hand-written span, while
+  <code>track_openai</code> (below) detects the Azure case for you. A span with no open trace opens
+  one around itself, so a stray <code>client.span(...)</code> still produces a valid run.</p>
 </div>
 
 <h2 id="sdk-scores">Scores and feedback</h2>
@@ -509,9 +511,15 @@ client.report_issue("Cites stale pricing", severity="High", trace_id=trace_id)</
 <strong>midpoint as neutral</strong> rather than positive: three out of five is not praise, and
 counting it as praise would flatter every quality report built on the signal.
 <code>report_issue()</code> is for the agent noticing its own failure — a retrieval that returned
-nothing, a tool that answered nonsense — rather than waiting for a person to complain; it raises a
-row on Feedback and Quality Loop with a severity of <code>Critical</code>, <code>High</code>,
-<code>Medium</code> or <code>Low</code>.</p>
+nothing, a tool that answered nonsense — rather than waiting for a person to complain. It travels
+as <strong>negative feedback</strong>: a <code>feedback.submitted</code> event with the source
+<em>Agent Response Rating</em>, which lands in the <strong>Feedback</strong> inbox on Feedback
+&amp; Quality Loop with the title leading the body and any <code>detail=</code> underneath it.
+<code>severity</code> is <code>Critical</code>, <code>High</code>, <code>Medium</code> or
+<code>Low</code> and is kept as structured metadata on the feedback row, so nobody has to read it
+back out of the sentence. It does <strong>not</strong> put a row on the <strong>Issues</strong>
+tab by itself — issues are raised from themes on that screen, from this feedback among the
+rest.</p>
 
 <h2 id="sdk-governance">Guardrails and policy violations</h2>
 
@@ -553,11 +561,28 @@ from anthropic import Anthropic
 from fulcrum_ops.integrations import track_openai, track_anthropic
 
 openai = track_openai(OpenAI())
-azure  = track_openai(AzureOpenAI(...))    # duck-typed, works the same
+azure  = track_openai(AzureOpenAI(...))    # reported under provider "azure"
 claude = track_anthropic(Anthropic())</code></pre>
 
+<p><strong>The provider is detected, because cost depends on it.</strong>
+<code>track_openai</code> reports provider <code>azure</code> for an <code>AzureOpenAI</code>
+client and for the plain client an Azure AI Foundry project hands back — it recognises the class
+name, and failing that an endpoint on <code>openai.azure.com</code>,
+<code>cognitiveservices.azure.com</code> or <code>services.ai.azure.com</code>. Everything else is
+<code>openai</code>. Pass <code>provider=</code> to override the detection when you are served from
+somewhere it cannot see.</p>
+
+<p>Pass <code>model=</code> when neither the call nor the response names a model, which is the case
+for a Foundry agent addressed by <code>agent_reference</code>; it is used only as the fallback, so
+a response that does name its model still wins:</p>
+
+<pre><code>openai = track_openai(project_client.get_openai_client(), model="gpt-5")
+openai.responses.create(input=[...], extra_body={"agent_reference": {...}})</code></pre>
+
 <p>Streaming responses keep the span open until the stream is exhausted, so a streamed answer is
-timed correctly rather than closing at first token. For LangChain, use the callback handler:</p>
+timed correctly rather than closing at first token. For LangChain, use the callback handler, which
+takes the provider from LangChain's own <code>ls_provider</code> and files
+<code>azure-openai</code> under <code>azure</code> for the same reason:</p>
 
 <pre><code>from fulcrum_ops.integrations import FulcrumOpsCallbackHandler
 
@@ -1293,7 +1318,7 @@ browser session with a 403.</p>
 <tbody>
 <tr><td>Agent runs, nothing appears in Live Runs</td><td>Check <code>client.stats()</code>. A non-zero <code>rejected</code> count with <code>agent_unprovisioned</code> means the agent name does not exist in the workspace, or your key is bound to a different agent. Register and activate the agent, or rebind the key.</td></tr>
 <tr><td>Everything is silently not reported</td><td>No <code>FULCRUM_OPS_API_KEY</code>. The SDK disables itself by design and your functions still run. Check <code>/health</code> on your agent or print <code>client.enabled</code>.</td></tr>
-<tr><td>Cost shows <code>$0.00</code> but tokens are right</td><td>The price table is keyed on <em>model plus provider</em>. Report the real model (not a deployment alias) and the provider vocabulary the table uses — <code>azure</code> for Azure-served OpenAI models, not <code>azure-openai</code>.</td></tr>
+<tr><td>Cost shows <code>$0.00</code> but tokens are right</td><td>The price table is keyed on <em>model plus provider</em>. Report the real model (not a deployment alias) and the provider vocabulary the table uses — <code>azure</code> for Azure-served OpenAI models, not <code>azure-openai</code>. On a hand-written span that is yours to set; <code>track_openai</code> detects it from the client, and a Foundry agent that names no model needs <code>model=</code> on the wrapper.</td></tr>
 <tr><td>A telemetry screen shows <code>telemetry_unavailable</code></td><td>The engine is unreachable. Governance screens keep working. Check the engine container and <code>/health</code>, which reports <code>"telemetry": false</code> when the adapter cannot reach it.</td></tr>
 <tr><td>A number is a dash</td><td>Not an error. It means nothing was measured for that window. Zero would be a claim the platform is not entitled to make.</td></tr>
 <tr><td>Guardrail event rejected as malformed</td><td><code>matched</code> must be a mapping of label to count, not a list. <code>action_taken</code> must be <code>Warn</code>, <code>Block</code>, <code>Mask</code> or <code>Log</code> (casing and variants like <code>Warned</code> are normalised; there is no <code>Passed</code>).</td></tr>

@@ -330,6 +330,11 @@
       get: (id, params, opts) => get(`/agents/${encodeURIComponent(id)}`, params, opts),
       runs: (id, params) => get('/runs', Object.assign({ agent_id: id }, params || {})),
       versions: (id) => get(`/agents/${encodeURIComponent(id)}/versions`),
+      /** One version with its COMPLETE prompt body, by commit id or version
+       *  label. The list carries a preview only, so the Create New Version
+       *  editor must load from here — committing what the preview showed would
+       *  silently truncate the prompt at the preview's cut-off. */
+      version: (id, commit) => get(`/agents/${encodeURIComponent(id)}/versions/${encodeURIComponent(commit)}`),
       /** Commit a new prompt version from the Agent Detail configuration tab. */
       createVersion: (id, body) => post(`/agents/${encodeURIComponent(id)}/versions`, body),
       /** Members who may own an agent — the New/Edit Agent owner picker. Those

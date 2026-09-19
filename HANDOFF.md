@@ -150,25 +150,28 @@ Do not merely call endpoints. Drive the console and confirm the loop closes:
 Every place it is wrong, incomplete, or assumes knowledge you do not have is a
 documentation bug — fix it, regenerate both formats, and republish.
 
-Two such bugs were found by the 2026-09-18 audit and are **not yet fixed in the
-master** (nor in its served copy, `apps/web/docs/index.html`). The SDK and
-`sdks/python/README.md` are already right; the guide has to catch up with them:
+Two such bugs were found by the 2026-09-18 audit. **Both are fixed in the master
+as of 2026-09-19**, and `build-docx.js` has been re-run, so the .docx and the
+served copy (`apps/web/docs/index.html`) carry the correction too. What the
+guide now says, matching the SDK and `sdks/python/README.md`:
 
-- **`report_issue()`** ("Scores and feedback"). The guide says it "raises a row
-  on Feedback and Quality Loop". What it does: it is delivered as negative
+- **`report_issue()`** ("Scores and feedback"). It is delivered as negative
   feedback (`feedback.submitted`, source *Agent Response Rating*) and appears in
   the Feedback inbox with the title leading the body. It does not create a row
-  on Feedback > Issues by itself.
-- **`track_openai`** ("Getting cost to resolve" and "Provider wrappers"). The
-  guide calls the Azure client "duck-typed, works the same". Say instead that it
-  reports provider `azure` for an `AzureOpenAI` or Azure AI Foundry client
-  (overridable with `provider=`), and that `model=` is the fallback for calls
-  that name no model, as with a Foundry agent addressed by `agent_reference`.
+  on Feedback > Issues by itself — issues are raised from themes on that screen.
+  The guide previously claimed it "raises a row on Feedback and Quality Loop".
+- **`track_openai`** ("Getting cost to resolve", "Provider wrappers" and the
+  cost row in Troubleshooting). It reports provider `azure` for an `AzureOpenAI`
+  client or an Azure AI Foundry endpoint (overridable with `provider=`), and
+  `model=` is the fallback for calls that name no model, as with a Foundry agent
+  addressed by `agent_reference`. The guide previously called the Azure client
+  "duck-typed, works the same", which left the reader to set the provider.
 
-One check behind the second bullet is still owed, because nobody could reach the
-engine while the fix was written: post a `gpt-4o` span with provider `openai`
-and one with provider `azure`, see which the engine prices, and make the guide
-and the SDK agree with what you observe.
+One check behind the second bullet is **still owed**, because nobody could reach
+the engine while any of this was written: post a `gpt-4o` span with provider
+`openai` and one with provider `azure`, see which the engine prices, and make
+the guide and the SDK agree with what you observe. Until that is done, both are
+stating what the SDK sends, not what the price table was seen to accept.
 
 ### 4. Close the three Red risks
 

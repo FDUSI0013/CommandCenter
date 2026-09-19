@@ -176,6 +176,31 @@ through a provider wrapper — when nothing is in scope: the trace opened to hol
 the span carries its input, output, metadata, tags and start time, and is in
 scope for whatever the body calls.
 
+### Conversations: `threadId`
+
+Runs that share a `threadId` are one session. The Sessions, Conversation State
+and Memory views are built from threads, so an agent that never names one shows
+runs and no sessions. `traced()` runs once, when the wrapper is built, which
+makes a string there the same thread for every call — pass a function, which is
+given the call's own arguments and `this`, or name the thread from inside once
+the code knows it:
+
+```ts
+const getInsight = traced(
+  async function getInsight(email: Email) { … },
+  { type: 'llm', threadId: (email) => email.conversationId },
+);
+
+const handle = traced(function handle(payload: Payload): string {
+  fulcrum.currentTrace()?.setThreadId(parse(payload).conversationId);
+  …
+});
+```
+
+The wrapped function keeps its own name and arity either way. A `threadId`
+function that throws costs that run its thread, never the call. An inner
+traced step that can name the thread gives it to a run that has none.
+
 ### Ids
 
 Ids are minted for you as version 7 UUIDs. Supply your own (`id`) only to make

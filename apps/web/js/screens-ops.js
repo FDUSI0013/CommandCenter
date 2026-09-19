@@ -118,6 +118,18 @@
   }
 
   /* ================= QUOTA, COST & CAPACITY ================= */
+
+  /* The three dimensions something actually counts: ingest meters Tokens and
+     Requests as batches land, and the cost sweep meters Cost. Concurrency and
+     Storage are in the resource vocabulary — and stay in the table's filter, so
+     a quota already written against one can be found and removed — but nothing
+     reports them, so a new one would sit at 0% for ever looking enforced. The
+     Create form offers only what is measured. */
+  const METERED_RESOURCES = ['Tokens','Requests','Cost'];
+  /* The unit a limit is written in. It is the noun quoted back in the quota's
+     chip, its breach alert and the audit row, so it has to be the resource's own. */
+  const RESOURCE_UNIT = { Tokens:'tokens', Requests:'requests', Cost:'USD' };
+
   SCREENS['quota'] = {
     title:'Quota, Cost & Capacity',
     render(main){
@@ -378,7 +390,7 @@
           body:`<label class="auth-field"><span>Name</span><input type="text" id="cqName" placeholder="Production token ceiling"></label>
             <div class="grid g2" style="margin-top:10px">
               <label class="auth-field"><span>Resource</span><select class="filter-select" id="cqResource" style="height:34px">
-                ${['Tokens','Requests','Cost','Concurrency','Storage'].map(o=>`<option>${o}</option>`).join('')}</select></label>
+                ${METERED_RESOURCES.map(o=>`<option>${o}</option>`).join('')}</select></label>
               <label class="auth-field"><span>Scope</span><select class="filter-select" id="cqScope" style="height:34px">
                 ${['Workspace','Agent','Team','Environment'].map(o=>`<option>${o}</option>`).join('')}</select></label>
             </div>
@@ -405,11 +417,15 @@
                 toast('error','Scope target required', `Name the ${scope.toLowerCase()} this quota applies to.`);
                 return;
               }
+              const resource = modal.querySelector('#cqResource').value;
               const payload = {
                 name: modal.querySelector('#cqName').value.trim(),
-                resource: modal.querySelector('#cqResource').value,
+                resource,
                 scope,
                 limit_value: Number(modal.querySelector('#cqLimit').value),
+                // Left out, the server writes "tokens" whatever the resource is — so a
+                // $5,000 ceiling read back, and alerted, as "5K tokens".
+                unit: RESOURCE_UNIT[resource] || 'units',
                 period: modal.querySelector('#cqPeriod').value,
                 enforcement: modal.querySelector('#cqEnf').value,
               };
@@ -621,7 +637,10 @@
           }
           e.currentTarget.disabled = true;
           try {
-            const res = await API.quota.refreshBudgets();
+            // Re-measuring is what raises a budget's threshold alert, so it goes
+            // through Store.mutate: the sidebar's Alerts badge is re-read as soon
+            // as the pass lands, instead of on the app shell's next timer tick.
+            const res = await Store.mutate(() => API.quota.refreshBudgets(), { event:'alerts:changed' });
             toast('success','Budgets re-measured', res && res.message ? res.message : 'Spend re-read and thresholds re-evaluated.');
             table.refresh(); loadKpis();
           } catch (err) { toast('error','Could not re-measure', err.message); }
@@ -1779,9 +1798,70 @@
           rowId:'id', itemName:'approval requests', pageSize:10,
           emptyText:'No deployment approvals raised',
           source: (p) => API.deployments.approvals(p),
-          rowActions: r => [{label:'Open in Approvals & Audit', icon:'stamp', onClick:()=>APP.go('approvals')}],
+          rowActions: r => {
+            /* Deciding here and deciding in Approvals & Audit are the same write —
+               both close the request and move the release's gate — so the decision
+               is offered on the row rather than only as a link away from the screen.
+               It is offered only where the server would take it: the request still
+               open, a release named in its payload, and not one this person started
+               (four eyes — the starter is answered 403 in either screen). */
+            const deploymentId = (r.payload || {}).deployment_id;
+            const mine = r.requested_by_user_id && r.requested_by_user_id === (Store.session.user || {}).id;
+            const actions = [];
+            if(r.is_open && deploymentId && !mine){
+              actions.push({label:'Approve', icon:'checkCircle', onClick:()=>decideRequest(r, true)});
+              actions.push({label:'Reject', icon:'xCircle', danger:true, onClick:()=>decideRequest(r, false)});
+            }
+            actions.push({label:'Open in Approvals & Audit', icon:'stamp', onClick:()=>APP.go('approvals')});
+            return actions;
+          },
         });
         body.appendChild(table.el);
+      }
+
+      /** Decide a queued gate from the Approvals tab, on the release its payload names. */
+      function decideRequest(r, approved){
+        if(!Store.session.can('approver')){
+          toast('error','Not permitted', `${approved ? 'Approving' : 'Rejecting'} a release requires the approver role.`);
+          return;
+        }
+        const ref = (r.payload || {}).deployment_ref || r.request_ref;
+        openModal({
+          title:`${approved ? 'Approve' : 'Reject'} ${r.request_ref}`, icon: approved ? 'checkCircle' : 'xCircle',
+          body:`<div class="small muted" style="margin-bottom:10px">${esc(r.action_detail || r.action)}${r.resource ? ' — ' + esc(r.resource) : ''}. ${approved
+              ? `Approving lets ${esc(ref)} continue to Deploy.`
+              : `Rejecting halts ${esc(ref)} and frees the environment.`}</div>
+            <label class="auth-field"><span>${approved ? 'Note' : 'Reason (required)'}</span>
+              <input type="text" id="daNote" maxlength="1000" placeholder="${approved ? 'Recorded with the decision (optional)' : 'Why is this being refused?'}"></label>`,
+          footer:[
+            {label: approved ? 'Approve' : 'Reject', cls: approved ? 'primary' : 'danger', onClick: async (close, modal) => {
+              const note = modal.querySelector('#daNote').value.trim();
+              // A refusal is quoted verbatim in the audit trail, so it is never blank.
+              if(!approved && !note){
+                toast('error','A reason is required','A rejection is recorded with the reason it was refused.');
+                return;
+              }
+              close();
+              try {
+                // Through Store.mutate: the queue this row came from lives on another
+                // screen, and the sidebar's Approvals badge has just gone down by one.
+                const res = await Store.mutate(
+                  () => API.deployments.approve(r.payload.deployment_id, { approved, note: note || null }),
+                  { event:'approvals:changed' });
+                toast('success', approved ? 'Approved' : 'Rejected',
+                  res && res.message ? res.message : `${ref} ${approved ? 'approved' : 'rejected'}.`);
+              } catch (err) {
+                // 403 is the four-eyes refusal; 409 that it was already decided in
+                // Approvals & Audit. Both say what happened and read as written.
+                toast('error', approved ? 'Could not approve' : 'Could not reject', err.message);
+              }
+              // Either way the row has moved, or someone else moved it.
+              if(table) table.refresh();
+              loadKpis();
+            }},
+            {label:'Cancel'},
+          ],
+        });
       }
 
       async function createDeployment(){

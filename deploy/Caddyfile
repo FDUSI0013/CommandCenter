@@ -128,10 +128,28 @@
 	# a previous deployment's JavaScript against this deployment's HTML, which
 	# fails in ways that look like the app is simply broken. "no-cache" means
 	# revalidate before reuse, not "do not store": an unchanged file still costs
-	# one conditional request answered with 304.
+	# one conditional request answered with 304 — unless its URL carries a build
+	# stamp, which is the exception set up inside the block below.
 	handle {
 		root * /srv/fulcrum-ops
 		header Cache-Control "no-cache"
+
+		# The exception, and the reason the console is not condemned to 14
+		# conditional requests per load: deploy/publish-console.sh rewrites the
+		# PUBLISHED index.html so every asset it references carries
+		# ?v=<digest of the published assets>. Such a URL names one build's file
+		# and nothing else, so it is safe to keep for a year — the next deploy
+		# that changes an asset changes the digest, and therefore the URL.
+		#
+		# index.html itself is never stamped and keeps the "no-cache" above: it
+		# is the single revalidated request that hands out the new URLs. So does
+		# any unstamped path, which is what a bookmarked js/app.js, a hand-typed
+		# URL, or a page cached from before this was added still asks for.
+		@stamped {
+			path /js/* /css/*
+			query v=*
+		}
+		header @stamped Cache-Control "public, max-age=31536000, immutable"
 
 		# A missing *asset* must 404. The SPA fallback below rewrites any
 		# unknown path to index.html, and for a route that is exactly right —

@@ -330,3 +330,80 @@ async def test_an_alert_that_cannot_be_raised_does_not_strand_the_release(
     deploy = next(stage for stage in stages if stage["name"] == "Deploy")
     assert "offline" in deploy["log"], "closed out by the stage itself, not by the last resort"
     assert await db.count(Alert, Alert.workspace_id == workspace.id) == 0
+
+
+# ---------------------------------------------------------------------------
+# 78 - a watcher does not sit on the connection its request was opened with
+# ---------------------------------------------------------------------------
+
+
+async def lowest_connections_held(counter, *, seconds: float) -> int:
+    """The fewest connections held at any moment of a quiet window.
+
+    Sampling, rather than one look: the stream opens a session for each poll, so
+    a single reading can catch one of those in flight and say nothing about what
+    is held between them. The low-water mark is what matters -- a connection
+    nobody ever gives back never lets it reach zero.
+    """
+    deadline = asyncio.get_running_loop().time() + seconds
+    lowest = counter()
+    while asyncio.get_running_loop().time() < deadline:
+        lowest = min(lowest, counter())
+        await asyncio.sleep(0.02)
+    return lowest
+
+
+async def test_a_progress_stream_hands_its_request_connection_back(
+    admin_client, as_role, db_engine, factory, workspace, instant_pipeline
+):
+    """A release parked at its gate keeps a tab streaming for as long as the
+    operator leaves it open -- up to STREAM_MAX_SECONDS. For all of that time the
+    request's own session used to stay checked out, idle inside the transaction
+    authentication opened, while the polls that do the work ran on their own
+    short-lived sessions."""
+    environment = await factory.environment(workspace, name="Production East")
+    created = await admin_client.post(
+        "/api/v1/deployments",
+        json={"environment_id": environment.id, "version": "v2.0.0"},
+    )
+    assert created.status_code == 201, created.text
+    deployment_id = created.json()["id"]
+    await wait_for(lambda: pipeline_state(admin_client, deployment_id), parked_or_over)
+
+    held = 0
+
+    def took_one(*_args) -> None:
+        nonlocal held
+        held += 1
+
+    def gave_one_back(*_args) -> None:
+        nonlocal held
+        held -= 1
+
+    event.listen(db_engine.sync_engine, "checkout", took_one)
+    event.listen(db_engine.sync_engine, "checkin", gave_one_back)
+    watching = asyncio.create_task(
+        admin_client.get(f"/api/v1/deployments/{deployment_id}/stream")
+    )
+    try:
+        # Long enough for the route to resolve the deployment and the first poll
+        # to come and go; a parked release is then polled once every
+        # STREAM_GATE_POLL_SECONDS, so the window that follows is mostly idle.
+        await asyncio.sleep(0.4)
+        assert not watching.done(), "the stream closed before it was watched"
+        lowest = await lowest_connections_held(lambda: held, seconds=1.5)
+    finally:
+        event.remove(db_engine.sync_engine, "checkout", took_one)
+        event.remove(db_engine.sync_engine, "checkin", gave_one_back)
+        if watching.done() and not watching.cancelled():
+            watching.exception()
+
+    assert lowest == 0, "the stream is holding a connection between its polls"
+
+    # And it is still a working stream: the gate opens, the release finishes and
+    # the watcher is told so before it closes.
+    state = await decide_the_gate(admin_client, as_role, deployment_id)
+    assert state["status"] == DeploymentStatus.SUCCEEDED.value
+    streamed = await asyncio.wait_for(watching, timeout=30)
+    assert streamed.status_code == 200, streamed.text
+    assert DeploymentStatus.SUCCEEDED.value in streamed.text

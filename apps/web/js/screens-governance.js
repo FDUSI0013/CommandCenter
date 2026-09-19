@@ -840,10 +840,12 @@
 
       function deactivate(r){
         if(!allowed('operator','Deactivating an agent')) return;
+        // The reason reaches the server now, which caps it at 500 characters —
+        // so the field stops at 500 rather than earning a 422 on Deactivate.
         confirmModal({ title:'Deactivate Agent', danger:true, confirmLabel:'Deactivate',
           body:`<p style="margin-top:0">You are about to deactivate <b style="color:var(--text)">${esc(r.name)}</b>.</p>
             <p>The agent stops accepting new runs immediately. In-flight executions complete. This is recorded in the audit trail.</p>
-            <div class="form-row" style="margin-top:10px"><label>REASON (RECORDED)</label><input class="input" id="deactReason" placeholder="Why is this agent being deactivated?"></div>`,
+            <div class="form-row" style="margin-top:10px"><label>REASON (RECORDED)</label><input class="input" id="deactReason" maxlength="500" placeholder="Why is this agent being deactivated?"></div>`,
           onConfirm: async (modal)=>{
             const reason = modal ? (modal.querySelector('#deactReason')||{}).value : '';
             try {
@@ -1240,10 +1242,12 @@
 
       function deactivate(){
         if(!allowed('operator','Deactivating an agent')) return;
+        // The reason reaches the server now, which caps it at 500 characters —
+        // so the field stops at 500 rather than earning a 422 on Deactivate.
         confirmModal({ title:'Deactivate Agent', danger:true, confirmLabel:'Deactivate',
           body:`<p style="margin-top:0">You are about to deactivate <b style="color:var(--text)">${esc(detail.agent.name)}</b>.</p>
             <p>New runs are rejected immediately; in-flight executions finish. The change is recorded in the audit trail.</p>
-            <div class="form-row" style="margin-top:10px"><label>REASON (RECORDED)</label><input class="input" id="adDeactReason" placeholder="Why is this agent being deactivated?"></div>`,
+            <div class="form-row" style="margin-top:10px"><label>REASON (RECORDED)</label><input class="input" id="adDeactReason" maxlength="500" placeholder="Why is this agent being deactivated?"></div>`,
           onConfirm: async (modal)=>{
             const reason = modal ? (modal.querySelector('#adDeactReason')||{}).value : '';
             try {
@@ -1298,7 +1302,11 @@
               <div class="form-row"><label>TEAM</label><input class="input" id="adEdTeam" value="${esc(a.team||'')}"></div>
             </div>
             <div class="grid g2">
-              <div class="form-row"><label>MEMORY POLICY</label><input class="input" id="adEdMem" value="${esc(a.memory_policy||'')}" placeholder="e.g. Conversation 90d"></div>
+              <div class="form-row"><label>MEMORY POLICY</label>
+                <select class="filter-select w-100" id="adEdMem" style="height:34px">
+                  <option value="">None</option>
+                  ${a.memory_policy ? `<option value="${esc(a.memory_policy)}" selected>${esc(a.memory_policy)}</option>` : ''}
+                </select></div>
               <div class="form-row"><label>ACCESS SCOPE</label><input class="input" id="adEdScope" value="${esc(a.access_scope||'')}" placeholder="e.g. Finance read-only"></div>
             </div>
             <div class="form-row"><label>DESCRIPTION</label><textarea class="input" id="adEdDesc" rows="2">${esc(a.description||'')}</textarea></div>`,
@@ -1329,6 +1337,26 @@
               if(err && err.status === 409) expected = await freshToken(a.id, expected);
             }
           }}],
+          /* An agent is joined to a memory store by an exact match between this
+             field and the store's name, so typed text almost never resolved and
+             the Memory screen showed the agent under no store at all. The stores
+             are listed instead; a value that matches none is kept as its own
+             option so editing another field cannot silently drop it. */
+          onOpen(modal){
+            const select = modal.querySelector('#adEdMem');
+            API.memory.list({ page_size: 50, sort:'name' })
+              .then(page => {
+                if(!select.isConnected) return;
+                const names = (page.items || []).map(s=>s.name);
+                const current = a.memory_policy || '';
+                if(current && !names.includes(current)) names.push(current);
+                select.innerHTML = '<option value="">None</option>' + names.map(n=>
+                  `<option value="${esc(n)}" ${n === current ? 'selected' : ''}>${esc(n)}${
+                    n === current && !(page.items || []).some(s=>s.name === current)
+                      ? ' — no store of this name' : ''}</option>`).join('');
+              })
+              .catch(()=>{ /* the current value stays selectable, so Save still works */ });
+          },
         });
       }
 
@@ -3424,7 +3452,9 @@
           {label:'Review', icon:'eye', onClick:()=>showRequest(r)},
           {label:'Approve', icon:'checkCircle', onClick:()=>decide(r,'approve')},
           {label:'Reject', icon:'xCircle', danger:true, onClick:()=>decide(r,'reject')},
-          {label:'Escalate', icon:'users', onClick:()=>decide(r,'escalate')},
+          // An escalated request can only be approved or rejected; escalating it
+          // again is refused with a 409, so the verb is not offered on one.
+          ...(r.status === 'Escalated' ? [] : [{label:'Escalate', icon:'users', onClick:()=>decide(r,'escalate')}]),
         ] : [
           {label:'View Details', icon:'eye', onClick:()=>showRequest(r)},
           {label:'View Audit Trail', icon:'history', onClick:()=>setTab(AUDIT_TAB)},
@@ -3771,11 +3801,16 @@
           onOpen(modal){
             if(verb !== 'escalate') return;
             const select = modal.querySelector('#apEscTo');
-            API.approvals.approvers({ page_size: 100, sort:'full_name' })
-              .then(page => {
-                const members = page.items || [];
+            /* The names-only directory, not the member roster: the roster is
+               admin-only, so the approver entitled to escalate was answered 403
+               and could only escalate to nobody in particular. The directory
+               answers a bare array of {id, full_name, initials} — no role, no
+               email — so the option carries the name alone. */
+            API.approvals.reviewers()
+              .then(res => {
+                const members = Array.isArray(res) ? res : (res.items || []);
                 select.innerHTML = `<option value="">Leave with the current reviewers</option>` + members.map(m=>
-                  `<option value="${esc(m.user_id || m.id)}">${esc(m.full_name || m.email)}${m.role?' — '+esc(m.role):''}</option>`).join('');
+                  `<option value="${esc(m.id)}">${esc(m.full_name)}</option>`).join('');
               })
               .catch(err => { select.innerHTML = `<option value="">Members unavailable — ${esc(err.message)}</option>`; });
           },
@@ -3884,7 +3919,7 @@
               <button class="btn success block" id="apApprove">${ICONS.checkCircle}Approve</button>
               <button class="btn danger block" id="apReject">${ICONS.xCircle}Reject</button>
             </div>
-            <button class="btn block" id="apEscalate" style="margin-top:8px">${ICONS.users}Escalate</button>
+            ${r.status === 'Escalated' ? '' : `<button class="btn block" id="apEscalate" style="margin-top:8px">${ICONS.users}Escalate</button>`}
             <button class="btn block" id="apComment" style="margin-top:8px">${ICONS.chat}Add Comment</button>
           </div>` : `
           <div class="insp-section"><button class="btn sm block" id="apComment">${ICONS.chat}Add Comment</button></div>`}`;
@@ -3895,7 +3930,9 @@
             .addEventListener('click', ()=>decide(r,'approve'));
           requireRole(insp.querySelector('#apReject'), 'approver', 'Rejecting a request')
             .addEventListener('click', ()=>decide(r,'reject'));
-          requireRole(insp.querySelector('#apEscalate'), 'approver', 'Escalating a request')
+          // Absent on an already-escalated request, which cannot escalate again.
+          const escalateBtn = insp.querySelector('#apEscalate');
+          if(escalateBtn) requireRole(escalateBtn, 'approver', 'Escalating a request')
             .addEventListener('click', ()=>decide(r,'escalate'));
         }
         requireRole(insp.querySelector('#apComment'), 'member', 'Commenting on a request')

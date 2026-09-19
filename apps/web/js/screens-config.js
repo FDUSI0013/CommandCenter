@@ -1427,6 +1427,14 @@
                   </details>`;
               } catch (err) {
                 out.innerHTML = '';
+                // A timeout is the console giving up, not the run being
+                // cancelled: the model may answer after we stop waiting, and
+                // that answer is billed. "Could not load this prompt run" reads
+                // as "nothing happened" and invites a second run on top of it.
+                if(err && err.code === 'timeout'){
+                  out.innerHTML = `<div class="quote small st-amber">${ICONS.alert} No answer came back before the console stopped waiting. The run may still have finished on the server — and been billed — so check this prompt's Audit Trail before running it again.</div>`;
+                  return;
+                }
                 // A deployment with no model configured is the common case, and
                 // the server names the missing setting; show that, not a generic
                 // failure.
@@ -1967,6 +1975,11 @@
         const watch = pollers[id] = { timer: null, failures: 0 };
         const again = (ms) => { if(pollers[id] === watch) watch.timer = setTimeout(poll, ms); };
         function poll(){
+          /* Nobody is watching a hidden tab's progress bar, so skip the read
+             and look again on the next tick. The watch stays armed, so it
+             catches up the moment the tab comes back — unlike a bare return,
+             which would strand the row at "Syncing… 40%". */
+          if(document.hidden){ again(SYNC_POLL_MS); return; }
           API.knowledge.syncStatus(id)
             .then(st => {
               if(pollers[id] !== watch) return;

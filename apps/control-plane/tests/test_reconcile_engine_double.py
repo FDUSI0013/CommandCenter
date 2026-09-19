@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import datetime as dt
 
+from fulcrum_ops_api.db.base import new_id
+
 
 def tokens_spent(engine, agent, *, at, tokens):
     """A run whose tokens are carried by its LLM span, as the engine accounts for them."""
@@ -117,3 +119,60 @@ async def test_workspace_usage_buckets_on_the_calendar_unit_it_is_asked_for(engi
     # Both days belong to the week that opened on Monday the 14th -- stamped
     # before the window asked about, exactly as the real engine stamps it.
     assert await stamps("WEEKLY") == {"2026-09-14T00:00:00Z": 140}
+
+
+# ---------------------------------------------------------------------------
+# A batch write of an id already stored
+# ---------------------------------------------------------------------------
+
+
+async def test_a_second_batch_write_of_a_run_replaces_the_row_it_finds(
+    ingest_client, factory, workspace, engine
+):
+    """``batch_insert_replaces`` was declared and documented but never honoured.
+
+    A flag a test can set and that then does nothing is worse than no flag:
+    the test reads as if it pinned the strict assumption and passes under the
+    kind one. Here the reporter that finishes a run resends everything but the
+    input, and on the store's own last-write-wins insert the input is gone.
+    """
+    await factory.provisioned_agent(workspace, engine, name="Support Bot")
+    engine.batch_insert_replaces = True
+    run_id = new_id()
+    opened_at = dt.datetime.now(dt.UTC) - dt.timedelta(minutes=5)
+    started = {
+        "id": run_id,
+        "name": "answer customer question",
+        "start_time": opened_at.isoformat().replace("+00:00", "Z"),
+        "input": {"question": "Where is my order?"},
+    }
+    finished = {
+        **started,
+        "end_time": (opened_at + dt.timedelta(seconds=1.5)).isoformat().replace("+00:00", "Z"),
+        "output": {"answer": "It ships tomorrow."},
+    }
+    finished.pop("input")
+
+    opened = await ingest_client.post(
+        "/api/v1/ingest/traces", json={"agent": "Support Bot", "traces": [started]}
+    )
+    closed = await ingest_client.post(
+        "/api/v1/ingest/traces", json={"agent": "Support Bot", "traces": [finished]}
+    )
+
+    assert opened.status_code == 200, opened.text
+    assert closed.status_code == 200, closed.text
+    assert [row["outcome"] for row in closed.json()["results"]] == ["accepted"]
+    (stored,) = engine.traces.values()
+    assert stored["output"] == {"answer": "It ships tomorrow."}
+    assert stored.get("input") is None, "the second batch write is the whole row"
+    # Left off, the double keeps merging -- which is what every test written
+    # before the flag existed relies on.
+    engine.batch_insert_replaces = False
+    merged_back = await ingest_client.post(
+        "/api/v1/ingest/traces", json={"agent": "Support Bot", "traces": [started]}
+    )
+    assert merged_back.status_code == 200, merged_back.text
+    (stored,) = engine.traces.values()
+    assert stored["input"] == {"question": "Where is my order?"}
+    assert stored["output"] == {"answer": "It ships tomorrow."}

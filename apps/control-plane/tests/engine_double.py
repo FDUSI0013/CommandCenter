@@ -938,7 +938,7 @@ class EngineDouble:
 
     # -- traces ------------------------------------------------------------
 
-    def _store_trace(self, payload: Mapping[str, Any]) -> JsonObject:
+    def _store_trace(self, payload: Mapping[str, Any], *, replace: bool = False) -> JsonObject:
         row = dict(payload)
         project_name = row.get("project_name")
         project = self._project_for(row)
@@ -954,7 +954,12 @@ class EngineDouble:
         row.setdefault("id", _new_id())
         row.setdefault("start_time", _iso())
         existing = self.traces.get(row["id"], {})
-        merged = {**existing, **row}
+        # ``replace`` is the batch insert's last-write-wins: the row the second
+        # writer sent IS the row, and a field it left out is gone rather than
+        # inherited. Feedback scores and comments are not fields of it -- they
+        # are their own entities, written through their own endpoints -- so they
+        # survive either way, below.
+        merged = dict(row) if replace else {**existing, **row}
         merged.setdefault("feedback_scores", list(existing.get("feedback_scores") or []))
         merged.setdefault("comments", list(existing.get("comments") or []))
         merged["duration"] = self._duration_ms(merged)
@@ -1060,7 +1065,7 @@ class EngineDouble:
                 raise EngineFailure(400, {"errors": ["each trace must be an object"]})
             if not row.get("project_name") and not row.get("project_id"):
                 raise EngineFailure(400, {"errors": ["a trace needs a project"]})
-            self._store_trace(row)
+            self._store_trace(row, replace=self.batch_insert_replaces)
         return None
 
     def _trace_scope(self, query: dict) -> list[JsonObject]:

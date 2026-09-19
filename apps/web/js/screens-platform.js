@@ -15,6 +15,14 @@
   const TOOL_LOGO = { 'sharepoint':'sharepoint','outlook':'outlook','graph':'m365','sql':'sql','mcp':'mcp',
     'vector':'vector','search':'vector','insights':'appinsights','blob':'azureblob','keyvault':'keyvault' };
 
+  /* A connection's kind decides its mark when the server did not name one.
+     The same map lives on the Connection Center; it is repeated here rather
+     than shared because icons.js holds the marks, not the vocabulary. */
+  const KIND_LOGO = { 'Azure AI Foundry':'foundry', 'Copilot Studio':'copilot', 'M365 Copilot':'m365',
+    'Microsoft 365':'m365', 'Power Platform':'power', 'MCP Server':'mcp', 'Vector Database':'vector',
+    'Microsoft Purview':'purview', 'Custom REST API':'custom', 'Azure Key Vault':'keyvault',
+    'SharePoint':'sharepoint', 'SQL Database':'sql', 'Azure Blob Storage':'azureblob' };
+
   /** Pick a logo for a tool by what its name contains; unknown tools get the generic mark. */
   function toolLogo(name){
     const n = String(name || '').toLowerCase();
@@ -114,15 +122,17 @@
             return;
           }
           chips.innerHTML = page.items.map(c=>
-            `<span class="conn-chip" data-nav="connections"><span class="logo">${platformLogo(c.platform)}</span>${esc(c.name)}<span class="stat"><span class="dot"></span>${esc(c.status)}</span></span>`
+            `<span class="conn-chip" data-nav="connections"><span class="logo">${connLogo(c)}</span>${esc(c.name)}<span class="stat"><span class="dot"></span>${esc(c.status)}</span></span>`
           ).join('');
         })
         .catch(()=>{ const el = document.getElementById('lrChips'); if(el) el.innerHTML = ''; });
 
-      function platformLogo(platform){
-        const map = { 'Azure AI Foundry':'foundry', 'Copilot Studio':'copilot', 'M365 Copilot':'m365',
-                      'Power Platform':'power', 'Custom Agent':'custom' };
-        return LOGOS[map[platform] || 'custom'];
+      /* The mark the server named, then the one its kind implies. This used to
+         read `c.platform`, which ConnectionRead does not return, so every chip
+         on the row fell through to the generic mark whatever it was connected
+         to. `logo_key` is what the Connection Center itself draws from. */
+      function connLogo(c){
+        return LOGOS[c.logo_key || KIND_LOGO[c.kind]] || LOGOS.custom;
       }
 
       // ---- KPI cards + the four sparkline KPIs -------------------------

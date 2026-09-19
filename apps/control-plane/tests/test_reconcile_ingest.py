@@ -14,6 +14,7 @@ import datetime as dt
 from sqlalchemy import event, select
 
 from fulcrum_ops_api.db.base import new_id
+from fulcrum_ops_api.models.governance import PolicyCategory
 from fulcrum_ops_api.models.licensing import UsageRecord
 from fulcrum_ops_api.models.quality import FeedbackItem
 from fulcrum_ops_api.models.registry import Agent
@@ -415,3 +416,47 @@ async def test_an_envelope_environment_that_cannot_be_one_does_not_cost_the_batc
         assert outcomes(posted) == [(0, "accepted", None)]
 
     assert engine.trace_count(agent.engine_project_name) == 3
+
+
+# ===========================================================================
+# approvals #108 -- an approval rule is never a control telemetry is judged by
+# ===========================================================================
+
+
+REFUND = {"conditions": [{"signal": "name", "operator": "eq", "value": "issue refund"}]}
+
+
+async def test_an_approval_rule_cannot_block_a_trace_however_its_body_is_edited(
+    ingest_client, factory, workspace, engine
+):
+    """A rule body carries no conditions -- until someone edits one in as JSON."""
+    agent = await factory.provisioned_agent(workspace, engine, name="Support Bot")
+    await factory.policy(
+        workspace,
+        name="Refund over threshold",
+        category=PolicyCategory.APPROVAL_ESCALATION.value,
+        rules={**REFUND, "approvers": ["ops"], "sla_minutes": 60},
+    )
+
+    posted = await ingest_client.post(
+        "/api/v1/ingest/traces",
+        json={"agent": "Support Bot", "traces": [trace(name="issue refund")]},
+    )
+
+    assert outcomes(posted) == [(0, "accepted", None)]
+    assert posted.json()["violations_recorded"] == 0
+    assert engine.trace_count(agent.engine_project_name) == 1
+
+
+async def test_the_same_body_in_a_guardrail_policy_still_blocks(
+    ingest_client, factory, workspace, engine
+):
+    await factory.provisioned_agent(workspace, engine, name="Support Bot")
+    await factory.policy(workspace, name="No refunds by bot", rules=REFUND)
+
+    posted = await ingest_client.post(
+        "/api/v1/ingest/traces",
+        json={"agent": "Support Bot", "traces": [trace(name="issue refund")]},
+    )
+
+    assert outcomes(posted) == [(0, "blocked", "policy_blocked")]

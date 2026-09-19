@@ -75,6 +75,7 @@ from ..engine import EngineBadRequest, EngineError, EngineUnavailable, get_engin
 from ..models.governance import (
     Policy,
     PolicyBinding,
+    PolicyCategory,
     PolicyEnforcement,
     PolicyScope,
     PolicyStatus,
@@ -915,6 +916,15 @@ async def _load_policies(
                     # it "Enforcing with warnings". Reading Active alone meant
                     # flagging a policy quietly switched it off.
                     Policy.status.in_(ENFORCED_POLICY_STATUSES),
+                    # An approval rule is a policy in this category, and it is
+                    # not a control telemetry can be judged against: it governs
+                    # a request raised before the action, which is over by the
+                    # time anything is reported about it. Its body carries no
+                    # conditions today, so none compiles -- but a rule edited
+                    # as raw JSON in the Policy Center could grow some, and a
+                    # rule for "refunds over $500" must never start blocking
+                    # the traces that mention one.
+                    Policy.category != PolicyCategory.APPROVAL_ESCALATION.value,
                 )
                 .order_by(Policy.updated_at.desc())
                 .limit(MAX_POLICIES_EVALUATED)
