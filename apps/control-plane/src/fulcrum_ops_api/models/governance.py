@@ -149,6 +149,10 @@ class SecretAccessAction(str, enum.Enum):
     ENABLE = "enable"
     CREATE = "create"
     UPDATE = "update"
+    # Written since the secrets vault learned to revoke; it was missing here, so
+    # the access log recorded "revoke" rows that ?action=revoke then refused to
+    # filter for (422) -- the one action an auditor most wants to isolate.
+    REVOKE = "revoke"
 
 
 def default_workflow() -> list:

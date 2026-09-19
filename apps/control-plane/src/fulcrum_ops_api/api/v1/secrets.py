@@ -98,7 +98,7 @@ def secret_filters(
 def access_log_filters(
     action: Annotated[
         SecretAccessAction | None,
-        Query(description="reveal, rotate, use, disable, enable, create or update"),
+        Query(description="reveal, rotate, use, disable, enable, create, update or revoke"),
     ] = None,
     success: Annotated[
         bool | None, Query(description="Only successful, or only refused, attempts")

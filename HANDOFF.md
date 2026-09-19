@@ -234,3 +234,71 @@ report it plainly rather than working around it.
 
 Finish by telling me: what you tested and how, what you fixed, what is still
 broken, and what you would do next.
+
+## Deferred: the schema changes this branch deliberately did not make
+
+The audit pass of 2026-09-18/19 fixed 229 findings across 34 file owners working
+in parallel. Seventeen of the fixes they proposed need a database migration, and
+none was made: concurrent owners writing concurrent Alembic revisions fork the
+revision chain, and a bug-fix release is the wrong place to change the schema.
+Each is written out below with what it is for, because the reason a column is
+wanted is the part that gets lost.
+
+They are independent of one another. Take them one at a time, each as its own
+revision, each with the data repair it needs — several of the indexes below are
+unique and will refuse to build until existing duplicates are resolved, which is
+itself the evidence that the constraint was missing.
+
+**Correctness, in rough order of how much it matters**
+
+1. `configuration_versions`: a partial unique index on `(configuration_id)` where
+   `is_current`, plus a repair pass keeping the row whose `version` matches
+   `configurations.current_version`. Two current versions is a state the service
+   now prevents but the table still permits.
+2. `seat_assignments`: unique on `(license_id, user_id)` where `released_at IS
+   NULL`. The row lock closes the race today; the index is what makes a double
+   seat impossible rather than merely unlikely.
+3. `backlog_items`: partial unique on `issue_id` where the item is open, after
+   de-duplicating. Backs the one-item-per-issue rule the service already keeps.
+4. `alerts`: partial unique on `(workspace_id, dedupe_key)` where the alert is
+   unresolved. `raise_alert` already absorbs the `IntegrityError` onto the twin,
+   so nothing in the service changes once the index exists — two simultaneous
+   raises of one condition simply stop producing two alerts.
+5. `policies` data repair: `UPDATE policies SET enforcement = rules->'action'->>'mode'`
+   where the two disagree. Sets the column to what ingest has really been
+   enforcing; changes no behaviour, but until it runs the `?enforcement=` filter
+   and the Policy Center's column can disagree with the rule that actually fires.
+
+**Performance**
+
+6. `policy_violations (policy_id, occurred_at)` — serves the 30-day rollup the
+   scheduler now recomputes and the inspector's Violations tab.
+7. `audit_events (workspace_id, entity_id, occurred_at)` — the existing
+   `(entity_type, entity_id)` index cannot serve the entity-history filter behind
+   Agent Detail and the connector and policy inspectors. Build it
+   `CONCURRENTLY`: this is the table that grows fastest.
+
+**New capability, each a small feature rather than a fix**
+
+8. `agents.invoke_url` + `invoke_secret_id`: let the console call an agent's own
+   runtime instead of parking a run and hoping something picks it up.
+9. `pending_runs` (or `triggered_runs`): a real work queue for console-issued
+   runs. Today a runtime polls `GET /runs?status=Running` every few seconds and
+   the control plane answers by scanning telemetry — the single most expensive
+   repeated query in production. An indexed table replaces a scan with a lookup,
+   and lets ingest merge the trigger's own metadata into the reported trace.
+   (The 2026-09-19 work made the scan much cheaper and made an abandoned request
+   report `Failed` rather than `Running` for ever. This removes the scan.)
+10. `evaluation_runs.progress` (JSON): so a worker that does not own a run can
+    still show its live judged count instead of zero during Scoring.
+11. `api_key_usage_daily`: real per-key metering, one upserted row per key per
+    day, replacing the estimate the key usage modal shows now.
+12. `users.credentials_changed_at`: stamp it on every password change and carry
+    it as a session claim, so changing a password invalidates sessions issued
+    before it. Today it does not.
+13. `connections.status_detail`: hold the last probe diagnostic in its own column
+    instead of deriving it back out of the operator's note.
+
+**Not a migration, and already done on this branch**: `SecretAccessAction.REVOKE`
+(the column is a plain string) — the vault was writing `revoke` rows that
+`?action=revoke` then refused to filter for.

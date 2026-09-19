@@ -424,6 +424,15 @@ async def test_revoking_through_patch_leaves_its_own_evidence(
     assert log.status_code == 200, log.text
     assert log.json()["items"][0]["action"] == "revoke"
 
+    # And an auditor can isolate it. "revoke" was written into the log without
+    # being a member of the filter's enum, so asking for exactly the rows that
+    # matter was refused as an invalid value.
+    filtered = await admin_client.get(
+        f"/api/v1/secrets/{live.id}/access-log", params={"action": "revoke"}
+    )
+    assert filtered.status_code == 200, filtered.text
+    assert [row["action"] for row in filtered.json()["items"]] == ["revoke"]
+
 
 async def test_a_health_chip_may_still_be_written(admin_client, db, factory, workspace):
     live = await factory.secret(workspace, name="Live key")

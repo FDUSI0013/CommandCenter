@@ -111,7 +111,6 @@ PRIVILEGED_ACCESS_ACTIONS: Final[tuple[str, ...]] = (
 #: string and the read model types it as ``str``, so the row reads back as
 #: written. Until the enum gains the member, ``?action=revoke`` is not a
 #: filter the access-log endpoint accepts.
-REVOKE_ACTION: Final[str] = "revoke"
 
 SEARCH_COLUMNS: Final[tuple[Any, ...]] = (
     Secret.name,
@@ -817,7 +816,7 @@ async def update_secret(
         # Revocation is a lifecycle event, not a metadata edit, so it gets its
         # own access row and its own audit action, the same standing the
         # disable and enable verbs give theirs.
-        session.add(_access_row(secret, principal, REVOKE_ACTION, request=request))
+        session.add(_access_row(secret, principal, SecretAccessAction.REVOKE, request=request))
         await audit.record(
             session,
             principal=principal,
