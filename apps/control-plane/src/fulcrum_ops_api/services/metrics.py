@@ -740,6 +740,39 @@ def _stat_runs(row: dict[str, Any]) -> int:
     return int(_measure(row, "trace_count", "traces", "total_traces", "run_count") or 0)
 
 
+#: The envelope reader under its public name. Other screens page engine rows of
+#: their own (spans, for the Connection Center's traffic view) and were reaching
+#: for the private spelling, which nothing promised to keep.
+records = _records
+
+
+async def project_run_counts(
+    client: EngineClient,
+    project_ids: set[str],
+    start: dt.datetime,
+    end: dt.datetime,
+    *,
+    fresh: bool = False,
+) -> dict[str, int]:
+    """Runs per namespace over one window: the statistics walk and nothing else.
+
+    For a caller that wants traffic volume only. ``project_rollups`` would also
+    sum tokens, one aggregation per busy namespace, for a number such a caller
+    never reads. The walk is the same one the Metrics screen shares, so asking
+    here costs nothing when that screen has just asked. A namespace the engine
+    has no statistics for counts zero runs: an agent nobody used in the window.
+    """
+    if not project_ids:
+        return {}
+    try:
+        stats = await _stats_by_project(client, set(project_ids), start, end, fresh=fresh)
+    except EngineError as exc:
+        raise telemetry_unavailable(exc) from exc
+    return {
+        project_id: _stat_runs(stats.get(project_id, {})) for project_id in project_ids
+    }
+
+
 async def project_rollups(
     client: EngineClient,
     projects: Sequence[AgentProject],
@@ -747,6 +780,7 @@ async def project_rollups(
     end: dt.datetime,
     *,
     fresh: bool = False,
+    tokens: bool = True,
 ) -> list[ProjectRollup]:
     """Measure every namespace of the workspace over one window.
 
@@ -759,6 +793,12 @@ async def project_rollups(
     when the result is going to be *stored* -- a budget's rolled-up spend, say
     -- rather than shown: a remembered number is fine on a screen that redraws
     in a minute and wrong in a row that is compared against a threshold.
+
+    ``tokens=False`` is for a caller that reads only what the statistics walk
+    reports -- runs, errors, cost, latency. Token totals are the expensive half
+    (one aggregation per busy namespace), and the budget roll-up made them on
+    every pass for a number it never looked at. Skipped, ``tokens`` is ``None``
+    on every rollup: not measured, which is not the same as none.
     """
     if not projects:
         return []
@@ -770,13 +810,15 @@ async def project_rollups(
         # runs in the window has no tokens to sum -- so only the ones the stats
         # walk found busy are asked. On a fleet where most agents are idle on
         # any given day that is most of the calls this function used to make.
-        tokens_by_project = await _project_token_totals(
-            client,
-            [p for p in projects if _stat_runs(stats.get(p.project_id, {})) > 0],
-            start,
-            end,
-            fresh=fresh,
-        )
+        tokens_by_project: dict[str, float | None] = {}
+        if tokens:
+            tokens_by_project = await _project_token_totals(
+                client,
+                [p for p in projects if _stat_runs(stats.get(p.project_id, {})) > 0],
+                start,
+                end,
+                fresh=fresh,
+            )
     except EngineError as exc:
         raise telemetry_unavailable(exc) from exc
 

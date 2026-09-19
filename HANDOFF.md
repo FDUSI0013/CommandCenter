@@ -150,6 +150,26 @@ Do not merely call endpoints. Drive the console and confirm the loop closes:
 Every place it is wrong, incomplete, or assumes knowledge you do not have is a
 documentation bug — fix it, regenerate both formats, and republish.
 
+Two such bugs were found by the 2026-09-18 audit and are **not yet fixed in the
+master** (nor in its served copy, `apps/web/docs/index.html`). The SDK and
+`sdks/python/README.md` are already right; the guide has to catch up with them:
+
+- **`report_issue()`** ("Scores and feedback"). The guide says it "raises a row
+  on Feedback and Quality Loop". What it does: it is delivered as negative
+  feedback (`feedback.submitted`, source *Agent Response Rating*) and appears in
+  the Feedback inbox with the title leading the body. It does not create a row
+  on Feedback > Issues by itself.
+- **`track_openai`** ("Getting cost to resolve" and "Provider wrappers"). The
+  guide calls the Azure client "duck-typed, works the same". Say instead that it
+  reports provider `azure` for an `AzureOpenAI` or Azure AI Foundry client
+  (overridable with `provider=`), and that `model=` is the fallback for calls
+  that name no model, as with a Foundry agent addressed by `agent_reference`.
+
+One check behind the second bullet is still owed, because nobody could reach the
+engine while the fix was written: post a `gpt-4o` span with provider `openai`
+and one with provider `azure`, see which the engine prices, and make the guide
+and the SDK agree with what you observe.
+
 ### 4. Close the three Red risks
 
 - ~~**The code exists only on this laptop.**~~ **Closed.** The source is a git

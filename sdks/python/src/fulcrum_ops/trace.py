@@ -16,11 +16,12 @@ the span closes.
 from __future__ import annotations
 
 import datetime as dt
+import logging
 import traceback as _traceback
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Union
 
 from . import context as _context
-from .ids import new_id
+from .ids import adoptable_id, new_id
 from .limits import (
     MAX_AGENT_LENGTH,
     MAX_EXCEPTION_MESSAGE_LENGTH,
@@ -49,6 +50,8 @@ if TYPE_CHECKING:  # pragma: no cover
     from .client import FulcrumOps
 
 __all__ = ["Span", "Trace", "NoopSpan", "NOOP_SPAN", "SPAN_TYPES"]
+
+logger = logging.getLogger("fulcrum_ops")
 
 #: The span classes the telemetry engine models separately.
 SPAN_TYPES = ("general", "llm", "tool", "guardrail")
@@ -507,9 +510,24 @@ class Trace(_Recordable):
         agent: Optional[str] = None,
         thread_id: Optional[str] = None,
         sampled: bool = True,
+        id: Optional[str] = None,  # noqa: A002 - matches the wire field name
     ) -> None:
         super().__init__(client, name, input=input, metadata=metadata, tags=tags, agent=agent)
-        self.id = new_id()
+        # A run somebody else already named. ``POST /agents/{id}/run`` opens the
+        # run in the console and answers with its ``run_id``; the runtime that
+        # then does the work has to report under that id, or the console's row
+        # waits for ever beside a second run nobody asked for. An id the store
+        # would refuse is replaced rather than sent -- it would cost every
+        # trace in the same request -- and said out loud, because the caller is
+        # holding an id this run is not filed under. ``.id`` is the one in use.
+        adopted = adoptable_id(id) if id is not None else None
+        if id is not None and adopted is None:
+            logger.warning(
+                "fulcrum-ops: trace id %r is not a version 7 UUID, the only kind the "
+                "telemetry store takes; this run is reported under a new id instead.",
+                id,
+            )
+        self.id = adopted or new_id()
         self.thread_id = thread_id
         self.sampled = sampled
         self.spans: List[Span] = []

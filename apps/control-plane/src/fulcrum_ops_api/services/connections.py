@@ -227,6 +227,18 @@ async def _probe(client: httpx.AsyncClient, url: str) -> ProbeResult:
             latency_ms=None,
             detail=f"Endpoint redirected more than {PROBE_MAX_REDIRECTS} times",
         )
+    except httpx.InvalidURL:
+        # Not an ``httpx.HTTPError``, so no arm here saw it: a malformed endpoint
+        # was an opaque 500 on Test, and inside a gather it took Test All and
+        # Sync All down for every other tile too. Rows saved before the schema
+        # began parsing the URL the way the probe does are still in the table,
+        # so this has to be an answer rather than an error.
+        return ProbeResult(
+            reachable=False,
+            http_status=None,
+            latency_ms=None,
+            detail="Endpoint is not a valid URL",
+        )
     except httpx.TransportError as exc:
         return ProbeResult(
             reachable=False,
@@ -276,13 +288,85 @@ def _activity_row(
     )
 
 
+#: The three vocabularies one test result is rendered in.
+_Verdict = tuple[ConnectionStatus, HealthState, ActivityStatus]
+
+#: Kinds agents run *on*. A tile of one of these may honestly have no endpoint:
+#: SDK agents push their telemetry, so there is no URL to call.
+_PLATFORM_KINDS: Final[frozenset[str]] = frozenset(platform.value for platform in Platform)
+
+
+async def _platform_agents(
+    session: AsyncSession, principal: Principal, kinds: set[str]
+) -> dict[str, tuple[int, int]]:
+    """(registered, reporting) agents per platform, in one grouped statement.
+
+    "Reporting" is having an engine project, the place an agent's telemetry
+    lands: an agent without one cannot be sending anything, and it is the same
+    test the traffic view applies before it reads a platform's spans. COUNT over
+    the column skips the NULLs.
+    """
+    if not kinds:
+        return {}
+    return {
+        platform: (int(registered), int(reporting))
+        for platform, registered, reporting in (
+            await session.execute(
+                select(
+                    Agent.platform,
+                    func.count(Agent.id),
+                    func.count(Agent.engine_project_id),
+                )
+                .where(Agent.workspace_id == principal.workspace_id, Agent.platform.in_(kinds))
+                .group_by(Agent.platform)
+            )
+        ).all()
+    }
+
+
+def _registry_reading(kind: str, registered: int, reporting: int) -> tuple[ProbeResult, _Verdict]:
+    """The test result of a platform tile that has no endpoint to call.
+
+    Such a tile used to be a dead end: Test answered 412, so it stayed at the
+    Disconnected it was created with, so Sync answered 412 as well -- red in the
+    KPI cards while its agents' runs were listed under Tool Calls & Data. What
+    can be known about it is in the registry, so that is where it is read from.
+    Nothing was timed, so there is no latency: unmeasured, not zero.
+    """
+    if reporting:
+        waiting = registered - reporting
+        detail = f"{reporting} agent(s) reporting via SDK ingest" + (
+            f"; {waiting} more registered with no telemetry project yet" if waiting else ""
+        )
+        verdict = (ConnectionStatus.CONNECTED, HealthState.HEALTHY, ActivityStatus.SUCCESS)
+    elif registered:
+        detail = (
+            f"0 agent(s) reporting via SDK ingest; {registered} registered on {kind} "
+            "have no telemetry project yet"
+        )
+        verdict = (ConnectionStatus.WARNING, HealthState.WARNING, ActivityStatus.WARNING)
+    else:
+        detail = f"0 agent(s) reporting via SDK ingest; no agent is registered on {kind}"
+        # Nothing was tried and failed, so the feed row is a warning, not an error.
+        verdict = (ConnectionStatus.DISCONNECTED, HealthState.UNHEALTHY, ActivityStatus.WARNING)
+    return (
+        ProbeResult(reachable=registered > 0, http_status=None, latency_ms=None, detail=detail),
+        verdict,
+    )
+
+
 def _record_probe(
     session: AsyncSession,
     connection: Connection,
     probe: ProbeResult,
     principal: Principal,
+    *,
+    verdict: _Verdict | None = None,
 ) -> ConnectionTestOutcome:
     """Apply a probe to the tile and append the activity row. No audit here.
+
+    ``verdict`` is given when the result was read from the registry rather than
+    off the network (:func:`_registry_reading`); otherwise the probe decides it.
 
     Testing deliberately does not touch ``last_sync_at``: a reachability check
     moved no data, and the Last Sync column has to keep meaning what it says.
@@ -296,7 +380,7 @@ def _record_probe(
     behind, which is cleared.
     """
     was_connected = connection.status == ConnectionStatus.CONNECTED.value
-    status, health, activity_status = _verdict(probe)
+    status, health, activity_status = verdict or _verdict(probe)
 
     connection.status = status.value
     connection.health = health.value
@@ -305,7 +389,9 @@ def _record_probe(
         connection.note = None
     connection.updated_by = principal.actor
 
-    if not probe.reachable:
+    # A platform nobody has registered an agent on was not called and did not
+    # fail to answer: read from the registry, that is a test result like any other.
+    if not probe.reachable and verdict is None:
         event = "Connection Failed"
     elif status is ConnectionStatus.CONNECTED and not was_connected:
         event = "Connection Restored"
@@ -942,7 +1028,12 @@ async def test_connection(
     *,
     request: Request | None = None,
 ) -> ConnectionTestOutcome:
-    """Probe the configured endpoint and flip the tile to what was measured."""
+    """Probe the configured endpoint and flip the tile to what was measured.
+
+    An agent platform saved without an endpoint has nothing to probe and is read
+    from the registry instead (:func:`_registry_reading`); any other kind
+    without one is refused.
+    """
     principal.require(Role.OPERATOR)
     connection = await get_connection(session, principal, connection_id)
 
@@ -950,20 +1041,26 @@ async def test_connection(
         raise PreconditionFailed(f"'{connection.name}' is disabled. Enable it before testing.")
 
     endpoint = _endpoint_for(connection)
-    if endpoint is None:
+    if endpoint is None and connection.kind not in _PLATFORM_KINDS:
+        # Any other kind is only ever validated by calling it.
         raise PreconditionFailed(
             f"'{connection.name}' has no endpoint configured. "
             f"Set one of {', '.join(ENDPOINT_CONFIG_KEYS)} in its config first."
         )
 
-    # The probe is a network wait of up to PROBE_TIMEOUT_SECONDS. End the read
-    # transaction first so the pooled connection is not held, idle, across it;
-    # the loaded row stays usable and the writes below open a new transaction.
-    await session.commit()
-    async with _probe_client() as client:
-        probe = await _probe(client, endpoint)
+    if endpoint is None:
+        counted = await _platform_agents(session, principal, {connection.kind})
+        probe, verdict = _registry_reading(connection.kind, *counted.get(connection.kind, (0, 0)))
+        outcome = _record_probe(session, connection, probe, principal, verdict=verdict)
+    else:
+        # The probe is a network wait of up to PROBE_TIMEOUT_SECONDS. End the read
+        # transaction first so the pooled connection is not held, idle, across it;
+        # the loaded row stays usable and the writes below open a new transaction.
+        await session.commit()
+        async with _probe_client() as client:
+            probe = await _probe(client, endpoint)
+        outcome = _record_probe(session, connection, probe, principal)
 
-    outcome = _record_probe(session, connection, probe, principal)
     await audit.record(
         session,
         principal=principal,
@@ -1030,6 +1127,8 @@ async def test_all(
     Disabled tiles and tiles with no endpoint are skipped rather than failed —
     they are a configuration state, not an outage. The probes run concurrently
     over one client; the database is touched only after they have all landed.
+    The exception is an agent platform with no endpoint, which is not skipped:
+    its result is read from the registry (:func:`_registry_reading`).
     """
     principal.require(Role.OPERATOR)
     connections = (
@@ -1040,28 +1139,45 @@ async def test_all(
 
     summary = BulkActionSummary(requested=len(connections))
     targets: list[tuple[Connection, str]] = []
+    pushed: list[Connection] = []
     for connection in connections:
         endpoint = _endpoint_for(connection)
+        if connection.enabled and endpoint is None and connection.kind in _PLATFORM_KINDS:
+            # Read from the registry, as test_connection reads it: not skipped.
+            pushed.append(connection)
+            continue
         if not connection.enabled or endpoint is None:
             summary.skipped += 1
             continue
         targets.append((connection, endpoint))
 
-    outcomes: list[ConnectionTestOutcome] = []
+    # One grouped count for all of them, and taken before the probes: it belongs
+    # to the read transaction that is ended below.
+    counted = await _platform_agents(session, principal, {tile.kind for tile in pushed})
+
+    recorded: dict[str, ConnectionTestOutcome] = {}
     if targets:
         # As in test_connection: no pooled connection is held across the probes.
         await session.commit()
         async with _probe_client() as client:
             probes = await asyncio.gather(*(_probe(client, url) for _, url in targets))
         for (connection, _), probe in zip(targets, probes, strict=True):
-            outcome = _record_probe(session, connection, probe, principal)
-            outcomes.append(outcome)
-            if not outcome.reachable:
-                summary.failed += 1
-            elif outcome.health == HealthState.HEALTHY:
-                summary.succeeded += 1
-            else:
-                summary.warned += 1
+            recorded[connection.id] = _record_probe(session, connection, probe, principal)
+    for connection in pushed:
+        probe, verdict = _registry_reading(connection.kind, *counted.get(connection.kind, (0, 0)))
+        recorded[connection.id] = _record_probe(
+            session, connection, probe, principal, verdict=verdict
+        )
+
+    # In the order the tiles were read, whichever way each was tested.
+    outcomes = [recorded[tile.id] for tile in connections if tile.id in recorded]
+    for outcome in outcomes:
+        if not outcome.reachable:
+            summary.failed += 1
+        elif outcome.health == HealthState.HEALTHY:
+            summary.succeeded += 1
+        else:
+            summary.warned += 1
 
     await audit.record(
         session,

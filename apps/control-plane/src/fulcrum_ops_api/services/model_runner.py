@@ -123,6 +123,12 @@ async def execute(
         # Reasoning models renamed this field; send both and let the provider
         # ignore the one it does not know.
         body["max_completion_tokens"] = cap
+    effort = (settings.prompt_studio_reasoning_effort or "").strip()
+    if effort:
+        # Only when the operator has said the configured model reasons: every
+        # other model answers 400 to a request that carries this field, so it
+        # is never sent "just in case".
+        body["reasoning_effort"] = effort
 
     started = time.perf_counter()
     try:

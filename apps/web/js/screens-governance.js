@@ -599,7 +599,11 @@
         btn.disabled = true; btn.innerHTML = `<span class="spin">${ICONS.refresh}</span>Testing…`;
         try {
           const res = await Store.mutate(()=>API.connections.testAll(), { event:'connections:changed' });
-          toast(res.ok ? 'success' : 'warn','All connections tested', res.message);
+          // test-all answers ok:true whatever the probes found, so the colour is
+          // read from the counts it reports: green only when nothing warned or failed.
+          const sum = (res.data || {}).summary || {};
+          const clean = res.ok !== false && !sum.warned && !sum.failed;
+          toast(clean ? 'success' : 'warn', clean ? 'All connections tested' : 'Tested — some connections need attention', res.message);
         } catch (err) { toast('error','Could not test the connections', err.message); }
         btn.disabled = false; btn.innerHTML = orig;
         reloadAll();
@@ -1559,7 +1563,16 @@
         const w = document.getElementById('adRunsTbl');
         const mode = document.getElementById('adRunsMode');
         mode.value = runsMode;
-        const draw = () => { w.innerHTML = ''; if(mode.value === 'window') windowRuns(w, a); else historyRuns(w, a); };
+        /* Both views paint into the same host, and the history's first page can
+           take seconds: without the ticket, switching to the 24-hour table while
+           it was in flight let the late answer wipe that table and mount the
+           history under a picker that said otherwise. */
+        let drawSeq = 0;
+        const draw = () => {
+          const mine = ++drawSeq;
+          w.innerHTML = '';
+          if(mode.value === 'window') windowRuns(w, a); else historyRuns(w, a, ()=>mine === drawSeq);
+        };
         mode.addEventListener('change', ()=>{ runsMode = mode.value; draw(); });
         draw();
       }
@@ -1569,7 +1582,7 @@
          for any agent that last ran yesterday. The history is cursor-paged (a
          total would mean scanning the whole project), so older pages are
          appended on demand and the table sorts and pages what has been loaded. */
-      function historyRuns(host, a){
+      function historyRuns(host, a, alive){
         let rows = [], cursor = null;
         host.innerHTML = `<div class="card card-loading" style="height:220px"></div>`;
         const ht = dataTable({
@@ -1595,7 +1608,7 @@
           note.textContent = 'Loading…';
           API.runs.history({ agent_id: a.id, limit: 50, cursor: cursor || undefined })
             .then(page => {
-              if(!host.isConnected) return;
+              if(!host.isConnected || !alive()) return;
               rows = rows.concat(page.items || []);
               cursor = page.next_cursor || null;
               mount();
@@ -1607,8 +1620,8 @@
                 : `${fmtFull(rows.length)} ${rows.length === 1 ? 'run' : 'runs'} loaded — ${cursor ? 'older runs load on demand.' : 'that is every run the store still holds.'}`;
             })
             .catch(err => {
-              if(!host.isConnected) return;
-              if(!mounted){ host.innerHTML = ''; host.appendChild(screenError(err, ()=>historyRuns(host, a), 'the run history')); return; }
+              if(!host.isConnected || !alive()) return;
+              if(!mounted){ host.innerHTML = ''; host.appendChild(screenError(err, ()=>historyRuns(host, a, alive), 'the run history')); return; }
               btn.disabled = false;
               btn.textContent = 'Try again';
               note.textContent = 'Older runs could not be loaded — ' + ((err && err.message) || 'the request failed') + '.';
@@ -1648,9 +1661,10 @@
             ${cur && cur.template_preview
               ? `<div class="quote" style="font-size:12.5px;line-height:1.7;white-space:pre-wrap">${esc(cur.template_preview)}${previewIsPartial(cur) ? '…' : ''}</div>
                 ${previewIsPartial(cur) ? `<div class="faint small" style="margin-top:6px">Preview — the first ${PREVIEW_CHARS} characters. The committed prompt continues beyond this.</div>` : ''}`
-              : EMPTY('pen','No prompt committed', detail.telemetry_error
-                  ? 'The prompt history could not be read just now.'
-                  : 'Commit a version to keep this agent’s system prompt under review.')}
+              : detail.telemetry_error
+                // Not read is not the same claim as not committed.
+                ? EMPTY('pen','Prompt unavailable','The prompt history could not be read just now.')
+                : EMPTY('pen','No prompt committed','Commit a version to keep this agent’s system prompt under review.')}
             <div class="flex" style="gap:8px;margin-top:10px">
               <button class="btn sm" data-nav="prompts">${ICONS.edit}Open in Prompt Manager</button>
               <button class="btn sm" id="adDiff" ${versions.length < 2 ? 'disabled title="Two committed versions are needed to compare"' : ''}>${ICONS.git}Compare Versions</button>

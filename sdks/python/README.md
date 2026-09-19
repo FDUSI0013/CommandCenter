@@ -155,8 +155,13 @@ with FulcrumOps(agent="nightly-job") as client:
 | `FULCRUM_OPS_CAPTURE_INPUT` | `capture_input` | `true` |
 | `FULCRUM_OPS_CAPTURE_OUTPUT` | `capture_output` | `true` |
 | `FULCRUM_OPS_TIMEOUT_SECONDS` | `timeout_seconds` | `30` |
+| `FULCRUM_OPS_TIMEOUT_MS` | `timeout_seconds`, in milliseconds | — |
 | `FULCRUM_OPS_DEBUG` | `debug` | `false` |
 | `FULCRUM_OPS_DISABLED` | — | unset |
+
+The timeout is read under the TypeScript SDK's name and unit
+(`FULCRUM_OPS_TIMEOUT_MS`) as well as this SDK's own, which wins when both are
+set — so one variable covers a fleet that runs agents in both languages.
 
 ---
 
@@ -265,6 +270,29 @@ The decorated function keeps its own signature either way. A `thread_id`
 callable that raises costs that run its thread, never the call. An inner
 decorated step that can name the thread gives it to a run that has none.
 `Trace.set_thread_id(...)` is the same thing on a run you hold.
+
+### Runs the console started: `trace_id`
+
+**Run** on an agent's page — `POST /agents/{id}/run` — opens the run in the
+console and answers with a `run_id` and a `session_id`. Nothing is dispatched:
+whoever asked hands both to the runtime, and the run stays `Running` until the
+runtime reports under that id. Give it to the run that does the work:
+
+```python
+@trace(name="handle", trace_id=lambda job: job.run_id, thread_id=lambda job: job.session_id)
+def handle(job): ...
+
+with client.trace("handle", id=job.run_id, thread_id=job.session_id, sampled=True):
+    ...
+```
+
+Only the call that opens the run reads it; a decorated call nested inside one is
+a step of that run. The id has to be a version 7 UUID — what the console issues
+and `fulcrum_ops.new_id()` mints — because the telemetry store takes no other
+kind and refuses the whole request over one that is not. Anything else is
+replaced, with a warning, and `.id` is the id actually in use. Sampling applies
+to these runs like any other; `client.trace(..., sampled=True)` keeps a run
+somebody is waiting on out of the draw.
 
 ### `client.span(...)`
 

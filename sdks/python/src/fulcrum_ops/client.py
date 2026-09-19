@@ -280,13 +280,28 @@ class FulcrumOps:
         tags: Optional[Sequence[str]] = None,
         agent: Optional[str] = None,
         thread_id: Optional[str] = None,
+        id: Optional[str] = None,  # noqa: A002 - matches the wire field name
+        sampled: Optional[bool] = None,
     ) -> Trace:
         """Open a trace: one end-to-end agent invocation.
 
         Use it as a context manager. The trace closes on exit, capturing an
         exception as the run's failure and re-raising it unchanged.
+
+        ``id`` reports the run under an id somebody else issued — the ``run_id``
+        the console answers a manual run with, which stays ``Running`` there
+        until a runtime reports under it::
+
+            with client.trace("handle", id=job.run_id, thread_id=job.session_id, sampled=True):
+                ...
+
+        It has to be a version 7 UUID, which is what the console and
+        :func:`fulcrum_ops.new_id` mint; anything else is replaced, with a
+        warning, so read the id in use back from ``.id``. Sampling still applies
+        to a run that was handed its id, and a run the console is waiting on is
+        not one to leave to a dice roll: ``sampled=True`` reports it regardless
+        of the rate, and ``sampled=False`` drops it.
         """
-        sampled = self._should_sample()
         return Trace(
             self,
             name,
@@ -295,7 +310,8 @@ class FulcrumOps:
             tags=tags,
             agent=agent or self._options.agent,
             thread_id=thread_id,
-            sampled=sampled,
+            sampled=self._should_sample() if sampled is None else bool(sampled),
+            id=id,
         )
 
     def span(

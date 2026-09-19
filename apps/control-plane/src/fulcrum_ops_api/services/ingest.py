@@ -494,13 +494,20 @@ def _reported_environments(items: Iterable[Any], envelope: Any) -> dict[str, str
     The SDKs stamp every trace with the environment they were configured with.
     It is read only to decide where a *never-seen* agent is filed; an agent that
     is already registered keeps whatever an operator set.
+
+    An item that does not say -- a score has no metadata to say it in -- is read
+    as the batch's envelope says, which is where the SDK states the environment
+    of the process that sent it.
     """
     allowed = {env.value.lower(): env.value for env in EnvironmentType}
     reported: dict[str, str] = {}
+    fallback = getattr(envelope, "environment", None)
     for item in items:
         name = (getattr(item, "agent", None) or getattr(envelope, "agent", None) or "").strip()
         metadata = getattr(item, "metadata", None)
         stated = metadata.get("environment") if isinstance(metadata, Mapping) else None
+        if not (isinstance(stated, str) and stated.strip()):
+            stated = fallback
         if name and isinstance(stated, str) and stated.strip().lower() in allowed:
             reported.setdefault(name.lower(), allowed[stated.strip().lower()])
     return reported
@@ -599,27 +606,44 @@ async def _register_agent(
     )
     session.add(agent)
     await session.flush()
-
-    await audit.record(
-        session,
-        principal=principal,
-        action="agent.auto_registered",
-        entity_type=ENTITY_TYPE_AGENT,
-        entity_id=agent.id,
-        entity_label=agent.name,
-        source_screen=SOURCE_SCREEN,
-        detail=(
-            f"Registered '{agent.name}' on its first telemetry and provisioned its "
-            "telemetry project; awaiting governance review."
-        ),
-        metadata={
-            "slug": agent.slug,
-            "environment": agent.environment,
-            "engine_project_name": project_name,
-        },
-        request=request,
-    )
+    # The audit row is written by ``_audit_registrations``, once the telemetry
+    # store has been dealt with -- not here, ahead of it.
     return agent
+
+
+async def _audit_registrations(
+    session: AsyncSession, principal: Principal, agents: _Agents, *, request: Request | None
+) -> None:
+    """Audit the agents this batch registered, after the store has been dealt with.
+
+    An audit row takes the workspace's place in the audit chain and keeps it
+    until the transaction ends. Written at the moment of registration it was
+    held across every call to the telemetry store the batch went on to make, so
+    each other audited change in the workspace waited out its lock poll and then
+    forked the chain -- for a row that describes a change no less truthfully a
+    few seconds later. It is written where the rest of a batch's audit rows
+    are: at the end of the unit of work, with nothing slow left to do.
+    """
+    for agent in agents.registered:
+        await audit.record(
+            session,
+            principal=principal,
+            action="agent.auto_registered",
+            entity_type=ENTITY_TYPE_AGENT,
+            entity_id=agent.id,
+            entity_label=agent.name,
+            source_screen=SOURCE_SCREEN,
+            detail=(
+                f"Registered '{agent.name}' on its first telemetry and provisioned its "
+                "telemetry project; awaiting governance review."
+            ),
+            metadata={
+                "slug": agent.slug,
+                "environment": agent.environment,
+                "engine_project_name": agent.engine_project_name,
+            },
+            request=request,
+        )
 
 
 async def _resolve_agents(
@@ -825,7 +849,12 @@ def _compile_policy(policy: Policy) -> _Rule | None:
         enforcement=str(action.get("mode") or policy.enforcement),
         severity=str(body.get("severity") or ViolationSeverity.MEDIUM.value),
         match="any" if str(body.get("match", "all")).lower() == "any" else "all",
-        fail_mode="open" if str(body.get("fail_mode", "closed")).lower() == "open" else "closed",
+        # A body that does not say fails open, which is what ``PolicyRules``
+        # reads into it and so what the Policy Center shows its reviewer. Read
+        # as closed here, the screen and the enforcement disagreed about the
+        # same stored rule. A value that *is* stated and is not "open" stays
+        # closed.
+        fail_mode="open" if str(body.get("fail_mode", "open")).lower() == "open" else "closed",
         exceptions=exceptions,
         conditions=tuple(conditions),
         message=message if isinstance(message, str) else None,
@@ -1744,7 +1773,11 @@ def _engine_score(
     reason: str | None = None,
     source: str = "sdk",
 ) -> dict[str, Any]:
-    if source.lower() not in _ENGINE_SCORE_SOURCES:
+    # Normalised before it is checked, because what is checked must be what is
+    # sent: "UI" passed a case-blind test and then travelled as written, to an
+    # enum that is spelled in lower case and refuses anything else.
+    source = (source or "").strip().lower()
+    if source not in _ENGINE_SCORE_SOURCES:
         source = "sdk"
     payload: dict[str, Any] = {
         "project_name": _project(agent),
@@ -2134,7 +2167,17 @@ async def ingest_traces(
             started, _store_traces(bundles, results)
         )
         quotas = await _commit_quotas(session, charges, accepted, request=request)
+        # The licence's meter, fed from the same survivors the quotas were just
+        # charged for: Usage & Limits and the overage alerts read rows that
+        # nothing wrote until this call existed.
+        await licensing.record_usage(
+            session,
+            principal.workspace_id,
+            tokens=sum(entry.tokens for entry in accepted),
+            runs=len(accepted),
+        )
 
+    await _audit_registrations(session, principal, agents, request=request)
     violations = await _record_evidence(
         session,
         principal,
@@ -2336,7 +2379,13 @@ async def ingest_spans(
         accepted, scores_sent = await _within_budget(started, store())
         spans_sent = len(accepted)
         quotas = await _commit_quotas(session, charges, accepted, request=request)
+        # Tokens only: a span posted on its own belongs to a run that is, or
+        # will be, counted where its trace is reported.
+        await licensing.record_usage(
+            session, principal.workspace_id, tokens=sum(entry.tokens for entry in accepted)
+        )
 
+    await _audit_registrations(session, principal, agents, request=request)
     violations = await _record_evidence(
         session,
         principal,
@@ -2384,6 +2433,10 @@ async def ingest_scores(
         principal,
         {(item.agent or parsed.envelope.agent or "") for _, item in parsed.valid},
         request=request,
+        # A score carries no metadata; only the envelope can say.
+        environments=_reported_environments(
+            (item for _, item in parsed.valid), parsed.envelope
+        ),
     )
 
     grouped: dict[ScoreTarget, list[tuple[int, dict[str, Any]]]] = {
@@ -2450,6 +2503,7 @@ async def ingest_scores(
         ]
         quotas = await _commit_quotas(session, charges, accepted, request=request)
 
+    await _audit_registrations(session, principal, agents, request=request)
     result = _finish(results, parsed, started, agents, quotas, False, 0)
     result.scores_accepted = len(accepted)
     return result
@@ -2536,6 +2590,19 @@ async def ingest_events(
         policy_refs,
     )
     seen_refs = await _existing_feedback_refs(session, principal, feedback_refs)
+
+    # Collection Settings' PII switch governs every comment the workspace keeps,
+    # whichever door it came in by. This one used to go round it: a comment an
+    # SDK reported was stored as written and copied, as the score's reason, into
+    # the telemetry store. Read once, and only for a batch that has a comment.
+    scrub: Callable[[str | None], tuple[str | None, list[str]]] | None = None
+    if any(
+        item.kind is IngestEventKind.FEEDBACK_SUBMITTED and item.body for _, item in parsed.valid
+    ):
+        from . import feedback as feedback_service
+
+        if await feedback_service.pii_scrubbing_enabled(session, principal):
+            scrub = feedback_service.scrub_pii
 
     now = _now()
     recorded = 0
@@ -2640,6 +2707,14 @@ async def ingest_events(
             )
             continue
         seen_refs.add(ref)
+        # Scrubbed before the item exists, so the row and the score reason the
+        # mirror builds from it both carry the scrubbed text. The kinds removed
+        # are ours to state, never the reporter's -- and never the values.
+        body, scrubbed = scrub(event.body) if scrub is not None else (event.body, [])
+        feedback_metadata = dict(event.detail)
+        feedback_metadata.pop("pii_scrubbed", None)
+        if scrubbed:
+            feedback_metadata["pii_scrubbed"] = scrubbed
         item = FeedbackItem(
             workspace_id=principal.workspace_id,
             feedback_ref=ref,
@@ -2647,11 +2722,11 @@ async def ingest_events(
             trace_id=event.trace_id,
             rating=event.rating,
             sentiment=_sentiment(event),
-            body=event.body,
+            body=body,
             source=_feedback_source(event),
             submitted_by=event.submitted_by,
             submitted_at=occurred_at,
-            event_metadata=dict(event.detail),
+            event_metadata=feedback_metadata,
         )
         session.add(item)
         mirror = _feedback_mirror(item, agent)

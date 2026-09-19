@@ -1067,12 +1067,12 @@ async def list_members(
 async def member_directory(
     session: AsyncSession, principal: Principal
 ) -> list[dict[str, Any]]:
-    """Active members' names only, for assignment pickers on operator screens.
+    """Active members' names only, for the assignment and escalation pickers.
 
     Deliberately thinner than :func:`list_members`: no emails, roles, teams or
-    login history — nothing worth mining — so it can open to operators without
-    weakening the admin gate on the roster itself. The caller enforces the
-    signed-in-person and operator checks.
+    login history — nothing worth mining — so it can open to approvers and
+    operators without weakening the admin gate on the roster itself. The caller
+    enforces the signed-in-person and approver checks.
     """
     stmt = (
         select(User)

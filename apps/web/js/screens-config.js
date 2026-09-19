@@ -1231,7 +1231,7 @@
                 toast(verb === 'block' ? 'warn' : 'success', LIFECYCLE_DONE[verb],
                   res.message || `${p.name || r.name}: ${res.previous_status || r.status} → ${p.status || ''}.`);
                 refreshAll();
-                if(res.prompt) showPrompt(res.prompt);
+                if(res.prompt) showSaved(res.prompt);
               } catch (err) {
                 toast('error', `Could not ${label.toLowerCase()}`, msgOf(err));
               }
@@ -1311,7 +1311,7 @@
                 close();
                 toast('success','Version committed', res.message || `${r.name} ${res.version ? res.version.version : ''} is now the head.`);
                 refreshAll();
-                if(res.prompt) showPrompt(res.prompt);
+                if(res.prompt) showSaved(res.prompt);
               } catch (err) {
                 toast('error','Could not commit the version', msgOf(err));
               }
@@ -1356,7 +1356,7 @@
               const res = await Store.mutate(() => API.prompts.restore(r.id, commit), { event:'prompts:changed' });
               toast('success','Version restored', res.message || `${r.name} restored to ${version}.`);
               refreshAll();
-              if(res.prompt) showPrompt(res.prompt);
+              if(res.prompt) showSaved(res.prompt);
             } catch (err) {
               toast('error','Could not restore', msgOf(err));
             }
@@ -1506,6 +1506,20 @@
             const holder = insp.querySelector('.card-loading');
             if(holder) holder.replaceWith(screenError(err, ()=>showPrompt(row), 'this prompt'));
           });
+      }
+
+      /**
+       * Paint the inspector from a mutation's own answer. Every verb here hands
+       * back the prompt as it now stands, the same shape GET /prompts/{id}
+       * serves, so going through showPrompt fetched it a second time — one more
+       * registry read and the audit queries behind it, after every click.
+       */
+      function showSaved(p){
+        const layout = document.getElementById('pmLayout');
+        const insp = document.getElementById('pmInspector');
+        if(!layout || !insp) return;
+        layout.classList.remove('collapsed');
+        paintPrompt(insp, p);
       }
 
       function paintPrompt(insp, p){
@@ -2575,7 +2589,9 @@
               ? hbars(byType.map(t=>({ label:t.secret_type, value:t.compliance_pct == null ? 0 : t.compliance_pct,
                   color: (t.compliance_pct || 0) >= 90 ? 'green' : (t.compliance_pct || 0) >= 70 ? 'amber' : 'red',
                   display: t.compliance_pct == null ? '—' : t.compliance_pct + '%',
-                  pct: `${t.compliant}/${t.count}` })), {labelW:130})
+                  // The percentage is taken over the credentials in service, so the
+                  // fraction beside it is too — "100%  2/5" read as a contradiction.
+                  pct: `${t.compliant}/${t.in_service == null ? t.count : t.in_service}` })), {labelW:130})
               : EMPTY('shieldCheck','Nothing to score','No secrets are stored yet.')}</div>
           <div class="card"><div class="card-head"><div class="card-title">Expiring Secrets <span class="muted small">(Next 7 Days)</span></div></div>
             <div id="scExpiring">${LOADING(110)}</div></div>

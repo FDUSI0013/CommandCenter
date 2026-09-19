@@ -188,17 +188,19 @@ async def get_own_membership(principal: CurrentPrincipal, session: Db) -> Member
     summary="Member names for pickers",
 )
 async def member_directory(principal: CurrentPrincipal, session: Db) -> list[MemberRef]:
-    """Names only, for assignment pickers on operator screens.
+    """Names only, for the assignment and escalation pickers.
 
     The full member list is admin-only so an API key can never enumerate the
     tenant's staff; this endpoint carries just id, name and initials, and is
-    open only to signed-in people — the alert-assignment and escalation
-    pickers are operator flows, and an operator choosing an assignee needs to
-    see who exists.
+    open only to signed-in people who route work to someone else. That starts
+    at approver, not operator: escalating a request is an approver's action,
+    and the dialog that names the next reviewer reads this list — gated one
+    role higher, the person entitled to escalate was shown "Members
+    unavailable" and could only escalate to nobody in particular.
     """
     if principal.kind != "user":
         raise PermissionDenied("This endpoint is for signed-in users, not API keys.")
-    principal.require(Role.OPERATOR)
+    principal.require(Role.APPROVER)
     rows = await service.member_directory(session, principal)
     return [MemberRef.model_validate(row) for row in rows]
 

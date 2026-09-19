@@ -2,12 +2,18 @@
 
 This module owns three things the rest of the platform depends on:
 
-* **Enforcement.** ``check_quota``, ``enforce_quota`` and ``record_usage`` are
-  the request-path entry points. Ingest calls them before accepting telemetry
-  and licensing calls them alongside its entitlement checks, so they are written
-  to be cheap, to write only when they genuinely advance state, and never to
-  fail open silently — a ``Block`` quota that is breached raises
-  :class:`QuotaExceeded` and nothing else decides otherwise.
+* **Metering and enforcement.** A quota fills up in one of two places, by what
+  it limits. *Requests* and *Tokens* are counted by ``services.ingest`` as
+  telemetry is accepted: it refuses a batch a ``Block`` quota cannot take,
+  increments ``used_value`` in SQL so concurrent batches cannot lose a count,
+  and then hands the row to :func:`evaluate_quota` here, which owns the status,
+  the alert and its wording. *Cost* is not known when a batch arrives -- the
+  engine prices a run after the fact -- so it is measured on the platform clock:
+  :func:`meter_cost_quotas`, run with the budget sweep, sets ``used_value`` from
+  the spend the engine reports for the quota's scope and period.
+  ``check_quota``, ``enforce_quota`` and ``record_usage`` are the same rules as
+  a library; nothing on the request path calls them, and ``record_usage`` is a
+  read-modify-write that must not be put on a concurrent one.
 * **Attribution.** Spend, tokens and calls are measured by the telemetry engine
   and attributed to a model, a service class, a team or a budget scope using the
   agent registry. The attribution rule is stated on every function that applies
@@ -24,6 +30,7 @@ audit row naming this screen.
 from __future__ import annotations
 
 import asyncio
+import calendar
 import dataclasses
 import datetime as dt
 import logging
@@ -502,7 +509,7 @@ def _refresh_period(quota: Quota, at: dt.datetime) -> bool:
     return True
 
 
-async def _evaluate_quota(
+async def evaluate_quota(
     session: AsyncSession, quota: Quota, *, request: Request | None = None
 ) -> LimitStatus:
     """Move a quota's status to match its usage and alert on an escalation.
@@ -510,14 +517,42 @@ async def _evaluate_quota(
     An alert is raised only when the state actually changes, and it is
     deduplicated on the quota and the state it entered, so a ceiling that stays
     breached produces one alert with a rising occurrence count.
+
+    Public because the ingest path calls it: that is where Requests and Tokens
+    quotas fill up, and the status and the alert are this module's to decide.
     """
     previous = quota.status
-    utilization = _utilisation(quota.used_value, quota.limit_value)
-    status = _status_for(utilization, previous)
+    status = _status_for(_utilisation(quota.used_value, quota.limit_value), previous)
     quota.status = status.value
-    if status.value == previous or status not in (LimitStatus.WARNING, LimitStatus.EXCEEDED):
-        return status
+    if status.value != previous:
+        await _alert_quota(session, quota, status, request=request)
+    return status
 
+
+#: The name this had while it was private. ``services.ingest`` still looks it up
+#: by that spelling (``getattr``, so a rename would not fail -- it would silently
+#: stop raising threshold alerts from ingest). Kept until ingest asks for
+#: :func:`evaluate_quota` by name.
+_evaluate_quota = evaluate_quota
+
+
+async def _alert_quota(
+    session: AsyncSession,
+    quota: Quota,
+    status: LimitStatus,
+    *,
+    request: Request | None = None,
+) -> None:
+    """Raise the alert for a quota that has just *entered* ``status``.
+
+    Only Warning and Exceeded are news; dropping back to Active moves the chip
+    and nothing else. Split from the evaluator so the clock's meter, which
+    writes the status as bookkeeping rather than as an edit, raises exactly the
+    alert an edit or an ingest batch would.
+    """
+    if status not in (LimitStatus.WARNING, LimitStatus.EXCEEDED):
+        return
+    utilization = _utilisation(quota.used_value, quota.limit_value)
     breached = status is LimitStatus.EXCEEDED
     blocking = quota.enforcement == QuotaEnforcement.BLOCK.value
     await alerts.raise_alert(
@@ -552,7 +587,6 @@ async def _evaluate_quota(
         },
         request=request,
     )
-    return status
 
 
 async def _applicable_quotas(
@@ -709,7 +743,7 @@ async def record_usage(
     for quota in quotas:
         _refresh_period(quota, at)
         quota.used_value = float(quota.used_value or 0.0) + amount
-        await _evaluate_quota(session, quota, request=request)
+        await evaluate_quota(session, quota, request=request)
     await session.flush()
     return _verdict(quotas, resource, 0.0)
 
@@ -833,7 +867,7 @@ async def update_quota(
     # A raised ceiling can clear a breach and a lowered one can create it, so the
     # status is always recomputed rather than left where the caller found it.
     if quota.status not in INERT_STATUSES:
-        await _evaluate_quota(session, quota, request=request)
+        await evaluate_quota(session, quota, request=request)
 
     try:
         await session.flush()
@@ -1090,7 +1124,7 @@ async def apply_approved_increase(
     # A raised ceiling can clear a Warning or a breach; a switched-off quota
     # stays switched off at its new limit.
     if quota.status not in INERT_STATUSES:
-        await _evaluate_quota(session, quota, request=request)
+        await evaluate_quota(session, quota, request=request)
     await session.flush()
     await audit.record(
         session,
@@ -1511,8 +1545,9 @@ async def delete_budget(
     await session.flush()
 
 
-def _in_scope(budget: Budget, project: telemetry.AgentProject) -> bool:
-    """Whether one agent's spend belongs to one budget."""
+def _in_scope(budget: Budget | Quota, project: telemetry.AgentProject) -> bool:
+    """Whether one agent's spend belongs to one budget -- or one quota: both
+    carry the same ``scope`` and ``scope_ref``."""
     scope = LimitScope(budget.scope)
     if scope is LimitScope.WORKSPACE:
         return True
@@ -1560,8 +1595,11 @@ async def _roll_up_spend(
     for (start, end), group in periods.items():
         try:
             async with engine_deadline(what="the budget roll-up"):
+                # Only ``cost_usd`` is read below, so the per-agent token
+                # aggregations are not asked for: they were the larger half of
+                # what every pass cost the store.
                 rollups = await telemetry.project_rollups(
-                    client, projects, start, end, fresh=True
+                    client, projects, start, end, fresh=True, tokens=False
                 )
         except EngineError as exc:
             raise telemetry.telemetry_unavailable(exc) from exc
@@ -1799,6 +1837,183 @@ async def refresh_budgets(
     return [budget_payload(budget, at=at) for budget in budgets]
 
 
+# ---------------------------------------------------------------------------
+# Cost quotas -- metered on the clock
+#
+# Ingest counts requests and tokens as they arrive. It cannot count dollars:
+# the engine prices a run after it has been stored. So a quota on Cost had no
+# meter at all -- it could be created, it read "$0 of $500" for ever, it never
+# warned and it never breached. Its usage is measured here instead, the way a
+# budget's spend is, by the same pass.
+# ---------------------------------------------------------------------------
+
+#: Months in one period of each cadence.
+PERIOD_MONTHS: Final[dict[LimitPeriod, int]] = {
+    LimitPeriod.MONTHLY: 1,
+    LimitPeriod.QUARTERLY: 3,
+    LimitPeriod.ANNUAL: 12,
+}
+#: How many periods a long-neglected quota is walked forward through before the
+#: arithmetic gives up and the calendar period is used instead.
+MAX_PERIOD_ROLLS: Final[int] = 64
+
+
+def _shift_months(moment: dt.datetime, months: int) -> dt.datetime:
+    """Move an instant by whole months, keeping its day where the month has one.
+
+    Unlike ``_add_months`` this is for a reset instant somebody chose -- the
+    fifteenth, say -- which has to stay the fifteenth as its period rolls.
+    """
+    year, month = divmod(moment.year * 12 + moment.month - 1 + months, 12)
+    day = min(moment.day, calendar.monthrange(year, month + 1)[1])
+    return moment.replace(year=year, month=month + 1, day=day)
+
+
+def _cost_period(quota: Quota, at: dt.datetime) -> tuple[dt.datetime, dt.datetime]:
+    """The period of ``quota`` that contains ``at``: its start and its reset.
+
+    A period ends at the quota's reset instant and is one cadence long, so a
+    reset that has passed is walked forward until it has not. The start is
+    always derived from the reset, never stored, so every pass over an unedited
+    quota measures the same window.
+    """
+    period = LimitPeriod(quota.period)
+    if quota.resets_at is None:
+        return period_bounds(period, at)
+    step = PERIOD_MONTHS[period]
+    resets_at = _as_utc(quota.resets_at)
+    for _ in range(MAX_PERIOD_ROLLS):
+        if resets_at > at:
+            return _shift_months(resets_at, -step), resets_at
+        resets_at = _shift_months(resets_at, step)
+    return period_bounds(period, at)
+
+
+def _quota_covers(quota: Quota, project: telemetry.AgentProject) -> bool:
+    """Whether one agent's spend counts against one quota.
+
+    The rule ingest applies to requests and tokens: a narrower quota that names
+    no target covers nothing, rather than every agent that has no team.
+    """
+    if quota.scope != LimitScope.WORKSPACE.value and not quota.scope_ref:
+        return False
+    return _in_scope(quota, project)
+
+
+async def _book_cost(
+    session: AsyncSession,
+    quota: Quota,
+    spend: float | None,
+    resets_at: dt.datetime,
+    *,
+    request: Request | None = None,
+) -> None:
+    """The meter's write: usage, period and status, without it being an edit.
+
+    As with a budget's scheduled roll-up, this is an observation about the row:
+    it must not move ``updated_at`` under an admin who has the quota open, and
+    it writes nothing when nothing moved. A period the engine reports no cost
+    for keeps the usage it had -- an unanswered read is not evidence of no
+    spend -- unless the period has just rolled, when the counter starts again
+    as every quota's does.
+    """
+    previous = quota.status
+    rolled = quota.resets_at is None or _as_utc(quota.resets_at) != resets_at
+    if spend is not None:
+        used = round(spend, 4)
+    elif rolled:
+        used = 0.0
+    else:
+        used = float(quota.used_value or 0.0)
+    status = _status_for(_utilisation(used, quota.limit_value), previous)
+
+    changes: dict[str, Any] = {}
+    if used != float(quota.used_value or 0.0):
+        changes["used_value"] = used
+    if rolled:
+        changes["resets_at"] = resets_at
+    if status.value != previous:
+        changes["status"] = status.value
+    if not changes:
+        return
+    await stamp(session, [quota], **changes)
+    if status.value != previous:
+        await _alert_quota(session, quota, status, request=request)
+
+
+async def meter_cost_quotas(
+    session: AsyncSession,
+    principal: Principal,
+    *,
+    at: dt.datetime | None = None,
+    request: Request | None = None,
+) -> int:
+    """Set every live Cost quota's usage from the spend the engine measured.
+
+    Usage is *set*, not added to: the engine is asked what the quota's scope has
+    cost since its period opened, and that is the number. Quotas whose periods
+    open together share one measurement, always a fresh one, because it is
+    stored and compared against a ceiling. Returns how many quotas were metered;
+    a workspace with none costs one query and no engine read.
+
+    The store is asked before any row is locked, and the quotas are then read
+    again under the lock: one an admin switched off, deleted or re-dated while
+    the store was answering is left to the next pass rather than overruled.
+
+    This does not make ``Block`` refuse anything. Cost is known only after the
+    run it belongs to, so a Cost quota warns and alerts; the chip and the alert
+    say so at the moment the ceiling is crossed, whatever its enforcement.
+    """
+    moment = at or _now()
+    live = _scoped_quotas(principal).where(
+        Quota.resource == QuotaResource.COST.value, Quota.status.not_in(INERT_STATUSES)
+    )
+    quotas = (await session.execute(live)).scalars().all()
+    if not quotas:
+        return 0
+
+    client = get_engine_client()
+    projects = await telemetry.workspace_projects(session, principal)
+    measured: dict[dt.datetime, list[telemetry.ProjectRollup]] = {}
+    for start in sorted({_cost_period(quota, moment)[0] for quota in quotas}):
+        if start >= moment:
+            continue  # a first period that has not opened yet has no spend
+        try:
+            async with engine_deadline(what="the cost quota meter"):
+                measured[start] = await telemetry.project_rollups(
+                    client, projects, start, moment, fresh=True, tokens=False
+                )
+        except EngineError as exc:
+            raise telemetry.telemetry_unavailable(exc) from exc
+
+    locked = (
+        (
+            await session.execute(
+                live.where(Quota.id.in_([quota.id for quota in quotas]))
+                # Id order, as ingest takes its quota rows, so two writers
+                # holding several of the same rows cannot deadlock.
+                .order_by(Quota.id.asc())
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    metered = 0
+    for quota in locked:
+        start, resets_at = _cost_period(quota, moment)
+        rollups = measured.get(start)
+        if rollups is None:
+            continue
+        spend = telemetry.sum_optional(
+            rollup.cost_usd for rollup in rollups if _quota_covers(quota, rollup.project)
+        )
+        await _book_cost(session, quota, spend, resets_at, request=request)
+        metered += 1
+    return metered
+
+
 #: When this process last ran the budget pass, on the monotonic clock.
 _last_budget_sweep: float | None = None
 
@@ -1835,6 +2050,11 @@ async def run_budget_sweep(*, force: bool = False) -> dict[str, int]:
     Each workspace is measured on its own session and committed on its own: a
     store that cannot answer for one, or one bad row, costs that workspace this
     pass and nobody else anything.
+
+    Cost quotas are metered by the same pass (``meter_cost_quotas``): they are
+    the same kind of number -- measured spend held against a ceiling -- wanted
+    at the same cadence, and this is the one measuring job the clock runs. Their
+    counts are reported only for a pass that had a Cost quota to meter.
     """
     global _last_budget_sweep
     moment = time.monotonic()
@@ -1854,7 +2074,14 @@ async def run_budget_sweep(*, force: bool = False) -> dict[str, int]:
                     await session.execute(
                         select(Budget.workspace_id)
                         .where(Budget.status != LimitStatus.DISABLED.value)
-                        .distinct()
+                        # A workspace may cap its spend with a quota and keep
+                        # no budget at all; UNION also removes the duplicates.
+                        .union(
+                            select(Quota.workspace_id).where(
+                                Quota.resource == QuotaResource.COST.value,
+                                Quota.status.not_in(INERT_STATUSES),
+                            )
+                        )
                     )
                 )
                 .scalars()
@@ -1883,6 +2110,17 @@ async def run_budget_sweep(*, force: bool = False) -> dict[str, int]:
         except Exception:  # noqa: BLE001 - one workspace must not stop the others
             counts["budget_sweeps_failed"] += 1
             log.exception("budget sweep failed for workspace %s", workspace_id)
+        # On a session of its own, so a budget row that failed above does not
+        # cost the workspace its quota meter as well, nor the other way round.
+        try:
+            async with get_sessionmaker()() as session:
+                metered = await meter_cost_quotas(session, principal)
+                await session.commit()
+            if metered:
+                counts["cost_quotas_metered"] = counts.get("cost_quotas_metered", 0) + metered
+        except Exception:  # noqa: BLE001 - one workspace must not stop the others
+            counts["cost_quota_sweeps_failed"] = counts.get("cost_quota_sweeps_failed", 0) + 1
+            log.exception("cost quota meter failed for workspace %s", workspace_id)
     return counts
 
 
@@ -2147,8 +2385,19 @@ async def record_capacity(
     principal.require(Role.OPERATOR)
     at = _now()
     oldest = at - dt.timedelta(days=CAPACITY_HISTORY_DAYS)
+    # The platform's own pools are not a reporter's to write. ``run_capacity_sweep``
+    # reads whether a pass is due from the newest reading under those names, in
+    # any workspace -- so one tenant's cron job posting "Platform Disk" every few
+    # minutes would stop the platform recording its readings for every tenant.
+    reserved = {name.casefold() for name in PLATFORM_POOLS}
     records: list[CapacityRecord] = []
     for position, reading in enumerate(payload.readings):
+        if reading.name.casefold() in reserved:
+            raise ValidationFailed(
+                f"Reading {position + 1}: '{reading.name}' is a pool the platform reports "
+                "about itself. Report yours under a name of its own.",
+                details={"field": f"readings[{position}].name"},
+            )
         measured_at = _as_utc(reading.measured_at) if reading.measured_at else at
         if measured_at > at + CAPACITY_CLOCK_SKEW:
             raise ValidationFailed(

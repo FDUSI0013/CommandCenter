@@ -332,6 +332,10 @@ async def export_deployments(
     strategy: Annotated[DeploymentStrategy | None, Query()] = None,
     agent_id: Annotated[str | None, Query()] = None,
     version: Annotated[str | None, Query()] = None,
+    terminal: Annotated[
+        bool | None,
+        Query(description="true: only finished deployments (the History tab)"),
+    ] = None,
 ) -> StreamingResponse:
     """The current view as CSV. Honours the same search and filters as the list
     endpoint so the file matches what the operator is looking at."""
@@ -344,6 +348,7 @@ async def export_deployments(
         strategy=strategy.value if strategy else None,
         agent_id=agent_id,
         version=version,
+        terminal=terminal,
     )
     reads = await _read_deployments(session, principal, rows)
     records = [

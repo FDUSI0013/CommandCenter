@@ -16,6 +16,7 @@ import ipaddress
 from typing import Any, Final
 from urllib.parse import urlparse
 
+import httpx
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from ..models.registry import ConnectionStatus, HealthState
@@ -92,9 +93,13 @@ def is_link_local_host(host: str | None) -> bool:
     an ordinary thing to connect.
     """
     try:
-        return ipaddress.ip_address((host or "").strip("[]")).is_link_local
+        address = ipaddress.ip_address((host or "").strip("[]"))
     except ValueError:
         return False  # a name, not an address literal
+    # An IPv4 address carried inside an IPv6 one is routed as the IPv4 address:
+    # ::ffff:169.254.169.254 is the metadata address by another spelling.
+    carried = getattr(address, "ipv4_mapped", None)
+    return (carried or address).is_link_local
 
 
 def _validate_endpoints(config: dict[str, Any]) -> dict[str, Any]:
@@ -108,7 +113,21 @@ def _validate_endpoints(config: dict[str, Any]) -> dict[str, Any]:
         parsed = urlparse(raw.strip())
         if parsed.scheme not in ("http", "https") or not parsed.netloc:
             raise ValueError(f"config.{key} must be an absolute http(s) URL")
-        if is_link_local_host(parsed.hostname):
+        # A scheme and a netloc are not enough: ``https://erp.internal:port/``
+        # has both, and so does the Add form's own ``https://…`` placeholder
+        # pasted back in. Those saved cleanly and then could never be tested. The
+        # value is parsed by the library that will later open it, so what is
+        # accepted here is exactly what the probe can address.
+        try:
+            url = httpx.URL(raw.strip())
+        except httpx.InvalidURL:
+            raise ValueError(f"config.{key} must be a valid http(s) URL") from None
+        if not url.host:
+            raise ValueError(f"config.{key} must be a valid http(s) URL with a host name")
+        # The library takes any integer at parse time and fails at connect.
+        if url.port is not None and not 0 < url.port < 65536:
+            raise ValueError(f"config.{key} must be a valid http(s) URL (the port is out of range)")
+        if is_link_local_host(url.host) or is_link_local_host(parsed.hostname):
             raise ValueError(f"config.{key} must not be a link-local (instance metadata) address")
     return config
 

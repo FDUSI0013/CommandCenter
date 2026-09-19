@@ -100,10 +100,22 @@ from ..schemas.runs import (
 )
 from . import audit, telemetry_cache
 
+# What Run Agent writes to ``metadata.source``. Read from where it is written, so
+# the writer and this reader cannot drift apart.
+from .agents import SOURCE_SCREEN_DETAIL as CONSOLE_REQUEST_SOURCE
+
 T = TypeVar("T")
 
 SOURCE_SCREEN: Final[str] = "Live Runs"
 ENTITY_TYPE: Final[str] = "run"
+
+#: What the inspector says of a console request that was never answered. The
+#: store recorded no error for it -- there was nobody to record one -- and a
+#: Failed row with no reason beside it reads as a fault in the screen.
+ABANDONED_REQUEST_MESSAGE: Final[str] = (
+    "No agent runtime reported on this request. It was recorded from the console "
+    "and never picked up, so it is shown as failed rather than as still running."
+)
 
 #: Hard ceiling on rows pulled from the engine to answer one request.
 MAX_SCAN_TRACES: Final[int] = 2_000
@@ -856,6 +868,32 @@ def _policy_of(trace: dict[str, Any], meta: dict[str, Any]) -> RunPolicy:
     return RunPolicy.ALLOWED
 
 
+def _abandoned_request(trace: dict[str, Any], meta: dict[str, Any]) -> bool:
+    """Is this an open console request that nothing is ever going to close?
+
+    Run Agent records the request as an open trace and dispatches nothing. When
+    no runtime reports under that id the trace never gets an end time, and it
+    read "Running" on every run screen for as long as the store kept it -- days
+    after anybody could have been running anything.
+
+    Only a trace that carries both marks Run Agent writes is judged, and only
+    while nothing has been reported on it. A run an agent reported is open
+    because the agent has not finished, however long that takes; so is a console
+    request a runtime did pick up, which by then has spans or an output.
+    """
+    limit = settings.run_request_abandoned_after_seconds
+    if limit <= 0:
+        return False
+    if meta.get("source") != CONSOLE_REQUEST_SOURCE or not meta.get("triggered_by"):
+        return False
+    if _instant(trace.get("end_time")) is not None:
+        return False
+    if _int(trace.get("span_count")) > 0 or trace.get("output"):
+        return False
+    started = _instant(trace.get("start_time"))
+    return started is not None and _now() - started > dt.timedelta(seconds=limit)
+
+
 def _status_of(
     trace: dict[str, Any], meta: dict[str, Any], policy: RunPolicy
 ) -> RunStatus:
@@ -869,6 +907,8 @@ def _status_of(
     if policy is RunPolicy.BLOCKED:
         return RunStatus.FAILED
     if _instant(trace.get("end_time")) is None:
+        if _abandoned_request(trace, meta):
+            return RunStatus.FAILED
         return RunStatus.RUNNING
     if policy is RunPolicy.WARNED:
         return RunStatus.WARNED
@@ -1018,6 +1058,12 @@ def _map_detail(trace: dict[str, Any], agent: Agent, principal: Principal) -> Ru
         error_message = error_info.get("message") or error_info.get("exception_type")
     elif isinstance(error_info, str):
         error_message = error_info
+    if (
+        not error_message
+        and row.status is RunStatus.FAILED
+        and _abandoned_request(trace, meta)
+    ):
+        error_message = ABANDONED_REQUEST_MESSAGE
 
     injection = next(
         (v.result for v in verdicts if "inject" in v.name.lower()),

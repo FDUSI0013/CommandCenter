@@ -108,6 +108,12 @@ class Settings(BaseSettings):
     runs_scan_cache_seconds: float = 4.0
     # How long a finished KPI row is served before it is folded again.
     runs_summary_cache_seconds: float = 20.0
+    # How long a run requested from the console may stay open before the run
+    # screens stop calling it Running. Such a request is only a record -- nothing
+    # is dispatched -- so one no runtime ever reported on would otherwise read
+    # "Running" for as long as the store keeps it. Runs reported by an agent are
+    # never judged by this, however long they take. Zero switches it off.
+    run_request_abandoned_after_seconds: float = 3600.0
 
     # ---- metrics rollups: what is remembered between requests -------------
     # See services/metrics.py. How long one engine measurement (a project's
@@ -192,9 +198,23 @@ class Settings(BaseSettings):
     prompt_studio_api_key: str | None = None
     prompt_studio_model: str = "gpt-4o-mini"
     prompt_studio_api_version: str | None = None
-    prompt_studio_timeout_seconds: float = 60.0
+    # A model that reasons before it answers routinely takes over a minute. The
+    # waits above this one are built around it and must stay in this order: the
+    # console gives a run 135 s (PROMPT_RUN_TIMEOUT_MS in apps/web/js/api.js) and
+    # the edge 150 s (deploy/Caddyfile), so the server is always the first to
+    # give up and the person is told why. Raise this past ~120 and those two
+    # have to move with it.
+    prompt_studio_timeout_seconds: float = 120.0
     # Ceiling on one execution, so a runaway template cannot bill unbounded.
-    prompt_studio_max_output_tokens: int = 1024
+    # A reasoning model spends this same allowance on its thinking: at 1024 it
+    # could use all of it before writing a word, and the run came back empty
+    # and marked truncated. The request may still ask for less.
+    prompt_studio_max_output_tokens: int = 4096
+    # How hard a reasoning model should think ("low", "medium", "high"; the
+    # provider defines the set). Unset -- or empty, which is what an unfilled
+    # compose variable arrives as -- sends nothing: a model that does not reason
+    # refuses a request that carries the field at all.
+    prompt_studio_reasoning_effort: str | None = None
 
     @property
     def prompt_studio_enabled(self) -> bool:

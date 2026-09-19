@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import datetime as dt
 import re
-from typing import Any, Final
+from typing import Any, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -38,7 +38,8 @@ from ..models.registry import (
 MAX_TEMPLATE_CHARS: Final[int] = 200_000
 
 #: How much of a version's template travels with the version list. The full
-#: body is only sent by the diff endpoint, which is what needs it.
+#: body is sent by the read-one-version route, which the editor opens on, and
+#: line by line by the diff endpoint.
 TEMPLATE_PREVIEW_CHARS: Final[int] = 400
 
 MAX_TAGS: Final[int] = 20
@@ -243,9 +244,26 @@ class AgentConnectorRead(BaseModel):
 
 
 class AgentPolicyBindingRead(BaseModel):
-    """One policy attached to this agent, for the Risk & Policy summary."""
+    """One policy that governs this agent, for the Risk & Policy summary.
 
-    binding_id: str
+    A policy reaches an agent two ways: somebody bound it to the agent, or its
+    scope covers the agent (Global, the agent's environment, a connector the
+    agent is granted, the agent itself). Most policies are of the second kind
+    and have no binding row, so ``binding_id`` is null for them and ``via`` says
+    which it was.
+    """
+
+    binding_id: str | None = Field(
+        None, description="Id of the explicit binding; null for a policy that applies by scope"
+    )
+    via: Literal["binding", "scope"] = Field(
+        "binding",
+        description=(
+            "'binding' when the policy is explicitly bound to the agent (listed in any "
+            "status), 'scope' when it reaches the agent through its scope alone (listed "
+            "only while it is being enforced)"
+        ),
+    )
     policy_id: str
     name: str
     category: str
@@ -273,7 +291,26 @@ class AgentVersionRead(BaseModel):
     template_preview: str | None = Field(
         None, description=f"First {TEMPLATE_PREVIEW_CHARS} characters of the prompt body"
     )
+    template_length: int | None = Field(
+        None,
+        description=(
+            "Length of the whole prompt body in characters, so a reader can tell a "
+            "preview that was cut short from a prompt that is simply that long. Null "
+            "when the telemetry engine returned no body"
+        ),
+    )
     token_count: int | None = None
+
+
+class AgentVersionDetail(AgentVersionRead):
+    """One commit with its whole prompt body.
+
+    The history carries a preview only; this is what the Create New Version
+    editor is opened on, so that committing a small change to a long prompt
+    does not replace it with its own first few hundred characters.
+    """
+
+    template: str = Field(description="The complete prompt body of this commit")
 
 
 class DiffLine(BaseModel):

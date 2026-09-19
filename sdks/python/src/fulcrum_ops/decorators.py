@@ -166,6 +166,7 @@ def trace(  # noqa: C901 - one function, four wrapper shapes; splitting it hides
     tags: Optional[Sequence[str]] = None,
     agent: Optional[str] = None,
     thread_id: Union[str, Callable[..., Optional[str]], None] = None,
+    trace_id: Union[str, Callable[..., Optional[str]], None] = None,
     client: Optional[Any] = None,
 ) -> Any:
     """Trace a function, coroutine, generator or async generator.
@@ -202,6 +203,19 @@ def trace(  # noqa: C901 - one function, four wrapper shapes; splitting it hides
 
         When the id is not among the arguments, call
         ``fulcrum_ops.set_thread_id(...)`` from inside the function instead.
+    :param trace_id: Report the run under an id somebody else issued, rather
+        than a fresh one: the ``run_id`` the console answers a manual run with,
+        which stays ``Running`` there until a runtime reports under it. Given
+        the same two ways as ``thread_id``, and for the same reason a callable
+        is nearly always the one that is meant::
+
+            @trace(trace_id=lambda job: job.run_id, thread_id=lambda job: job.session_id)
+            def handle(job): ...
+
+        It names the run, so it is read only by the call that opens one — a
+        decorated call nested inside another is a step of that run and keeps
+        its place in it. It has to be a version 7 UUID; anything else is
+        replaced, with a warning.
     :param client: Report to this client instead of the default one.
     """
 
@@ -229,6 +243,16 @@ def trace(  # noqa: C901 - one function, four wrapper shapes; splitting it hides
                 return None
             return None if value is None else str(value)
 
+        def resolve_trace_id(args: Sequence[Any], kwargs: Dict[str, Any]) -> Optional[str]:
+            if not callable(trace_id):
+                return trace_id
+            try:
+                value = trace_id(*args, **kwargs)
+            except Exception:  # noqa: BLE001 - the caller's lambda must not break the caller's call
+                logger.debug("fulcrum-ops: trace_id() raised for %s", span_name, exc_info=True)
+                return None
+            return None if value is None else str(value)
+
         def open_item(active: Any, args: Sequence[Any], kwargs: Dict[str, Any]) -> Optional[_Item]:
             """Open a trace or a child span, whichever the context calls for."""
             try:
@@ -239,6 +263,10 @@ def trace(  # noqa: C901 - one function, four wrapper shapes; splitting it hides
                     else None
                 )
                 if _context.current_trace() is None:
+                    # Resolved here and nowhere else: only the call that opens
+                    # the run can name it. Inside somebody else's run the id is
+                    # already on every span that run has opened.
+                    adopted = resolve_trace_id(args, kwargs) if trace_id is not None else None
                     root = active.trace(
                         span_name,
                         input=captured,
@@ -246,6 +274,7 @@ def trace(  # noqa: C901 - one function, four wrapper shapes; splitting it hides
                         tags=tags,
                         agent=agent,
                         thread_id=conversation,
+                        id=adopted,
                     )
                     if type == "general":
                         return root

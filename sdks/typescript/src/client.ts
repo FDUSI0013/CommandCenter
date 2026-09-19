@@ -76,11 +76,25 @@ export type SpanBody<T> = (span: Span) => T;
  * carry, because a traced function is a span whenever it is called inside
  * another — and, given a `type`, a typed step even when it is not.
  */
-export type TracedOptions = TraceOptions &
+export type TracedOptions<A extends unknown[] = unknown[]> = Omit<TraceOptions, 'threadId'> &
   Pick<SpanOptions, 'type' | 'model' | 'provider' | 'usage' | 'cost'> & {
     /** `true`: always a span of whatever is in scope. `false`: always a run of its own. */
     asSpan?: boolean;
+    /**
+     * The conversation each call belongs to: what Sessions and Memory & State
+     * group runs by.
+     *
+     * `traced()` runs once, when the wrapper is built, so a string here files
+     * every call the wrapper ever makes under the same thread. Pass a function
+     * to work it out per call — it gets the call's own arguments and `this`.
+     * When the id is not among the arguments, call
+     * `fulcrum.currentTrace()?.setThreadId(...)` from inside the function.
+     */
+    threadId?: string | ThreadIdResolver<A>;
   };
+
+/** Works out a traced call's conversation from that call's own arguments. */
+export type ThreadIdResolver<A extends unknown[] = unknown[]> = (...args: A) => string | null | undefined;
 
 /** A span that opens its own trace may say what only a trace can record. */
 type RootSpanOptions = SpanOptions & Pick<TraceOptions, 'threadId' | 'sampled'>;
@@ -496,15 +510,19 @@ export class FulcrumOps implements TraceSink {
    * The wrapper keeps the original's arity and name, so it can be dropped in
    * where the original was without anything downstream noticing.
    */
-  traced<A extends unknown[], R>(fn: (...args: A) => R, options: TracedOptions | string = {}): (...args: A) => R {
-    const settings = typeof options === 'string' ? { name: options } : { ...options };
+  traced<A extends unknown[], R>(fn: (...args: A) => R, options: TracedOptions<A> | string = {}): (...args: A) => R {
+    const { threadId: conversationOf, ...settings } =
+      typeof options === 'string' ? { threadId: undefined, name: options } : { ...options };
     const client = this;
     // `fn.name` is `''` for an anonymous function expression, and `??` would
     // keep the empty string; `||` is what falls through to the fallback.
     const name = settings.name ?? (fn.name || 'anonymous');
 
     const wrapper = function (this: unknown, ...args: A): R {
-      const unitOptions = { ...settings, name };
+      // Per call, not per wrapper: the wrapper is built once, and the
+      // conversation is a fact about the call.
+      const threadId = client.resolveThreadId(conversationOf, this, args);
+      const unitOptions = { ...settings, name, threadId };
       // Only capture arguments when the client is recording input at all;
       // serialising them otherwise is pure cost.
       if (client.effectiveCaptureInput && settings.input === undefined && args.length > 0) {
@@ -513,8 +531,16 @@ export class FulcrumOps implements TraceSink {
       const body = () => fn.apply(this, args) as R;
       // A nested `traced` function becomes a span of the trace above it, which
       // is what makes decorating a whole call graph produce one tree.
-      const inScope = client.currentSpan() !== undefined || client.currentTrace() !== undefined;
-      if (settings.asSpan ?? inScope) return client.span(unitOptions as SpanOptions, body);
+      const enclosing = client.currentTrace();
+      const inScope = client.currentSpan() !== undefined || enclosing !== undefined;
+      if (settings.asSpan ?? inScope) {
+        // The function that knows the conversation is not always the outermost
+        // one, and a span has nowhere to put a thread. A run that has none yet
+        // takes it from the first step that can name one; a run that was told
+        // its thread keeps it.
+        if (threadId && enclosing && !enclosing.threadId) enclosing.setThreadId(threadId);
+        return client.span(unitOptions as SpanOptions, body);
+      }
       // A run of its own. A trace has no type, model or token counters — only
       // a span does — so `traced(callModel, { type: 'llm' })` recorded as a
       // bare trace is a run with a name, a duration and an empty step list: no
@@ -529,6 +555,29 @@ export class FulcrumOps implements TraceSink {
     Object.defineProperty(wrapper, 'name', { value: name, configurable: true });
     Object.defineProperty(wrapper, 'length', { value: fn.length, configurable: true });
     return wrapper as (...args: A) => R;
+  }
+
+  /**
+   * The conversation one `traced()` call belongs to.
+   *
+   * A resolver is the caller's code running on the caller's hot path, before
+   * the function it decorates. If it throws — a field that is not there on
+   * this payload — that costs the run its thread and is reported to `onError`;
+   * it does not get to stop the call.
+   */
+  private resolveThreadId<A extends unknown[]>(
+    source: string | ThreadIdResolver<A> | undefined,
+    self: unknown,
+    args: A,
+  ): string | undefined {
+    if (typeof source !== 'function') return source;
+    let resolved: unknown;
+    this.safely('traced:threadId', () => {
+      resolved = source.apply(self, args);
+    });
+    // From JavaScript a numeric conversation id is the likely return, and the
+    // trace would drop anything that is not a string.
+    return resolved === undefined || resolved === null ? undefined : String(resolved);
   }
 
   /**
@@ -1045,7 +1094,7 @@ function isThenable(value: unknown): value is PromiseLike<unknown> {
  */
 export function traced<A extends unknown[], R>(
   fn: (...args: A) => R,
-  options: (TracedOptions & { client?: FulcrumOps }) | string = {},
+  options: (TracedOptions<A> & { client?: FulcrumOps }) | string = {},
 ): (...args: A) => R {
   const { client: explicit, ...settings } =
     typeof options === 'string' ? { client: undefined, name: options } : { ...options };

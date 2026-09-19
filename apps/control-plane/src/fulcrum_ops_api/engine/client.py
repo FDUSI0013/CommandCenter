@@ -66,6 +66,10 @@ _BACKOFF_CAP_SECONDS: Final[float] = 4.0
 _RECYCLE_MIN_INTERVAL_SECONDS: Final[float] = 30.0
 _ERROR_BODY_LIMIT: Final[int] = 2048
 
+#: A stream body larger than this is parsed on a worker thread (see ``_stream``).
+#: Below it the hop to a thread costs more than the parse it would move.
+_OFF_LOOP_DECODE_BYTES: Final[int] = 256 * 1024
+
 JsonObject = dict[str, Any]
 Filters = Sequence[Mapping[str, Any]] | str | None
 Ids = Sequence[str] | None
@@ -621,6 +625,12 @@ class EngineClient:
             headers={"accept": "application/octet-stream"},
             timeout_seconds=timeout_seconds,
         )
+        if len(response.content) > _OFF_LOOP_DECODE_BYTES:
+            # An untruncated page of 500 spans is megabytes of prompt and
+            # completion JSON, and parsing it row by row here held the event
+            # loop -- every other request on this worker -- until the last row.
+            # On a thread the parse gives the interpreter back between rows.
+            return await asyncio.to_thread(_decode_lines, response)
         return _decode_lines(response)
 
     async def _create(self, path: str, payload: JsonObject) -> str | None:
@@ -725,7 +735,11 @@ class EngineClient:
         to_time: dt.datetime | str | None = None,
         sorting: Filters = None,
         timeout_seconds: float | None = None,
+        retries: int | None = None,
     ) -> JsonObject:
+        # ``retries`` is for a caller racing a deadline of its own: a refused
+        # connection or a 5xx is otherwise re-dialled with backoff, which a scan
+        # that must answer in seconds would rather hear about at once.
         return await self._request(
             "GET",
             f"{API_ROOT}/projects/stats",
@@ -738,6 +752,7 @@ class EngineClient:
                 to_time=_iso(to_time),
                 sorting=_json_param(sorting),
             ),
+            retries=retries,
             timeout_seconds=self._screen_read(timeout_seconds),
         )
 
@@ -771,10 +786,30 @@ class EngineClient:
 
     # -- traces ------------------------------------------------------------
 
-    async def create_traces_batch(self, traces: Sequence[Mapping[str, Any]]) -> None:
-        """Ingest path. Never retried: a replay would double-count telemetry."""
+    async def create_traces_batch(
+        self,
+        traces: Sequence[Mapping[str, Any]],
+        *,
+        timeout_seconds: float | None = None,
+        retries: int | None = None,
+    ) -> None:
+        """Ingest path. Never retried: a replay would double-count telemetry.
+
+        The five batch writes (traces, spans and the three score targets) share
+        one signature so ingest can drive any of them the same way. Ingest
+        answers its reporter inside a budget and the reporter is the retry
+        layer, so it passes a ``timeout_seconds`` well under the client-wide
+        one: an exchange is shielded from its caller's cancellation, and a write
+        ingest has already answered 503 for should not go on occupying the store
+        for the rest of thirty seconds. ``retries`` only means something on the
+        score PUTs; a POST is sent once whatever is asked.
+        """
         await self._request(
-            "POST", f"{API_ROOT}/traces/batch", json_body={"traces": list(traces)}
+            "POST",
+            f"{API_ROOT}/traces/batch",
+            json_body={"traces": list(traces)},
+            retries=retries,
+            timeout_seconds=timeout_seconds,
         )
 
     async def list_traces(
@@ -898,9 +933,20 @@ class EngineClient:
 
     # -- spans -------------------------------------------------------------
 
-    async def create_spans_batch(self, spans: Sequence[Mapping[str, Any]]) -> None:
+    async def create_spans_batch(
+        self,
+        spans: Sequence[Mapping[str, Any]],
+        *,
+        timeout_seconds: float | None = None,
+        retries: int | None = None,
+    ) -> None:
+        """See :meth:`create_traces_batch` for the two keyword arguments."""
         await self._request(
-            "POST", f"{API_ROOT}/spans/batch", json_body={"spans": list(spans)}
+            "POST",
+            f"{API_ROOT}/spans/batch",
+            json_body={"spans": list(spans)},
+            retries=retries,
+            timeout_seconds=timeout_seconds,
         )
 
     async def list_spans(
@@ -920,8 +966,16 @@ class EngineClient:
         strip_attachments: bool = False,
         from_time: dt.datetime | str | None = None,
         to_time: dt.datetime | str | None = None,
+        timeout_seconds: float | None = None,
+        retries: int | None = None,
     ) -> JsonObject:
-        """Spans of one trace, or of a whole project when ``trace_id`` is None."""
+        """Spans of one trace, or of a whole project when ``trace_id`` is None.
+
+        A page already on the wire outlives its caller (exchanges are shielded),
+        so a scan with a deadline of its own passes that deadline as
+        ``timeout_seconds`` -- and ``retries=0`` -- or the store goes on
+        answering for the client-wide timeout after the screen has been served.
+        """
         return await self._request(
             "GET",
             f"{API_ROOT}/spans",
@@ -941,6 +995,8 @@ class EngineClient:
                 from_time=_iso(from_time),
                 to_time=_iso(to_time),
             ),
+            retries=retries,
+            timeout_seconds=timeout_seconds,
         )
 
     async def search_spans(
@@ -1129,25 +1185,54 @@ class EngineClient:
 
     # -- feedback scores ---------------------------------------------------
 
-    async def score_traces_batch(self, scores: Sequence[Mapping[str, Any]]) -> None:
+    # A score write is a PUT, so unlike the creates it IS re-sent after a refused
+    # connection or a 5xx. A caller that is itself retried from outside (ingest:
+    # the SDK re-sends the batch) passes ``retries=0`` so the two layers do not
+    # multiply, and ``timeout_seconds`` for the reason create_traces_batch gives.
+
+    async def score_traces_batch(
+        self,
+        scores: Sequence[Mapping[str, Any]],
+        *,
+        timeout_seconds: float | None = None,
+        retries: int | None = None,
+    ) -> None:
         await self._request(
             "PUT",
             f"{API_ROOT}/traces/feedback-scores",
             json_body={"scores": list(scores)},
+            retries=retries,
+            timeout_seconds=timeout_seconds,
         )
 
-    async def score_spans_batch(self, scores: Sequence[Mapping[str, Any]]) -> None:
+    async def score_spans_batch(
+        self,
+        scores: Sequence[Mapping[str, Any]],
+        *,
+        timeout_seconds: float | None = None,
+        retries: int | None = None,
+    ) -> None:
         await self._request(
             "PUT",
             f"{API_ROOT}/spans/feedback-scores",
             json_body={"scores": list(scores)},
+            retries=retries,
+            timeout_seconds=timeout_seconds,
         )
 
-    async def score_threads_batch(self, scores: Sequence[Mapping[str, Any]]) -> None:
+    async def score_threads_batch(
+        self,
+        scores: Sequence[Mapping[str, Any]],
+        *,
+        timeout_seconds: float | None = None,
+        retries: int | None = None,
+    ) -> None:
         await self._request(
             "PUT",
             f"{API_ROOT}/traces/threads/feedback-scores",
             json_body={"scores": list(scores)},
+            retries=retries,
+            timeout_seconds=timeout_seconds,
         )
 
     async def list_feedback_score_names(

@@ -57,6 +57,7 @@ from ..models.governance import (
 from ..models.identity import Role
 from ..models.operations import (
     DEFAULT_PIPELINE_STAGES,
+    AlertSeverity,
     Deployment,
     DeploymentStage,
     DeploymentStageStatus,
@@ -75,7 +76,7 @@ from ..schemas.deployments import (
     EnvironmentRestartRequest,
     EnvironmentUpdate,
 )
-from . import audit
+from . import alerts, audit
 
 log = logging.getLogger("fulcrum_ops.deployments")
 
@@ -114,6 +115,9 @@ MAX_EXPORT_ROWS = 5000
 # Reference allocation ("dep-41", "REQ-108") probes forward from the row count;
 # the unique constraint is the real guard, this just keeps the numbers tidy.
 MAX_REFERENCE_PROBES = 200
+# How many times the approval gate re-reads and tries again when another writer
+# takes the reference it had just picked.
+APPROVAL_REF_ATTEMPTS = 5
 
 STREAM_POLL_SECONDS = 1.0
 # While a release waits at its approval gate, where only a person can move it.
@@ -711,9 +715,15 @@ async def export_deployments(
     strategy: str | None = None,
     agent_id: str | None = None,
     version: str | None = None,
+    terminal: bool | None = None,
 ) -> Sequence[Deployment]:
     """Every row the current filters select, capped so one click cannot pull the
-    whole history into memory."""
+    whole history into memory.
+
+    ``terminal`` is one of those filters: the History tab pins it, and a file
+    exported from that tab that also carried the releases still in flight would
+    not be the table the operator was looking at.
+    """
     stmt = _deployment_stmt(
         principal,
         params,
@@ -722,6 +732,7 @@ async def export_deployments(
         strategy=strategy,
         agent_id=agent_id,
         version=version,
+        terminal=terminal,
     ).limit(MAX_EXPORT_ROWS)
     return (await session.execute(stmt)).scalars().all()
 
@@ -1665,6 +1676,50 @@ async def _close_approval_request(
     )
 
 
+async def _raise_release_alert(
+    session: AsyncSession,
+    deployment: Deployment,
+    *,
+    condition: str,
+    title: str,
+    description: str,
+    metadata: dict[str, Any],
+) -> None:
+    """Put a release that went wrong in front of whoever is watching Alerts.
+
+    A pipeline fails with nobody looking: the person who started it has moved
+    on, and the audit row is read only by whoever goes looking for it. One alert
+    per release and condition, keyed on both, so closing the same release out
+    twice (the runner, then its last-resort ``_abandon``) cannot raise another.
+
+    The alert is never the reason the bookkeeping around it is lost. The
+    caller's own rows are written first, in its transaction, so a fault of
+    theirs is not mistaken for one of the alert's; the raise then runs in a
+    savepoint, and if it cannot be made the release is still closed out -- a
+    deployment left Running because its alert would not insert is the worse
+    failure by far.
+    """
+    await session.flush()
+    try:
+        async with session.begin_nested():
+            await alerts.raise_alert(
+                session,
+                workspace_id=deployment.workspace_id,
+                title=title,
+                description=description,
+                source=SOURCE_SCREEN,
+                severity=AlertSeverity.HIGH,
+                dedupe_key=f"deployment:{deployment.id}:{condition}",
+                source_entity_type="Deployment",
+                source_entity_id=deployment.id,
+                metadata=metadata,
+            )
+    except Exception:
+        log.exception(
+            "could not raise the %s alert for deployment %s", condition, deployment.id
+        )
+
+
 def _approval_risk(env_type: str) -> str:
     if env_type in (EnvironmentType.PRODUCTION.value, EnvironmentType.DR.value):
         return RiskLevel.HIGH.value
@@ -2018,37 +2073,55 @@ class PipelineRunner:
 
         approval_request = await _approval_request_for(session, deployment)
         if approval_request is None:
-            approval_request = ApprovalRequest(
-                workspace_id=deployment.workspace_id,
-                request_ref=await _next_approval_ref(session, deployment.workspace_id),
-                agent_id=deployment.agent_id,
-                source=SOURCE_SCREEN,
-                action="Deploy",
-                action_detail=f"Deploy {deployment.version} to {environment_name}",
-                resource=environment_name,
-                risk=_approval_risk(env_type),
-                reason=deployment.notes,
-                requested_by_user_id=deployment.triggered_by_user_id,
-                requested_at=now,
-                sla_due_at=now + APPROVAL_SLA,
-                sla_label=APPROVAL_SLA_LABEL,
-                status=ApprovalStatus.PENDING.value,
-                payload={
-                    "deployment_id": deployment.id,
-                    "deployment_ref": deployment.deployment_ref,
-                    "stage_id": stage.id,
-                    "version": deployment.version,
-                    "environment_id": deployment.environment_id,
-                },
-                impact={
-                    "environment": environment_name,
-                    "environment_type": env_type,
-                    "version": deployment.version,
-                    "strategy": deployment.strategy,
-                },
-            )
-            session.add(approval_request)
-            await session.flush()
+            # The reference is count()+offset, read without a lock, so two gates
+            # that open in one workspace in the same instant pick the same REQ-n
+            # and the unique constraint refuses the second. Flushed straight into
+            # the runner's transaction, that refusal took the transaction with it
+            # and the release was written off as Failed at its gate, for want of
+            # a number. In a savepoint, losing the race costs a re-read.
+            for _attempt in range(APPROVAL_REF_ATTEMPTS):
+                candidate = ApprovalRequest(
+                    workspace_id=deployment.workspace_id,
+                    request_ref=await _next_approval_ref(session, deployment.workspace_id),
+                    agent_id=deployment.agent_id,
+                    source=SOURCE_SCREEN,
+                    action="Deploy",
+                    action_detail=f"Deploy {deployment.version} to {environment_name}",
+                    resource=environment_name,
+                    risk=_approval_risk(env_type),
+                    reason=deployment.notes,
+                    requested_by_user_id=deployment.triggered_by_user_id,
+                    requested_at=now,
+                    sla_due_at=now + APPROVAL_SLA,
+                    sla_label=APPROVAL_SLA_LABEL,
+                    status=ApprovalStatus.PENDING.value,
+                    payload={
+                        "deployment_id": deployment.id,
+                        "deployment_ref": deployment.deployment_ref,
+                        "stage_id": stage.id,
+                        "version": deployment.version,
+                        "environment_id": deployment.environment_id,
+                    },
+                    impact={
+                        "environment": environment_name,
+                        "environment_type": env_type,
+                        "version": deployment.version,
+                        "strategy": deployment.strategy,
+                    },
+                )
+                try:
+                    async with session.begin_nested():
+                        session.add(candidate)
+                        await session.flush()
+                except IntegrityError:
+                    continue
+                approval_request = candidate
+                break
+            if approval_request is None:
+                raise Conflict(
+                    "Could not allocate an approval reference because other requests "
+                    "were being raised at the same moment."
+                )
             deployment.approval_request_id = approval_request.id
 
         stage.status = DeploymentStageStatus.RUNNING.value
@@ -2141,6 +2214,28 @@ class PipelineRunner:
                     "to_version": deployment.version,
                 },
             )
+            # Raised now, when the release actually stops serving, and against
+            # the release that was undone -- that is the one people will look up.
+            where = environment.name if environment is not None else source.environment_id
+            await _raise_release_alert(
+                session,
+                source,
+                condition="rolled_back",
+                title=f"Release rolled back: {source.deployment_ref} ({source.version})",
+                description=(
+                    f"{source.version} in '{where}' was rolled back to "
+                    f"{deployment.version} by {deployment.deployment_ref}."
+                ),
+                metadata={
+                    "deployment_ref": source.deployment_ref,
+                    "environment_id": source.environment_id,
+                    "environment": environment.name if environment is not None else None,
+                    "from_version": source.version,
+                    "to_version": deployment.version,
+                    "rolled_back_by_deployment_id": deployment.id,
+                    "rolled_back_by": deployment.deployment_ref,
+                },
+            )
 
         await audit.record(
             session,
@@ -2193,6 +2288,34 @@ class PipelineRunner:
             source_screen=SOURCE_SCREEN,
             detail=reason,
             metadata={"version": deployment.version},
+        )
+
+        # The environment may be the very thing that went missing.
+        environment_name = (
+            await session.execute(
+                select(Environment.name).where(
+                    Environment.id == deployment.environment_id,
+                    Environment.workspace_id == deployment.workspace_id,
+                )
+            )
+        ).scalar_one_or_none()
+        await _raise_release_alert(
+            session,
+            deployment,
+            condition="failed",
+            title=f"Deployment failed: {deployment.deployment_ref} ({deployment.version})",
+            description=(
+                f"{deployment.version} did not reach "
+                f"'{environment_name or deployment.environment_id}'. {reason}"
+            ),
+            metadata={
+                "deployment_ref": deployment.deployment_ref,
+                "version": deployment.version,
+                "environment_id": deployment.environment_id,
+                "environment": environment_name,
+                "rollback_of_deployment_id": deployment.rollback_of_deployment_id,
+                "reason": reason,
+            },
         )
 
 

@@ -67,7 +67,12 @@ from ..models.governance import (
     default_workflow,
 )
 from ..models.identity import Membership, Role, User
-from ..models.operations import Deployment, DeploymentStage, DeploymentStageStatus
+from ..models.operations import (
+    AlertSeverity,
+    Deployment,
+    DeploymentStage,
+    DeploymentStageStatus,
+)
 from ..models.registry import Agent
 from ..schemas.approvals import (
     ApprovalCommentCreate,
@@ -86,7 +91,7 @@ from ..schemas.approvals import (
     AuditEventRead,
     FollowOnAction,
 )
-from . import audit
+from . import alerts, audit
 
 log = logging.getLogger(__name__)
 
@@ -1407,6 +1412,33 @@ async def expire_overdue(
             row,
             approved=False,
             note=f"Approval SLA elapsed: {row.request_ref} expired with no decision.",
+            request=request,
+        )
+        # Expiry is the one outcome nobody chose, so it is the one nobody was
+        # there to see: the requester's action silently never happens and the
+        # audit row is read only by whoever goes looking. One alert per request,
+        # keyed on it, so a second pass over the same row cannot raise another.
+        await alerts.raise_alert(
+            session,
+            workspace_id=row.workspace_id,
+            title=f"Approval expired undecided: {row.request_ref}",
+            description=(
+                f"{row.action}"
+                + (f" on {row.resource}" if row.resource else "")
+                + f" ({row.risk} risk) passed its SLA at {row.sla_due_at.isoformat()} "
+                "with no decision, so it was not carried out."
+            ),
+            source=SOURCE_SCREEN,
+            severity=AlertSeverity.MEDIUM,
+            dedupe_key=f"approval:{row.id}:expired",
+            source_entity_type=ENTITY_REQUEST,
+            source_entity_id=row.id,
+            metadata={
+                "request_ref": row.request_ref,
+                "action": row.action,
+                "risk": row.risk,
+                "sla_due_at": row.sla_due_at.isoformat(),
+            },
             request=request,
         )
     await session.flush()

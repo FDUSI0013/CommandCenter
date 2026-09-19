@@ -102,6 +102,20 @@ async def _note_key_used(session: AsyncSession, key: ApiKey, request: Request) -
     read-only request stays read-only. The address is not a reason to write
     sooner: a fleet behind several addresses would flip it on every request and
     put the write straight back.
+
+    The note is committed here rather than with the request. Left to the
+    request's own commit, the row lock it takes is held for as long as the
+    handler runs -- an ingest batch waiting on the engine included -- and every
+    other request presenting the same key in that time still reads the old
+    ``last_used_at``, issues the same UPDATE and queues behind it: a fleet
+    sharing one key serialised once a minute. It also rolled back with a request
+    that was refused, so a key being tried against doors closed to it read
+    "never used". Nothing else is pending on the session this early -- the
+    caller is still being identified -- and ``expire_on_commit`` is off, so the
+    rows loaded for the principal stay usable. A session-token request writes
+    nothing here and is deliberately not committed: that would hand its
+    connection back only to check one out again for the handler's first
+    statement, two round trips on every console request for no lock released.
     """
     now = dt.datetime.now(dt.UTC)
     if key.last_used_at is not None and now - key.last_used_at < KEY_TOUCH_INTERVAL:
@@ -112,6 +126,7 @@ async def _note_key_used(session: AsyncSession, key: ApiKey, request: Request) -
         last_used_at=now,
         last_used_ip=request.client.host if request.client else None,
     )
+    await session.commit()
 
 
 #: Routes any live key may call whatever it carries: they say who the key is and

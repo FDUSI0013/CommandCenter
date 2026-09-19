@@ -414,7 +414,7 @@ export class Span extends Unit {
 
 /** One end-to-end agent invocation. */
 export class Trace extends Unit {
-  private threadId: string | undefined;
+  private conversation: string | undefined;
   private readonly spans: Span[] = [];
   /** Deferred spans a closed trace is still waiting on before it reports. */
   private readonly waitingOn = new Set<Span>();
@@ -425,14 +425,25 @@ export class Trace extends Unit {
 
   constructor(sink: TraceSink, options: TraceOptions) {
     super(sink, options);
-    this.threadId = clampText(options.threadId, MAX_THREAD_ID_LENGTH);
+    this.conversation = clampText(options.threadId, MAX_THREAD_ID_LENGTH);
     this.sampled = options.sampled ?? true;
   }
 
   /** Group this trace with others into one conversation. */
   setThreadId(threadId: string): this {
-    this.threadId = clampText(threadId, MAX_THREAD_ID_LENGTH);
+    this.conversation = clampText(threadId, MAX_THREAD_ID_LENGTH);
     return this;
+  }
+
+  /**
+   * The conversation this trace is filed under, once it has been told one.
+   *
+   * Readable because the step that knows the conversation is not always the
+   * one that opened the run: a `traced()` helper nested inside it names the
+   * thread only for a run that does not have one yet, and has to be able to ask.
+   */
+  get threadId(): string | undefined {
+    return this.conversation;
   }
 
   /** Every span opened under this trace, in creation order. */
@@ -526,7 +537,7 @@ export class Trace extends Unit {
     if (input) wire.input = input;
     const output = this.redactedOutput();
     if (output) wire.output = output;
-    if (this.threadId) wire.thread_id = this.threadId;
+    if (this.conversation) wire.thread_id = this.conversation;
     if (this.errorInfo) wire.error_info = this.errorInfo;
     if (this.scores.length > 0) wire.feedback_scores = this.scores;
     const metadata = this.redactedMetadata();

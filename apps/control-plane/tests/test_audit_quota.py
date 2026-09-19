@@ -580,6 +580,27 @@ async def test_a_reading_must_be_reportable_and_recent(as_role):
             assert response.status_code == 422, (bad, response.text)
 
 
+async def test_a_reporter_cannot_write_under_the_platforms_own_pools(as_role, db, workspace):
+    """Whether the platform's pass is due is read from its pools' newest reading."""
+    async with as_role(Role.OPERATOR) as http:
+        response = await http.post(
+            "/api/v1/quota/capacity",
+            json={
+                "readings": [
+                    {"name": quota_service.PLATFORM_DISK, "resource_type": "Disk",
+                     "provisioned": 500, "used": 100, "unit": "GiB"}
+                ]
+            },
+        )
+
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["details"]["field"] == "readings[0].name"
+    # Accepted, that reading would have told the sweep a pass had just run --
+    # for this workspace and for every other one on the machine.
+    assert (await quota_service.run_capacity_sweep())["capacity_recorded"] >= 1
+    assert await db.count(CapacityRecord, CapacityRecord.workspace_id == workspace.id) >= 1
+
+
 async def test_the_platform_records_what_it_can_see_of_itself(
     admin_client, db, factory, workspace, other_workspace
 ):

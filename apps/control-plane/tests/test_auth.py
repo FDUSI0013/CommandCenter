@@ -387,7 +387,8 @@ async def test_a_key_without_the_ingest_scope_may_not_report_telemetry(
     client.headers["Authorization"] = f"Bearer {token}"
 
     response = await client.post(
-        "/api/v1/ingest/traces", json={"traces": [{"name": "run", "start_time": "2026-01-01T00:00:00Z"}]}
+        "/api/v1/ingest/traces",
+        json={"traces": [{"name": "run", "start_time": "2026-01-01T00:00:00Z"}]},
     )
     assert response.status_code == 403
     assert error_code(response) == "permission_denied"

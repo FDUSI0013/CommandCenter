@@ -16,8 +16,9 @@ import os
 import threading
 import time
 import uuid
+from typing import Optional
 
-__all__ = ["new_id", "is_valid_id"]
+__all__ = ["new_id", "is_valid_id", "adoptable_id"]
 
 _lock = threading.Lock()
 _last_ms = 0
@@ -55,3 +56,21 @@ def new_id() -> str:
 def is_valid_id(value: object) -> bool:
     """Whether a value is usable as an ingest id: a non-empty string within the length cap."""
     return isinstance(value, str) and 0 < len(value.strip()) <= 64
+
+
+def adoptable_id(value: object) -> Optional[str]:
+    """A caller-supplied trace id in the form the telemetry store takes, else ``None``.
+
+    "Is a UUID" is not the test. The store addresses a run by a *version 7*
+    UUID and nothing else, and its refusal is not confined to the run that
+    earned it: one ``uuid.uuid4()`` on a trace costs every trace sent in the
+    same request. The control plane's own check stops at the UUID shape, so
+    this is the last place the difference still belongs to one run. The
+    canonical spelling is returned because that is the one the run is stored
+    and linked under.
+    """
+    try:
+        parsed = value if isinstance(value, uuid.UUID) else uuid.UUID(str(value).strip())
+    except (ValueError, AttributeError, TypeError):
+        return None
+    return str(parsed) if parsed.version == 7 else None

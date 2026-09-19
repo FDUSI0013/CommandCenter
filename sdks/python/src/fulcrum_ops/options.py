@@ -30,6 +30,8 @@ ENV_DEBUG = "FULCRUM_OPS_DEBUG"
 ENV_DISABLED = "FULCRUM_OPS_DISABLED"
 ENV_SAMPLING = "FULCRUM_OPS_SAMPLING_RATE"
 ENV_TIMEOUT = "FULCRUM_OPS_TIMEOUT_SECONDS"
+#: The TypeScript SDK's spelling of the same setting, in its own unit.
+ENV_TIMEOUT_MS = "FULCRUM_OPS_TIMEOUT_MS"
 ENV_CAPTURE_INPUT = "FULCRUM_OPS_CAPTURE_INPUT"
 ENV_CAPTURE_OUTPUT = "FULCRUM_OPS_CAPTURE_OUTPUT"
 
@@ -68,6 +70,24 @@ def _env_float(name: str) -> Optional[float]:
         return float(raw)
     except ValueError:
         return None
+
+
+def _env_timeout_seconds() -> Optional[float]:
+    """The timeout the environment asks for, in seconds, under either SDK's name.
+
+    The two SDKs name this setting in their own unit -- seconds here,
+    milliseconds in the TypeScript one -- and a deployment that runs agents in
+    both languages sets one variable for the whole fleet. Reading only our own
+    name meant an operator who wrote ``FULCRUM_OPS_TIMEOUT_MS=2000`` to keep
+    telemetry from holding a request open got thirty seconds in every Python
+    agent, and nothing said so. This SDK's own name wins when both are set, and
+    a value that does not parse is passed over rather than trusted.
+    """
+    seconds = _env_float(ENV_TIMEOUT)
+    if seconds is not None:
+        return seconds
+    millis = _env_float(ENV_TIMEOUT_MS)
+    return None if millis is None else millis / 1000.0
 
 
 def _clamp(value: float, low: float, high: float) -> float:
@@ -237,7 +257,7 @@ def resolve_options(  # noqa: PLR0913 - this is the public surface; each name ma
         # caller who passes 0 means zero, and ``0 or 30`` silently means 30 —
         # so ``timeout_seconds=0`` would have become a thirty-second timeout
         # rather than being clamped to the floor the SDK actually supports.
-        timeout_seconds=max(0.1, _given(timeout_seconds, _env_float(ENV_TIMEOUT), 30.0)),
+        timeout_seconds=max(0.1, _given(timeout_seconds, _env_timeout_seconds(), 30.0)),
         batch_max_items=max(1, int(_given(batch_max_items, None, 100))),
         batch_max_spans=max(1, int(_given(batch_max_spans, None, 1_000))),
         batch_max_bytes=max(1_024, int(_given(batch_max_bytes, None, 4 * 1024 * 1024))),

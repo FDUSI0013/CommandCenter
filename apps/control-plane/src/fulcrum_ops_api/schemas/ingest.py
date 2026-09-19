@@ -465,8 +465,24 @@ class BatchEnvelope(BaseModel):
     )
     sdk: str | None = Field(None, max_length=80, description="Reporting SDK, e.g. 'python'.")
     sdk_version: str | None = Field(None, max_length=40)
+    environment: str | None = Field(
+        None,
+        max_length=40,
+        description="Environment the reporting process was configured for.",
+    )
 
-    @field_validator("agent", "sdk", "sdk_version")
+    @field_validator("environment", mode="before")
+    @classmethod
+    def _usable_environment(cls, value: Any) -> Any:
+        # Until this field was declared the envelope ignored the key, whatever
+        # it held. It is a hint about where to file an agent nobody has seen
+        # before, so a value that cannot be one is dropped: it is never worth
+        # refusing a whole batch of telemetry over.
+        if not isinstance(value, str) or len(value.strip()) > 40:
+            return None
+        return value.strip()
+
+    @field_validator("agent", "sdk", "sdk_version", "environment")
     @classmethod
     def _trim(cls, value: str | None) -> str | None:
         if value is None:

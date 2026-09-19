@@ -9,7 +9,7 @@ screens end up written the same way.
 | Piece | Where | What it gives you |
 |---|---|---|
 | `API` | `js/api.js` | One method per endpoint: `API.<domain>.<verb>()`. It handles the base URL, credentials, timeouts, error translation, CSV downloads and SSE. **Never construct a URL or a fetch anywhere else.** |
-| `Store` | `js/store.js` | `Store.collection(name, fetcher)` (cached list resource), `Store.session`, `Store.mutate()`, `Store.on/emit`, `Store.badges` |
+| `Store` | `js/store.js` | `Store.session`, `Store.mutate()`, `Store.on/emit`, `Store.badges`, `Store.refreshBadges({maxAge})`. There is no shared list cache: each table owns its rows through `source`, and a screen that must react to another screen's mutation subscribes to the event that mutation emits. |
 | `C.dataTable` | `js/components.js` | Pass `source` and the table fetches from the server: search, sort, filters and paging become query parameters, and it renders its own loading, error-with-retry and empty states |
 | `AUTH` / shell | `js/login.js`, `js/app.js` | Sign-in gate, session boot, workspace switch, sidebar badges. Screens can assume `Store.session.user` exists. |
 

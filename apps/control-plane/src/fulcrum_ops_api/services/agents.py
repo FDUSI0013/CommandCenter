@@ -35,7 +35,7 @@ from collections.abc import Awaitable, Mapping, Sequence
 from typing import Any, Final, TypeVar
 
 from fastapi import Request
-from sqlalchemy import Select, case, delete, func, or_, select
+from sqlalchemy import Select, and_, case, delete, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -59,7 +59,17 @@ from ..engine import (
     EngineUnavailable,
     get_engine_client,
 )
-from ..models.governance import Policy, PolicyBinding, PolicyEnforcement, PolicyViolation
+from ..models.governance import (
+    Policy,
+    PolicyBinding,
+    PolicyEnforcement,
+    PolicyScope,
+    PolicyViolation,
+)
+
+# Two vocabularies share the name: a *policy's* lifecycle state here, and the
+# agent's policy verdict (``registry.PolicyStatus``) everywhere else in this file.
+from ..models.governance import PolicyStatus as PolicyLifecycle
 from ..models.identity import Role, User
 from ..models.registry import (
     Agent,
@@ -89,6 +99,7 @@ from ..schemas.agents import (
     AgentsSummary,
     AgentUpdate,
     AgentVersionCreate,
+    AgentVersionDetail,
     AgentVersionDiff,
     AgentVersionRead,
     DiffLine,
@@ -97,6 +108,7 @@ from ..schemas.agents import (
     RetryPolicy,
     slugify,
 )
+from ..schemas.policies import enforced_mode
 from . import audit
 
 T = TypeVar("T")
@@ -796,24 +808,85 @@ async def _linked_connectors(
     ]
 
 
+#: Policy states the enforcement path evaluates. "Warning" is a policy firing
+#: above its baseline -- still in force -- so it counts as governing here too.
+ENFORCED_POLICY_STATES: Final[tuple[str, ...]] = (
+    PolicyLifecycle.ACTIVE.value,
+    PolicyLifecycle.WARNING.value,
+)
+
+
+def _exempts(policy: Policy, agent: Agent) -> bool:
+    """Whether the policy's own exception list lets this agent out of it.
+
+    Read the way the enforcement path compiles it: an entry is an agent id or a
+    tag, and either one exempts the agent.
+    """
+    rules = policy.rules if isinstance(policy.rules, dict) else {}
+    raw = rules.get("exceptions")
+    if not isinstance(raw, list) or not raw:
+        return False
+    exceptions = {str(item) for item in raw}
+    return agent.id in exceptions or bool({str(tag) for tag in (agent.tags or ())} & exceptions)
+
+
 async def _policy_bindings(
-    session: AsyncSession, principal: Principal, agent_id: str
+    session: AsyncSession, principal: Principal, agent: Agent
 ) -> list[AgentPolicyBindingRead]:
-    """Policies explicitly bound to this agent, for the Risk & Policy summary."""
+    """The policies that govern this agent, for the Risk & Policy summary.
+
+    Bindings alone are the small part of the answer: a Global policy, one scoped
+    to the agent's environment, to a connector it is granted or to the agent
+    itself has no binding row, and the enforcement path applies it all the same.
+    Selecting bindings only, the page read "0 policies bound" for an agent whose
+    every run was being checked. The predicate here is the enforcement path's
+    own reach test, and its exception list is honoured the same way.
+
+    An explicit binding is listed whatever state its policy is in -- it is a row
+    somebody made and can remove, and the page says which are not active. A
+    policy that reaches the agent by scope alone is listed only while it is
+    being enforced: a draft Global policy governs nobody yet.
+    """
+    granted = select(AgentConnector.connector_id).where(
+        AgentConnector.workspace_id == principal.workspace_id,
+        AgentConnector.agent_id == agent.id,
+    )
+    in_scope = or_(
+        Policy.scope == PolicyScope.GLOBAL.value,
+        and_(Policy.scope == PolicyScope.AGENT.value, Policy.scope_ref == agent.id),
+        and_(
+            Policy.scope == PolicyScope.ENVIRONMENT.value,
+            Policy.scope_ref == agent.environment,
+        ),
+        and_(Policy.scope == PolicyScope.CONNECTOR.value, Policy.scope_ref.in_(granted)),
+    )
     rows = (
         await session.execute(
-            select(PolicyBinding, Policy)
-            .join(Policy, Policy.id == PolicyBinding.policy_id)
+            select(Policy, PolicyBinding)
+            # At most one binding per (policy, agent), so the outer join cannot
+            # repeat a policy.
+            .outerjoin(
+                PolicyBinding,
+                and_(
+                    PolicyBinding.policy_id == Policy.id,
+                    PolicyBinding.workspace_id == principal.workspace_id,
+                    PolicyBinding.agent_id == agent.id,
+                ),
+            )
             .where(
-                PolicyBinding.workspace_id == principal.workspace_id,
-                PolicyBinding.agent_id == agent_id,
+                Policy.workspace_id == principal.workspace_id,
+                or_(
+                    PolicyBinding.id.is_not(None),
+                    and_(Policy.status.in_(ENFORCED_POLICY_STATES), in_scope),
+                ),
             )
             .order_by(Policy.name.asc())
         )
     ).all()
     return [
         AgentPolicyBindingRead(
-            binding_id=binding.id,
+            binding_id=binding.id if binding is not None else None,
+            via="binding" if binding is not None else "scope",
             policy_id=policy.id,
             name=policy.name,
             category=policy.category,
@@ -821,14 +894,22 @@ async def _policy_bindings(
             scope_label=policy.scope_label,
             risk_level=RiskLevel(policy.risk_level),
             status=policy.status,
-            enforcement=policy.enforcement,
+            # What is applied, which for a row written before the two were kept
+            # equal is the rule body's mode and not the column beside it.
+            enforcement=enforced_mode(policy.rules, policy.enforcement),
             version=policy.version,
             violations_30d=policy.violations_30d,
-            bound_at=binding.bound_at,
-            bound_by=binding.bound_by,
+            bound_at=binding.bound_at if binding is not None else None,
+            bound_by=binding.bound_by if binding is not None else None,
         )
-        for binding, policy in rows
+        for policy, binding in rows
+        if not _exempts(policy, agent)
     ]
+
+
+def _policies_in_force(policies: Sequence[AgentPolicyBindingRead]) -> int:
+    """How many of the listed policies the enforcement path is applying now."""
+    return sum(1 for policy in policies if policy.status in ENFORCED_POLICY_STATES)
 
 
 def _empty_stats(window_start: dt.datetime, window_end: dt.datetime) -> AgentRunStats:
@@ -1123,7 +1204,7 @@ async def get_detail(
     window_start = window_end - dt.timedelta(days=STATS_WINDOW_DAYS)
 
     connectors = await _linked_connectors(session, principal, agent.id)
-    policies = await _policy_bindings(session, principal, agent.id)
+    policies = await _policy_bindings(session, principal, agent)
     violations, escalations = await _governance_counts(
         session, principal, agent.id, window_start
     )
@@ -1175,6 +1256,10 @@ async def get_detail(
     read.metrics = (read.metrics or AgentMetrics()).model_copy(
         update={"violations_30d": violations, "escalations_30d": escalations}
     )
+    # Counted from the policies listed beside it. The column is whatever was
+    # typed when the agent was registered and nothing has kept it since, so on
+    # this page it disagreed with the list it sits next to.
+    read.policies_applied = _policies_in_force(policies)
     return AgentDetail(
         agent=read,
         configuration=_configuration(
@@ -1781,6 +1866,7 @@ def _version_row(row: dict[str, Any], *, current_commit: str | None) -> AgentVer
         created_at=_instant(row.get("created_at") or row.get("last_updated_at")),
         is_current=is_current,
         template_preview=template[:TEMPLATE_PREVIEW_CHARS] or None,
+        template_length=len(template) if template else None,
         token_count=(
             int(count) if (count := _number(row.get("token_count"))) is not None else None
         ),
@@ -1883,6 +1969,36 @@ async def list_versions(
     if not agent.is_provisioned:
         return []
     return await _versions(_client(), agent)
+
+
+async def get_version(
+    session: AsyncSession, principal: Principal, agent_id: str, version: str
+) -> AgentVersionDetail:
+    """One commit with its whole prompt body, by commit id or version label.
+
+    The history carries only a preview of each body. The editor used to be
+    opened on that preview, and had nothing else to open on: for any prompt
+    longer than the preview it now refuses to guess and starts empty unless
+    this read answers. Resolved from the same listing the diff uses, so the
+    two accept the same coordinates and agree on which commit is current.
+    """
+    agent = await get_agent(session, principal, agent_id)
+    missing = NotFound(f"Version '{version}' does not exist for this agent.")
+    if not agent.is_provisioned:
+        raise missing
+    rows = await _raw_versions(_client(), agent)
+    row = _match_version(rows, version)
+    if row is None:
+        raise missing
+    template = _text(row.get("template"))
+    if template is None:
+        # A commit the engine lists without a body is not an empty prompt, and
+        # an editor opened on "" would commit exactly that.
+        raise TelemetryBackendUnavailable(
+            "The telemetry store returned this version without its prompt body."
+        )
+    read = _version_row(row, current_commit=_current_commit(rows, agent))
+    return AgentVersionDetail(**read.model_dump(), template=template)
 
 
 async def create_version(

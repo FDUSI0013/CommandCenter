@@ -572,6 +572,13 @@ async def _get(session: AsyncSession, principal: Principal, policy_id: str) -> P
 def _assert_enforceable(policy: Policy) -> None:
     conditions = (policy.rules or {}).get("conditions")
     if not isinstance(conditions, list) or not conditions:
+        if policy.category == PolicyCategory.APPROVAL_ESCALATION.value:
+            # An approval rule has no conditions on purpose: it takes effect when
+            # a request is raised, and the missing clause list is what keeps
+            # ingest from evaluating it. Refusing it here left a rule switched
+            # off in the Policy Center with no way to switch it back on there.
+            # One that does carry conditions is still checked like any other.
+            return
         raise PreconditionFailed(
             "This policy has no conditions to evaluate. Add at least one rule before "
             "activating it.",

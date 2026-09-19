@@ -101,7 +101,9 @@ async def test_all(principal: CurrentPrincipal, session: Db, request: Request) -
     """Probe every enabled connection that has an endpoint, concurrently.
 
     Disabled tiles and tiles with no endpoint are reported as skipped rather
-    than failed. Requires the operator role.
+    than failed -- except an agent platform with no endpoint, which is tested
+    against the registry as `POST /connections/{id}/test` tests it. Requires the
+    operator role.
     """
     outcomes, summary = await service.test_all(session, principal, request=request)
     if not summary.requested:
@@ -313,14 +315,25 @@ async def test_connection(
     The tile's status, health and latency are set from what the probe observed;
     a reachable endpoint answering 4xx/5xx degrades it to Warning, and only a
     transport failure marks it Disconnected. Requires the operator role.
+
+    An agent platform saved without an endpoint (SDK agents push; there is no
+    URL to call) is tested against the registry instead: Connected when agents
+    on that platform are reporting, Warning when they are registered and not
+    yet reporting, Disconnected when there are none. Its `latency_ms` is null.
+    Any other kind without an endpoint is refused with 412.
     """
     outcome: ConnectionTestOutcome = await service.test_connection(
         session, principal, connection_id, request=request
     )
-    latency = f"{outcome.latency_ms}ms" if outcome.latency_ms is not None else "no response"
+    # No latency means nothing was timed: nobody answered, or the result was read
+    # from the registry. "(no response)" would be wrong of the second --
+    # "Connected (no response)" -- and what was found is the better answer for both.
+    found = (
+        f"({outcome.latency_ms}ms)" if outcome.latency_ms is not None else f"- {outcome.detail}"
+    )
     return ActionResult(
         ok=outcome.reachable,
-        message=f"{outcome.name}: {outcome.status.value} ({latency}).",
+        message=f"{outcome.name}: {outcome.status.value} {found}.",
         entity_id=outcome.connection_id,
         data=outcome.model_dump(mode="json"),
     )

@@ -48,6 +48,26 @@ from ..deps import CurrentPrincipal, Db
 router = APIRouter(prefix="/testing", tags=["Testing & Regression"])
 
 
+def _run_columns() -> tuple[tuple[str, str], ...]:
+    """The runs CSV's columns: the schema's, with Status put beside Result.
+
+    Two different facts. ``status`` is how the run ended -- Failed when any case
+    failed -- and is what the Test Runs tab sorts and filters on; ``result`` is
+    the verdict its pass rate earned. The tab shows both, and a file exported
+    under Status = Failed that carried only the verdict read "Passed" on a 95%
+    run with nothing to say why it was there. Left alone once the schema's own
+    list names the column, so it can move there without appearing twice.
+    """
+    if any(key == "status" for key, _ in RUN_EXPORT_COLUMNS):
+        return RUN_EXPORT_COLUMNS
+    columns: list[tuple[str, str]] = []
+    for key, header in RUN_EXPORT_COLUMNS:
+        if key == "result":
+            columns.append(("status", "Status"))
+        columns.append((key, header))
+    return tuple(columns)
+
+
 def _stamp() -> str:
     return dt.datetime.now(dt.UTC).strftime("%Y%m%d")
 
@@ -298,8 +318,21 @@ async def export_runs(
     run_status: Annotated[TestRunStatus | None, Query(alias="status")] = None,
     trigger: Annotated[RunTrigger | None, Query()] = None,
 ) -> StreamingResponse:
-    """The Test Runs tab as CSV, honouring the same filters."""
-    export_params = params.model_copy(update={"page": 1, "page_size": 200})
+    """The Test Runs tab as CSV, honouring the same filters.
+
+    Every matching run up to ``EXPORT_LIMIT``, the cap the suites export beside
+    it already applies.
+    """
+    # This used to take one 200-row page -- the most a *table* may ask for -- and
+    # call it the export. Nothing in the file said it had stopped, so a workspace
+    # with a few weeks of scheduled runs downloaded its newest 200 and read them
+    # as its history. ``model_copy`` does not re-validate, which is what lets the
+    # export's cap through a field the query string is held to 200 on; the same
+    # ``list_runs`` still does the scoping, the filtering and the ordering, so the
+    # file cannot drift from the table it was exported from.
+    export_params = params.model_copy(
+        update={"page": 1, "page_size": service.EXPORT_LIMIT}
+    )
     rows, _ = await service.list_runs(
         session,
         principal,
@@ -314,6 +347,7 @@ async def export_runs(
             "run_ref": record.run_ref,
             "suite_name": record.suite_name,
             "trigger": record.trigger.value,
+            "status": record.status.value,
             "result": record.result.value,
             "pass_rate": record.pass_rate,
             "total_cases": record.total_cases,
@@ -327,7 +361,7 @@ async def export_runs(
         for record in records
     ]
     return StreamingResponse(
-        iter([to_csv(payload, RUN_EXPORT_COLUMNS)]),
+        iter([to_csv(payload, _run_columns())]),
         media_type="text/csv",
         headers={"Content-Disposition": f'attachment; filename="test-runs-{_stamp()}.csv"'},
     )

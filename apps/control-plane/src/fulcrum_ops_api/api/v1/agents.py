@@ -1,8 +1,8 @@
 """Agent Registry and Agent Detail routes.
 
-Fifteen endpoints back two screens: the registry's table, KPI row, filters and
+Sixteen endpoints back two screens: the registry's table, KPI row, filters and
 CSV export; the detail screen's nine tabs, its Run Agent button, its version
-history and Compare Versions modal, and Export Configuration.
+history, version editor and Compare Versions modal, and Export Configuration.
 
 Handlers here only parse, delegate and shape. Workspace scoping, role checks,
 the status state machine, audit writes and every telemetry call live in
@@ -35,6 +35,7 @@ from ...schemas.agents import (
     AgentStatusChange,
     AgentUpdate,
     AgentVersionCreate,
+    AgentVersionDetail,
     AgentVersionDiff,
     AgentVersionRead,
 )
@@ -475,3 +476,22 @@ async def diff_versions(
     return await service.diff_versions(
         session, principal, agent_id, from_version=from_version, to_version=to_version
     )
+
+
+# Declared after ``/versions/diff``, which it would otherwise swallow.
+@router.get(
+    "/{agent_id}/versions/{version}",
+    response_model=AgentVersionDetail,
+    summary="Get one prompt version",
+)
+async def get_version(
+    principal: CurrentPrincipal, session: Db, agent_id: str, version: str
+) -> AgentVersionDetail:
+    """One commit with its complete prompt body, addressed by commit id or by
+    version label.
+
+    The version list carries a preview of each body only, so this is what the
+    Create New Version editor loads before it lets anything be committed.
+    Answers 404 when the agent has no such version.
+    """
+    return await service.get_version(session, principal, agent_id, version)

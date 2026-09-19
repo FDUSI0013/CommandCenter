@@ -1001,10 +1001,16 @@
             fetch: (p) => API.memory.agentState(p), name:'agent state records', empty:'No agent state recorded',
             columns:[
               { key:'agent_name', label:'Agent', render:r=>r.agent_id?`<span class="link" data-nav="agent/${esc(r.agent_id)}">${esc(r.agent_name||r.agent_id)}</span>`:esc(r.agent_name||'—') },
-              { key:'state_store', label:'Store', sortable:false, render:r=>esc(r.state_store||'—') },
+              /* An agent is bound to a store by naming it in its Memory Policy. A policy
+                 that names no store resolves to nothing, and the server still answers
+                 "Synced" for it — a state nobody measured, since there is no store to
+                 be in step with. So the policy is shown for what it is, and the sync
+                 state of an agent with no store is a dash. */
+              { key:'state_store', label:'Store', sortable:false, render:r=>r.state_store?esc(r.state_store)
+                  :r.memory_policy?`<span class="faint" title="No memory store has this name">${esc(r.memory_policy)} — no store by this name</span>`:dash },
               { key:'session_count', label:'Sessions', align:'right', cls:'num', sortable:false, render:r=>r.session_count==null?dash:fmtFull(r.session_count) },
               { key:'last_activity_at', label:'Last Activity', render:r=>`<span class="dim nowrap">${when(r.last_activity_at)}</span>` },
-              { key:'sync_state', label:'Sync State', sortable:false, render:r=>statusText(r.sync_state) },
+              { key:'sync_state', label:'Sync State', sortable:false, render:r=>(r.state_store || r.sync_state !== 'Synced')?statusText(r.sync_state):dash },
             ],
             rowId:'agent_id',
           },

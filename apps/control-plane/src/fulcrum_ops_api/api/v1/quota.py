@@ -419,8 +419,10 @@ async def report_capacity(
     and `used`; utilisation and the Healthy/Warning/Critical status are derived
     here with the thresholds the rest of the screen uses, so they are not
     accepted. A reading dated in the future, or older than the thirty days of
-    history the screen shows, is refused with 422. Requires the operator role
-    (an API key needs the `admin` scope).
+    history the screen shows, is refused with 422; so is one filed under a pool
+    the platform reports about itself (`Control Plane Memory`, `Host Memory`,
+    `Platform Disk`, `Host CPU`). Requires the operator role (an API key needs
+    the `admin` scope).
     """
     recorded = await service.record_capacity(session, principal, payload)
     return ActionResult(

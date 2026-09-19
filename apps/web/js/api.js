@@ -275,6 +275,9 @@
       logout: () => post('/auth/logout', {}),
       me: () => get('/auth/me'),
       switchWorkspace: (slug) => post('/auth/workspace', { workspace: slug }),
+      changePassword: (body) => post('/auth/change-password', body),
+      profile: () => get('/auth/profile'),
+      updateProfile: (body) => patch('/auth/profile', body),
       apiKeys: Object.assign(collection('/workspaces/api-keys'), {
         summary: () => get('/workspaces/api-keys/summary'),
         revoke: (id, body) => post(`/workspaces/api-keys/${encodeURIComponent(id)}/revoke`, body || {}),
@@ -640,6 +643,7 @@
       purchaseSeats: (licenseId, body) => post(`/licensing/tenants/${encodeURIComponent(licenseId)}/seats/purchase`, body),
       suspend: (licenseId, body) => post(`/licensing/tenants/${encodeURIComponent(licenseId)}/suspend`, body || {}),
       reactivate: (licenseId) => post(`/licensing/tenants/${encodeURIComponent(licenseId)}/reactivate`, {}),
+      revoke: (licenseId, body) => post(`/licensing/tenants/${encodeURIComponent(licenseId)}/revoke`, body || {}),
       invoice: (invoiceId) => download(`/licensing/invoices/${encodeURIComponent(invoiceId)}/pdf`),
       invoices: (params) => get('/licensing/invoices', params),
       entitlementCheck: (params) => get('/licensing/entitlement-check', params),

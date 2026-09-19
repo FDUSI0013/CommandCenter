@@ -242,6 +242,31 @@ def _within(row: Mapping[str, Any], field: str, since: Any, until: Any) -> bool:
     return not (upper is not None and start > upper)
 
 
+def _bucket_start(value: Any, interval: str) -> str | None:
+    """Where the engine's bucket holding ``value`` starts, as it stamps it.
+
+    The real engine buckets on the *calendar* unit it was asked for, in UTC:
+    the hour, the day, or the week starting Monday 00:00. A bucket is stamped
+    with where it starts, so the first one of a window that opens mid-week is
+    stamped BEFORE interval_start. A reader that lays its own grid from the
+    window start loses that bucket.
+
+    One rule for every series that takes an ``interval`` -- the per-project
+    metrics and the workspace-wide usage alike -- because a double that buckets
+    one of them by the day whatever it was asked cannot show an hourly chart
+    putting a whole day's tokens on midnight.
+    """
+    moment = _parse_instant(value)
+    if moment is None:
+        return None
+    moment = moment.astimezone(dt.UTC)
+    if interval == "WEEKLY":
+        moment = moment - dt.timedelta(days=moment.weekday())
+    if interval in ("DAILY", "WEEKLY"):
+        moment = moment.replace(hour=0)
+    return _iso(moment.replace(minute=0, second=0, microsecond=0))
+
+
 # ---------------------------------------------------------------------------
 # Recorded traffic
 # ---------------------------------------------------------------------------
@@ -320,6 +345,19 @@ class EngineDouble:
         #: One row that fails costs the batch a 400. Opt-in, because older tests
         #: were written against a double that took anything.
         self.strict_writes = False
+        #: What a second ``POST /traces/batch`` of an id already stored does to
+        #: the first. Off, the rows are merged key by key, which is what this
+        #: double has always done and what every older test was written against.
+        #: On, the new row REPLACES the old one and whatever the second writer
+        #: did not resend is gone -- which is how the audit reads the real
+        #: store's batch insert (last write wins on the whole row; only the
+        #: single-trace create and PATCH merge). That reading has NOT been
+        #: confirmed against a deployed engine, so it is opt-in rather than the
+        #: default. It is the stricter of the two assumptions: a flow that is
+        #: right when the row is replaced is right when it is merged, and never
+        #: the other way round, so a test that completes a run somebody else
+        #: opened should turn this on.
+        self.batch_insert_replaces = False
         #: Awaited with ``(method, path)`` before a request is served. A round
         #: trip to the real engine takes long enough for the rest of the world
         #: to move; this is where a test makes it move.
@@ -498,7 +536,9 @@ class EngineDouble:
         root = re.escape(API_ROOT)
         uid = r"([^/]+)"
 
-        def route(method: str, path: str, handler: Callable) -> tuple[str, re.Pattern[str], Callable]:
+        def route(
+            method: str, path: str, handler: Callable
+        ) -> tuple[str, re.Pattern[str], Callable]:
             return method, re.compile(path), handler
 
         # Order matters: literal paths are registered ahead of the parameterised
@@ -823,27 +863,12 @@ class EngineDouble:
             and _within(row, "start_time", start, end)
         ]
 
-        # The real engine buckets on the *calendar* unit it was asked for, in
-        # UTC: the hour, the day, or the week starting Monday 00:00. A bucket
-        # is stamped with where it starts, so the first one of a window that
-        # opens mid-week is stamped BEFORE interval_start. A reader that lays
-        # its own grid from the window start loses that bucket.
+        # Calendar buckets in UTC, stamped with where they start: _bucket_start.
         interval = str((body or {}).get("interval") or "HOURLY").upper()
-
-        def bucket_of(row: Mapping[str, Any]) -> str | None:
-            moment = _parse_instant(row.get("start_time"))
-            if moment is None:
-                return None
-            moment = moment.astimezone(dt.UTC)
-            if interval == "WEEKLY":
-                moment = moment - dt.timedelta(days=moment.weekday())
-            if interval in ("DAILY", "WEEKLY"):
-                moment = moment.replace(hour=0)
-            return _iso(moment.replace(minute=0, second=0, microsecond=0))
 
         grouped: dict[str, list[Mapping[str, Any]]] = {}
         for row in traces:
-            key = bucket_of(row)
+            key = _bucket_start(row.get("start_time"), interval)
             if key is not None:
                 grouped.setdefault(key, []).append(row)
 
@@ -1573,7 +1598,9 @@ class EngineDouble:
         )
 
     def _thread_score_names(self, _match: re.Match, _query: dict, _body: Any) -> JsonObject:
-        names = sorted({str(score.get("name")) for score in self.thread_scores if score.get("name")})
+        names = sorted(
+            {str(score.get("name")) for score in self.thread_scores if score.get("name")}
+        )
         return {"scores": [{"name": name} for name in names]}
 
     # -- comments ----------------------------------------------------------
@@ -1658,7 +1685,8 @@ class EngineDouble:
             if (not name or str(prompt["name"]).startswith(name))
             and (not project_id or prompt.get("project_id") == project_id)
         ]
-        rows = [row for row in rows if _matches_filters(row, _json_param(self._query_one(query, "filters")))]
+        filters = _json_param(self._query_one(query, "filters"))
+        rows = [row for row in rows if _matches_filters(row, filters)]
         rows = _sorted_rows(rows, _json_param(self._query_one(query, "sorting")))
         return _page(
             rows,
@@ -2352,21 +2380,25 @@ class EngineDouble:
             raise EngineFailure(
                 400, {"errors": [f"metric type {metric or '(none)'} is not supported"]}
             )
+        # Unlike the workspace *cost* series, which takes no interval and always
+        # answers in days, this endpoint honours the interval it is asked for.
+        # It used to answer in days regardless, which put a 24-hour chart's
+        # tokens on midnight where no test could tell the hours apart.
+        interval = str(payload.get("interval") or "DAILY").upper()
         buckets: dict[str, dict[str, float]] = {}
         for span in self._spans_for(payload.get("project_ids")):
             if not _within(
                 span, "start_time", payload.get("interval_start"), payload.get("interval_end")
             ):
                 continue
-            moment = _parse_instant(span.get("start_time"))
-            if moment is None:
+            stamp = _bucket_start(span.get("start_time"), interval)
+            if stamp is None:
                 continue
-            day = _iso(moment.replace(hour=0, minute=0, second=0, microsecond=0))
             usage = span.get("usage")
             if not isinstance(usage, Mapping):
                 continue
             slot = buckets.setdefault(
-                day, {"total_tokens": 0.0, "prompt_tokens": 0.0, "completion_tokens": 0.0}
+                stamp, {"total_tokens": 0.0, "prompt_tokens": 0.0, "completion_tokens": 0.0}
             )
             for key in slot:
                 slot[key] += float(usage.get(key) or 0)
