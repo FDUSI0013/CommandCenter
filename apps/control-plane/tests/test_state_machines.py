@@ -520,8 +520,13 @@ async def test_the_pipeline_runs_its_stages_in_order_and_stops_at_the_gate(
 
 
 async def test_approving_the_gate_lets_the_release_finish(
-    admin_client, factory, workspace, instant_pipeline
+    admin_client, owner_client, factory, workspace, instant_pipeline
 ):
+    """One person starts the release and a different one approves it.
+
+    Four eyes: whoever started a deployment cannot also wave it through the
+    gate. (Rejecting your own release is still allowed -- see the next test.)
+    """
     environment = await factory.environment(workspace, name="Production East")
     created = await admin_client.post(
         "/api/v1/deployments",
@@ -539,7 +544,13 @@ async def test_approving_the_gate_lets_the_release_finish(
 
     await wait_for(stages, lambda s: s["Approval"] == DeploymentStageStatus.RUNNING.value)
 
-    approved = await admin_client.post(
+    own = await admin_client.post(
+        f"/api/v1/deployments/{deployment_id}/approve",
+        json={"approved": True, "note": "Approving my own release"},
+    )
+    assert own.status_code == 403, own.text
+
+    approved = await owner_client.post(
         f"/api/v1/deployments/{deployment_id}/approve",
         json={"approved": True, "note": "Release window agreed"},
     )

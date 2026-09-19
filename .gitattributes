@@ -1,0 +1,35 @@
+# Everything that runs on, or is read by, the Linux host keeps LF endings on
+# every checkout. With core.autocrlf=true a Windows checkout would otherwise
+# hand these out as CRLF: bash reads "\r" as part of the command, and the
+# analytics store refuses a config file it cannot parse — while compose reports
+# only "unhealthy". (`git archive`, which is what deploy/ship.sh ships, always
+# emits the stored LF form; this protects the working copy.)
+*.sh            text eol=lf
+*.py            text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+*.xml           text eol=lf
+*.toml          text eol=lf
+*.ini           text eol=lf
+*.cfg           text eol=lf
+*.conf          text eol=lf
+*.json          text eol=lf
+*.js            text eol=lf
+*.mjs           text eol=lf
+*.ts            text eol=lf
+*.css           text eol=lf
+*.html          text eol=lf
+*.md            text eol=lf
+*.txt           text eol=lf
+Caddyfile       text eol=lf
+Dockerfile      text eol=lf
+.env.example    text eol=lf
+deploy/cron.d/*      text eol=lf
+deploy/logrotate.d/* text eol=lf
+
+*.png  binary
+*.jpg  binary
+*.ico  binary
+*.whl  binary
+*.docx binary
+*.tgz  binary

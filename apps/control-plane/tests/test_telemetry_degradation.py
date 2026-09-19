@@ -17,6 +17,12 @@ The rest of the file covers the boundary: surfaces backed by our own database
 carry on working, the registry reports *no* metrics rather than zeroed ones, an
 outage is distinguishable from a refusal, and everything comes back when the
 store does.
+
+Agent Detail sits on that boundary and is deliberately NOT in the list. Most of
+the page is our own rows -- and an outage is exactly when an operator needs its
+Deactivate button -- so it is served with the telemetry half absent: ``stats``
+null, no prompt history, a sentence saying why, and only the last figures that
+*were* measured, stamped with when. It never refuses, and it never invents.
 """
 
 from __future__ import annotations
@@ -41,6 +47,7 @@ class Fixtures:
     agent_id: str
     run_id: str
     source_id: str
+    configuration_id: str
 
 
 @pytest.fixture
@@ -56,7 +63,24 @@ async def seeded(factory, workspace, engine) -> Fixtures:
     source = await factory.knowledge_source(workspace, name="Product documentation")
     await factory.quota(workspace, name="Tokens per month")
     await factory.memory_store(workspace, name="Conversation memory")
-    return Fixtures(agent_id=agent.id, run_id=trace["id"], source_id=source.id)
+    # The seeded agent's model defaults to gpt-4o, so this Model configuration
+    # binds it and its usage really is read from telemetry while the store is up.
+    configuration = await factory.configuration(
+        workspace,
+        name="gpt-4o",
+        payload={
+            "provider": "azure-openai",
+            "model": "gpt-4o",
+            "temperature": 0.2,
+            "max_tokens": 1024,
+        },
+    )
+    return Fixtures(
+        agent_id=agent.id,
+        run_id=trace["id"],
+        source_id=source.id,
+        configuration_id=configuration.id,
+    )
 
 
 #: Every read whose answer is telemetry rather than our own rows.
@@ -68,7 +92,6 @@ TELEMETRY_READS: list[str] = [
     "/api/v1/runs/{run_id}/trace",
     "/api/v1/runs/{run_id}/response",
     "/api/v1/runs/{run_id}/replay",
-    "/api/v1/agents/{agent_id}",
     "/api/v1/metrics/summary",
     "/api/v1/metrics/series",
     "/api/v1/metrics/models",
@@ -93,6 +116,7 @@ TELEMETRY_READS: list[str] = [
     "/api/v1/evaluations/datasets",
     "/api/v1/knowledge/{source_id}/documents",
     "/api/v1/knowledge/{source_id}/grounding",
+    "/api/v1/configurations/{configuration_id}/usage",
 ]
 
 
@@ -118,7 +142,7 @@ async def test_a_telemetry_read_fails_closed_when_the_store_is_down(
     admin_client, engine, seeded, template
 ):
     path = template.format(
-        agent_id=seeded.agent_id, run_id=seeded.run_id, source_id=seeded.source_id
+        **dataclasses.asdict(seeded)
     )
 
     healthy = await admin_client.get(path)
@@ -144,7 +168,7 @@ async def test_a_failing_telemetry_read_reports_no_figure_at_all(
 ):
     """Not one number: the envelope carries a code and a sentence, nothing else."""
     path = template.format(
-        agent_id=seeded.agent_id, run_id=seeded.run_id, source_id=seeded.source_id
+        **dataclasses.asdict(seeded)
     )
     engine.fail(503)
 
@@ -292,21 +316,31 @@ async def test_the_registry_row_reports_no_metrics_rather_than_zeroed_ones(
     assert down.json()["items"][0]["name"] == "Support Bot"
 
 
-async def test_the_agent_detail_refuses_rather_than_drawing_an_empty_chart(
+async def test_the_agent_detail_opens_blind_rather_than_drawing_an_empty_chart(
     admin_client, factory, workspace, engine
 ):
-    """The detail screen is where the counters and the latency series live."""
+    """The detail screen is where the counters and the latency series live.
+
+    It is also mostly our own data, so it opens during an outage -- with the
+    telemetry half absent and saying so, never with a row of zeros in its place.
+    """
     agent = await factory.provisioned_agent(workspace, engine, name="Support Bot")
     engine.add_trace(project_name=agent.engine_project_name, name="a run")
 
     healthy = await admin_client.get(f"/api/v1/agents/{agent.id}")
     assert healthy.status_code == 200, healthy.text
+    assert healthy.json()["telemetry_error"] is None
 
     engine.fail(503)
     down = await admin_client.get(f"/api/v1/agents/{agent.id}")
 
-    assert down.status_code == 503
-    assert numbers_in(down.json()) == []
+    assert down.status_code == 200, down.text
+    body = down.json()
+    assert body["stats"] is None, "not measured is null, never a row of zeros"
+    assert body["versions"] == []
+    assert body["telemetry_error"], "the page has to say what it could not read"
+    # The only figures left are the last ones that were really measured, dated.
+    assert body["agent"]["metrics"]["computed_at"] is not None
 
 
 async def test_health_says_the_store_is_the_thing_that_is_down(client, engine):
