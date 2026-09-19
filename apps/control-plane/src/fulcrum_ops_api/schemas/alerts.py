@@ -190,7 +190,11 @@ class AlertMuteRequest(BaseModel):
 
 
 class AlertRuleRead(BaseModel):
-    """A condition that raises alerts, as shown in the Alert Rules editor."""
+    """A rule as the Alert Rules editor shows it.
+
+    It governs the alerts its ``source`` screen raises at its ``severity``; it
+    does not raise them.
+    """
 
     model_config = ConfigDict(from_attributes=True)
 

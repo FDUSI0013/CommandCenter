@@ -369,6 +369,78 @@ async def test_the_sweep_closes_a_lapsed_period_and_opens_the_next(
     assert await db.count(Alert, Alert.source_entity_type == "budget") == 0
 
 
+async def test_a_budget_nobody_renewed_is_closed_but_not_reopened(
+    db, factory, workspace, engine, engine_client
+):
+    now = _now()
+    this_start, _ = quota_service.period_bounds(LimitPeriod.MONTHLY, now)
+    last_start, _ = quota_service.period_bounds(
+        LimitPeriod.MONTHLY, this_start - dt.timedelta(days=1)
+    )
+    old_start, old_end = quota_service.period_bounds(
+        LimitPeriod.MONTHLY, last_start - dt.timedelta(days=1)
+    )
+    await factory.provisioned_agent(workspace, engine, name="Support Bot")
+    abandoned = await factory.add(
+        Budget(
+            workspace_id=workspace.id,
+            name="Spring pilot",
+            amount_usd=500.0,
+            spent_usd=120.0,
+            period_start=old_start,
+            period_end=old_end,
+        )
+    )
+
+    await quota_service.run_budget_sweep(force=True)
+
+    # The sweep is new, and every workspace has rows like this one. Its books
+    # are closed; it is not brought back to life and added to Total Budget.
+    rows = await db.scalars(select(Budget).where(Budget.name == "Spring pilot"))
+    assert [(row.id, row.status, row.spent_usd) for row in rows] == [
+        (abandoned.id, "Expired", 120.0)
+    ]
+    assert await db.count(AuditEvent, AuditEvent.action == "budget.rolled_over") == 0
+
+
+async def test_a_period_still_opens_when_the_store_cannot_answer(
+    db, factory, workspace, engine, engine_client
+):
+    now = _now()
+    this_start, this_end = quota_service.period_bounds(LimitPeriod.MONTHLY, now)
+    last_start, last_end = quota_service.period_bounds(
+        LimitPeriod.MONTHLY, this_start - dt.timedelta(days=1)
+    )
+    await factory.provisioned_agent(workspace, engine, name="Support Bot")
+    await factory.add(
+        Budget(
+            workspace_id=workspace.id,
+            name="Production monthly",
+            amount_usd=100.0,
+            spent_usd=80.0,
+            period_start=last_start,
+            period_end=last_end,
+        )
+    )
+    engine.fail(503)
+
+    counts = await quota_service.run_budget_sweep(force=True)
+
+    # Opening a period is our own SQL. It is not lost with the measurement.
+    assert counts == {"budgets_measured": 0, "budget_sweeps_failed": 1}
+    rows = await db.scalars(
+        select(Budget)
+        .where(Budget.name == "Production monthly")
+        .order_by(Budget.period_start.asc())
+    )
+    assert [(row.period_start, row.period_end) for row in rows] == [
+        (last_start, last_end),
+        (this_start, this_end),
+    ]
+    assert (rows[1].amount_usd, rows[1].spent_usd, rows[1].status) == (100.0, 0.0, "Active")
+    assert rows[0].spent_usd == 80.0  # unmeasured, so left exactly as it was
+
+
 async def test_a_workspace_the_store_cannot_answer_for_keeps_the_spend_it_had(
     db, factory, workspace, engine, engine_client
 ):

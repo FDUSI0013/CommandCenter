@@ -1253,6 +1253,10 @@ async def update_source(
             f"Settable statuses: {', '.join(sorted(OPERATOR_SETTABLE_STATUS))}.",
             details={"field": "status"},
         )
+    # Pause is the third exit a sync that died with its worker used to bar,
+    # beside Sync Now and Delete.
+    if payload.status is not None and _stranded(source):
+        await _close_out_stranded(session, source)
     if source.status == KnowledgeSourceStatus.SYNCING.value and payload.status is not None:
         raise PreconditionFailed(
             f"'{source.name}' is syncing. Wait for the job to finish before changing "

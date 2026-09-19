@@ -39,13 +39,14 @@ from collections.abc import AsyncIterator, Callable, Sequence
 from typing import Any
 
 from fastapi import Request
-from sqlalchemy import Select, case, func, select
+from sqlalchemy import Select, and_, case, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..api.common import ListParams, apply_filters, apply_search, apply_sort, paginate
 from ..api.deps import Principal
 from ..core.errors import Conflict, NotFound, PermissionDenied, PreconditionFailed
+from ..db.base import stamp
 from ..db.session import get_sessionmaker
 from ..models.governance import (
     ApprovalRequest,
@@ -115,6 +116,8 @@ MAX_EXPORT_ROWS = 5000
 MAX_REFERENCE_PROBES = 200
 
 STREAM_POLL_SECONDS = 1.0
+# While a release waits at its approval gate, where only a person can move it.
+STREAM_GATE_POLL_SECONDS = 5.0
 STREAM_MAX_SECONDS = 900.0
 
 # How long a freshly started runner keeps looking for a deployment it cannot see
@@ -336,6 +339,40 @@ async def last_deployment_index(
     return {row.environment_id: (row.happened_at, row.actor) for row in rows}
 
 
+async def live_release_counts(
+    session: AsyncSession, workspace_id: str, environment_ids: Sequence[str]
+) -> dict[str, int]:
+    """How many releases each environment is serving: ``{env_id: count}``.
+
+    An environment serves one release per agent (a platform release, which has
+    no agent, is one more): whichever succeeded last. A newer release replaces
+    the older one and a rollback that lands replaces the release it undoes, so
+    neither adds to the number -- which is what counting successes did, until a
+    Production environment twelve releases old read "12 active deployments" and
+    could never be deleted. So it is counted from the history every time rather
+    than kept: the agents with a succeeded release there. An environment nothing
+    has succeeded in is simply absent from the result.
+    """
+    ids = [env_id for env_id in dict.fromkeys(environment_ids) if env_id]
+    if not ids:
+        return {}
+    rows = (
+        await session.execute(
+            select(
+                Deployment.environment_id,
+                func.count(func.distinct(func.coalesce(Deployment.agent_id, ""))),
+            )
+            .where(
+                Deployment.workspace_id == workspace_id,
+                Deployment.environment_id.in_(ids),
+                Deployment.status == DeploymentStatus.SUCCEEDED.value,
+            )
+            .group_by(Deployment.environment_id)
+        )
+    ).all()
+    return {environment_id: int(count) for environment_id, count in rows}
+
+
 async def create_environment(
     session: AsyncSession,
     principal: Principal,
@@ -453,7 +490,15 @@ async def delete_environment(
     *,
     request: Request | None = None,
 ) -> None:
-    """Remove an environment. Refused while anything is deployed to it."""
+    """Remove an environment. Refused while anything is deployed to it.
+
+    "Deployed to it" is counted here and now, not read off the stored counter,
+    which on rows written before it was a count of live releases holds every
+    success the environment ever had. And since a release, once live, stays
+    live until something replaces it, there has to be a way to say an
+    environment is finished with: taking it Offline is that. Nothing can be
+    released into an offline environment and nothing is served from one.
+    """
     principal.require(Role.ADMIN)
     environment = await _get_environment(session, principal, environment_id)
 
@@ -473,10 +518,13 @@ async def delete_environment(
             f"'{environment.name}' has {in_flight} deployment(s) in flight. "
             "Halt them before deleting the environment."
         )
-    if environment.active_deployment_count:
+    live = (
+        await live_release_counts(session, principal.workspace_id, [environment.id])
+    ).get(environment.id, 0)
+    if live and environment.status != EnvironmentStatus.OFFLINE.value:
         raise Conflict(
-            f"'{environment.name}' still hosts {environment.active_deployment_count} "
-            "active deployment(s)."
+            f"'{environment.name}' still hosts {live} live release(s). "
+            "Take the environment offline before deleting it."
         )
 
     label = environment.name
@@ -761,7 +809,20 @@ async def summary(session: AsyncSession, principal: Principal) -> DeploymentSumm
                 func.sum(
                     case((Deployment.status == DeploymentStatus.ROLLED_BACK.value, 1), else_=0)
                 ),
-                func.sum(case((Deployment.rollback_of_deployment_id.is_not(None), 1), else_=0)),
+                # "Executed" is a rollback that landed. One that is still waiting
+                # at its gate, or was refused there, has undone nothing.
+                func.sum(
+                    case(
+                        (
+                            and_(
+                                Deployment.rollback_of_deployment_id.is_not(None),
+                                Deployment.status == DeploymentStatus.SUCCEEDED.value,
+                            ),
+                            1,
+                        ),
+                        else_=0,
+                    )
+                ),
                 # AVG skips NULLs, so the CASE without an ELSE restricts the
                 # average to deployments that actually completed.
                 func.avg(
@@ -1400,6 +1461,13 @@ async def rollback_deployment(
 
     The rollback is its own deployment pointing back at the one it undoes, so
     the history table can render the pair as a single incident.
+
+    Asking for a rollback undoes nothing yet: the rollback is a release like
+    any other and has to get through its own gate. The source keeps serving,
+    and keeps its status, until the rollback lands -- ``PipelineRunner._succeed``
+    is what marks it ``RolledBack``. Marking it here left a release that was
+    still live reading RolledBack for as long as the rollback waited for its
+    approver, and for ever if the approver said no.
     """
     principal.require(Role.OPERATOR)
     source = await _get_deployment(session, principal, deployment_id)
@@ -1411,11 +1479,16 @@ async def rollback_deployment(
             f"{source.deployment_ref} is still {source.status}; halt it before rolling back."
         )
 
+    # A rollback that failed, or was halted or refused at its gate, undid
+    # nothing, and must not be the reason the release can never be rolled back.
     existing = (
         await session.execute(
             select(Deployment.deployment_ref).where(
                 Deployment.workspace_id == principal.workspace_id,
                 Deployment.rollback_of_deployment_id == source.id,
+                Deployment.status.not_in(
+                    (DeploymentStatus.FAILED.value, DeploymentStatus.HALTED.value)
+                ),
             )
         )
     ).scalars().first()
@@ -1443,16 +1516,6 @@ async def rollback_deployment(
         notes=reason,
         rollback_of_deployment_id=source.id,
     )
-
-    finished_at = rollback.started_at or _now()
-    source.status = DeploymentStatus.ROLLED_BACK.value
-    if source.finished_at is None:
-        source.finished_at = finished_at
-        source.duration_seconds = _elapsed_seconds(source.started_at, finished_at)
-    source.updated_by = principal.actor
-    if environment.active_deployment_count > 0:
-        environment.active_deployment_count -= 1
-    await session.flush()
 
     await audit.record(
         session,
@@ -1917,6 +1980,23 @@ class PipelineRunner:
             )
         ).scalar_one_or_none()
 
+    async def _rolled_back_by(
+        self, session: AsyncSession, deployment: Deployment
+    ) -> Deployment | None:
+        """The live release ``deployment`` undoes by succeeding, if it is a
+        rollback and that release was still live."""
+        if not deployment.rollback_of_deployment_id:
+            return None
+        return (
+            await session.execute(
+                select(Deployment).where(
+                    Deployment.id == deployment.rollback_of_deployment_id,
+                    Deployment.workspace_id == deployment.workspace_id,
+                    Deployment.status == DeploymentStatus.SUCCEEDED.value,
+                )
+            )
+        ).scalar_one_or_none()
+
     async def _open_approval_gate(
         self,
         session: AsyncSession,
@@ -2017,10 +2097,50 @@ class PipelineRunner:
             )
         ).scalar_one_or_none()
         if environment is not None:
-            environment.active_deployment_count += 1
             # The environment's own probe is the only health reading we have
             # until the post-deploy probe lands; nothing is invented here.
             deployment.health = environment.health
+
+        # A rollback that lands is the moment the release it undoes stops
+        # serving, and so the moment that release becomes RolledBack -- not when
+        # the rollback was asked for, which is before its gate. Only a release
+        # that was live can be rolled back in that sense: a Failed or Halted
+        # source never served, and keeps the status that says why.
+        source = await self._rolled_back_by(session, deployment)
+        if source is not None:
+            source.status = DeploymentStatus.ROLLED_BACK.value
+            source.updated_by = _system_principal(deployment.workspace_id).actor
+
+        # Flushed first: the session does not autoflush, and the count has to
+        # see this release as succeeded and its source as rolled back. Written
+        # with ``stamp`` because it is bookkeeping about the environment, not an
+        # edit of it, and must not move the token an open edit form is holding.
+        await session.flush()
+        if environment is not None:
+            live = await live_release_counts(session, deployment.workspace_id, [environment.id])
+            await stamp(
+                session, [environment], active_deployment_count=live.get(environment.id, 0)
+            )
+
+        if source is not None:
+            await audit.record(
+                session,
+                principal=_system_principal(deployment.workspace_id),
+                action="deployment.rolled_back",
+                entity_type="Deployment",
+                entity_id=source.id,
+                entity_label=source.deployment_ref,
+                source_screen=SOURCE_SCREEN,
+                detail=(
+                    f"{source.version} was rolled back to {deployment.version} "
+                    f"by {deployment.deployment_ref}."
+                ),
+                metadata={
+                    "rolled_back_by_deployment_id": deployment.id,
+                    "from_version": source.version,
+                    "to_version": deployment.version,
+                },
+            )
 
         await audit.record(
             session,
@@ -2189,11 +2309,18 @@ async def recover_orphaned_pipelines(*, grace_seconds: float = ORPHAN_GRACE_SECO
 def _progress_payload(
     deployment: Deployment, stages: Sequence[DeploymentStage]
 ) -> dict[str, Any]:
+    # Parked at the gate: nothing moves until a person decides. The stream slows
+    # down on it, and the console can say so instead of showing a stalled bar.
+    awaiting_approval = not deployment.is_terminal and any(
+        stage.name == STAGE_APPROVAL and stage.status == DeploymentStageStatus.RUNNING.value
+        for stage in stages
+    )
     return {
         "deployment_id": deployment.id,
         "deployment_ref": deployment.deployment_ref,
         "status": deployment.status,
         "is_terminal": deployment.is_terminal,
+        "awaiting_approval": awaiting_approval,
         "version": deployment.version,
         "environment_id": deployment.environment_id,
         "health": deployment.health,
@@ -2223,35 +2350,48 @@ async def stream_progress(
     deployment_id: str,
     *,
     poll_seconds: float = STREAM_POLL_SECONDS,
+    gate_poll_seconds: float = STREAM_GATE_POLL_SECONDS,
     max_seconds: float = STREAM_MAX_SECONDS,
 ) -> AsyncIterator[dict[str, Any]]:
     """Yield a pipeline snapshot per poll until the deployment reaches a
     terminal state or the stream ages out.
 
     Deliberately opens its own short-lived session per poll: a subscription can
-    outlive a request by minutes and must not pin a pooled connection.
+    outlive a request by minutes and must not pin a pooled connection. Each poll
+    is one statement -- the deployment and its stages together.
+
+    Stages move every few seconds, which is what the one-second poll is for.
+    A release parked at its approval gate moves when a person decides it, which
+    is minutes to hours away, and every pipeline parks there; so while it is
+    parked the poll drops to ``gate_poll_seconds``. The watcher sees the gate
+    open a few seconds late instead of costing a query a second all morning.
     """
     deadline = asyncio.get_running_loop().time() + max_seconds
     while True:
         async with get_sessionmaker()() as session:
-            deployment = (
+            rows = (
                 await session.execute(
-                    select(Deployment).where(
+                    select(Deployment, DeploymentStage)
+                    .outerjoin(DeploymentStage, DeploymentStage.deployment_id == Deployment.id)
+                    .where(
                         Deployment.id == deployment_id,
                         Deployment.workspace_id == principal.workspace_id,
                     )
+                    .order_by(DeploymentStage.sequence.asc())
                 )
-            ).scalar_one_or_none()
-            if deployment is None:
+            ).all()
+            if not rows:
                 return
             payload = _progress_payload(
-                deployment, await _stages_for(session, deployment.id)
+                rows[0][0], [stage for _deployment, stage in rows if stage is not None]
             )
 
         yield payload
         if payload["is_terminal"] or asyncio.get_running_loop().time() >= deadline:
             return
-        await asyncio.sleep(poll_seconds)
+        await asyncio.sleep(
+            max(poll_seconds, gate_poll_seconds) if payload["awaiting_approval"] else poll_seconds
+        )
 
 
 def progress_frame(payload: dict[str, Any]) -> str:

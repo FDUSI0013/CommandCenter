@@ -35,6 +35,7 @@ from ..api.common import ListParams, apply_filters, apply_search, apply_sort, pa
 from ..api.deps import Principal
 from ..core.errors import Conflict, NotFound, PreconditionFailed
 from ..core.ttlcache import SingleFlightCache
+from ..db.base import stamp
 from ..engine import EngineError, get_engine_client
 from ..models.identity import Role
 from ..models.registry import (
@@ -360,9 +361,17 @@ async def _record_sync(
         detail = f"{counted}. No endpoint configured; recorded agent count only"
     else:
         status, health, activity_status = _verdict(probe)
-        connection.status = status.value
-        connection.health = health.value
-        connection.latency_ms = probe.latency_ms
+        # What the probe measured is an observation about the tile, like the
+        # counter below, and the latency differs on nearly every sync. Set on
+        # the instance it would ride an ordinary UPDATE, ``onupdate`` would
+        # fire, and Configure left open across a Sync Now would answer 409.
+        await stamp(
+            session,
+            [connection],
+            status=status.value,
+            health=health.value,
+            latency_ms=probe.latency_ms,
+        )
         detail = f"{counted}, {probe.detail}"
 
     synced = probe is None or probe.reachable

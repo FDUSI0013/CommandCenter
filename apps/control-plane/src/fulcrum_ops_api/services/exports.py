@@ -33,7 +33,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any
 
-from croniter import croniter
+from croniter import CroniterError, croniter
 from fastapi import Request
 from sqlalchemy import Select, case, func, select
 from sqlalchemy import update as sa_update
@@ -947,6 +947,10 @@ _SCHEDULE_SORTABLE: dict[str, Any] = {
 }
 
 
+#: How many references one request will try before it gives up with a 409.
+_REF_ATTEMPTS = 5
+
+
 async def _next_export_ref(session: AsyncSession, workspace_id: str) -> str:
     """Allocate the next ``exp-N`` reference for a workspace."""
     used = (
@@ -1059,21 +1063,37 @@ async def _queue_job(
     requested_by_user_id: str | None,
 ) -> ExportJob:
     requested_at = _now()
-    job = ExportJob(
-        workspace_id=workspace_id,
-        export_ref=await _next_export_ref(session, workspace_id),
-        name=name,
-        source_screen=source_screen,
-        export_format=export_format,
-        status=ExportStatus.QUEUED.value,
-        filters=filters,
-        requested_by_user_id=requested_by_user_id,
-        requested_at=requested_at,
-        expires_at=requested_at + dt.timedelta(days=retention_days()),
+    # ``exp-N`` is chosen by counting, and two requests in one workspace can
+    # count the same rows and choose the same N. The unique constraint then
+    # refuses whichever flushes second, which used to be that caller's 500. The
+    # winner has committed by the time the loser is refused, so counting again
+    # yields a free reference; the savepoint keeps the refusal from costing the
+    # caller the rest of its transaction.
+    for _ in range(_REF_ATTEMPTS):
+        ref = await _next_export_ref(session, workspace_id)
+        job = ExportJob(
+            workspace_id=workspace_id,
+            export_ref=ref,
+            name=name,
+            source_screen=source_screen,
+            export_format=export_format,
+            status=ExportStatus.QUEUED.value,
+            filters=filters,
+            requested_by_user_id=requested_by_user_id,
+            requested_at=requested_at,
+            expires_at=requested_at + dt.timedelta(days=retention_days()),
+        )
+        try:
+            async with session.begin_nested():
+                session.add(job)
+                await session.flush()
+        except IntegrityError:
+            log.info("export reference %s was taken concurrently; choosing another", ref)
+            continue
+        return job
+    raise Conflict(
+        "Too many exports were requested in this workspace at the same moment. Try again."
     )
-    session.add(job)
-    await session.flush()
-    return job
 
 
 async def run_export_job(job_id: str, workspace_id: str) -> None:
@@ -1594,11 +1614,37 @@ def _refuse_undeliverable(recipients: Sequence[str], *, already: Sequence[str] =
 
 
 def next_run_after(cron: str, after: dt.datetime | None = None) -> dt.datetime:
-    """Next UTC firing of a cron expression, strictly after ``after``."""
+    """Next UTC firing of a cron expression, strictly after ``after``.
+
+    The schema refuses an expression with no next firing, but only on the
+    requests that carry one. A schedule saved paused by an older build holds
+    whatever it was given, and Resume sends ``enabled`` alone: ``0 0 31 4 *``
+    then raised here on every click and reached the client as a 500. It is the
+    caller's input that is wrong, so it is answered as such.
+    """
     base = after or _now()
     if base.tzinfo is None:
         base = base.replace(tzinfo=dt.UTC)
-    return croniter(cron, base).get_next(dt.datetime)
+    try:
+        return croniter(cron, base).get_next(dt.datetime)
+    except CroniterError as exc:
+        raise ValidationFailed(
+            f"The cron expression '{cron}' never fires: no date matches it. "
+            "Correct it before enabling this schedule.",
+            details={"field": "cron"},
+        ) from exc
+
+
+def dated_name(base: str, moment: dt.datetime | None = None) -> str:
+    """Name one firing of a schedule, kept inside the column's 200-character bound.
+
+    A schedule may already be named up to the limit, so the date is appended to
+    a trimmed base rather than overflowing it. The run-now route always did
+    this; the sweeper did not, and one schedule named in 188 characters or more
+    made the flush below it raise on every tick.
+    """
+    suffix = f" — {moment or _now():%Y-%m-%d}"
+    return f"{base[: 200 - len(suffix)].rstrip()}{suffix}"
 
 
 async def list_schedules(
@@ -1852,30 +1898,51 @@ async def run_due_schedules(
         .all()
     )
 
+    # Every tenant's due schedules share this loop and the one commit after it,
+    # so each firing is on its own. One schedule that raised used to roll the
+    # whole batch back -- the other tenants' firings and every advanced cadence
+    # with them -- and, still due, it sorted first again on the next tick: no
+    # export schedule on the platform fired until that row was fixed by hand.
     queued: list[tuple[str, str]] = []
     for schedule in due:
-        if schedule.source_screen not in _DATASETS:
+        # Read up front. A savepoint that rolls back may expire the row, and an
+        # expired attribute cannot be re-read from synchronous code under asyncio.
+        schedule_id, workspace_id = schedule.id, schedule.workspace_id
+        source_screen, export_format = schedule.source_screen, schedule.export_format
+        name, filters = dated_name(schedule.name, moment), dict(schedule.filters or {})
+
+        # The cadence moves first, whatever becomes of the firing, so a schedule
+        # that cannot fire is never what the next tick finds at the head of the
+        # queue. A cron with no next firing (written before the schema refused
+        # them) is parked: any edit re-derives it and says what is wrong.
+        try:
+            schedule.next_run_at = next_run_after(schedule.cron, moment)
+        except ValidationFailed:
+            log.warning("schedule %s parked: cron %r never fires", schedule_id, schedule.cron)
+            schedule.next_run_at = None
+            continue
+        if source_screen not in _DATASETS:
             # The dataset was retired after the schedule was written; skip the
             # firing rather than queue work that cannot succeed.
-            log.warning(
-                "schedule %s targets unknown dataset %s", schedule.id, schedule.source_screen
-            )
-            schedule.next_run_at = next_run_after(schedule.cron, moment)
+            log.warning("schedule %s targets unknown dataset %s", schedule_id, source_screen)
             continue
-        job = await _queue_job(
-            session,
-            workspace_id=schedule.workspace_id,
-            name=f"{schedule.name} — {moment.strftime('%Y-%m-%d')}",
-            source_screen=schedule.source_screen,
-            export_format=schedule.export_format,
-            filters=_recorded_filters(
-                _DATASETS[schedule.source_screen], schedule.filters or {}
-            ),
-            requested_by_user_id=None,
-        )
+        try:
+            async with session.begin_nested():
+                job = await _queue_job(
+                    session,
+                    workspace_id=workspace_id,
+                    name=name,
+                    source_screen=source_screen,
+                    export_format=export_format,
+                    filters=_recorded_filters(_DATASETS[source_screen], filters),
+                    requested_by_user_id=None,
+                )
+                job_id = job.id
+        except Exception:  # noqa: BLE001 - one schedule must not stop the rest
+            log.exception("schedule %s could not queue its export; firing skipped", schedule_id)
+            continue
         schedule.last_run_at = moment
-        schedule.next_run_at = next_run_after(schedule.cron, moment)
-        queued.append((job.id, schedule.workspace_id))
+        queued.append((job_id, workspace_id))
 
     await session.flush()
     return stranded + queued

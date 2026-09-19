@@ -97,6 +97,16 @@ def _fresh_rate_windows():
 
 
 @pytest.fixture(autouse=True)
+def _fresh_sign_in_windows():
+    """So are the sign-in throttle's: every test signs in from the same address."""
+    from fulcrum_ops_api.services import identity
+
+    identity.reset_sign_in_windows()
+    yield
+    identity.reset_sign_in_windows()
+
+
+@pytest.fixture(autouse=True)
 def _no_run_screen_memory(monkeypatch):
     """The run screens' short-lived caches are off unless a test asks for them.
 

@@ -334,9 +334,11 @@ async def wait_for(probe, predicate, *, stalled_after: float = 20.0, give_up_aft
     )
 
 
-async def a_release_parked_at_its_gate(client, factory, workspace) -> tuple[str, str]:
+async def a_release_parked_at_its_gate(
+    client, factory, workspace, *, environment_name: str = "Production East"
+) -> tuple[str, str]:
     """Deploy through the API and wait for the gate. Returns (deployment, request) ids."""
-    environment = await factory.environment(workspace, name="Production East")
+    environment = await factory.environment(workspace, name=environment_name)
     created = await client.post(
         "/api/v1/deployments", json={"environment_id": environment.id, "version": "v2.0.0"}
     )
@@ -527,6 +529,46 @@ async def test_a_release_left_parked_by_an_old_decision_can_be_settled(
     assert stages["Approval"] == DeploymentStageStatus.APPROVED.value
 
 
+async def test_the_gate_sweep_finishes_what_old_decisions_left_parked(
+    admin_client, db, factory, workspace, instant_pipeline
+):
+    """The scheduler's entry point: every workspace, its own session, and the
+    pipeline started only once the opened gate is committed."""
+    from fulcrum_ops_api.services import approvals as approvals_service
+
+    released, approved_request = await a_release_parked_at_its_gate(
+        admin_client, factory, workspace
+    )
+    refused, rejected_request = await a_release_parked_at_its_gate(
+        admin_client, factory, workspace, environment_name="Production West"
+    )
+    assert await approvals_service.settle_parked_gates() == 0, "an open gate is a person's"
+
+    for request_id, status in (
+        (approved_request, ApprovalStatus.APPROVED),
+        (rejected_request, ApprovalStatus.REJECTED),
+    ):
+        await db.execute(
+            update(ApprovalRequest)
+            .where(ApprovalRequest.id == request_id)
+            .values(
+                status=status.value,
+                decision_note="Decided before decisions reached the release",
+                decided_at=dt.datetime.now(dt.UTC),
+            )
+        )
+
+    assert await approvals_service.settle_parked_gates() == 2
+
+    detail = (await admin_client.get(f"/api/v1/deployments/{refused}")).json()
+    assert detail["status"] == DeploymentStatus.HALTED.value
+    await wait_for(
+        lambda: progress_of(admin_client, released),
+        lambda seen: seen[0]["status"] == DeploymentStatus.SUCCEEDED.value,
+    )
+    assert await approvals_service.settle_parked_gates() == 0, "settled once, not every tick"
+
+
 # ---------------------------------------------------------------------------
 # 109 - write paths that answered 500, or could be made to
 # ---------------------------------------------------------------------------
@@ -572,6 +614,49 @@ async def test_a_poisoned_reference_already_in_the_table_no_longer_resets_the_se
 
     assert raised.status_code == 201, raised.text
     assert raised.json()["request_ref"] == f"APR-{year}-00042"
+
+
+async def test_losing_the_race_for_a_reference_costs_a_re_read_not_a_500(
+    as_role, db, db_engine, factory, workspace
+):
+    """Two workers read the same max() and the unique constraint refuses the second.
+
+    The other worker is played by a second connection that takes the reference
+    in the instant between this request's read and its insert.
+    """
+    import sqlite3
+
+    from sqlalchemy import event
+
+    year = dt.datetime.now(dt.UTC).year
+    contested = f"APR-{year}-00001"
+    other_workers = await factory.approval(workspace, request_ref="FIN-1")
+    taken: list[str] = []
+
+    def take_it_first(_conn, _cursor, statement, _parameters, _context, _many) -> None:
+        if taken or not statement.lstrip().upper().startswith("INSERT INTO APPROVAL_REQUESTS"):
+            return
+        taken.append(contested)
+        with sqlite3.connect(db_engine.url.database, timeout=30) as other:
+            other.execute(
+                "UPDATE approval_requests SET request_ref = ? WHERE id = ?",
+                (contested, other_workers.id),
+            )
+
+    event.listen(db_engine.sync_engine, "before_cursor_execute", take_it_first)
+    try:
+        async with as_role(Role.MEMBER) as http:
+            raised = await http.post("/api/v1/approvals", json={"action": "Refund Initiate"})
+    finally:
+        event.remove(db_engine.sync_engine, "before_cursor_execute", take_it_first)
+
+    assert taken, "the race was staged"
+    assert raised.status_code == 201, raised.text
+    assert raised.json()["request_ref"] == f"APR-{year}-00002"
+    refs = await db.scalars(
+        select(ApprovalRequest.request_ref).where(ApprovalRequest.workspace_id == workspace.id)
+    )
+    assert sorted(refs) == [contested, f"APR-{year}-00002"]
 
 
 @pytest.mark.parametrize("field", ["action", "payload"])

@@ -304,6 +304,7 @@
     },
     metrics: {
       summary: (params) => get('/metrics/summary', params),
+      overview: (params) => get('/metrics/overview', params),
       series: (params) => get('/metrics/series', params),
       models: (params) => get('/metrics/models', params),
       platforms: (params) => get('/metrics/platforms', params),
@@ -536,6 +537,7 @@
       trend: (params) => get('/evaluations/trend', params),
       // Paged, so the Testing screen's Datasets tab can drive it server-side.
       datasets: (params) => get('/evaluations/datasets', params),
+      datasetsInUse: () => get('/evaluations/datasets/in-use'),
       // The detail view pages its per-case breakdown, which collection().get cannot express.
       detail: (id, params) => get(`/evaluations/${encodeURIComponent(id)}`, params),
       export: (params) => download('/evaluations/export', params),
@@ -546,6 +548,7 @@
       tune: (id, body) => patch(`/guardrails/${encodeURIComponent(id)}/threshold`, body),
       enable: (id) => post(`/guardrails/${encodeURIComponent(id)}/enable`, {}),
       disable: (id) => post(`/guardrails/${encodeURIComponent(id)}/disable`, {}),
+      shadow: (id) => post(`/guardrails/${encodeURIComponent(id)}/shadow`, {}),
       events: (params) => get('/guardrails/events', params),
       eventsExport: (params) => download('/guardrails/events/export', params),
       export: (params) => download('/guardrails/export', params),
@@ -556,6 +559,7 @@
       runs: (id, params) => get(`/testing/suites/${encodeURIComponent(id)}/runs`, params),
       promoteBaseline: (id, runId) => post(`/testing/suites/${encodeURIComponent(id)}/promote-baseline`, { run_id: runId }),
       progress: (id, runId) => get(`/testing/suites/${encodeURIComponent(id)}/runs/${encodeURIComponent(runId)}/progress`),
+      cancelRun: (id, runId) => post(`/testing/suites/${encodeURIComponent(id)}/runs/${encodeURIComponent(runId)}/cancel`, {}),
       schedules: collection('/testing/schedules'),
       compare: (params) => get('/testing/compare', params),
       // The tabs beside Test Suites: every one is its own server-side view.

@@ -58,7 +58,7 @@ from fastapi import Request
 from sqlalchemy import Select, func, or_, select
 from sqlalchemy import update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm.attributes import set_committed_value
+from sqlalchemy.orm.attributes import flag_modified, set_committed_value
 
 from ..api.deps import Principal
 from ..core.config import settings
@@ -371,28 +371,48 @@ async def _push_rows(call: BatchCall, rows: Sequence[Mapping[str, Any]]) -> list
     against all of them cost forty healthy traces their acceptance for one bad
     one, which is the opposite of what the per-item results promise.
 
-    So a refused batch is halved and asked again until the rows at fault stand
-    alone. The common case is still one call; one bad row among a thousand costs
-    about twenty. The search is capped, and whatever is still unresolved when
-    the cap is reached is reported refused together, which is no worse than
+    So a refused batch is divided and asked again until the rows at fault stand
+    alone. The common case is still one call. The first cut is not blind: the
+    one refusal that can be seen from here is an id that is not version 7, so
+    the rows that carry one are set apart from the rows that do not. A reporter
+    that mints its own ids does so for *every* row, and halving its batch would
+    have spent the whole search -- forty refused calls, against a store that may
+    already be behind -- rediscovering that one by one; this way it costs three.
+    Whatever else the store dislikes is found by halving, about twenty calls for
+    one bad row among a thousand. The search is capped, and what is still
+    unresolved at the cap is reported refused together, which is no worse than
     before. Returns one entry per row: ``None`` for stored, else the reason.
     """
     refusals: list[str | None] = [None] * len(rows)
     budget = MAX_ISOLATION_CALLS
-    pending: list[tuple[int, int]] = [(0, len(rows))] if rows else []
+    pending: list[list[int]] = [list(range(len(rows)))] if rows else []
     while pending:
-        low, high = pending.pop()
-        refusal = await _push(call, rows[low:high])
+        group = pending.pop()
+        refusal = await _push(call, [rows[at] for at in group])
         if refusal is None:
             continue
         status, reason = refusal
-        if high - low == 1 or budget < 2 or status not in _CONTENT_REFUSALS:
-            refusals[low:high] = [reason] * (high - low)
+        suspects = [at for at in group if _unaddressable(rows[at])]
+        if (
+            len(group) == 1
+            or budget < 2
+            or status not in _CONTENT_REFUSALS
+            # Every row here has the fault the store is known to refuse for,
+            # and it has just refused them: there is nothing left to narrow.
+            or len(suspects) == len(group)
+        ):
+            for at in group:
+                refusals[at] = reason
             continue
         budget -= 2
-        middle = (low + high) // 2
-        pending.append((middle, high))
-        pending.append((low, middle))
+        if suspects:
+            apart = set(suspects)
+            pending.append(suspects)
+            pending.append([at for at in group if at not in apart])
+        else:
+            middle = len(group) // 2
+            pending.append(group[middle:])
+            pending.append(group[:middle])
     return refusals
 
 
@@ -401,6 +421,11 @@ def _is_v7(value: str | None) -> bool:
         return uuid.UUID(str(value)).version == 7
     except (ValueError, AttributeError, TypeError):
         return False
+
+
+def _unaddressable(row: Mapping[str, Any]) -> bool:
+    """Whether a row names a trace or a span by an id the store will not address."""
+    return any(value and not _is_v7(value) for value in (row.get("id"), row.get("trace_id")))
 
 
 def _explained(reason: str, *ids: str | None) -> str:
@@ -1482,6 +1507,12 @@ async def _announce_quota(
         return
     try:
         async with session.begin_nested():
+            # The service moves the status on the instance, and the flush that
+            # follows writes it as an edit -- moving ``updated_at`` under the
+            # admin who opened the form *because* the quota is filling up.
+            # Naming the column in that UPDATE, at the value it already has, is
+            # what stops ``onupdate``: see ``db.base.stamp``.
+            flag_modified(quota, "updated_at")
             await evaluate(session, quota, request=request)
             await session.flush()
     except Exception:  # noqa: BLE001 - see above: never at the batch's expense
@@ -3258,6 +3289,10 @@ async def _record_evidence(
             .where(Policy.workspace_id == principal.workspace_id, Policy.id.in_(policy_ids))
             # Named, and set to itself, so that a policy firing is not an edit to it.
             .values(last_triggered_at=now, updated_at=Policy.updated_at)
+            # The policies this request loaded are still in the session. Left to
+            # synchronise, the ORM expires ``updated_at`` on them, and the next
+            # read of an expired attribute under asyncio is a MissingGreenlet.
+            .execution_options(synchronize_session=False)
         )
     await session.flush()
     violations = sum(1 for row in rows if isinstance(row, PolicyViolation))

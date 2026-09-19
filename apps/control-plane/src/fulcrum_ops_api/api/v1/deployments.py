@@ -20,6 +20,7 @@ from typing import Annotated
 from fastapi import APIRouter, BackgroundTasks, Depends, Query, Request, status
 from fastapi.responses import StreamingResponse
 
+from ...db.session import commit_then
 from ...models.operations import Deployment, DeploymentStatus, DeploymentStrategy
 from ...models.registry import Environment, EnvironmentStatus, EnvironmentType
 from ...schemas.deployments import (
@@ -81,16 +82,23 @@ STREAM_HEARTBEAT_SECONDS = 15.0
 async def _read_environments(
     session: Db, principal: Principal, rows: Sequence[Environment]
 ) -> list[EnvironmentRead]:
-    """Attach the "last deployment" pair the environments table renders."""
-    index = await deployments_service.last_deployment_index(
-        session, principal, [row.id for row in rows]
-    )
+    """Attach the "last deployment" pair the environments table renders, and
+    the number of releases each environment is serving.
+
+    That number is counted from the history rather than read off the row: the
+    stored counter used to be bumped by every success and lowered by nothing, so
+    rows written before it was corrected hold the environment's lifetime total.
+    """
+    ids = [row.id for row in rows]
+    index = await deployments_service.last_deployment_index(session, principal, ids)
+    live = await deployments_service.live_release_counts(session, principal.workspace_id, ids)
     out: list[EnvironmentRead] = []
     for environment in rows:
         read = EnvironmentRead.model_validate(environment)
         read.last_deployment_at, read.last_deployment_by = index.get(
             environment.id, (None, None)
         )
+        read.active_deployment_count = live.get(environment.id, 0)
         out.append(read)
     return out
 
@@ -129,21 +137,19 @@ async def _start_pipeline(
 ) -> None:
     """Make the request's writes durable, THEN hand the deployment to the runner.
 
-    The request-scoped session commits when its dependency exits, and under the
-    FastAPI this service runs on that is after the response has been sent --
-    which is after ``BackgroundTasks`` have run. The runner works on its own
-    connection, so a runner scheduled first looks for a row (or an ``Approved``
-    gate) nobody else can see yet, finds nothing to do and exits for good: the
-    release sits Queued, or parked behind a gate that reads Approved, with its
-    environment locked. SQLite happens to lose that race every time; Postgres
-    with a warm pool does not.
+    :func:`~fulcrum_ops_api.db.session.commit_then` has the whole story. Here it
+    matters twice over: the runner works on its own connection, so one that is
+    scheduled before the commit looks for a row (or an ``Approved`` gate) nobody
+    else can see yet, finds nothing to do and exits for good -- the release sits
+    Queued, or parked behind a gate that reads Approved, with its environment
+    locked. SQLite happens to lose that race every time; Postgres with a warm
+    pool does not.
 
-    Call it last, after everything else in the route that can still fail: what
-    is committed here stays committed. The dependency's own commit afterwards
-    is a no-op, and the rows stay readable (``expire_on_commit`` is off).
+    Call it last, after everything else in the route that can still fail.
     """
-    await session.commit()
-    background.add_task(deployments_service.run_pipeline, deployment_id, principal.workspace_id)
+    await commit_then(
+        session, background, deployments_service.run_pipeline, deployment_id, principal.workspace_id
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -233,7 +239,8 @@ async def delete_environment(
     request: Request,
 ) -> None:
     """Remove an environment. Refused while deployments are in flight or live
-    in it, so history never loses the target it points at."""
+    in it, so history never loses the target it points at. An environment that
+    has been taken Offline serves nothing and can be deleted."""
     await deployments_service.delete_environment(
         session, principal, environment_id, request=request
     )
@@ -452,6 +459,15 @@ async def stream_deployment(
     # Resolve first so a missing or cross-workspace id is a clean 404 rather
     # than an empty stream.
     await deployments_service.get_deployment(session, principal, deployment_id)
+
+    # That was the last thing this request needs from the database. Its session
+    # is not given back until the response has been sent in full, which for a
+    # stream is up to a quarter of an hour away -- and a release waiting for its
+    # approver keeps a tab streaming for as long as it is left open. Until then
+    # the connection would sit checked out, idle inside the transaction that
+    # authentication opened. Ending the transaction hands it back; the stream
+    # opens a short-lived session for each poll.
+    await session.commit()
 
     async def frames() -> AsyncIterator[str]:
         previous: dict | None = None

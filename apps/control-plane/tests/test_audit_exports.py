@@ -13,20 +13,23 @@ the answer back off the database and the spool.
   export of Secrets Compliance held only the secrets created that month.
 * Generation lives only in the process that started it. A deploy or an OOM kill
   left the row Queued or Generating for ever, with nothing to move it on.
+* A schedule collected recipients, showed them and audited them, and nothing
+  ever sent them anything.
 """
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import os
 from pathlib import Path
 
 import pytest
-from sqlalchemy import update
+from sqlalchemy import select, update
 
 from conftest import utcnow
 from fulcrum_ops_api.models.governance import Secret
-from fulcrum_ops_api.models.operations import Alert, ExportJob, ExportStatus
+from fulcrum_ops_api.models.operations import Alert, ExportJob, ExportSchedule, ExportStatus
 from fulcrum_ops_api.services import exports as exports_service
 from fulcrum_ops_api.services import scheduler
 
@@ -275,3 +278,199 @@ async def test_the_clock_settles_jobs_a_restart_left_in_flight(
     polled = (await admin_client.get(f"/api/v1/exports/{wedged.id}/status")).json()
     assert polled["status"] == "Failed", "the console polls until it sees a terminal state"
 
+
+
+# ---------------------------------------------------------------------------
+# Recipients nobody delivers to
+# ---------------------------------------------------------------------------
+
+WEEKLY = {"name": "Weekly audit trail", "source_screen": "Audit Trail", "cron": "0 6 * * 1"}
+
+
+async def test_a_schedule_cannot_promise_a_delivery_nothing_makes(admin_client, db):
+    summary = (await admin_client.get("/api/v1/exports/summary")).json()
+    assert summary["delivery_available"] is False, "the console keys its input off this"
+
+    refused = await admin_client.post(
+        "/api/v1/exports/schedules", json={**WEEKLY, "recipients": ["audit@example.com"]}
+    )
+    assert refused.status_code == 422, "it was stored, shown and audited, and never sent"
+    error = refused.json()["error"]
+    assert error["details"]["field"] == "recipients"
+    assert "not configured" in error["message"]
+    assert await db.count(ExportSchedule) == 0
+
+    created = await admin_client.post("/api/v1/exports/schedules", json=WEEKLY)
+    assert created.status_code == 201, created.text
+    assert created.json()["recipients"] == []
+
+
+async def test_a_schedule_that_already_holds_recipients_can_still_be_edited(
+    admin_client, factory, workspace
+):
+    """The editor sends the whole form back, recipients included."""
+    legacy = await factory.add(
+        ExportSchedule(
+            workspace_id=workspace.id,
+            name="Written before the check",
+            source_screen="Audit Trail",
+            export_format="CSV",
+            cron="0 6 * * 1",
+            filters={},
+            recipients=["audit@example.com"],
+            enabled=True,
+            next_run_at=utcnow() + dt.timedelta(days=3),
+        )
+    )
+    path = f"/api/v1/exports/schedules/{legacy.id}"
+
+    renamed = await admin_client.patch(
+        path, json={"name": "Weekly audit trail", "recipients": ["audit@example.com"]}
+    )
+    assert renamed.status_code == 200, renamed.text
+
+    widened = await admin_client.patch(
+        path, json={"recipients": ["audit@example.com", "ciso@example.com"]}
+    )
+    assert widened.status_code == 422, "nobody new may be promised a delivery"
+
+    cleared = await admin_client.patch(path, json={"recipients": []})
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.json()["recipients"] == []
+
+
+# ---------------------------------------------------------------------------
+# Schedule inputs that validated and then broke something later
+# ---------------------------------------------------------------------------
+
+
+async def due_schedule(factory, workspace, *, name: str, cron: str, minutes_late: int):
+    """A schedule the next tick owes a firing, written as an older build left it."""
+    return await factory.add(
+        ExportSchedule(
+            workspace_id=workspace.id,
+            name=name,
+            source_screen="Audit Trail",
+            export_format="CSV",
+            cron=cron,
+            filters={"days": 7},
+            recipients=[],
+            enabled=True,
+            next_run_at=utcnow() - dt.timedelta(minutes=minutes_late),
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("cron", "reason"),
+    [
+        ("0 0 31 4 *", "never fires"),  # every field in range; April has 30 days
+        ("0 0 30 2 *", "never fires"),
+        ("* * * * * *", "five fields"),  # a seconds field: due on every tick
+    ],
+)
+async def test_a_cron_the_clock_could_not_honour_is_refused_at_the_door(
+    admin_client, db, cron, reason
+):
+    refused = await admin_client.post("/api/v1/exports/schedules", json={**WEEKLY, "cron": cron})
+
+    assert refused.status_code == 422, "it passed validation and then answered 500"
+    assert reason in refused.text
+    assert await db.count(ExportSchedule) == 0
+
+    # An alias is five fields by another name, and a rare date is still a date.
+    for index, fine in enumerate(("@daily", "0 0 29 2 *")):
+        created = await admin_client.post(
+            "/api/v1/exports/schedules", json={**WEEKLY, "name": f"Fine {index}", "cron": fine}
+        )
+        assert created.status_code == 201, created.text
+        assert created.json()["next_run_at"] is not None
+
+
+async def test_resuming_a_schedule_whose_cron_never_fires_explains_itself(
+    admin_client, factory, workspace
+):
+    """Saved paused by an older build, so no validator ever looked at its cron."""
+    parked = await factory.add(
+        ExportSchedule(
+            workspace_id=workspace.id,
+            name="Saved paused",
+            source_screen="Audit Trail",
+            export_format="CSV",
+            cron="0 0 31 4 *",
+            enabled=False,
+        )
+    )
+
+    resumed = await admin_client.patch(
+        f"/api/v1/exports/schedules/{parked.id}", json={"enabled": True}
+    )
+
+    assert resumed.status_code == 422, "every Resume click was a 500"
+    assert resumed.json()["error"]["details"]["field"] == "cron"
+
+
+async def test_a_firing_is_named_inside_the_column_whatever_the_schedule_is_called(
+    admin_client, db, factory, workspace
+):
+    """Postgres refuses 201 characters in a String(200); SQLite just stores them."""
+    longest = "Quarterly attestation pack " + "x" * 173
+    assert len(longest) == 200
+    created = await admin_client.post(
+        "/api/v1/exports/schedules", json={**WEEKLY, "name": longest}
+    )
+    assert created.status_code == 201, created.text
+    await db.execute(
+        update(ExportSchedule)
+        .where(ExportSchedule.id == created.json()["id"])
+        .values(next_run_at=utcnow() - dt.timedelta(minutes=1))
+    )
+
+    counts = await scheduler.run_once()
+
+    assert counts["exports_fired"] == 1
+    [job] = await db.scalars(select(ExportJob))
+    assert len(job.name) <= 200, "the flush raised and took every tenant's firings with it"
+    assert job.name.startswith("Quarterly attestation pack")
+    assert job.name.endswith(f" — {utcnow():%Y-%m-%d}")
+    assert job.status == ExportStatus.READY.value, job.error
+
+
+async def test_one_schedule_that_cannot_fire_does_not_stop_the_others(
+    admin_client, db, factory, workspace, other_workspace
+):
+    broken = await due_schedule(
+        factory, workspace, name="Cannot be advanced", cron="0 0 31 4 *", minutes_late=30
+    )
+    healthy = await due_schedule(
+        factory, other_workspace, name="Another tenant's Monday export", cron="0 6 * * 1",
+        minutes_late=5,
+    )
+
+    counts = await scheduler.run_once()
+
+    assert counts["exports_fired"] == 1, "the first failure rolled the whole batch back"
+    [job] = await db.scalars(select(ExportJob))
+    assert job.workspace_id == other_workspace.id
+    assert job.status == ExportStatus.READY.value, job.error
+    assert (await db.get(ExportSchedule, healthy.id)).next_run_at > utcnow()
+    # Parked, not left due: it would otherwise sort first again on every tick.
+    assert (await db.get(ExportSchedule, broken.id)).next_run_at is None
+    assert (await scheduler.run_once())["exports_fired"] == 0
+
+
+async def test_two_exports_requested_at_once_both_get_a_reference(admin_client, db):
+    """Both requests count the same rows and both choose exp-1."""
+    answers = await asyncio.gather(
+        *[
+            admin_client.post(
+                "/api/v1/exports",
+                json={"name": f"Concurrent {index}", "source_screen": "Audit Trail"},
+            )
+            for index in range(4)
+        ]
+    )
+
+    assert [answer.status_code for answer in answers] == [202] * 4, [a.text for a in answers]
+    refs = [job.export_ref for job in await db.scalars(select(ExportJob))]
+    assert len(refs) == len(set(refs)) == 4

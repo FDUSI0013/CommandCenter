@@ -7,6 +7,7 @@ authority for both browser sessions and SDK API keys.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import datetime as dt
@@ -14,12 +15,17 @@ import hashlib
 import hmac
 import json
 import secrets
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from typing import Any, TypeVar
 
 from cryptography.fernet import Fernet, InvalidToken
 from passlib.context import CryptContext
 
 from .config import settings
+
+_T = TypeVar("_T")
 
 # --------------------------------------------------------------------------
 # Passwords
@@ -41,6 +47,25 @@ def verify_password(raw: str, hashed: str) -> bool:
 
 def needs_rehash(hashed: str) -> bool:
     return _pwd.needs_update(hashed)
+
+
+# argon2 is slow and memory-hard on purpose: one hash is tens of milliseconds of
+# CPU and 64 MiB of working memory. Called straight from an ``async`` handler it
+# holds that worker's event loop for the duration, and everything else the loop
+# is serving -- ingest batches, the live-runs stream -- stands still behind a
+# sign-in. The hash releases the GIL, so a thread is all it takes to give the
+# loop back. The pool is deliberately small: it is what bounds the memory a
+# burst of sign-ins can claim (two hashes at a time per worker, the rest queue),
+# which ``asyncio.to_thread`` and its 32-thread default pool would not.
+PASSWORD_POOL_WORKERS = 2
+_password_pool = ThreadPoolExecutor(
+    max_workers=PASSWORD_POOL_WORKERS, thread_name_prefix="password-hash"
+)
+
+
+async def off_loop(work: Callable[..., _T], *args: Any) -> _T:
+    """Run one password hash or verification without blocking the event loop."""
+    return await asyncio.get_running_loop().run_in_executor(_password_pool, work, *args)
 
 
 # --------------------------------------------------------------------------

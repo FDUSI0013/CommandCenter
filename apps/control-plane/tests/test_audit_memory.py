@@ -183,6 +183,49 @@ async def test_a_store_no_agent_names_is_not_purged(admin_client, factory, works
     assert engine.calls_to("/traces/delete") == []
 
 
+async def test_a_purge_reaches_the_idle_agents_the_screens_fan_out_cap_drops(
+    admin_client, factory, workspace, engine
+):
+    """The cap keeps the most recently used agents, which is backwards for a purge.
+
+    The agent nobody has used for months is the one whose conversations have
+    expired, and it was the first to fall off the end of a capped list — on
+    every run, so repeating the purge never reached it.
+    """
+    from fulcrum_ops_api.services.memory import MAX_PROJECT_FANOUT
+
+    store = await factory.memory_store(
+        workspace,
+        name="Support memory",
+        store_type=MemoryStoreType.CONVERSATION.value,
+        retention_days=30,
+        retention_policy="30 days",
+    )
+    dormant = await factory.provisioned_agent(
+        workspace,
+        engine,
+        name="Dormant Bot",
+        memory_policy=store.name,
+        last_used_at=utcnow() - dt.timedelta(days=90),
+    )
+    for index in range(MAX_PROJECT_FANOUT):
+        await factory.provisioned_agent(
+            workspace, engine, name=f"Busy Bot {index:02d}", memory_policy=store.name
+        )
+    expired = say(engine, dormant, "conv-dormant", age=OLD)
+
+    response = await admin_client.post(
+        f"/api/v1/memory/{store.id}/purge", json={"confirm": store.name}
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["projects"] == MAX_PROJECT_FANOUT + 1
+    assert "Dormant Bot" in body["agents"]
+    assert body["purged_records"] == 1
+    assert expired["id"] not in engine.traces
+
+
 async def test_a_dry_run_says_what_would_go_and_whose_without_touching_it(
     admin_client, factory, workspace, engine, db
 ):
@@ -204,6 +247,40 @@ async def test_a_dry_run_says_what_would_go_and_whose_without_touching_it(
     assert "Nothing was deleted" in body["message"]
     assert expired["id"] in engine.traces
     assert engine.calls_to("/traces/delete") == []
+
+
+async def test_a_conversations_expiry_is_its_own_stores_window_or_none(
+    admin_client, factory, workspace, engine
+):
+    """The Conversation State tab promises only what a purge would do.
+
+    It quoted the workspace's tightest conversation store against every thread:
+    a 7-day Development store put a 7-day expiry on a Production conversation
+    held for 30, and on one that no store — and so no purge — governs at all.
+    """
+    store, support = await bound(factory, workspace, engine)
+    await factory.memory_store(
+        workspace,
+        name="Scratch memory",
+        store_type=MemoryStoreType.CONVERSATION.value,
+        environment=EnvironmentType.DEVELOPMENT.value,
+        retention_days=7,
+        retention_policy="7 days",
+    )
+    unbound = await factory.provisioned_agent(workspace, engine, name="Billing Bot")
+    say(engine, support, "conv-support", age=dt.timedelta(days=1))
+    say(engine, unbound, "conv-billing", age=dt.timedelta(days=1))
+
+    page = (await admin_client.get("/api/v1/memory/conversations")).json()
+    rows = {row["conversation_id"]: row for row in page["items"]}
+
+    governed = rows["conv-support"]
+    assert governed["retention_policy"] == "30 days"
+    expires = dt.datetime.fromisoformat(governed["expires_at"].replace("Z", "+00:00"))
+    last = dt.datetime.fromisoformat(governed["last_activity_at"].replace("Z", "+00:00"))
+    assert expires - last == dt.timedelta(days=30)
+    assert rows["conv-billing"]["retention_policy"] is None
+    assert rows["conv-billing"]["expires_at"] is None, "no store governs it, so nothing expires it"
 
 
 async def test_a_purge_is_audited_with_whose_records_it_removed(
@@ -492,6 +569,32 @@ async def test_the_store_table_answers_without_telemetry_and_shows_no_figure(
     assert row["name"] == store.name
     assert row["record_count"] is None and row["active_session_count"] is None
     assert row["bound_agents"] == 1
+
+
+async def test_a_policys_records_count_its_conversation_stores_live(
+    admin_client, factory, workspace, engine
+):
+    """The Retention Policies tab summed the same never-written column: Records 0."""
+    store, support = await bound(factory, workspace, engine)
+    await factory.memory_store(
+        workspace,
+        name="Product embeddings",
+        store_type=MemoryStoreType.VECTOR.value,
+        retention_days=30,
+        retention_policy="30 days",
+        record_count=1200,
+    )
+    say(engine, support, "conv-a", age=dt.timedelta(days=2))
+    say(engine, support, "conv-b", age=dt.timedelta(days=1))
+
+    (policy,) = (await admin_client.get("/api/v1/memory/retention-policies")).json()
+    assert policy["store_count"] == 2
+    assert policy["record_count"] == 1202, "two live threads plus what the vector store reported"
+
+    engine.fail(503)
+    (unread,) = (await admin_client.get("/api/v1/memory/retention-policies")).json()
+    assert unread["stores"] == ["Product embeddings", "Support memory"], "our rows still answer"
+    assert unread["record_count"] is None, "half a sum is not shown as the total"
 
 
 async def test_a_reported_stores_counters_are_still_what_its_runtime_sent(

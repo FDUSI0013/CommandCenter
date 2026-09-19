@@ -1568,6 +1568,12 @@ async def _roll_up_spend(
         for budget in group:
             matched = [rollup for rollup in rollups if _in_scope(budget, rollup.project)]
             spend = telemetry.sum_optional(rollup.cost_usd for rollup in matched)
+            if spend is not None and at >= _as_utc(budget.period_end):
+                # What a period cost does not fall once the period is over. A
+                # lower answer for one -- the first scheduled pass closes books
+                # that may be months old -- means the store has let the traces
+                # go, and the figure we recorded while it had them is the truer.
+                spend = max(spend, float(budget.spent_usd or 0.0))
             if bookkeeping:
                 await _book_spend(session, budget, spend, at, request=request)
                 continue
@@ -1634,10 +1640,14 @@ async def _open_next_periods(
     has lapsed its amount, thresholds, scope and owner are carried into the
     period that contains now.
 
-    Two kinds of budget are left alone. One that was switched off stays off --
-    Disabled is how an admin ends a recurring budget. And one created with
+    Three kinds of budget are left alone. One that was switched off stays off --
+    Disabled is how an admin ends a recurring budget. One created with
     hand-picked dates was never "Monthly" in the calendar sense, so there is no
-    next period to infer for it.
+    next period to infer for it. And only the period that has *just* ended
+    carries forward: a budget nobody renewed for a whole period of its own is
+    one its owner let go, and this pass did not exist until now -- without the
+    rule its first run would reopen every budget the workspace ever abandoned
+    and add them all to the Total Budget card.
     """
     covered = set(
         (
@@ -1674,6 +1684,8 @@ async def _open_next_periods(
         if period_bounds(period, span[0]) != span:
             continue
         period_start, period_end = period_bounds(period, at)
+        if span[1] != period_start:
+            continue  # it lapsed a period or more ago and was never renewed
         successor = Budget(
             workspace_id=budget.workspace_id,
             name=budget.name,
@@ -1834,26 +1846,38 @@ async def run_budget_sweep(*, force: bool = False) -> dict[str, int]:
         return {}
     _last_budget_sweep = moment
 
-    async with get_sessionmaker()() as session:
-        workspace_ids = (
-            (
-                await session.execute(
-                    select(Budget.workspace_id)
-                    .where(Budget.status != LimitStatus.DISABLED.value)
-                    .distinct()
-                )
-            )
-            .scalars()
-            .all()
-        )
-
     counts = {"budgets_measured": 0, "budget_sweeps_failed": 0}
+    try:
+        async with get_sessionmaker()() as session:
+            workspace_ids = (
+                (
+                    await session.execute(
+                        select(Budget.workspace_id)
+                        .where(Budget.status != LimitStatus.DISABLED.value)
+                        .distinct()
+                    )
+                )
+                .scalars()
+                .all()
+            )
+    except Exception:  # noqa: BLE001 - the scheduler runs this beside other deferred work
+        # "Never raises" includes the first read: the scheduler runs this after
+        # its lock with the export jobs it claimed under it, and an exception
+        # here would leave those claimed and never generated.
+        counts["budget_sweeps_failed"] += 1
+        log.exception("budget sweep could not list the workspaces to measure")
+        return counts
+
     for workspace_id in workspace_ids:
+        principal = _sweep_principal(workspace_id)
         try:
             async with get_sessionmaker()() as session:
-                rows = await refresh_budgets(
-                    session, _sweep_principal(workspace_id), scheduled=True
-                )
+                # Opening a period is our own SQL and is committed before
+                # anything is measured: a store that cannot answer on the first
+                # of the month must not also cost the workspace its budget.
+                await _open_next_periods(session, principal, _now())
+                await session.commit()
+                rows = await refresh_budgets(session, principal, scheduled=True)
                 await session.commit()
             counts["budgets_measured"] += len(rows)
         except Exception:  # noqa: BLE001 - one workspace must not stop the others

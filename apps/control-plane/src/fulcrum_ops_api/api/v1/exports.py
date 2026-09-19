@@ -102,16 +102,6 @@ def _stamp() -> str:
     return dt.datetime.now(dt.UTC).strftime("%Y%m%d")
 
 
-def _dated_name(base: str) -> str:
-    """Name one firing of a schedule, kept inside the column's 200-character bound.
-
-    A schedule may already be named up to the limit, so the date is appended to
-    a trimmed base rather than overflowing it and failing validation.
-    """
-    suffix = f" — {dt.datetime.now(dt.UTC):%Y-%m-%d}"
-    return f"{base[: 200 - len(suffix)].rstrip()}{suffix}"
-
-
 _Row = TypeVar("_Row")
 
 
@@ -428,7 +418,9 @@ async def run_schedule_now(
     """
     schedule = await service.get_schedule(session, principal, schedule_id)
     payload = ExportJobCreate(
-        name=_dated_name(schedule.name),
+        # The same naming the sweeper uses, so a manual firing and a timed one
+        # read alike in the table and both fit the column.
+        name=service.dated_name(schedule.name),
         source_screen=schedule.source_screen,
         export_format=ExportFormat(schedule.export_format),
         filters=dict(schedule.filters or {}),

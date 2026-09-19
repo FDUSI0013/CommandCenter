@@ -50,16 +50,50 @@
     };
   }
 
+  /**
+   * What a run recorded about ITSELF, as opposed to on its spans: its input,
+   * output, error and metadata, which the API reads off the trace.
+   *
+   * A run reported as one decorated call has no spans at all, and these four
+   * are then the whole account of it. The trace modal and Replay Studio used to
+   * draw such a run as an empty shell ("0 of 0 steps", "No spans were
+   * recorded") while the API held every word of it — and for one customer that
+   * is every run they have. Nothing here is a span and the callers label it as
+   * the run's own record; a field that was not recorded is left out, never
+   * filled in. `skip` names the fields the caller already shows in full.
+   */
+  function runRecord(rec, skip){
+    rec = rec || {}; skip = skip || {};
+    const label = (text, first) =>
+      `<div class="small muted" style="font-weight:700;margin:${first?'0':'10px'} 0 3px">${text}</div>`;
+    const block = (text, cls) =>
+      `<div class="quote ${cls||''}" style="white-space:pre-wrap;overflow-wrap:anywhere;max-height:280px;overflow:auto">${esc(text)}</div>`;
+    const meta = rec.metadata && typeof rec.metadata === 'object' ? rec.metadata : {};
+    const metaKeys = Object.keys(meta).filter(k => meta[k] != null && meta[k] !== '').sort();
+    const parts = [];
+    if(rec.input && !skip.input) parts.push(['INPUT', block(rec.input)]);
+    if(rec.response && !skip.response) parts.push(['RESPONSE', block(rec.response)]);
+    if(rec.error && !skip.error) parts.push(['ERROR', block(rec.error, 'st-red')]);
+    if(metaKeys.length) parts.push(['METADATA', kv(metaKeys.map(k =>
+      [k, esc(typeof meta[k] === 'object' ? JSON.stringify(meta[k]) : String(meta[k])), 'mono']))]);
+    return parts.map((p, i) => label(p[0], i === 0) + p[1]).join('');
+  }
+
   /* ================= LIVE RUNS ================= */
   SCREENS['live-runs'] = {
     title:'Live Runs',
     render(main){
       let liveOn = true, runStream = null, streamKey = '', currentRunId = null;
+      // Set by cleanup. A request that was in flight when the screen was left
+      // still resolves into these closures; every path that would start new
+      // work (a summary, a stream, an inspector read) checks this first.
+      let disposed = false;
 
       main.innerHTML = `
         ${pageHead({ title:'Live Runs', sub:'Real-time observability of agent executions across every connected platform.',
           actions:`${searchBox('lrSearch','Search runs…')}
             <span class="live-pill" id="livePill"><span class="dot pulse" style="background:currentColor"></span>LIVE</span>
+            <button class="btn" id="lrExport">${ICONS.download}Export</button>
             <button class="btn orange" id="btnRun">${ICONS.play}Run</button>` })}
         <div class="chip-row" id="lrChips"></div>
         <div id="lrKpis">${kpiSkeleton(['Total Runs','Success Rate','Avg Latency','Policy Violations'])}</div>
@@ -92,46 +126,144 @@
       }
 
       // ---- KPI cards + the four sparkline KPIs -------------------------
+      /* One summary is two window scans, each fanning out to every reporting
+         agent — the most expensive read on the screen. It used to be asked for
+         after every table load (so every sort, page and search), once more at
+         mount for the tenant list, and once per streamed run, with nothing in
+         flight ever superseded: a busy workspace kept several running at once,
+         each slowing the others until the cards timed out. It depends on three
+         filters and on time, so those are the only two reasons it is read:
+
+           - the filters it answers changed        -> now (loadSummary)
+           - runs arrived, or the tab came back    -> at most once per
+             SUMMARY_REFRESH_MS, trailing, never while one is in flight
+             (summarySoon)
+
+         The server memoises a summary for the same 20 s, so asking sooner
+         would only be handed the same numbers. */
+      const SUMMARY_REFRESH_MS = 20000;
+      const SUMMARY_LABELS = ['Total Runs','Success Rate','Avg Latency','Policy Violations'];
+      let summaryKey = null;      // the filters the cards on screen (or on their way) answer
+      let summaryAt = 0;          // when the last answer, good or bad, arrived
+      let summarySeq = 0, summaryInflight = false, summaryDirty = false, summaryTimer = null;
+
+      function summaryParams(){
+        const p = table ? table.params() : {};
+        return { time_range: p.time_range, tenant: p.tenant, source: p.source };
+      }
+
       function loadSummary(){
         const host = document.getElementById('lrKpis');
         const mini = document.getElementById('lrMini');
-        const note = document.getElementById('lrScanNote');
-        if(!host) return;
-        const params = table ? table.params() : {};
-        API.runs.summary({ time_range: params.time_range, tenant: params.tenant, source: params.source })
+        if(disposed || !host) return;
+        const params = summaryParams();
+        const key = JSON.stringify(params);
+        // The same question is already on its way; its answer will do.
+        if(summaryInflight && key === summaryKey) return;
+        clearTimeout(summaryTimer); summaryTimer = null;
+        // Numbers for other filters must not sit under the new ones while the
+        // request runs. A refresh of the same filters keeps its cards.
+        if(key !== summaryKey){
+          host.innerHTML = kpiSkeleton(SUMMARY_LABELS);
+          if(mini) mini.innerHTML = '';
+        }
+        summaryKey = key;
+        summaryInflight = true; summaryDirty = false;
+        // A change of filters does not wait for the request it supersedes; the
+        // ticket makes sure that one's late answer is never painted.
+        const ticket = ++summarySeq;
+        API.runs.summary(params)
           .then(s => {
-            if(!document.getElementById('lrKpis')) return;
-            host.innerHTML = kpiRow([
-              { label:'Total Runs', value:fmtFull(s.total_runs), icon:'activity', color:'purple',
-                delta: s.total_runs_delta_percent == null ? null : Math.abs(s.total_runs_delta_percent).toFixed(1)+'%',
-                dir: deltaDir(s.total_runs_delta_percent), good: s.total_runs_delta_percent >= 0, vs:'vs previous period' },
-              { label:'Success Rate', value: s.success_rate == null ? '—' : pct(s.success_rate), icon:'target', color:'green',
-                delta: s.success_rate_delta_points == null ? null : Math.abs(s.success_rate_delta_points).toFixed(1)+' pp',
-                dir: deltaDir(s.success_rate_delta_points), good: s.success_rate_delta_points >= 0, vs:'vs previous period' },
-              { label:'Avg Latency', value: secs(s.avg_latency_seconds), icon:'clock', color:'amber',
-                delta: s.avg_latency_delta_seconds == null ? null : Math.abs(s.avg_latency_delta_seconds).toFixed(2)+'s',
-                dir: deltaDir(s.avg_latency_delta_seconds), good: s.avg_latency_delta_seconds <= 0, vs:'vs previous period' },
-              { label:'Policy Violations', value:fmtFull(s.policy_violations), icon:'shield', color:'red',
-                delta: s.policy_violations_delta_percent == null ? null : Math.abs(s.policy_violations_delta_percent).toFixed(1)+'%',
-                dir: deltaDir(s.policy_violations_delta_percent), good: s.policy_violations_delta_percent <= 0, vs:'vs previous period' },
-            ]);
-            if(mini) mini.innerHTML = [s.tokens_used, s.estimated_cost, s.fallback_rate, s.human_escalations]
-              .filter(Boolean)
-              .map((k, i) => miniKpi({
-                label: k.label,
-                value: formatSpark(k),
-                spark: (k.series || []).map(p => p.value),
-                color: ['green','orange','orange','purple'][i],
-              })).join('');
-            if(note) note.innerHTML = s.scan && s.scan.truncated
-              ? `<div class="scan-note">${ICONS.info} Showing the most recent ${fmtFull(s.scan.runs_scanned)} runs across ${s.scan.agents_scanned} of ${s.scan.agents_total} agents — the window was capped, so totals below are a floor, not a complete count.</div>`
-              : '';
+            if(disposed || ticket !== summarySeq || !document.getElementById('lrKpis')) return;
+            summaryInflight = false; summaryAt = Date.now();
+            paintSummary(s);
+            fillTenants(s.tenants);
+            if(summaryDirty) summarySoon();
           })
           .catch(err => {
+            if(disposed || ticket !== summarySeq || !document.getElementById('lrKpis')) return;
+            summaryInflight = false; summaryAt = Date.now();
             host.innerHTML = '';
             host.appendChild(screenError(err, loadSummary, 'the run summary'));
             if(mini) mini.innerHTML = '';
+            // Runs that arrived meanwhile still earn a retry — a throttled one.
+            if(summaryDirty) summarySoon();
           });
+      }
+
+      /** Read the cards again only if the filters they answer have changed. */
+      function summaryIfChanged(){
+        if(!disposed && JSON.stringify(summaryParams()) !== summaryKey) loadSummary();
+      }
+
+      /** Refresh the cards for the filters already on screen: trailing, at most
+       *  one per SUMMARY_REFRESH_MS, and never on top of one in flight. */
+      function summarySoon(){
+        if(disposed) return;
+        if(summaryInflight){ summaryDirty = true; return; }
+        if(summaryTimer) return;
+        const wait = Math.max(0, summaryAt + SUMMARY_REFRESH_MS - Date.now());
+        summaryTimer = setTimeout(()=>{ summaryTimer = null; loadSummary(); }, wait);
+      }
+
+      function paintSummary(s){
+        const host = document.getElementById('lrKpis');
+        const mini = document.getElementById('lrMini');
+        const note = document.getElementById('lrScanNote');
+        const scan = s.scan || {};
+        // When either window hit the scan cap the server withholds every delta
+        // (they arrive null); say why the trend line is missing.
+        const withheld = s.comparable === false ? 'trend withheld — a window was capped' : null;
+        host.innerHTML = kpiRow([
+          { label:'Total Runs', value:fmtFull(s.total_runs), icon:'activity', color:'purple',
+            delta: s.total_runs_delta_percent == null ? null : Math.abs(s.total_runs_delta_percent).toFixed(1)+'%',
+            dir: deltaDir(s.total_runs_delta_percent), good: s.total_runs_delta_percent >= 0, vs:'vs previous period', sub: withheld },
+          { label:'Success Rate', value: s.success_rate == null ? '—' : pct(s.success_rate), icon:'target', color:'green',
+            delta: s.success_rate_delta_points == null ? null : Math.abs(s.success_rate_delta_points).toFixed(1)+' pp',
+            dir: deltaDir(s.success_rate_delta_points), good: s.success_rate_delta_points >= 0, vs:'vs previous period', sub: withheld },
+          { label:'Avg Latency', value: secs(s.avg_latency_seconds), icon:'clock', color:'amber',
+            delta: s.avg_latency_delta_seconds == null ? null : Math.abs(s.avg_latency_delta_seconds).toFixed(2)+'s',
+            dir: deltaDir(s.avg_latency_delta_seconds), good: s.avg_latency_delta_seconds <= 0, vs:'vs previous period', sub: withheld },
+          { label:'Policy Violations', value:fmtFull(s.policy_violations), icon:'shield', color:'red',
+            delta: s.policy_violations_delta_percent == null ? null : Math.abs(s.policy_violations_delta_percent).toFixed(1)+'%',
+            dir: deltaDir(s.policy_violations_delta_percent), good: s.policy_violations_delta_percent <= 0, vs:'vs previous period', sub: withheld },
+        ]);
+        /* A capped scan holds each agent's NEWEST runs, so the window is read
+           whole only from `covered_from` on. A bucket before that is not a
+           measurement — drawing it made a busy morning look like a flat line
+           of zeros — so it is not drawn. sparkline() needs two points. */
+        const from = scan.truncated && scan.covered_from ? ts(scan.covered_from) : null;
+        if(mini) mini.innerHTML = [s.tokens_used, s.estimated_cost, s.fallback_rate, s.human_escalations]
+          .filter(Boolean)
+          .map((k, i) => {
+            const points = (k.series || []).filter(p => from == null || ts(p.at) >= from).map(p => p.value);
+            return miniKpi({
+              label: k.label,
+              value: formatSpark(k),
+              spark: points.length >= 2 ? points : null,
+              color: ['green','orange','orange','purple'][i],
+            });
+          }).join('');
+        if(note) note.innerHTML = scan.truncated
+          ? `<div class="scan-note">${ICONS.info} Showing the most recent ${fmtFull(scan.runs_scanned)} runs across ${fmtFull(scan.agents_scanned)} of ${fmtFull(scan.agents_total)} agents — the window was capped, so totals below are a floor, not a complete count.${
+              from == null ? '' : ` The figures are complete from ${esc(U.fmtDateTime(from))} onwards; before that the window was only partly read, and the trend lines start there.`}</div>`
+          : '';
+      }
+
+      /* The Tenant filter's options are workspace-specific and ride on the
+         summary. They used to cost a second, identical summary at mount. A
+         summary narrowed to one tenant names only that tenant, so names are
+         only ever added, never taken away. */
+      function fillTenants(tenants){
+        const select = table && table.filterEl && table.filterEl.querySelector('[data-fi="0"]');
+        if(!select) return;
+        const have = new Set(Array.from(select.options).map(o => o.value || o.textContent));
+        (tenants || []).forEach(t => {
+          if(!t || have.has(t)) return;
+          const opt = document.createElement('option');
+          opt.textContent = t; select.appendChild(opt);
+          have.add(t);
+        });
       }
 
       function deltaDir(v){ return v == null || v === 0 ? null : (v > 0 ? 'up' : 'down'); }
@@ -164,7 +296,24 @@
         { key:'occurred_at', label:'Time', render:r=>`<span class="dim nowrap">${relTime(ts(r.occurred_at))}</span>` },
       ];
 
-      const table = dataTable({
+      /* `scan.truncated` on a page means the list was cut at the scan cap and
+         `total` is a floor. The footer prints cfg.totalOverride in place of the
+         count when one is set, so the floor is worded as one ("of at least
+         2,000 runs") instead of passing for the size of the window. It is set
+         before the table paints the page, and only by the newest request. */
+      let listSeq = 0;
+      function listRuns(params){
+        const my = ++listSeq;
+        return API.runs.list(params).then(page => {
+          if(my === listSeq){
+            tableCfg.totalOverride = page && page.scan && page.scan.truncated && page.total != null
+              ? 'at least ' + fmtFull(page.total) : null;
+          }
+          return page;
+        });
+      }
+
+      const tableCfg = {
         columns: cols, rowId:'id', pageSize:25, pageSizes:[10,25,50],
         itemName:'runs', searchPlaceholder:'Search runs…',
         defaultSort:{ key:'occurred_at', dir:-1 },
@@ -177,9 +326,16 @@
           {key:'policy', label:'Policy', param:'policy', options:['Allowed','Warned','Blocked'], allLabel:'All'},
           {key:'time_range', label:'Time Range', param:'time_range', options:['Last hour','Last 6 hours','Last 24 hours'], allLabel:'Last 24 hours'},
         ],
-        source: (params) => API.runs.list(params),
+        source: listRuns,
         exportSource: (params) => API.runs.export(params),
-        onLoad: () => { loadSummary(); syncStream(); },
+        // Every sort, page and search lands here. The cards depend on none of
+        // those, so they are re-read only when their own filters changed. A
+        // load that resolves after the screen was left does nothing at all.
+        onLoad: () => {
+          if(disposed) return;
+          summaryIfChanged();
+          syncStream();
+        },
         autoSelectFirst: true,
         onSelect: showRun,
         rowActions: r=>[
@@ -191,23 +347,33 @@
             {label:'Flag for Review', icon:'flag', onClick:()=>flagRun(r)},
           ] : []),
         ],
-      });
+      };
+      const table = dataTable(tableCfg);
 
       const wrap = document.getElementById('lrTableWrap');
       wrap.appendChild(table.filterEl);
       wrap.appendChild(table.el);
+      // table.search() waits out the typing (300 ms) before it asks the server.
       document.getElementById('lrSearch').addEventListener('input', e=>table.search(e.target.value));
 
-      // The tenant list is workspace-specific, so it comes from the summary.
-      API.runs.summary({}).then(s => {
-        const select = table.filterEl && table.filterEl.querySelector('[data-fi="0"]');
-        if(select && (s.tenants||[]).length){
-          s.tenants.forEach(t => {
-            const opt = document.createElement('option');
-            opt.textContent = t; select.appendChild(opt);
-          });
-        }
-      }).catch(()=>{});
+      // The cards do not wait for the run list: if the list fails they still
+      // load, and the Tenant filter is filled from this same first summary.
+      // A filter change is heard here as well as in onLoad, so the cards stop
+      // showing the old filters' numbers while the new list is still loading.
+      // (The table's own listeners were attached first and have already put
+      // the new value in table.params() by the time these run.)
+      loadSummary();
+      table.filterEl.addEventListener('change', summaryIfChanged);
+      table.filterEl.querySelector('.clear-filters').addEventListener('click', summaryIfChanged);
+
+      // The filtered set as CSV, from the server — the table always carried the
+      // export, but no control on the screen ever called it.
+      const exportBtn = document.getElementById('lrExport');
+      exportBtn.addEventListener('click', async () => {
+        if(exportBtn.disabled) return;
+        exportBtn.disabled = true;
+        try { await table.export(); } finally { exportBtn.disabled = false; }
+      });
 
       async function flagRun(r){
         if(!Store.session.can('member')){
@@ -217,7 +383,7 @@
         try {
           const result = await API.runs.flag(r.id, { reason: 'Flagged from Live Runs' });
           toast('warn','Flagged for review', `${String(result.run_id).slice(0,12)}… routed to the review queue.`);
-          table.refresh();
+          if(!disposed) table.refresh();
         } catch (err) {
           toast('error','Could not flag run', err.message);
         }
@@ -226,7 +392,10 @@
       // ---- inspector ----------------------------------------------------
       function showRun(row){
         const insp = document.getElementById('lrInspector');
-        if(!insp || !row) return;
+        // A first load that lands after the screen was left still auto-selects
+        // its first row; that must not cost a run read, nor paint into the
+        // inspector of a Live Runs screen opened since.
+        if(disposed || !insp || !row) return;
         currentRunId = row.id;
         document.getElementById('lrLayout').classList.remove('collapsed');
         insp.innerHTML = `<div class="insp-head"><div>
@@ -237,9 +406,9 @@
         insp.querySelector('#lrInspClose').addEventListener('click', ()=>document.getElementById('lrLayout').classList.add('collapsed'));
 
         API.runs.get(row.id)
-          .then(r => { if(currentRunId === row.id) paintRun(insp, r); })
+          .then(r => { if(!disposed && currentRunId === row.id) paintRun(insp, r); })
           .catch(err => {
-            if(currentRunId !== row.id) return;
+            if(disposed || currentRunId !== row.id) return;
             const holder = insp.querySelector('.card-loading');
             if(holder) holder.replaceWith(screenError(err, ()=>showRun(row), 'this run'));
           });
@@ -320,8 +489,13 @@
             API.runs.response(runId)
               .then(r => {
                 modal.querySelector('.modal-title').textContent = 'Full Response — ' + String(r.run_id).slice(0,12) + '…';
+                // A failed run usually has no response at all — what it has is
+                // an error, and a blank dialog under "Full Response" hid it.
                 body.innerHTML = `<div class="quote" style="font-size:12.5px"><b>${esc(r.agent||'—')}</b> · ${esc(r.model||'—')} · ${fmtTime(ts(r.occurred_at))} · ${fmtFull(r.output_tokens)} tokens · ${fmtFull(r.character_count)} chars</div>
-                  <p style="white-space:pre-wrap">${esc(r.response)}</p>`;
+                  ${r.response ? `<p style="white-space:pre-wrap">${esc(r.response)}</p>`
+                    : `<p class="faint">${r.error ? 'This run recorded no response — it ended with the error below.' : 'This run recorded no response.'}</p>`}
+                  ${r.error ? `<div class="small muted" style="font-weight:700;margin:10px 0 3px">ERROR</div>
+                    <div class="quote st-red" style="white-space:pre-wrap;overflow-wrap:anywhere">${esc(r.error)}</div>` : ''}`;
               })
               .catch(err => { body.innerHTML = ''; body.appendChild(screenError(err, null, 'the response')); });
           },
@@ -346,12 +520,29 @@
                     ${kv([['Spans', fmtFull(t.span_count)]])}${kv([['Tokens', fmtFull(t.total_tokens)]])}
                     ${kv([['Cost', fmtMoney(t.total_cost,4)]])}
                   </div>
-                  ${t.spans && t.spans.length ? `<div class="pipe">${renderSpans(t.spans, 0)}</div>`
-                    : '<div class="empty-state">'+ICONS.search+'<div class="es-title">No spans were recorded for this run</div><div>The agent reported the run but not its internal steps.</div></div>'}`;
+                  ${traceBody(t)}`;
               })
               .catch(err => { body.innerHTML = ''; body.appendChild(screenError(err, null, 'the execution trace')); });
           },
         });
+      }
+
+      /* The span tree when there is one. A run reported as a single decorated
+         call has none, and "No spans were recorded" was then the whole dialog
+         although the run carries its own input, output, error and metadata —
+         so that is what a span-less run shows, labelled as the run's own
+         record rather than dressed up as a span. */
+      function traceBody(t){
+        if(t.spans && t.spans.length){
+          return `${t.error ? `<div class="scan-note st-red" style="margin:0 0 12px">${ICONS.alert}<span style="white-space:pre-wrap;overflow-wrap:anywhere">${esc(t.error)}</span></div>` : ''}
+            <div class="pipe">${renderSpans(t.spans, 0)}</div>`;
+        }
+        const record = runRecord(t);
+        if(!record){
+          return '<div class="empty-state">'+ICONS.search+'<div class="es-title">No spans were recorded for this run</div><div>The agent reported the run but not its internal steps, and nothing was recorded on the run itself.</div></div>';
+        }
+        return `<div class="scan-note" style="margin:0 0 12px">${ICONS.info} No spans were recorded — the agent reported this run as a single call. What follows is what the run itself recorded.</div>
+          ${record}`;
       }
 
       function renderSpans(spans, depth){
@@ -387,7 +578,12 @@
       }
 
       function openStream(){
-        if(runStream) return;
+        // Never after cleanup: a run list that resolved late used to come
+        // through onLoad -> syncStream and open an EventSource whose only
+        // handle lived in this dead closure. Nothing could close it, so it
+        // polled the telemetry store and held a stream slot for the life of
+        // the tab.
+        if(disposed || runStream) return;
         const p = streamParams();
         streamKey = JSON.stringify(p);
         runStream = API.runs.stream({
@@ -395,12 +591,22 @@
           events: {
             open: () => setPill('live'),
             run: (frame) => {
-              if(!frame || !frame.run || !liveOn) return;
+              if(disposed || !frame || !frame.run || !liveOn) return;
               table.prependRow(frame.run);
-              loadSummary();
+              // A burst of runs is one refresh of the cards, not one each.
+              summarySoon();
             },
           },
-          onError: () => setPill('reconnecting'),
+          onError: () => { if(!disposed) setPill('reconnecting'); },
+          /* api.js parks the stream while the tab sits in the background and
+             reconnects when it is looked at again; the stream only carries
+             runs that start from then on, so whatever was reported while it
+             was parked is read back here. */
+          onResume: () => {
+            if(disposed || !liveOn) return;
+            table.refresh();
+            summarySoon();
+          },
         });
       }
 
@@ -411,7 +617,7 @@
       function syncStream(){
         // The stream answers the query it was opened with; once the filters or
         // search change it would keep pushing rows the table no longer shows.
-        if(!liveOn) return;
+        if(disposed || !liveOn) return;
         if(runStream && JSON.stringify(streamParams()) === streamKey) return;
         closeStream();
         openStream();
@@ -425,7 +631,11 @@
           liveOn?'New runs appear as they are reported.':'The connection is closed until you resume.');
       });
       openStream();
-      this.cleanup = closeStream;
+      this.cleanup = () => {
+        disposed = true;
+        clearTimeout(summaryTimer); summaryTimer = null;
+        closeStream();
+      };
 
       // ---- trigger a run --------------------------------------------------
       document.getElementById('btnRun').addEventListener('click', async () => {
@@ -456,7 +666,7 @@
                 const started = await API.agents.run(agentId, input ? { input } : {});
                 const d = started.data || {};
                 toast('success','Run started', `${esc(d.agent_name || 'Agent')} · ${String(d.run_id || started.entity_id || '').slice(0,12)}…`);
-                table.refresh();
+                if(!disposed) table.refresh();
               } catch (err) {
                 toast('error','Could not start the run', err.message);
               }
@@ -588,9 +798,13 @@
            * worst possible failure for a debugging tool. So a named run picks
            * its own agent and loads directly, and if it cannot be fetched
            * that is said plainly rather than quietly swapped. */
-          if(requested && named && named.agent_id && items.some(a=>a.id===named.agent_id)){
-            agentPick.value = named.agent_id;
-            fetchPage(named.agent_id, ()=>markActive(requested));
+          if(requested && named){
+            // Its own agent's history, and only that one: the rail never walks
+            // the first agent in the picker on the way to a named run. An agent
+            // the picker does not list (beyond its 200) still gets its run
+            // loaded; the rail then shows the picker's agent, as it says.
+            if(named.agent_id && items.some(a=>a.id===named.agent_id)) agentPick.value = named.agent_id;
+            fetchPage(agentPick.value, ()=>markActive(requested));
             load(requested);
             return;
           }
@@ -622,6 +836,16 @@
 
       function paint(session){
         const r = session.run || {};
+        const steps = session.steps || [];
+        // The run's own record sits under the timeline. A step carries a
+        // preview, so whatever a step already shows word for word is not
+        // printed twice; a longer input or output appears here in full.
+        const shown = (field, text) => Boolean(text) && steps.some(s => s[field] === text);
+        const record = runRecord(session, {
+          input: shown('prompt', session.input),
+          response: shown('response', session.response),
+          error: shown('error', session.error),
+        });
         body.innerHTML = `
           <div class="kpi-row" style="grid-template-columns:repeat(auto-fit,minmax(170px,1fr))">
             ${kpiCard({label:'Run', value:`<span style="font-size:15px" class="mono">${esc(String(r.id||'').slice(0,14))}…</span>`, sub:r.agent||'—', icon:'activity', color:'purple'})}
@@ -629,13 +853,19 @@
             ${kpiCard({label:'Duration', value:secs(session.total_duration_ms == null ? r.duration_seconds : session.total_duration_ms/1000), sub:`${session.step_count} steps`, icon:'clock', color:'amber'})}
             ${kpiCard({label:'Fidelity', value:session.fidelity == null ? '—' : pct(session.fidelity,0), sub:`${session.captured_steps} of ${session.step_count} steps with full payloads`, icon:'layers', color:'blue'})}
           </div>
+          ${session.steps_from_trace ? `<div class="scan-note">${ICONS.info} This run recorded no spans — the agent reported it as a single call. The steps below were built from the run’s own input and output, not from recorded spans.</div>` : ''}
           ${session.replayable ? '' : `<div class="scan-note">${ICONS.info} This run was reported without step payloads, so the timeline shows what was recorded and no more.</div>`}
           <div class="card" style="margin-top:14px">
             <div class="card-head"><div class="card-title">Execution Timeline</div>
               <div class="faint small">${session.step_count} steps</div></div>
-            <div class="pipe" id="rpSteps">${session.steps.map((s,i)=>stepHtml(s,i)).join('')}</div>
-          </div>`;
-        playBtn.disabled = !session.steps.length;
+            <div class="pipe" id="rpSteps">${steps.map((s,i)=>stepHtml(s,i)).join('')}</div>
+          </div>
+          ${record ? `<div class="card" style="margin-top:14px">
+            <div class="card-head"><div class="card-title">Recorded on the Run</div>
+              <div class="faint small">the run’s own input, output, error and metadata</div></div>
+            ${record}
+          </div>` : ''}`;
+        playBtn.disabled = !steps.length;
         playBtn.onclick = ()=>play(session);
       }
 
@@ -735,41 +965,72 @@
         catch (err) { toast('error','Export failed', err.message); }
       });
 
-      function loadAll(){ loadSummary(); loadCharts(); loadModels(); }
+      function loadAll(){ loadOverview(); loadCharts(); }
 
-      function loadSummary(){
+      /* Every change of window or agent starts both loaders again, and a wide
+         window answers slower than a narrow one. Whatever resolved last used to
+         be painted, so switching 30d -> 24h could leave the 30-day cards and
+         charts under a picker reading "Last 24 hours", with nothing on screen
+         to give it away. Each loader takes a ticket, the way dataTable.load()
+         does, and only the newest request of each kind may paint. The counter
+         lives in the loader, not in loadAll(), because "Try again" calls the
+         loader directly. */
+      let overviewSeq = 0, chartSeq = 0;
+
+      const KPI_LABELS = ['Total Runs','Success Rate','p50 Latency','p90 Latency','Tokens','Cost'];
+
+      /* The six cards and the models table are two views of one measurement —
+         the window's per-agent rollup — and /metrics/overview answers both from
+         a single pass over the store. They used to be /metrics/summary plus a
+         server-mode table on /metrics/models, which measured the same rollup
+         again for every sort click and page. The breakdown is a handful of
+         rows, so it arrives whole and the table sorts and pages it here. */
+      function loadOverview(){
         const host = document.getElementById('mtKpis');
+        const models = document.getElementById('mtModels');
         if(!host) return;
-        host.innerHTML = kpiSkeleton(['Total Runs','Success Rate','p50 Latency','p90 Latency','Tokens','Cost']);
-        API.metrics.summary(q())
-          .then(s => {
-            if(!document.getElementById('mtKpis')) return;
-            host.innerHTML = kpiRow([
-              serverKpi(s.total_runs), serverKpi(s.success_rate), serverKpi(s.latency_p50),
-              serverKpi(s.latency_p90), serverKpi(s.tokens), serverKpi(s.cost),
-            ], 190);
+        const my = ++overviewSeq;
+        host.innerHTML = kpiSkeleton(KPI_LABELS);
+        if(models) models.innerHTML = '<div class="card"><div class="card-loading" style="height:160px"></div></div>';
+        API.metrics.overview(q())
+          .then(o => {
+            if(my !== overviewSeq || !host.isConnected) return;
+            const s = o.summary || {};
+            host.innerHTML = kpiRow(
+              [s.total_runs, s.success_rate, s.latency_p50, s.latency_p90, s.tokens, s.cost]
+                .filter(Boolean).map(k => serverKpi(k)), 190);
+            if(models) paintModels(models, o.models || []);
           })
-          .catch(err => { host.innerHTML=''; host.appendChild(screenError(err, loadSummary, 'the metric summary')); });
+          .catch(err => {
+            if(my !== overviewSeq || !host.isConnected) return;
+            host.innerHTML = '';
+            host.appendChild(screenError(err, loadOverview, 'the metric summary'));
+            if(models) models.innerHTML = '';
+          });
       }
 
       function loadCharts(){
         const host = document.getElementById('mtCharts');
         if(!host) return;
+        const my = ++chartSeq;
         host.innerHTML = `<div class="card"><div class="card-loading" style="height:220px"></div></div>
                           <div class="card"><div class="card-loading" style="height:220px"></div></div>`;
-        Promise.all([
-          API.metrics.series(q({ metric: 'runs' })),
-          API.metrics.series(q({ metric: 'cost' })),
-        ])
-          .then(([runs, cost]) => {
-            if(!document.getElementById('mtCharts')) return;
-            host.innerHTML = `${chartCard('Runs over time', runs)}${chartCard('Cost over time', cost)}`;
+        // Both lines in one request: the server reads them off one shared
+        // bucket grid, where two requests resolved the workspace twice.
+        API.metrics.series(q({ metric: ['runs','cost'] }))
+          .then(res => {
+            if(my !== chartSeq || !host.isConnected) return;
+            host.innerHTML = `${chartCard('Runs over time', res, 'runs')}${chartCard('Cost over time', res, 'cost')}`;
           })
-          .catch(err => { host.innerHTML=''; host.appendChild(screenError(err, loadCharts, 'the trend charts')); });
+          .catch(err => {
+            if(my !== chartSeq || !host.isConnected) return;
+            host.innerHTML = '';
+            host.appendChild(screenError(err, loadCharts, 'the trend charts'));
+          });
       }
 
-      function chartCard(title, res){
-        const s = (res.series || [])[0];
+      function chartCard(title, res, metric){
+        const s = (res.series || []).find(line => line.metric === metric);
         if(!s || !s.points.length){
           return `<div class="card"><div class="card-head"><div class="card-title">${esc(title)}</div></div>
             <div class="empty-state">${ICONS.chart}<div class="es-title">No data in this window</div></div></div>`;
@@ -784,9 +1045,9 @@
           })}</div></div>`;
       }
 
-      function loadModels(){
-        const host = document.getElementById('mtModels');
-        if(!host) return;
+      /** The models table over rows already in hand: sorting and paging it asks
+       *  the server nothing. Rows arrive heaviest token consumer first. */
+      function paintModels(host, rows){
         host.innerHTML = '';
         const table = dataTable({
           columns: [
@@ -800,8 +1061,7 @@
             { key:'cost_share_percent', label:'Share of Cost', render:r=>r.cost_share_percent==null?dash:U.barPct(r.cost_share_percent,'orange', pct(r.cost_share_percent,0)) },
           ],
           rowId:'model', itemName:'models', pageSize:10, emptyText:'No model usage in this window',
-          extraParams: q(),
-          source: (params) => API.metrics.models(params),
+          rows,
         });
         host.appendChild(table.el);
       }

@@ -208,6 +208,11 @@ class Settings(BaseSettings):
     rate_limit_enabled: bool = True
     rate_limit_ingest_per_minute: int = 12_000
     rate_limit_read_per_minute: int = 1_200
+    # Sign-in attempts, counted BEFORE the password is checked (services/
+    # identity.py) because the check is the expensive part: for the account an
+    # attempt names, and for the address it comes from. 0 switches one off.
+    rate_limit_login_per_minute: int = 10
+    rate_limit_login_per_address_per_minute: int = 60
     # NOT READ BY ANYTHING. This service has no Redis client, so there is no
     # shared limiter to switch on; the compose file has always set this and it
     # has always been ignored. Kept only so those deployments still start.

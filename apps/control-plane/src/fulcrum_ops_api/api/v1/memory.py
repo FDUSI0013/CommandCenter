@@ -146,8 +146,9 @@ async def list_conversations(
 ) -> Page[MemoryConversationRead]:
     """The Conversation State tab: message counts, context size and expiry.
 
-    Expiry is the thread's last activity plus the retention window of the
-    workspace's tightest active conversation store.
+    Expiry is the thread's last activity plus the retention window of the store
+    its agent's memory policy names — the store whose purge reaches it. Both
+    `retention_policy` and `expires_at` are null for an agent bound to no store.
     """
     rows, total = await service.list_conversations(
         session, principal, params, agent_id=agent_id
@@ -188,7 +189,9 @@ async def list_retention_policies(
     """The Retention Policies tab: every distinct policy and what it governs.
 
     Policies are derived from the stores that use them, so the tab cannot drift
-    from the windows the purge actually enforces.
+    from the windows the purge actually enforces. `record_count` counts a
+    policy's conversation and session stores live, and is null — not zero — when
+    the telemetry store cannot be read.
     """
     return await service.list_retention_policies(session, principal)
 

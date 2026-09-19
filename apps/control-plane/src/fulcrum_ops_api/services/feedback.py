@@ -448,6 +448,10 @@ _PII_PATTERNS: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
 )
 
 
+#: The marker as the clustering meets it, which is after lowercasing.
+_REDACTION_MARKER_LOWER: Final[str] = REDACTION_MARKER.lower()
+
+
 def _luhn_valid(digits: str) -> bool:
     """The card check digit. Thirteen-plus digits that fail it are an order number."""
     total = 0
@@ -1055,7 +1059,12 @@ def _tokenise(text: str | None) -> set[str]:
     """
     if not text:
         return set()
-    cleaned = "".join(char if char.isalnum() else " " for char in text.lower())
+    # The PII scrub's marker is our words, not the user's. Left in, "write to
+    # [marker]" under a refund complaint and under a login complaint share the
+    # marker's words on top of "write", and that is enough to found a theme
+    # about nothing but the fact that both users left an address.
+    lowered = text.lower().replace(_REDACTION_MARKER_LOWER, " ")
+    cleaned = "".join(char if char.isalnum() else " " for char in lowered)
     tokens: set[str] = set()
     for raw in cleaned.split():
         word = raw
@@ -1649,17 +1658,26 @@ async def list_themes(
 
 
 async def get_issue(
-    session: AsyncSession, principal: Principal, issue_id: str
+    session: AsyncSession, principal: Principal, issue_id: str, *, for_update: bool = False
 ) -> FeedbackIssue:
-    """Load one issue, or raise :class:`NotFound`."""
-    issue = (
-        await session.execute(
-            select(FeedbackIssue).where(
-                FeedbackIssue.workspace_id == principal.workspace_id,
-                (FeedbackIssue.id == issue_id) | (FeedbackIssue.issue_ref == issue_id),
-            )
-        )
-    ).scalars().first()
+    """Load one issue, or raise :class:`NotFound`.
+
+    ``for_update`` is for the two paths that put an issue on the backlog. Each
+    looks for an item already planning the issue and inserts one when there is
+    none, and no constraint backs that check: without the row lock two clicks on
+    two workers both find nothing and both insert. With it the second waits for
+    the first to commit and gets the 409. SQLite has a single writer and ignores
+    the clause.
+    """
+    stmt = select(FeedbackIssue).where(
+        FeedbackIssue.workspace_id == principal.workspace_id,
+        (FeedbackIssue.id == issue_id) | (FeedbackIssue.issue_ref == issue_id),
+    )
+    if for_update:
+        # populate_existing: the lock is only worth having if the row in hand is
+        # the one that was locked, not a copy the session loaded earlier.
+        stmt = stmt.with_for_update().execution_options(populate_existing=True)
+    issue = (await session.execute(stmt)).scalars().first()
     if issue is None:
         raise NotFound(f"Issue '{issue_id}' does not exist.")
     return issue
@@ -2232,11 +2250,11 @@ async def create_backlog_item(
 
     issue: FeedbackIssue | None = None
     if payload.issue_id:
-        issue = await get_issue(session, principal, payload.issue_id)
+        issue = await get_issue(session, principal, payload.issue_id, for_update=True)
     if payload.feedback_id:
         item = await get_feedback(session, principal, payload.feedback_id)
         if issue is None and item.issue_id:
-            issue = await get_issue(session, principal, item.issue_id)
+            issue = await get_issue(session, principal, item.issue_id, for_update=True)
     issue_id = issue.id if issue is not None else None
 
     if issue is not None:
@@ -2298,7 +2316,7 @@ async def promote_issue(
     reopened issue again has to be able to make a new row.
     """
     principal.require(Role.MEMBER)
-    issue = await get_issue(session, principal, issue_id)
+    issue = await get_issue(session, principal, issue_id, for_update=True)
     if issue.status == IssueStatus.WONT_FIX.value:
         raise PreconditionFailed(
             f"Issue {issue.issue_ref} is marked Wont Fix. Reopen it before planning work."

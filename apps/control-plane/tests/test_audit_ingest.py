@@ -28,7 +28,7 @@ from fulcrum_ops_api.models.operations import (
     QuotaEnforcement,
     QuotaResource,
 )
-from fulcrum_ops_api.models.quality import FeedbackItem, GuardrailConfig
+from fulcrum_ops_api.models.quality import FeedbackItem, GuardrailAction, GuardrailConfig
 from fulcrum_ops_api.models.registry import Agent, Connector
 
 NOW = dt.datetime.now(dt.UTC) - dt.timedelta(minutes=5)
@@ -319,6 +319,28 @@ async def test_one_id_the_store_refuses_costs_only_its_own_trace(
     assert (await db.get(Quota, quota.id)).used_value == 9
 
 
+async def test_a_reporter_that_mints_its_own_ids_does_not_cost_the_store_a_search(
+    ingest_client, factory, workspace, engine
+):
+    """Halving a batch whose every other id is wrong spent forty refused calls on it."""
+    agent = await factory.provisioned_agent(workspace, engine, name="Support Bot")
+    engine.strict_writes = True
+    batch = [
+        trace(id=new_id() if n % 2 else str(uuid.uuid4()), name=f"run {n}") for n in range(16)
+    ]
+    engine.reset_calls()
+
+    posted = await ingest_client.post(
+        "/api/v1/ingest/traces", json={"agent": "Support Bot", "traces": batch}
+    )
+
+    assert posted.status_code == 200, posted.text
+    assert [row["outcome"] for row in posted.json()["results"]] == ["rejected", "accepted"] * 8
+    assert engine.trace_count(agent.engine_project_name) == 8
+    # The batch, then the rows that can be addressed, then the rows that cannot.
+    assert len(engine.calls_to("/traces/batch")) == 3
+
+
 async def test_spans_the_store_refuses_are_reported_and_not_billed(
     ingest_client, factory, workspace, engine, db
 ):
@@ -409,6 +431,65 @@ async def test_an_error_without_a_traceback_and_a_bad_parent_do_not_cost_the_bat
     assert "parent_span_id" not in stored
     assert stored["error_info"]["exception_type"] == "TimeoutError"
     assert stored["error_info"]["traceback"]
+
+
+# ===========================================================================
+# n=40 -- a Mask verdict removes what it found, not the run
+# ===========================================================================
+
+EMAIL = "dana@acme.test"
+
+
+def email_scanner(text: str, validation: dict) -> dict:
+    """Locate the address the way the deployed scanner reports a PII hit."""
+    at = text.find(EMAIL)
+    if validation.get("type") != "PII" or at < 0:
+        return {"validation_passed": True}
+    found = {"start": at, "end": at + len(EMAIL), "score": 1.0, "text": EMAIL}
+    return {
+        "type": "PII",
+        "validation_passed": False,
+        "validation_details": {"detected_entities": {"EMAIL_ADDRESS": [found]}},
+    }
+
+
+async def test_a_masked_run_keeps_everything_but_what_the_guardrail_found(
+    ingest_client, factory, workspace, engine
+):
+    """The whole trace and every span under it used to be stored as a redaction marker."""
+    await factory.provisioned_agent(workspace, engine, name="Support Bot")
+    await factory.guardrail(workspace, name="PII mask", action=GuardrailAction.MASK.value)
+    engine.checker_handler = email_scanner
+
+    posted = await ingest_client.post(
+        "/api/v1/ingest/traces",
+        json={
+            "agent": "Support Bot",
+            "traces": [
+                trace(
+                    input={"question": f"Where is my order? Write to {EMAIL} please."},
+                    spans=[
+                        span(
+                            name="chat",
+                            type="llm",
+                            input={"prompt": f"Customer {EMAIL} asks about an order."},
+                            output={"text": "It ships tomorrow."},
+                        )
+                    ],
+                )
+            ],
+        },
+    )
+
+    assert posted.status_code == 200, posted.text
+    assert posted.json()["results"][0]["masked"] is True
+    (stored,) = engine.traces.values()
+    (step,) = engine.spans.values()
+    assert EMAIL not in str(stored) + str(step)
+    assert "Where is my order?" in stored["input"]["question"]
+    assert stored["output"] == {"answer": "It ships tomorrow."}
+    assert "asks about an order" in step["input"]["prompt"]
+    assert step["output"] == {"text": "It ships tomorrow."}
 
 
 # ===========================================================================
@@ -525,7 +606,10 @@ async def test_crossing_the_watch_threshold_turns_the_quota_amber_and_raises_the
 
     assert posted.status_code == 200, posted.text
     assert posted.json()["quotas"][0]["status"] == LimitStatus.WARNING.value
-    assert (await db.get(Quota, quota.id)).status == LimitStatus.WARNING.value
+    stored = await db.get(Quota, quota.id)
+    assert stored.status == LimitStatus.WARNING.value
+    # A quota filling up is when its form is open; going amber is not an edit to it.
+    assert stored.updated_at == quota.updated_at
     alerts = await db.scalars(select(Alert).where(Alert.source_entity_id == quota.id))
     assert [alert.title for alert in alerts] == ["Quota approaching limit: Requests per month"]
 

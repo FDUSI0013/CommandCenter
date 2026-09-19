@@ -287,7 +287,14 @@ class RetentionPolicyRead(BaseModel):
         default_factory=list, description="Store types governed by this policy"
     )
     store_count: int = 0
-    record_count: int = 0
+    record_count: int | None = Field(
+        None,
+        description=(
+            "Records under the policy: threads counted live for its conversation and "
+            "session stores, plus what its other stores' runtimes reported. Null when "
+            "the telemetry store could not be read — not measured, which is not zero"
+        ),
+    )
     stores: list[str] = Field(default_factory=list)
     status: str = Field("Active", description="Active while any store still uses it")
 

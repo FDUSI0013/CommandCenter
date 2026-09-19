@@ -20,9 +20,11 @@ database the handlers themselves use.
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 
-from sqlalchemy import select, update
+from sqlalchemy import event, select, update
+from sqlalchemy.orm import Session
 
 from fulcrum_ops_api.models.governance import AuditEvent
 from fulcrum_ops_api.models.licensing import (
@@ -284,3 +286,261 @@ async def test_revoking_a_licence_releases_its_seats_and_lets_another_be_issued(
 
     replacement = await _license(owner_client, plan)
     assert replacement["id"] != first["id"]
+
+
+# ---------------------------------------------------------------------------
+# #162 - a plan change changes what is enforced
+# ---------------------------------------------------------------------------
+
+
+async def _resolved(owner_client, license_id: str) -> dict:
+    response = await owner_client.get(f"/api/v1/licensing/tenants/{license_id}/entitlements")
+    assert response.status_code == 200, response.text
+    return {row["key"]: row for row in response.json()["entitlements"]}
+
+
+async def test_moving_a_licence_to_another_plan_re_resolves_what_is_enforced(
+    owner_client, db, factory
+):
+    starter = await _plan(
+        owner_client, "starter", included_tokens=1_000_000, features=["Tracing", "Email support"]
+    )
+    enterprise = await _plan(
+        owner_client,
+        "enterprise",
+        tier="Enterprise",
+        included_tokens=100_000_000,
+        included_runs=50_000,
+        features=["Tracing", "SSO", "Policy Center"],
+    )
+    held = await _license(owner_client, starter)
+    # Not resolved from any plan: an operator's own row, which a plan change keeps.
+    stored = await db.get(TenantLicense, held["id"])
+    await factory.entitlement(stored, "max_agents", 40)
+
+    check = "/api/v1/licensing/entitlement-check?key=included_tokens&current_usage=2000000"
+    assert (await owner_client.get(check)).status_code == 402
+
+    upgraded = await owner_client.patch(
+        f"/api/v1/licensing/tenants/{held['id']}", json={"plan_id": enterprise["id"]}
+    )
+    assert upgraded.status_code == 200, upgraded.text
+
+    rows = await _resolved(owner_client, held["id"])
+    assert rows["included_tokens"]["int_value"] == 100_000_000, "still the old plan's ceiling"
+    assert rows["included_runs"]["int_value"] == 50_000
+    assert sorted(rows) == [
+        "Policy Center",
+        "SSO",
+        "Tracing",
+        "included_runs",
+        "included_tokens",
+        "max_agents",
+    ]
+    # The gate the ingest path runs agrees with the panel.
+    assert (await owner_client.get(check)).status_code == 200
+    granted = await owner_client.get("/api/v1/licensing/entitlement-check?key=SSO")
+    assert granted.json()["data"]["entitled"] is True
+    event = await db.scalar(
+        select(AuditEvent)
+        .where(AuditEvent.action == "licensing.license.updated")
+        .order_by(AuditEvent.occurred_at.desc())
+    )
+    assert "re-resolved" in event.detail
+
+    # And back down: the tenant does not keep what it no longer pays for.
+    downgraded = await owner_client.patch(
+        f"/api/v1/licensing/tenants/{held['id']}", json={"plan_id": starter["id"]}
+    )
+    assert downgraded.status_code == 200, downgraded.text
+    rows = await _resolved(owner_client, held["id"])
+    assert sorted(rows) == ["Email support", "Tracing", "included_tokens", "max_agents"]
+    assert rows["included_tokens"]["int_value"] == 1_000_000
+    assert rows["max_agents"]["int_value"] == 40
+    assert (await owner_client.get(check)).status_code == 402
+    assert await db.count(Entitlement, Entitlement.license_id == held["id"]) == 4
+
+
+async def test_editing_a_plan_reaches_every_current_licence_sold_on_it(
+    owner_client, db, factory, other_workspace
+):
+    plan = await _plan(owner_client, "team", included_tokens=1_000_000, features=["Tracing"])
+    held = await _license(owner_client, plan)
+    # Plans are global: another tenant on the same plan, and one whose licence is
+    # history and must keep the rows it ended with.
+    elsewhere = await factory.add(
+        TenantLicense(
+            tenant_workspace_id=other_workspace.id,
+            plan_id=plan["id"],
+            status="Suspended",
+            seats_purchased=3,
+            starts_at=_now() - dt.timedelta(days=10),
+        )
+    )
+    await factory.entitlement(elsewhere, "included_tokens", 1_000_000)
+    ended = await factory.add(
+        TenantLicense(
+            tenant_workspace_id=other_workspace.id,
+            plan_id=plan["id"],
+            status="Revoked",
+            seats_purchased=3,
+            starts_at=_now() - dt.timedelta(days=400),
+        )
+    )
+    await factory.entitlement(ended, "included_tokens", 1_000_000)
+
+    edited = await owner_client.patch(
+        f"/api/v1/licensing/plans/{plan['id']}",
+        json={"included_tokens": 5_000_000, "features": ["Tracing", "Replay Studio"]},
+    )
+    assert edited.status_code == 200, edited.text
+
+    rows = await _resolved(owner_client, held["id"])
+    assert rows["included_tokens"]["int_value"] == 5_000_000
+    assert "Replay Studio" in rows
+
+    async def ceiling(license_id: str) -> int:
+        return await db.scalar(
+            select(Entitlement.int_value).where(
+                Entitlement.license_id == license_id, Entitlement.key == "included_tokens"
+            )
+        )
+
+    assert await ceiling(elsewhere.id) == 5_000_000, "a suspended licence is still current"
+    assert await ceiling(ended.id) == 1_000_000, "a revoked licence was rewritten"
+    event = await db.scalar(
+        select(AuditEvent).where(AuditEvent.action == "licensing.plan.updated")
+    )
+    assert event.event_metadata["licenses_reseeded"] == 2
+
+    # An edit that changes nothing a licence is resolved from leaves them alone.
+    before = {row.id for row in await db.scalars(select(Entitlement))}
+    renamed = await owner_client.patch(
+        f"/api/v1/licensing/plans/{plan['id']}", json={"description": "For small teams"}
+    )
+    assert renamed.status_code == 200, renamed.text
+    assert {row.id for row in await db.scalars(select(Entitlement))} == before
+
+
+async def test_saving_the_same_plan_repairs_a_licence_that_moved_before_the_fix(
+    owner_client, db
+):
+    starter = await _plan(owner_client, "starter", included_tokens=1_000_000, features=["Tracing"])
+    enterprise = await _plan(
+        owner_client, "enterprise", included_tokens=100_000_000, features=["Tracing", "SSO"]
+    )
+    held = await _license(owner_client, enterprise)
+    # How a downgrade used to land: the plan swapped, the rows left as they were.
+    await db.execute(
+        update(TenantLicense).where(TenantLicense.id == held["id"]).values(plan_id=starter["id"])
+    )
+    assert "SSO" in await _resolved(owner_client, held["id"])
+
+    # Change Plan, keep the plan, save -- which is what the console sends.
+    saved = await owner_client.patch(
+        f"/api/v1/licensing/tenants/{held['id']}",
+        json={"plan_id": starter["id"], "seats_purchased": 5},
+    )
+    assert saved.status_code == 200, saved.text
+    rows = await _resolved(owner_client, held["id"])
+    assert sorted(rows) == ["Tracing", "included_tokens"]
+    assert rows["included_tokens"]["int_value"] == 1_000_000
+
+
+# ---------------------------------------------------------------------------
+# #223 - seat mutations serialise on the licence
+# ---------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def _locked_reads():
+    """Collect the tables the handlers read ``FOR UPDATE`` while this is open.
+
+    The test database is SQLite, which has no row locks and never emits the
+    clause, so what is observed is the statement the handler asked for -- the
+    same object Postgres compiles ``FOR UPDATE`` from.
+    """
+    locked: list[str] = []
+
+    def watch(state) -> None:
+        if state.is_select and getattr(state.statement, "_for_update_arg", None) is not None:
+            locked.extend(table.name for table in state.statement.get_final_froms())
+
+    event.listen(Session, "do_orm_execute", watch)
+    try:
+        yield locked
+    finally:
+        event.remove(Session, "do_orm_execute", watch)
+
+
+async def test_every_seat_and_status_mutation_takes_the_licence_row(
+    owner_client, factory, workspace, member
+):
+    held = await factory.license(workspace, seats_purchased=2)
+    base = f"/api/v1/licensing/tenants/{held.id}"
+    calls = (
+        ("assign", "post", f"{base}/seats", {"user_id": member.id}, 201),
+        ("purchase", "post", f"{base}/seats/purchase", {"seats": 3}, 200),
+        ("amend", "patch", base, {"seats_purchased": 9}, 200),
+        ("suspend", "post", f"{base}/suspend", {}, 200),
+        ("reactivate", "post", f"{base}/reactivate", None, 200),
+        ("revoke", "post", f"{base}/revoke", {}, 200),
+    )
+    for name, verb, url, body, expected in calls:
+        with _locked_reads() as locked:
+            response = await getattr(owner_client, verb)(url, json=body)
+        assert response.status_code == expected, f"{name}: {response.text}"
+        assert "tenant_licenses" in locked, f"{name} decided on a licence row it had not locked"
+
+    # A read has nothing to decide and must not queue behind the writers.
+    with _locked_reads() as locked:
+        assert (await owner_client.get(f"{base}/seats")).status_code == 200
+    assert locked == []
+
+
+async def test_the_locked_lookup_is_for_update_where_rows_can_be_locked():
+    from sqlalchemy.dialects import postgresql
+
+    plain = licensing_service._license_lookup("ws", "lic")
+    locked = licensing_service._license_lookup("ws", "lic", lock=True)
+    assert "FOR UPDATE" not in str(plain.compile(dialect=postgresql.dialect()))
+    assert "FOR UPDATE" in str(locked.compile(dialect=postgresql.dialect()))
+
+
+async def test_a_user_left_holding_two_active_seats_can_still_be_managed(
+    owner_client, db, factory, workspace, member, admin
+):
+    held = await factory.license(workspace, seats_purchased=5)
+    # What two assignments racing past the unlocked check left behind.
+    now = _now()
+    await factory.add_all(
+        [
+            SeatAssignment(
+                license_id=held.id,
+                user_id=member.id,
+                assigned_at=now - dt.timedelta(seconds=offset),
+                role="member",
+            )
+            for offset in (2, 1)
+        ]
+    )
+
+    again = await owner_client.post(
+        f"/api/v1/licensing/tenants/{held.id}/seats", json={"user_id": member.id}
+    )
+    assert again.status_code == 409, again.text
+
+    moved = await owner_client.post(
+        f"/api/v1/licensing/tenants/{held.id}/seats",
+        json={"user_id": admin.id, "replaces_user_id": member.id},
+    )
+    assert moved.status_code == 201, moved.text
+
+    active = await db.scalars(
+        select(SeatAssignment).where(
+            SeatAssignment.license_id == held.id, SeatAssignment.released_at.is_(None)
+        )
+    )
+    assert [seat.user_id for seat in active] == [admin.id], "the duplicate was not cleared"
+    stored = await db.get(TenantLicense, held.id)
+    assert stored.seats_assigned == 1

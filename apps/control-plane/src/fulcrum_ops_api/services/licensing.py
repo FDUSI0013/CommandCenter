@@ -30,11 +30,12 @@ import contextlib
 import datetime as dt
 import enum
 import logging
+from collections.abc import Sequence
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any
 
 from fastapi import Request
-from sqlalchemy import Select, and_, case, func, or_, select, update
+from sqlalchemy import Select, and_, case, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..api.common import (
@@ -108,6 +109,13 @@ MAX_EXPORT_ROWS = 10_000
 #: The invoice PDF is a single page; anything past this is summarised.
 MAX_INVOICE_PDF_LINES = 22
 MAX_LICENSE_SEATS = 1_000_000
+
+#: The metered ceilings a plan sells. Each is a plan column and, when the plan
+#: sets it, a hard integer entitlement under the same key.
+CEILING_KEYS: tuple[str, ...] = ("included_seats", "included_tokens", "included_runs")
+#: The plan columns entitlement rows are resolved from: an edit to any of them
+#: changes what every licence on the plan is entitled to.
+ENTITLEMENT_PLAN_FIELDS: frozenset[str] = frozenset({"features", *CEILING_KEYS})
 
 #: Statuses that mean the licence is currently serving the tenant.
 LIVE_STATUSES: tuple[str, ...] = (
@@ -359,12 +367,18 @@ def _license_lookup(workspace_id: str, license_id: str, *, lock: bool = False) -
     row first makes those transactions queue on it, and the loser then reads
     what the winner committed. SQLite has no row locks and serialises writers
     anyway, so the clause is simply not emitted there.
+
+    ``populate_existing`` goes with the lock: should the session already hold
+    the licence, the locked read must overwrite that copy, or the loser decides
+    on the numbers it had before it waited.
     """
     stmt = select(TenantLicense).where(
         TenantLicense.id == license_id,
         TenantLicense.tenant_workspace_id == workspace_id,
     )
-    return stmt.with_for_update() if lock else stmt
+    if not lock:
+        return stmt
+    return stmt.with_for_update().execution_options(populate_existing=True)
 
 
 async def _license_or_404(
@@ -726,6 +740,15 @@ async def update_plan(
     plan.updated_by = principal.actor
     await _persist(session, plan)
 
+    # The plan row is written first, so a second edit to the same plan queues on
+    # it before either touches a licence.
+    reseeded = 0
+    if ENTITLEMENT_PLAN_FIELDS.intersection(changed):
+        reseeded = await _reseed_plan_licenses(session, plan)
+
+    detail = f"Plan '{plan.name}' updated: {', '.join(sorted(changed))}."
+    if reseeded:
+        detail += f" Entitlements re-resolved for {reseeded} current license(s) on it."
     await audit.record(
         session,
         principal=principal,
@@ -734,8 +757,8 @@ async def update_plan(
         entity_id=plan.id,
         entity_label=plan.name,
         source_screen=SOURCE_SCREEN,
-        detail=f"Plan '{plan.name}' updated: {', '.join(sorted(changed))}.",
-        metadata={"fields": sorted(changed)},
+        detail=detail,
+        metadata={"fields": sorted(changed), "licenses_reseeded": reseeded},
         request=request,
     )
     return (await _hydrate_plans(session, principal.workspace_id, [plan]))[0]
@@ -852,11 +875,8 @@ async def _seed_entitlements(
             )
         )
 
-    for key, amount in (
-        ("included_seats", plan.included_seats),
-        ("included_tokens", plan.included_tokens),
-        ("included_runs", plan.included_runs),
-    ):
+    for key in CEILING_KEYS:
+        amount = getattr(plan, key)
         if not amount:
             continue
         rows.append(
@@ -873,6 +893,75 @@ async def _seed_entitlements(
         return
     session.add_all(rows)
     await session.flush()
+
+
+async def _reseed_entitlements(
+    session: AsyncSession, licenses: Sequence[TenantLicense], plan: LicensePlan
+) -> None:
+    """Re-resolve the entitlement rows of licences that are on ``plan``.
+
+    :func:`_seed_entitlements` ran once, when the licence was issued, and nothing
+    ran it again. Moving a licence to another plan, or editing the plan it is on,
+    changed the plan card and the feature chips -- both read the plan live -- and
+    left the rows the gate reads exactly as they were: an upgrade to 100M tokens
+    went on answering 402 at the old 1M, and a downgrade kept every feature of
+    the plan it had left.
+
+    What goes is what a plan seeds: the three ceilings, the new plan's own keys,
+    and every soft boolean grant -- the shape a feature bullet is seeded in. That
+    last clause is what clears the features of a plan the licence has *left*,
+    including one it left before this existed. A row of any other shape (a hard
+    ``ingest.enabled = false``, an integer ``max_agents``) was put there by an
+    operator rather than resolved from a plan, and is kept.
+    """
+    if not licenses:
+        return
+    keys = {str(feature).strip() for feature in plan.features or []} | set(CEILING_KEYS)
+    await session.execute(
+        delete(Entitlement)
+        .where(
+            Entitlement.license_id.in_([license_.id for license_ in licenses]),
+            or_(
+                Entitlement.key.in_(sorted(keys)),
+                and_(
+                    Entitlement.value_type == EntitlementValueType.BOOL.value,
+                    Entitlement.bool_value.is_(True),
+                    Entitlement.hard_limit.is_(False),
+                ),
+            ),
+        )
+        .execution_options(synchronize_session=False)
+    )
+    for license_ in licenses:
+        await _seed_entitlements(session, license_, plan)
+
+
+async def _reseed_plan_licenses(session: AsyncSession, plan: LicensePlan) -> int:
+    """Carry an edit to a plan through to every current licence sold on it.
+
+    Plans are global, so this crosses workspaces -- which is the point: the plan
+    is what each of them was sold. Revoked and expired licences are history and
+    keep the rows they ended with. The licence rows are taken ``FOR UPDATE``, in
+    id order, so this queues behind a plan change or a seat assignment in flight
+    on one of them instead of interleaving its delete and insert with theirs.
+    """
+    licenses = (
+        (
+            await session.execute(
+                select(TenantLicense)
+                .where(
+                    TenantLicense.plan_id == plan.id,
+                    TenantLicense.status.in_(CURRENT_STATUSES),
+                )
+                .order_by(TenantLicense.id.asc())
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    await _reseed_entitlements(session, licenses, plan)
+    return len(licenses)
 
 
 async def create_license(
@@ -975,9 +1064,14 @@ async def update_license(
     payload: TenantLicenseUpdate,
     request: Request | None = None,
 ) -> TenantLicenseRead:
-    """Amend a licence, including the plan change behind Upgrade Plan."""
+    """Amend a licence, including the plan change behind Upgrade Plan.
+
+    The row is locked: the seat floor below is a count read and then relied on,
+    and the entitlement rows are deleted and written again, neither of which
+    survives a second amendment or a seat assignment running alongside it.
+    """
     principal.require(Role.OWNER)
-    license_ = await _license_or_404(session, principal, license_id)
+    license_ = await _license_or_404(session, principal, license_id, lock=True)
 
     if license_.status in TERMINAL_STATUSES:
         raise PreconditionFailed(
@@ -990,11 +1084,13 @@ async def update_license(
 
     previous_plan_id = license_.plan_id
     new_plan_id = data.get("plan_id")
-    if new_plan_id is not None and new_plan_id != previous_plan_id:
-        new_plan = await _plan_or_404(session, new_plan_id)
-        if new_plan.status == PlanStatus.RETIRED.value:
+    plan_moved = new_plan_id is not None and new_plan_id != previous_plan_id
+    sent_plan: LicensePlan | None = None
+    if new_plan_id is not None:
+        sent_plan = await _plan_or_404(session, new_plan_id)
+        if plan_moved and sent_plan.status == PlanStatus.RETIRED.value:
             raise ValidationFailed(
-                f"Plan '{new_plan.name}' is retired and cannot be assigned to a license."
+                f"Plan '{sent_plan.name}' is retired and cannot be assigned to a license."
             )
 
     if "seats_purchased" in data:
@@ -1028,6 +1124,15 @@ async def update_license(
 
     changed = _apply_updates(license_, data)
     now = _now()
+
+    # Whenever the request names a plan, not only when it names a different one.
+    # The rows are a pure function of the plan, so writing them again is
+    # harmless, and it is the way back for a licence that changed plan before
+    # this existed and still carries the old plan's limits: Change Plan, keep the
+    # plan, save.
+    if sent_plan is not None:
+        await _reseed_entitlements(session, [license_], sent_plan)
+
     if not changed:
         items = await _hydrate_licenses(session, principal.workspace_id, [license_], now)
         return items[0]
@@ -1036,8 +1141,11 @@ async def update_license(
     await _persist(session, license_)
 
     detail = f"License updated: {', '.join(sorted(changed))}."
-    if new_plan_id is not None and new_plan_id != previous_plan_id:
-        detail = f"License moved from plan {previous_plan_id} to {new_plan_id}. " + detail
+    if plan_moved:
+        detail = (
+            f"License moved from plan {previous_plan_id} to {new_plan_id}; its "
+            "entitlements were re-resolved from the new plan. " + detail
+        )
 
     await audit.record(
         session,
@@ -1260,7 +1368,8 @@ async def reactivate_license(
 ) -> ActionResult:
     """Lift a suspension and return the licence to service."""
     principal.require(Role.OWNER)
-    license_ = await _license_or_404(session, principal, license_id)
+    # Locked, so a revocation landing at the same moment is not written over.
+    license_ = await _license_or_404(session, principal, license_id, lock=True)
 
     if license_.status != LicenseStatus.SUSPENDED.value:
         raise Conflict("Only a suspended license can be reactivated.")
@@ -1664,10 +1773,21 @@ async def assign_seat(
     Enforces the two invariants the table cannot: one active seat per user per
     licence, and never more active seats than were purchased. The seat count is
     re-read from the database inside this transaction rather than trusted from
-    the denormalised counter, so two concurrent assignments cannot both pass.
+    the denormalised counter -- but a re-read alone does not stop two concurrent
+    assignments: under READ COMMITTED neither sees the other's uncommitted seat,
+    so both counted 9 of 10 and the licence ended at 11. What stops them is the
+    lock on the licence row (:func:`_license_lookup`): the second assignment
+    waits for the first to commit and then counts its seat.
+
+    The two lookups below tolerate a user who already holds *two* active seats,
+    which is what such a race left behind (a retry after a client timeout is
+    enough). ``scalar_one_or_none`` raised on that row, so every later Assign or
+    Reassign involving that user answered 500 and the seat could no longer be
+    managed; now Assign answers the 409 it should, and Reassign releases every
+    seat the outgoing user holds, which is also how the duplicate is cleared.
     """
     principal.require(Role.ADMIN)
-    license_ = await _license_or_404(session, principal, license_id)
+    license_ = await _license_or_404(session, principal, license_id, lock=True)
 
     if license_.status in SEAT_BLOCKING_STATUSES:
         raise PreconditionFailed(
@@ -1695,11 +1815,13 @@ async def assign_seat(
 
     held = (
         await session.execute(
-            select(SeatAssignment).where(
+            select(SeatAssignment.id)
+            .where(
                 SeatAssignment.license_id == license_.id,
                 SeatAssignment.user_id == user.id,
                 SeatAssignment.released_at.is_(None),
             )
+            .limit(1)
         )
     ).scalar_one_or_none()
     if held is not None:
@@ -1708,18 +1830,26 @@ async def assign_seat(
     now = _now()
     replaced: SeatAssignment | None = None
     if payload.replaces_user_id is not None:
-        replaced = (
-            await session.execute(
-                select(SeatAssignment).where(
-                    SeatAssignment.license_id == license_.id,
-                    SeatAssignment.user_id == payload.replaces_user_id,
-                    SeatAssignment.released_at.is_(None),
+        outgoing = (
+            (
+                await session.execute(
+                    select(SeatAssignment)
+                    .where(
+                        SeatAssignment.license_id == license_.id,
+                        SeatAssignment.user_id == payload.replaces_user_id,
+                        SeatAssignment.released_at.is_(None),
+                    )
+                    .order_by(SeatAssignment.assigned_at.asc(), SeatAssignment.id.asc())
                 )
             )
-        ).scalar_one_or_none()
-        if replaced is None:
+            .scalars()
+            .all()
+        )
+        if not outgoing:
             raise NotFound("That user holds no active seat on this license.")
-        replaced.released_at = now
+        for row in outgoing:
+            row.released_at = now
+        replaced = outgoing[0]
         await session.flush()
 
     active = await _active_seat_count(session, license_.id)
@@ -1779,9 +1909,14 @@ async def purchase_seats(
     payload: SeatPurchaseRequest,
     request: Request | None = None,
 ) -> ActionResult:
-    """Add seats to a licence. This changes what the tenant is billed."""
+    """Add seats to a licence. This changes what the tenant is billed.
+
+    ``seats_purchased + n`` is a read and a write-back, so the row is locked:
+    two purchases in flight would otherwise both start from the same pool and
+    the second would overwrite the first -- seats paid for and not there.
+    """
     principal.require(Role.OWNER)
-    license_ = await _license_or_404(session, principal, license_id)
+    license_ = await _license_or_404(session, principal, license_id, lock=True)
 
     if license_.status in TERMINAL_STATUSES:
         raise PreconditionFailed(

@@ -451,6 +451,22 @@ async def test_a_comment_without_identifiers_is_stored_untouched(admin_client):
     assert submitted.json()["pii_scrubbed"] == []
 
 
+async def test_the_scrub_marker_is_not_something_two_comments_have_in_common(admin_client):
+    """Two unrelated complaints that both left an address are not a theme."""
+    for comment in (
+        "Refund never arrived, write to jane.doe@example.com",
+        "Login crashes, write to bob@example.com",
+    ):
+        submitted = await admin_client.post(FEEDBACK, json={"rating": 1, "body": comment})
+        assert submitted.status_code == 201, submitted.text
+        assert submitted.json()["pii_scrubbed"] == ["email"]
+
+    result = (await admin_client.post(f"{FEEDBACK}/analyze", json={})).json()
+    assert result["analysed"] == 2
+    assert result["clustered"] == 0, "the marker's own words must not count as overlap"
+    assert result["clusters"] == []
+
+
 async def _auto_issue_at(http, threshold: int) -> None:
     saved = await http.put(f"{FEEDBACK}/sla-rules", json={"auto_issue_threshold": threshold})
     assert saved.status_code == 200, saved.text

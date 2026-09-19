@@ -21,6 +21,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, BackgroundTasks, Depends, Query, Request, status
 from fastapi.responses import StreamingResponse
 
+from ...db.session import commit_then
 from ...models.registry import (
     EnvironmentType,
     KnowledgeSourceStatus,
@@ -213,8 +214,9 @@ async def create_source(
     # the job's own session would otherwise look for a row no other connection
     # can see yet, find nothing and give up -- leaving the new source Syncing
     # at 0% with nothing working on it.
-    await session.commit()
-    background.add_task(service.run_sync, source.id, principal.workspace_id, job_id)
+    await commit_then(
+        session, background, service.run_sync, source.id, principal.workspace_id, job_id
+    )
     return KnowledgeActionResponse(
         source=response.source,
         message=f"{read.name} added; initial sync started.",
@@ -308,8 +310,9 @@ async def sync_source(
     # Commit first, for the reason given in create_source above: a job that
     # starts ahead of this commit rewrites the sync block from the snapshot
     # before it, dropping who started the sync and when.
-    await session.commit()
-    background.add_task(service.run_sync, source_id, principal.workspace_id, job_id)
+    await commit_then(
+        session, background, service.run_sync, source_id, principal.workspace_id, job_id
+    )
     return response
 
 

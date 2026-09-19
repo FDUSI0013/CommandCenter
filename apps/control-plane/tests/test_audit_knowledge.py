@@ -400,6 +400,28 @@ async def test_sync_now_and_delete_are_exits_from_a_stranded_sync(
     assert deleted.status_code == 204, deleted.text
 
 
+async def test_pausing_is_an_exit_from_a_stranded_sync(admin_client, factory, workspace, db):
+    source = await stranded_source(factory, db, workspace, minutes_ago=30)
+
+    paused = await admin_client.patch(
+        f"/api/v1/knowledge/{source.id}", json={"status": "Paused"}
+    )
+
+    assert paused.status_code == 200, paused.text
+    body = paused.json()
+    assert body["status"] == KnowledgeSourceStatus.PAUSED.value
+    # The dead job is on the record as failed, not quietly painted over.
+    assert body["sync"]["state"] == "Failed"
+    assert "Interrupted" in body["sync"]["error"]
+
+    # Inside a job's lifetime the row is still taken at its word.
+    live = await stranded_source(factory, db, workspace, minutes_ago=1, name="Handbook")
+    refused = await admin_client.patch(
+        f"/api/v1/knowledge/{live.id}", json={"status": "Paused"}
+    )
+    assert refused.status_code == 412, refused.text
+
+
 async def test_a_sync_that_may_still_be_running_elsewhere_is_left_alone(
     admin_client, factory, workspace, db
 ):

@@ -485,6 +485,14 @@ async def raise_alert(
     # committed between them) choose different references and both insert; only
     # a unique index on the live key can refuse that, and the lookup above
     # tolerates it by landing on the newest.
+    #
+    # A screen's evaluator calls this with its own edit still pending (the quota
+    # it has just restated, say). That is written first, in the caller's
+    # transaction, so that nothing of the caller's is ever inside the savepoint:
+    # opening one flushes whatever is pending, and from inside the ``try`` a
+    # constraint the *caller's* row broke would be read as a lost race for the
+    # reference and retried on a transaction that is already dead.
+    await session.flush()
     alert: Alert | None = None
     for _attempt in range(REF_ALLOCATION_ATTEMPTS):
         candidate = _candidate(await _next_alert_ref(session, workspace_id))

@@ -1658,13 +1658,22 @@ async def trigger_run(
     *,
     request: Request | None = None,
 ) -> AgentRunAccepted:
-    """Start one execution of the agent from the console.
+    """Record one requested execution of the agent.
 
-    The invocation is recorded as an open trace in the telemetry engine — the
-    run appears on Live Runs as ``Running`` immediately — and the agent's
-    runtime completes it through the ingest API when it finishes. The metadata
-    written here is exactly what Live Runs reads back: tenant, environment,
-    platform, risk and who pressed the button.
+    The request is written as an open trace in the telemetry engine, so it
+    appears on Live Runs as ``Running`` immediately. That is all that happens
+    here. Nothing is dispatched: an agent row holds no address for its runtime,
+    so the runtime is not invoked and cannot learn ``run_id`` from us. Whoever
+    called this is expected to hand ``run_id`` to the runtime, which reports the
+    run under that id through the ingest API; a request no runtime reports on
+    stays open. Pressed from the console, where nobody carries the id anywhere,
+    that is every request -- closing the gap needs a registered endpoint per
+    agent, which is a column this table does not have yet.
+
+    The metadata written here is exactly what Live Runs reads back: tenant,
+    environment, platform, risk and who pressed the button. ``source`` and
+    ``triggered_by`` also mark the trace as console-issued, which is what lets
+    a reader tell an unanswered request from a long run.
 
     Refused unless the agent is active, provisioned and permitted by policy.
     Requires the operator role.

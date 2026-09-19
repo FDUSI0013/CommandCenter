@@ -16,7 +16,7 @@ import datetime as dt
 import json
 from typing import Annotated, Any
 
-from croniter import croniter
+from croniter import CroniterBadDateError, croniter
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -48,13 +48,38 @@ def _check_filters(value: dict[str, Any]) -> dict[str, Any]:
 
 
 def _normalise_cron(value: str) -> str:
-    """Collapse whitespace and reject anything croniter cannot schedule."""
+    """Collapse whitespace and reject anything the platform clock could not honour.
+
+    ``croniter.is_valid`` only checks that each field is in range, and two kinds
+    of expression pass it that the sweeper cannot live with:
+
+    * A sixth (seconds) or seventh (year) field. ``* * * * * *`` is due again on
+      every tick of a 30-second clock, which is a file on the spool volume every
+      30 seconds for as long as the schedule exists. The column is documented as
+      five fields, so that is what is accepted -- an ``@daily`` style alias is
+      five fields by another name and still is.
+    * A date that does not exist. ``0 0 31 4 *`` is in range field by field and
+      has no next firing; asking for one raises, which used to reach the client
+      as a 500 after the editor had already closed and thrown the form away.
+    """
     expression = " ".join(value.split())
     if not croniter.is_valid(expression):
         raise ValueError(
             "cron must be a valid expression, evaluated in UTC — for example "
             "'0 6 * * 1' for every Monday at 06:00."
         )
+    if len(croniter.expand(expression)[0]) != 5:
+        raise ValueError(
+            "cron must have exactly five fields — minute, hour, day of month, month, "
+            "day of week — for example '0 6 * * 1'. Seconds and years are not supported."
+        )
+    try:
+        croniter(expression, dt.datetime.now(dt.UTC)).get_next(dt.datetime)
+    except CroniterBadDateError as exc:
+        raise ValueError(
+            f"cron '{expression}' never fires: no date matches it. Check the day "
+            "of the month against the month."
+        ) from exc
     return expression
 
 

@@ -417,7 +417,10 @@ async def update_plan(
     """Amend a plan — the "Edit Plan" action.
 
     Withdrawing a plan from sale is a status change to Retired, not a delete, so
-    licences that reference it keep resolving. Requires the owner role.
+    licences that reference it keep resolving. An edit to ``features`` or to an
+    ``included_*`` allowance is carried through to the entitlements of every
+    current licence sold on the plan, in the same transaction; revoked and
+    expired licences keep what they ended with. Requires the owner role.
     """
     return await service.update_plan(session, principal, plan_id, payload, request)
 
@@ -529,8 +532,10 @@ async def update_license(
     licence answers 412 rather than lifting the suspension unchecked. The term
     is validated only when ``starts_at`` or ``expires_at`` is in the body, so
     this is also how a lapsed or mis-entered term is corrected: send a later
-    ``expires_at``. Moving to another plan re-resolves the licence's
-    entitlements from the new plan. Requires the owner role.
+    ``expires_at``. Sending ``plan_id`` re-resolves the licence's entitlements
+    from that plan -- on a move to another plan, and equally when it names the
+    plan already held, which is how a licence still carrying an earlier plan's
+    limits is repaired. Requires the owner role.
     """
     return await service.update_license(session, principal, license_id, payload, request)
 
@@ -685,10 +690,13 @@ async def assign_seat(
 
     Sending ``replaces_user_id`` releases that user's seat and issues the new
     one in the same transaction, so a fully allocated licence can be reshuffled
-    without buying a spare. The seat count is re-read inside the transaction, so
-    two concurrent assignments cannot both slip past the purchased ceiling: the
-    loser answers 402. A suspended, revoked or expired licence refuses new
-    assignment with 412. Requires the admin role.
+    without buying a spare. Assignments serialise on the licence row and the
+    seat count is re-read under that lock, so two concurrent assignments cannot
+    both slip past the purchased ceiling (the loser answers 402) nor give one
+    user two seats (the loser answers 409). A user who holds a duplicate seat
+    from before that lock existed has all of them released by a reassignment.
+    A suspended, revoked or expired licence refuses new assignment with 412.
+    Requires the admin role.
     """
     return await service.assign_seat(session, principal, license_id, payload, request)
 

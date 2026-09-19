@@ -568,6 +568,44 @@ async def test_a_configuration_nothing_links_to_is_renamed_as_before(
     assert response.json()["name"] == "PII Shield"
 
 
+async def test_an_archived_configuration_restore_refuses_still_comes_back_by_rollback(
+    admin_client, db, factory, workspace
+):
+    """Archived, with a live body whose link target has gone: restore answers 422
+    and Edit and New Version answer "restore it first". Roll Back to a body that
+    passes is the one way back, so it must not grow the Archived guard the other
+    verbs have."""
+    configuration = await factory.configuration(
+        workspace,
+        name="Retired router",
+        status=ConfigurationStatus.ARCHIVED.value,
+        current_version="v1.1.0",
+        payload=model_body(links={"guardrail": "A guard that was deleted"}),
+    )
+    await factory.configuration_version(
+        workspace,
+        configuration,
+        version="v1.0.0",
+        payload=model_body(),
+        status=ConfigurationStatus.DEPRECATED.value,
+    )
+
+    restored = await admin_client.post(f"/api/v1/configurations/{configuration.id}/restore")
+    versioned = await admin_client.post(
+        f"/api/v1/configurations/{configuration.id}/versions", json={"payload": model_body()}
+    )
+    rolled = await admin_client.post(
+        f"/api/v1/configurations/{configuration.id}/rollback", json={"version": "v1.0.0"}
+    )
+
+    assert restored.status_code == 422, restored.text
+    assert versioned.status_code == 412, versioned.text
+    assert rolled.status_code == 200, rolled.text
+    stored = await db.get(Configuration, configuration.id)
+    assert stored.status == ConfigurationStatus.ACTIVE.value
+    assert stored.current_version == "v1.2.0"
+
+
 async def test_a_null_identity_field_is_no_change_not_a_name_conflict(
     admin_client, factory, workspace
 ):

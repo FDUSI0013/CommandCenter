@@ -29,3 +29,4 @@ node_modules/
 docs/node_modules/
 docs/package-lock.json
 docs/package.json
+.ship-params.json

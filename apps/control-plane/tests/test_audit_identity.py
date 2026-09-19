@@ -8,13 +8,16 @@ checked nowhere but ingest.
 
 from __future__ import annotations
 
+import datetime as dt
 from pathlib import Path
 
 import httpx
 import pytest
+from sqlalchemy import event, update
 
 from conftest import APP_BASE_URL, authorise, error_code
-from fulcrum_ops_api.models.identity import Role, User
+from fulcrum_ops_api.core.config import settings
+from fulcrum_ops_api.models.identity import ApiKey, Role, User, Workspace
 
 STRONG_PASSWORD = "horse-battery-staple-9"
 ATTACKER_PASSWORD = "attacker-chosen-pass-1"
@@ -279,3 +282,172 @@ async def test_an_unbound_key_that_cannot_register_is_told_the_agent_must_exist(
         )
     ).json()
     assert "registers it on first report" in _snippet(registrar, "Python SDK")
+
+
+# ---------------------------------------------------------------------------
+# #169  Every API-key request rewrote its api_keys row; a console request paid
+#       three lookups in a row to find out who was calling
+# ---------------------------------------------------------------------------
+
+
+async def test_a_busy_key_is_noted_once_a_minute_not_on_every_request(client, db, ingest_key):
+    """The five-second config poller was some 17,000 UPDATEs a day on one hot row."""
+    token, row = ingest_key
+    client.headers["Authorization"] = f"Bearer {token}"
+
+    assert (await client.get("/api/v1/auth/status")).status_code == 204
+    first = await db.get(ApiKey, row.id)
+    assert first.last_used_at is not None, "the first use is still recorded"
+    assert first.updated_at == row.updated_at, "being used is not an edit of the key"
+
+    for _ in range(3):
+        assert (await client.get("/api/v1/auth/status")).status_code == 204
+    again = await db.get(ApiKey, row.id)
+    assert again.last_used_at == first.last_used_at, "rewritten inside the same minute"
+
+    # Once the note is more than a minute old the next request refreshes it.
+    stale = first.last_used_at - dt.timedelta(minutes=2)
+    await db.execute(
+        update(ApiKey)
+        .where(ApiKey.id == row.id)
+        .values(last_used_at=stale, updated_at=ApiKey.updated_at)
+    )
+    assert (await client.get("/api/v1/auth/status")).status_code == 204
+    refreshed = await db.get(ApiKey, row.id)
+    assert refreshed.last_used_at > first.last_used_at
+    assert refreshed.updated_at == row.updated_at
+
+
+async def test_a_recently_noted_key_makes_a_read_only_request(client, db_engine, ingest_key):
+    """Once noted, authenticating with the key writes nothing at all."""
+    token, _row = ingest_key
+    client.headers["Authorization"] = f"Bearer {token}"
+    assert (await client.get("/api/v1/auth/status")).status_code == 204
+
+    statements: list[str] = []
+
+    def _seen(_conn, _cursor, statement, *_rest) -> None:
+        statements.append(statement.lstrip().split(None, 1)[0].upper())
+
+    event.listen(db_engine.sync_engine, "before_cursor_execute", _seen)
+    try:
+        assert (await client.get("/api/v1/auth/status")).status_code == 204
+    finally:
+        event.remove(db_engine.sync_engine, "before_cursor_execute", _seen)
+    assert "UPDATE" not in statements, statements
+
+
+async def test_a_console_request_finds_its_caller_in_one_statement(admin_client, db_engine):
+    """Account, workspace and membership were three round trips before any handler ran."""
+    statements: list[str] = []
+
+    def _seen(_conn, _cursor, statement, *_rest) -> None:
+        statements.append(statement)
+
+    event.listen(db_engine.sync_engine, "before_cursor_execute", _seen)
+    try:
+        assert (await admin_client.get("/api/v1/auth/status")).status_code == 204
+    finally:
+        event.remove(db_engine.sync_engine, "before_cursor_execute", _seen)
+    assert len(statements) == 1, statements
+
+
+async def test_the_single_lookup_still_tells_the_refusals_apart(
+    admin_client, db, workspace, other_workspace
+):
+    unknown = await admin_client.get(
+        "/api/v1/auth/status", headers={"X-Fulcrum-Workspace": "no-such-tenant"}
+    )
+    assert unknown.status_code == 403
+    assert unknown.json()["error"]["message"] == "Unknown workspace."
+
+    foreign = await admin_client.get(
+        "/api/v1/auth/status", headers={"X-Fulcrum-Workspace": other_workspace.slug}
+    )
+    assert foreign.status_code == 403
+    assert "do not have access" in foreign.json()["error"]["message"]
+
+    await db.execute(
+        update(Workspace).where(Workspace.id == workspace.id).values(status="suspended")
+    )
+    suspended = await admin_client.get("/api/v1/auth/status")
+    assert suspended.status_code == 401
+    assert "not active" in suspended.json()["error"]["message"]
+
+
+async def test_sign_in_attempts_are_refused_before_the_password_is_checked(
+    client, monkeypatch, northwind_owner
+):
+    """Nothing bounded the argon2 verifications an anonymous caller could ask for:
+    the lockout counts failures against a real account, and a loop over made-up
+    addresses never trips it."""
+    monkeypatch.setattr(settings, "rate_limit_login_per_minute", 3)
+
+    for _ in range(3):
+        wrong = await client.post(
+            "/api/v1/auth/login", json={"email": "nobody@nowhere.test", "password": "guess-1"}
+        )
+        assert wrong.status_code == 401, wrong.text
+
+    refused = await client.post(
+        "/api/v1/auth/login", json={"email": "nobody@nowhere.test", "password": "guess-1"}
+    )
+    assert refused.status_code == 429, refused.text
+    assert error_code(refused) == "rate_limited"
+    assert int(refused.headers["Retry-After"]) >= 1
+
+    # The window is the named account's: somebody else still signs in.
+    other = await client.post(
+        "/api/v1/auth/login", json={"email": northwind_owner.email, "password": STRONG_PASSWORD}
+    )
+    assert other.status_code == 200, other.text
+
+
+async def test_a_spray_across_accounts_meets_the_window_of_its_address(client, monkeypatch):
+    monkeypatch.setattr(settings, "rate_limit_login_per_address_per_minute", 4)
+
+    answers = [
+        (
+            await client.post(
+                "/api/v1/auth/login",
+                json={"email": f"guess-{index}@nowhere.test", "password": "guess-1"},
+            )
+        ).status_code
+        for index in range(6)
+    ]
+    assert answers == [401, 401, 401, 401, 429, 429]
+
+
+async def test_a_password_is_verified_off_the_event_loop(client, northwind_owner):
+    """argon2 inside the handler held the worker's loop for every attempt, and the
+    ingest batches and live streams that loop was serving with it.
+
+    Proved by occupying the hashing pool: a sign-in that really goes through it
+    has to wait its turn, and the loop goes on running while it does.
+    """
+    import asyncio
+    import threading
+
+    from fulcrum_ops_api.core import security
+
+    release = threading.Event()
+    held = [
+        security._password_pool.submit(release.wait, 30)
+        for _ in range(security.PASSWORD_POOL_WORKERS)
+    ]
+    try:
+        attempt = asyncio.create_task(
+            client.post(
+                "/api/v1/auth/login",
+                json={"email": northwind_owner.email, "password": STRONG_PASSWORD},
+            )
+        )
+        for _ in range(20):
+            await asyncio.sleep(0.05)
+        assert not attempt.done(), "the password was checked on the event loop, not in the pool"
+    finally:
+        release.set()
+    signed_in = await attempt
+    assert signed_in.status_code == 200, signed_in.text
+    for job in held:
+        job.result(timeout=5)

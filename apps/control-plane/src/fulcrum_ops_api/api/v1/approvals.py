@@ -19,6 +19,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, Query, Request
 from fastapi import status as http_status
 from fastapi.responses import StreamingResponse
 
+from ...db.session import commit_then
 from ...models.governance import ApprovalStatus, PolicyScope, PolicyStatus, RiskLevel
 from ...schemas.approvals import (
     ApprovalCommentCreate,
@@ -392,9 +393,12 @@ async def approve_request(
         # The runner works on its own session, so the approved stage has to be
         # committed before it is allowed to look: a task scheduled first races
         # this request's COMMIT, sees the gate still shut, and exits for good.
-        await session.commit()
-        background.add_task(
-            deployments_service.run_pipeline, resume_deployment_id, principal.workspace_id
+        await commit_then(
+            session,
+            background,
+            deployments_service.run_pipeline,
+            resume_deployment_id,
+            principal.workspace_id,
         )
     return decision
 

@@ -37,7 +37,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any, Final
 
 from fastapi import Request
-from sqlalchemy import Select, case, func, nullslast, select
+from sqlalchemy import Select, and_, case, func, nullslast, select
 from sqlalchemy import update as sa_update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -432,6 +432,7 @@ async def _store_projects(
     store: MemoryStore,
     *,
     agent_id: str | None = None,
+    limit: int | None = MAX_PROJECT_FANOUT,
 ) -> list[EngineProject]:
     """Engine projects of the agents bound to one store — and of nobody else.
 
@@ -445,6 +446,9 @@ async def _store_projects(
     agents' history with it. There is deliberately no fallback here: a store no
     agent names owns no threads, and the answer is an empty list, never the
     workspace.
+
+    ``limit`` is the screen's fan-out cap, and a read keeps it. The purge passes
+    ``None``: see :func:`purge_store`.
     """
     stmt = (
         select(Agent.id, Agent.name, Agent.engine_project_name, Agent.engine_project_id)
@@ -454,8 +458,9 @@ async def _store_projects(
             Agent.engine_project_name.is_not(None),
         )
         .order_by(nullslast(Agent.last_used_at.desc()), Agent.name.asc())
-        .limit(MAX_PROJECT_FANOUT)
     )
+    if limit is not None:
+        stmt = stmt.limit(limit)
     if agent_id is not None:
         stmt = stmt.where(Agent.id == agent_id)
     return [
@@ -1360,6 +1365,38 @@ def _expires_at(
     return last_activity + dt.timedelta(days=retention_days)
 
 
+async def _governing_retention(
+    session: AsyncSession, principal: Principal, agent_ids: Iterable[str]
+) -> dict[str, tuple[int | None, str | None]]:
+    """``agent id -> (retention days, label)`` of the store each agent is bound to.
+
+    The binding is the one a purge follows (:func:`_store_projects`): the
+    thread-backed store the agent's memory policy names. Store names are unique
+    in a workspace, so an agent resolves to at most one.
+    """
+    wanted = sorted(set(agent_ids))
+    if not wanted:
+        return {}
+    rows = (
+        await session.execute(
+            select(Agent.id, MemoryStore.retention_days, MemoryStore.retention_policy)
+            .join(
+                MemoryStore,
+                and_(
+                    MemoryStore.workspace_id == Agent.workspace_id,
+                    MemoryStore.name == Agent.memory_policy,
+                ),
+            )
+            .where(
+                Agent.workspace_id == principal.workspace_id,
+                Agent.id.in_(wanted),
+                MemoryStore.store_type.in_(sorted(THREAD_BACKED_TYPES)),
+            )
+        )
+    ).all()
+    return {agent_id: (days, label) for agent_id, days, label in rows}
+
+
 async def list_records(
     session: AsyncSession,
     principal: Principal,
@@ -1452,29 +1489,22 @@ async def list_conversations(
 ) -> tuple[list[MemoryConversationRead], int]:
     """The Conversation State tab: threads with their context size and expiry.
 
-    Expiry is the thread's last activity plus the retention window of the
-    conversation store that governs its environment; with no conversation store
-    registered there is no policy to apply and the column is null.
+    Expiry is the thread's last activity plus the retention window of the store
+    its agent is bound to — the one store whose purge can reach it. A thread
+    whose agent names no store is under no policy, and the two columns are null.
+
+    It used to quote the tightest conversation store in the workspace against
+    every thread, which promised an expiry to conversations no purge would ever
+    remove and the wrong date to most of the rest.
     """
     projects = await _projects(session, principal, agent_id=agent_id)
     rows, total = await _fetch_threads(
         projects, want=params.offset + params.page_size, search=params.q
     )
-    policy = (
-        await session.execute(
-            _scoped(principal)
-            .where(
-                MemoryStore.store_type == MemoryStoreType.CONVERSATION.value,
-                MemoryStore.status == MemoryStoreStatus.ACTIVE.value,
-            )
-            .order_by(MemoryStore.retention_days.asc())
-            .limit(1)
-        )
-    ).scalar_one_or_none()
-    retention_days = policy.retention_days if policy else None
-    label = policy.retention_policy if policy else None
-
     page = _slice(rows, params)
+    governing = await _governing_retention(
+        session, principal, {row.agent_id for row in page if row.agent_id}
+    )
     return [
         MemoryConversationRead(
             conversation_id=row.thread_id,
@@ -1482,9 +1512,11 @@ async def list_conversations(
             agent_name=row.agent_name,
             messages=row.message_count,
             context_tokens=row.context_tokens,
-            retention_policy=label,
+            retention_policy=governing.get(row.agent_id or "", (None, None))[1],
             last_activity_at=row.last_activity_at,
-            expires_at=_expires_at(row.last_activity_at, retention_days),
+            expires_at=_expires_at(
+                row.last_activity_at, governing.get(row.agent_id or "", (None, None))[0]
+            ),
         )
         for row in page
     ], total
@@ -1574,22 +1606,54 @@ async def list_retention_policies(
 
     The counts are SQL aggregates; the labels beside them are resolved in a
     second, capped statement so a workspace with thousands of stores still
-    answers in two queries.
+    answers in a handful of queries.
+
+    Records is the one figure that is not all ours. A thread-backed store's
+    counter column is never written (see :func:`_live_counts`), so a policy that
+    governs conversation stores read Records 0 however much they held. Their
+    share is read live, the same way the store table reads it, and added to what
+    the other stores' runtimes reported; when it cannot be read the figure is
+    null — not measured — rather than the reported part passed off as the whole.
     """
     workspace = MemoryStore.workspace_id == principal.workspace_id
+    threaded = MemoryStore.store_type.in_(sorted(THREAD_BACKED_TYPES))
     aggregates = (
         await session.execute(
             select(
                 MemoryStore.retention_policy,
                 MemoryStore.retention_days,
                 func.count(MemoryStore.id),
-                func.coalesce(func.sum(MemoryStore.record_count), 0),
+                func.coalesce(func.sum(case((threaded, 0), else_=MemoryStore.record_count)), 0),
+                func.coalesce(func.sum(case((threaded, 1), else_=0)), 0),
             )
             .where(workspace)
             .group_by(MemoryStore.retention_policy, MemoryStore.retention_days)
             .order_by(MemoryStore.retention_days.asc())
         )
     ).all()
+
+    thread_stores = (
+        (
+            await session.execute(
+                select(MemoryStore)
+                .where(workspace, threaded)
+                .order_by(MemoryStore.name.asc())
+                .limit(MAX_POLICY_DETAIL_ROWS)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    live = await _live_counts(session, principal, thread_stores)
+    # policy -> (thread-backed stores measured, threads they hold)
+    held: dict[tuple[str | None, int | None], tuple[int, int]] = {}
+    for store in thread_stores:
+        records = live.get(store.id, (None, None, 0))[0]
+        if records is None:
+            continue
+        key = (store.retention_policy, store.retention_days)
+        measured, threads = held.get(key, (0, 0))
+        held[key] = (measured + 1, threads + records)
 
     detail = (
         await session.execute(
@@ -1616,15 +1680,22 @@ async def list_retention_policies(
         active[key] = active.get(key, False) or status == MemoryStoreStatus.ACTIVE.value
 
     rows: list[RetentionPolicyRead] = []
-    for policy, days, store_count, record_count in aggregates:
+    for policy, days, store_count, reported, threaded_stores in aggregates:
         key = (policy, days)
+        measured, threads = held.get(key, (0, 0))
         rows.append(
             RetentionPolicyRead(
                 policy=policy or (retention_label(days) if days else "No policy set"),
                 retention_days=days,
                 applies_to=sorted(types.get(key, set())),
                 store_count=int(store_count),
-                record_count=int(record_count or 0),
+                # Every thread-backed store under the policy was measured, or
+                # the sum is not a total and is not shown as one.
+                record_count=(
+                    int(reported or 0) + threads
+                    if measured == int(threaded_stores or 0)
+                    else None
+                ),
                 stores=sorted(names.get(key, [])),
                 status="Active" if active.get(key, False) else "Inactive",
             )
@@ -1880,13 +1951,26 @@ async def purge_store(
             details={"field": "confirm"},
         )
 
-    projects = await _store_projects(session, principal, store)
+    # Every bound agent, not the screen's fan-out cap. The cap keeps the most
+    # recently used agents, so the ones it dropped — the idle ones, whose
+    # threads are the likeliest to have expired — were never swept however often
+    # the purge was repeated, and the response still read as complete. The time
+    # budget bounds the run instead: a repeat passes quickly over the projects
+    # that are already clean and carries on where the last one stopped.
+    projects = await _store_projects(session, principal, store, limit=None)
     if not projects:
+        width = Agent.memory_policy.type.length or 0
+        too_long = (
+            f" An agent's memory policy holds at most {width} characters, so rename "
+            "the store to fit first."
+            if width and len(store.name) > width
+            else ""
+        )
         raise PreconditionFailed(
             f"No provisioned agent names '{store.name}' as its memory policy, so the "
             "control plane cannot tell which conversation records belong to it and "
             "will not delete any. Set the memory policy of the agents that use this "
-            "store to its name, then run the purge again.",
+            f"store to its name, then run the purge again.{too_long}",
             details={"bound_agents": 0},
         )
 
@@ -1951,6 +2035,8 @@ async def purge_store(
             f"{progress.candidates} record(s) held by {whose} are past "
             f"{store.retention_policy} retention. Nothing was deleted."
         )
+        if progress.capped:
+            message += " The count stopped at the run's limit, so there may be more."
     else:
         message = (
             f"Removed {progress.records} expired record(s) "
@@ -1972,7 +2058,9 @@ async def purge_store(
             f"past {store.retention_policy} retention"
         )
     )
-    detail = f"{detail}; agents: {', '.join(agents)}"
+    # The sentence names a handful; the metadata below carries every one.
+    shown = ", ".join(agents[:5]) + (f" and {len(agents) - 5} others" if len(agents) > 5 else "")
+    detail = f"{detail}; agents: {shown}"
     if partial:
         detail = f"{detail}; stopped early, the telemetry store failed part way"
     if payload.reason:

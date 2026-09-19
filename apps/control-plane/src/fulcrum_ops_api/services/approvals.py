@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
-import inspect
 import logging
 import re
 from collections.abc import Sequence
@@ -53,6 +52,7 @@ from ..core.errors import (
     PreconditionFailed,
     ValidationFailed,
 )
+from ..db.session import get_sessionmaker
 from ..models.governance import (
     ApprovalComment,
     ApprovalRequest,
@@ -67,12 +67,7 @@ from ..models.governance import (
     default_workflow,
 )
 from ..models.identity import Membership, Role, User
-from ..models.operations import (
-    Deployment,
-    DeploymentStage,
-    DeploymentStageStatus,
-    DeploymentStatus,
-)
+from ..models.operations import Deployment, DeploymentStage, DeploymentStageStatus
 from ..models.registry import Agent
 from ..schemas.approvals import (
     ApprovalCommentCreate,
@@ -607,9 +602,9 @@ async def export_requests(
 # locked; rejecting left it free to be pushed through from the other screen.
 # ---------------------------------------------------------------------------
 
-#: The deployments service may own this step. When it exposes a coroutine of
-#: this name taking exactly these keywords, it is used; otherwise the writes
-#: below are made here. Both leave the same rows behind.
+#: The deployments service owns the stage and halt writes; this is the coroutine
+#: it exposes for a decision taken here. Looked up by name at call time, because
+#: that module must stay free to import this one.
 GATE_HOOK = "apply_gate_decision"
 
 
@@ -659,112 +654,61 @@ async def _settle_gate(
     from . import deployments as deployments_service
 
     hook = getattr(deployments_service, GATE_HOOK, None)
-    if hook is not None:
-        offered = {
-            "session": session,
-            "principal": principal,
-            "approval_request": row,
-            "approved": approved,
-            "note": note,
-            "request": request,
-        }
-        try:
-            inspect.signature(hook).bind(**offered)
-        except TypeError:
-            log.warning("deployments.%s does not take the gate contract; ignoring it", GATE_HOOK)
-        else:
-            outcome = await hook(**offered)
-            resume = outcome[-1] if isinstance(outcome, tuple) else outcome
-            return deployment.id if resume else None
-
-    stage = (
-        await session.execute(
-            select(DeploymentStage).where(
-                DeploymentStage.deployment_id == deployment.id,
-                DeploymentStage.name == deployments_service.STAGE_APPROVAL,
-            )
+    if hook is None:
+        # The decision is evidence and stands either way; failing it because the
+        # release could not be moved would lose the record as well. The release
+        # stays parked and ``settle_decided_gates`` finds it on its next pass.
+        log.error(
+            "deployments.%s is missing: %s was decided but %s was left parked",
+            GATE_HOOK,
+            row.request_ref,
+            deployment.deployment_ref,
         )
-    ).scalar_one_or_none()
-    if stage is None or stage.status != DeploymentStageStatus.RUNNING.value:
         return None
 
-    decided_at = _now()
-    actor = principal.actor
-    if approved:
-        stage.status = DeploymentStageStatus.APPROVED.value
-        stage.finished_at = decided_at
-        stage.log = note or f"Approved by {actor} (request {row.request_ref})."
-        stage.detail = {
-            **(stage.detail or {}),
-            "approved_by": actor,
-            "approved_at": decided_at.isoformat(),
-        }
-        deployment.updated_by = actor
-        await session.flush()
-        await audit.record(
-            session,
-            principal=principal,
-            action="deployment.approve",
-            entity_type="Deployment",
-            entity_id=deployment.id,
-            entity_label=deployment.deployment_ref,
-            source_screen=SOURCE_SCREEN,
-            detail=f"Approved {deployment.version} for release via {row.request_ref}.",
-            metadata={"approval_request_id": row.id},
-            request=request,
-        )
-        return deployment.id
-
-    # Refused, or nobody decided in time: the gate stays shut, which is a halt
-    # rather than a failure. The runner is parked, so cancel is a formality.
-    deployments_service.runner.cancel(deployment.id)
-    reason = note or f"Rejected by {actor} (request {row.request_ref})."
-    stage.status = DeploymentStageStatus.FAILED.value
-    stage.finished_at = decided_at
-    stage.log = reason
-    stage.detail = {
-        **(stage.detail or {}),
-        "rejected_by": actor,
-        "rejected_at": decided_at.isoformat(),
-    }
-    waiting = (
-        (
-            await session.execute(
-                select(DeploymentStage).where(
-                    DeploymentStage.deployment_id == deployment.id,
-                    DeploymentStage.status == DeploymentStageStatus.PENDING.value,
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
-    for pending in waiting:
-        pending.status = DeploymentStageStatus.SKIPPED.value
-        pending.finished_at = decided_at
-        pending.log = "Skipped: approval was not given."
-
-    deployment.status = DeploymentStatus.HALTED.value
-    deployment.finished_at = decided_at
-    if deployment.started_at is not None:
-        deployment.duration_seconds = max(
-            0, int(round((decided_at - deployment.started_at).total_seconds()))
-        )
-    deployment.updated_by = actor
-    await session.flush()
-    await audit.record(
-        session,
+    resume = await hook(
+        session=session,
         principal=principal,
-        action="deployment.reject",
-        entity_type="Deployment",
-        entity_id=deployment.id,
-        entity_label=deployment.deployment_ref,
-        source_screen=SOURCE_SCREEN,
-        detail=reason,
-        metadata={"approval_request_id": row.id, "request_status": row.status},
+        approval_request=row,
+        approved=approved,
+        note=note,
         request=request,
     )
-    return None
+    return deployment.id if resume else None
+
+
+def _parked_on_a_closed_request(stmt: Select) -> Select:
+    """Narrow a query over requests to the closed ones a release still waits on.
+
+    "Waits" is read off the release, not the request: in flight, with its
+    Approval stage still Running. A release whose gate has been opened and whose
+    pipeline is simply still going has a closed request too, and is left alone.
+    """
+    # Imported here so the deployments service stays free to import this module.
+    from . import deployments as deployments_service
+
+    return (
+        stmt.join(
+            Deployment,
+            and_(
+                Deployment.approval_request_id == ApprovalRequest.id,
+                Deployment.workspace_id == ApprovalRequest.workspace_id,
+            ),
+        )
+        .join(DeploymentStage, DeploymentStage.deployment_id == Deployment.id)
+        .where(
+            ApprovalRequest.status.in_(
+                (
+                    ApprovalStatus.APPROVED.value,
+                    ApprovalStatus.REJECTED.value,
+                    ApprovalStatus.EXPIRED.value,
+                )
+            ),
+            Deployment.status.in_(deployments_service.IN_FLIGHT_STATUSES),
+            DeploymentStage.name == deployments_service.STAGE_APPROVAL,
+            DeploymentStage.status == DeploymentStageStatus.RUNNING.value,
+        )
+    )
 
 
 async def settle_decided_gates(session: AsyncSession, principal: Principal) -> list[str]:
@@ -778,26 +722,8 @@ async def settle_decided_gates(session: AsyncSession, principal: Principal) -> l
     parked = (
         (
             await session.execute(
-                select(ApprovalRequest)
-                .join(
-                    Deployment,
-                    and_(
-                        Deployment.approval_request_id == ApprovalRequest.id,
-                        Deployment.workspace_id == ApprovalRequest.workspace_id,
-                    ),
-                )
-                .where(
-                    ApprovalRequest.workspace_id == principal.workspace_id,
-                    ApprovalRequest.status.in_(
-                        (
-                            ApprovalStatus.APPROVED.value,
-                            ApprovalStatus.REJECTED.value,
-                            ApprovalStatus.EXPIRED.value,
-                        )
-                    ),
-                    Deployment.status.in_(
-                        (DeploymentStatus.QUEUED.value, DeploymentStatus.RUNNING.value)
-                    ),
+                _parked_on_a_closed_request(select(ApprovalRequest)).where(
+                    ApprovalRequest.workspace_id == principal.workspace_id
                 )
             )
         )
@@ -815,6 +741,57 @@ async def settle_decided_gates(session: AsyncSession, principal: Principal) -> l
         if deployment_id is not None:
             resume.append(deployment_id)
     return resume
+
+
+def _sweep_principal(workspace_id: str) -> Principal:
+    """How the gate sweep signs what it does, as the platform scheduler signs its own."""
+    return Principal(
+        workspace_id=workspace_id,
+        workspace_slug="",
+        engine_workspace="",
+        role=Role.OPERATOR,
+        kind="api_key",
+        api_key_id="platform-scheduler",
+        display_name="Platform Scheduler",
+    )
+
+
+async def settle_parked_gates() -> int:
+    """``settle_decided_gates`` for every workspace, on a session of its own.
+
+    Meant for the platform scheduler's tick (one worker at a time), next to the
+    SLA sweep: that sweep only visits workspaces with an overdue Pending request,
+    and a release parked on a request that is already *closed* has none. Returns
+    how many releases it found parked, each of which is resumed or halted.
+
+    The pipelines are started only after the commit, for the reason the routes
+    commit first: the runner works on its own connection and exits for good if
+    it finds the gate still shut.
+    """
+    # Imported here so the deployments service stays free to import this module.
+    from . import deployments as deployments_service
+
+    found = 0
+    resume: list[tuple[str, str]] = []
+    async with get_sessionmaker()() as session:
+        parked = (
+            await session.execute(
+                _parked_on_a_closed_request(
+                    select(ApprovalRequest.workspace_id, func.count(ApprovalRequest.id))
+                ).group_by(ApprovalRequest.workspace_id)
+            )
+        ).all()
+        for workspace_id, count in parked:
+            found += int(count)
+            for deployment_id in await settle_decided_gates(
+                session, _sweep_principal(workspace_id)
+            ):
+                resume.append((deployment_id, workspace_id))
+        await session.commit()
+
+    for deployment_id, workspace_id in resume:
+        await deployments_service.run_pipeline(deployment_id, workspace_id)
+    return found
 
 
 # ---------------------------------------------------------------------------

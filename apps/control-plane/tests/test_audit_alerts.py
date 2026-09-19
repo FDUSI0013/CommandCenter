@@ -246,6 +246,53 @@ async def test_a_burst_of_one_condition_is_one_alert_that_counts_every_occurrenc
     assert {response.json()["id"] for response in responses} == {row.id}
 
 
+async def test_a_quota_edit_that_loses_the_race_for_a_reference_keeps_the_edit(
+    admin_client, factory, workspace, db
+):
+    """A screen's evaluator raises inside the transaction of the edit behind it.
+
+    Losing the reference to another raise used to abort that transaction: the
+    admin's PATCH answered 500 and the ceiling stayed where it was.
+    """
+    quota = await factory.quota(workspace, name="Monthly tokens", used_value=500_000.0)
+
+    async with db.session() as rival:
+        # Another raise, caught between its insert and its commit. Nobody else
+        # can see its row yet, so the quota's evaluator counts none and reaches
+        # for ``al-1`` as well.
+        rival.add(
+            Alert(
+                workspace_id=workspace.id,
+                alert_ref="al-1",
+                title="Vector store unreachable",
+                source="Connection Center",
+                severity=AlertSeverity.CRITICAL.value,
+                status=AlertStatus.OPEN.value,
+                raised_at=dt.datetime.now(dt.UTC),
+            )
+        )
+        await rival.flush()
+        edit = asyncio.create_task(
+            admin_client.patch(f"/api/v1/quota/{quota.id}", json={"limit_value": 400_000.0})
+        )
+        # The edit cannot finish before the rival does; this is time for it to
+        # get as far as it can, which is past reading the references.
+        finished, _ = await asyncio.wait({edit}, timeout=1.5)
+        assert not finished
+        await rival.commit()
+
+    response = await edit
+    assert response.status_code == 200, response.text
+    assert response.json()["limit_value"] == 400_000.0
+    stored = await db.get(type(quota), quota.id)
+    assert (stored.limit_value, stored.status) == (400_000.0, "Exceeded")
+    rows = await db.scalars(select(Alert).where(Alert.workspace_id == workspace.id))
+    assert {row.alert_ref: row.source for row in rows} == {
+        "al-1": "Connection Center",
+        "al-2": QUOTA_SCREEN,
+    }
+
+
 async def test_two_raises_that_both_settle_for_an_opaque_reference_do_not_collide(
     as_role, workspace, db
 ):

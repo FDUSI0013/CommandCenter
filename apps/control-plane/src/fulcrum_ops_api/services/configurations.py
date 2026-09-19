@@ -1824,6 +1824,14 @@ async def rollback(
     configuration = await get_configuration(
         session, principal, configuration_id, lock=True
     )
+    # No Archived guard here, unlike Edit, New Version and Activate, and on
+    # purpose. Restore re-validates the body that was live when the row was
+    # archived; when that body no longer passes (a link whose target has gone,
+    # rules that tightened since) restore answers 422 and every other verb
+    # answers "restore it first". Rolling back to an earlier body that *does*
+    # pass is then the only way the configuration returns to service. It is an
+    # admin verb like restore, the body is validated below like restore's, and
+    # Archived -> Active is an edge in ``ALLOWED_TRANSITIONS``.
     current = await _current_version(session, principal, configuration.id)
 
     if payload.version:

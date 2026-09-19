@@ -534,14 +534,127 @@
   const GR_ACTIONS = ['Block','Mask','Warn','Log'];
   const GR_STATUS = ['Active','Disabled','Tuning'];
   const GR_SCOPES = ['Global','Agent','Environment'];
+  const GR_STATUS_LABEL = {
+    'Active':'Active — enforce the action',
+    'Tuning':'Tuning — record detections, enforce nothing',
+    'Disabled':'Disabled — do not check',
+  };
   // The inline checker on this deployment implements only these three
   // validations; any other type is recorded but cannot block or mask at ingest.
   const GR_ENFORCEABLE = ['PII','Topic','Prompt Injection'];
+  // `config` is what the content checker is told to look for, and these are the
+  // keys each type's form collects. A PATCH replaces the stored config whole, so
+  // a key no form owns is carried through an edit untouched.
+  const GR_CONFIG_KEYS = { 'Topic':['topics','mode'], 'PII':['entities','language'], 'Secrets':['patterns'], 'Custom':['validation','patterns'] };
+  // "Active" is a setting; whether live content is actually checked is a
+  // separate fact the server reports as `enforcement`. These three read Active
+  // and enforce nothing.
+  const GR_NOT_ENFORCED = ['unsupported','misconfigured','suspended'];
+
+  function grNotEnforced(r){
+    if(r.enforcement) return GR_NOT_ENFORCED.includes(r.enforcement);
+    return r.status === 'Active' && r.checker_supported === false;
+  }
+  function grReason(r){
+    return r.not_enforced_reason
+      || "This deployment's content checker does not implement this validation, so the rule is recorded but never enforced at ingest.";
+  }
+  function grStatusColor(r){
+    return grNotEnforced(r) ? 'red' : r.status === 'Active' ? 'green' : r.status === 'Tuning' ? 'amber' : 'gray';
+  }
+  /** The status as the server set it, plus the warning when it enforces nothing. */
+  function grStatusCell(r){
+    return statusText(r.status, r.status === 'Active' ? 'green' : r.status === 'Tuning' ? 'amber' : 'gray')
+      + (grNotEnforced(r) ? ` <span title="${esc(grReason(r))}">${badge('Not enforced','red')}</span>` : '');
+  }
+
+  /** The type-specific inputs for what the checker is told to look for. */
+  function grConfigFields(type, config){
+    const c = config || {};
+    const list = (v) => Array.isArray(v) ? v.join('\n') : '';
+    if(type === 'Topic') return `
+      <div class="form-row"><label>TOPICS (ONE PER LINE)</label>
+        <textarea class="input" id="gcTopics" rows="3" placeholder="e.g. investment advice">${esc(list(c.topics))}</textarea>
+        <div class="small faint" style="margin-top:4px">Required: a Topic guardrail with no topics is saved but never enforced.</div></div>
+      <div class="form-row"><label>MODE</label><select class="filter-select w-100" id="gcMode" style="height:34px">
+        <option value="restrict" ${c.mode === 'allow' ? '' : 'selected'}>Restrict — trigger on content about these topics</option>
+        <option value="allow" ${c.mode === 'allow' ? 'selected' : ''}>Allow — trigger on content about anything else</option></select></div>`;
+    if(type === 'PII') return `
+      <div class="grid g2">
+        <div class="form-row"><label>ENTITIES (OPTIONAL)</label>
+          <input class="input" id="gcEntities" value="${esc((Array.isArray(c.entities) ? c.entities : []).join(', '))}" placeholder="Comma-separated entity labels"></div>
+        <div class="form-row"><label>LANGUAGE (OPTIONAL)</label>
+          <input class="input" id="gcLang" value="${esc(typeof c.language === 'string' ? c.language : '')}" placeholder="e.g. en"></div>
+      </div>
+      <div class="small faint" style="margin:-2px 0 8px">Left blank, the checker uses its own entity list and language.</div>`;
+    if(GR_CONFIG_KEYS[type]){
+      const p = c.patterns && typeof c.patterns === 'object' ? c.patterns : {};
+      return `${type === 'Custom' ? `<div class="form-row"><label>VALIDATOR NAME (OPTIONAL)</label>
+          <input class="input" id="gcValidation" value="${esc(typeof c.validation === 'string' ? c.validation : '')}" placeholder="A bespoke validator the checker runs under this name"></div>` : ''}
+        <div class="form-row"><label>PATTERNS (OPTIONAL — ONE PER LINE, LABEL = REGULAR EXPRESSION)</label>
+          <textarea class="input mono" id="gcPatterns" rows="3" placeholder="INVOICE_NO = INV-[0-9]{6}">${esc(Object.keys(p).map(k => `${k} = ${p[k]}`).join('\n'))}</textarea></div>`;
+    }
+    return '';
+  }
+
+  /**
+   * The config the form describes, or null after saying what is wrong with it.
+   *
+   * `stored` is the config being edited: every key this type's form does not
+   * own rides along, because the server replaces the config with what is sent.
+   */
+  function grReadConfig(modal, type, stored, storedType){
+    const out = Object.assign({}, stored || {});
+    // The checker is sent every key it finds, so what the previous type's form
+    // collected must not follow the guardrail into a type it means nothing to.
+    if(storedType && storedType !== type) (GR_CONFIG_KEYS[storedType] || []).forEach(k => { delete out[k]; });
+    const val = (sel) => { const el = modal.querySelector(sel); return el ? el.value : ''; };
+    const names = (text) => text.split(/[\n,]/).map(x => x.trim()).filter(Boolean);
+    const put = (key, value, keep) => { if(keep) out[key] = value; else delete out[key]; };
+
+    if(type === 'Topic'){
+      const topics = names(val('#gcTopics'));
+      if(!topics.length && !out.validation){
+        toast('error','Topics required','A Topic guardrail checks for the topics it is given. Add at least one.');
+        return null;
+      }
+      put('topics', topics, topics.length > 0);
+      out.mode = val('#gcMode') === 'allow' ? 'allow' : 'restrict';
+    } else if(type === 'PII'){
+      const entities = names(val('#gcEntities'));
+      put('entities', entities, entities.length > 0);
+      const lang = val('#gcLang').trim();
+      put('language', lang, Boolean(lang));
+    } else if(GR_CONFIG_KEYS[type]){
+      if(type === 'Custom'){
+        const validation = val('#gcValidation').trim();
+        put('validation', validation, Boolean(validation));
+      }
+      const patterns = {};
+      const lines = val('#gcPatterns').split('\n');
+      for(let i = 0; i < lines.length; i++){
+        const line = lines[i].trim();
+        if(!line) continue;
+        const cut = line.indexOf('=');
+        const label = cut < 0 ? '' : line.slice(0, cut).trim();
+        const expr = cut < 0 ? '' : line.slice(cut + 1).trim();
+        if(!label || !expr){
+          toast('error','Pattern not understood', `Line ${i + 1}: write each pattern as LABEL = regular expression.`);
+          return null;
+        }
+        patterns[label] = expr;
+      }
+      put('patterns', patterns, Object.keys(patterns).length > 0);
+    }
+    return out;
+  }
 
   SCREENS['guardrails'] = {
     title:'Guardrails',
     render(main){
-      let selectedId = null;
+      // `painted` is the row the inspector was last drawn from, as text, so a
+      // table reload can tell whether the selected guardrail has moved under it.
+      let selectedId = null, painted = null;
 
       main.innerHTML = `
         ${pageHead({title:'Guardrails', sub:'Runtime safety filters for prompts and responses — injection, PII, toxicity, hallucination, and secrets.',
@@ -562,9 +675,14 @@
           .then(s => {
             if(!document.getElementById('grKpis')) return;
             const w = `vs previous ${s.window_days} days`;
+            // An Active guardrail the checker cannot run protects nothing, so
+            // the card that counts them says how many of them that is.
+            const suspended = s.suspended_validations || [];
             host.innerHTML = kpiRow([
-              { label:'Active Guardrails', value:fmtFull(s.active), icon:'shieldCheck', color:'purple',
-                sub:`of ${fmtFull(s.configured)} configured · ${fmtFull(s.disabled)} disabled, ${fmtFull(s.tuning)} tuning` },
+              { label:'Active Guardrails', value:fmtFull(s.active), icon:'shieldCheck', color: s.not_enforced ? 'red' : 'purple',
+                sub:`of ${fmtFull(s.configured)} configured · ${fmtFull(s.disabled)} disabled, ${fmtFull(s.tuning)} tuning`
+                  + (s.not_enforced ? ` · ${fmtFull(s.not_enforced)} not enforced` : '')
+                  + (suspended.length ? ` · suspended: ${suspended.join(', ')}` : '') },
               { label:`Triggers (${s.window_days}d)`, value:fmtFull(s.triggers), icon:'zap', color:'amber',
                 delta: s.triggers_delta_percent == null ? null : Math.abs(s.triggers_delta_percent).toFixed(1) + '%',
                 dir: dirOf(s.triggers_delta_percent), good: s.triggers_delta_percent <= 0, vs: w },
@@ -582,13 +700,9 @@
 
       const table = dataTable({
         columns:[
-          { key:'name', label:'Guardrail', render:r => entityCell(r.name, r.coverage, 'shieldCheck',
-              r.status === 'Active' ? 'green' : r.status === 'Tuning' ? 'amber' : 'gray') },
-          { key:'guardrail_type', label:'Type', render:r => badge(r.guardrail_type, 'purple')
-              + (r.checker_supported === false
-                ? ` <span class="small faint" title="This deployment's content checker does not implement this validation; the rule is recorded but not enforced at ingest.">not enforced</span>`
-                : '') },
-          { key:'status', label:'Status', render:r => statusText(r.status, r.status === 'Active' ? 'green' : r.status === 'Tuning' ? 'amber' : 'gray') },
+          { key:'name', label:'Guardrail', render:r => entityCell(r.name, r.coverage, 'shieldCheck', grStatusColor(r)) },
+          { key:'guardrail_type', label:'Type', render:r => badge(r.guardrail_type, 'purple') },
+          { key:'status', label:'Status', render:grStatusCell },
           { key:'action', label:'Action', render:r => badge(r.action, r.action === 'Block' ? 'red' : r.action === 'Mask' ? 'amber' : 'gray') },
           { key:'triggers_30d', label:'Triggers (30d)', align:'right', cls:'num', render:r => num(r.triggers_30d) },
           { key:'blocked_30d', label:'Blocked (30d)', align:'right', cls:'num', render:r => num(r.blocked_30d) },
@@ -607,16 +721,22 @@
         ],
         source: (params) => API.guardrails.list(params),
         exportSource: (params) => API.guardrails.export(params),
-        onLoad: () => loadSummary(),
+        // The KPI cards do not depend on the table's page, sort, filter or
+        // search, and each summary is a heavy read server-side — so it loads
+        // once with the screen and again after a change, not on every reload.
+        onLoad: resync,
         autoSelectFirst: true,
-        onSelect: showGuardrail,
+        onSelect: (row) => showGuardrail(row),
         rowActions: r => [
           { label:'Test Guardrail', icon:'beaker', onClick:()=>openTest(r) },
           { label:'Tune Threshold', icon:'sliders', onClick:()=>openTune(r) },
+          { label:'Edit Guardrail', icon:'edit', onClick:()=>openEdit(r) },
           { sep:true },
-          r.status === 'Active'
-            ? { label:'Disable', icon:'xCircle', danger:true, onClick:()=>toggle(r, false) }
-            : { label:'Enable', icon:'checkCircle', onClick:()=>toggle(r, true) },
+          ...(r.status !== 'Active' ? [{ label:'Enable', icon:'checkCircle', onClick:()=>setStatus(r, 'Active') }] : []),
+          ...(r.status !== 'Tuning' ? [{ label:'Run in Tuning', icon:'eye', onClick:()=>setStatus(r, 'Tuning') }] : []),
+          ...(r.status !== 'Disabled' ? [{ label:'Disable', icon:'xCircle', danger:true, onClick:()=>setStatus(r, 'Disabled') }] : []),
+          { sep:true },
+          { label:'Delete Guardrail', icon:'trash', danger:true, onClick:()=>remove(r) },
         ],
       });
 
@@ -625,29 +745,72 @@
       wrap.appendChild(table.el);
       document.getElementById('grSearch').addEventListener('input', e => table.search(e.target.value));
       document.getElementById('grExport').addEventListener('click', () => table.export());
+      loadSummary();
 
       // ---- inspector -------------------------------------------------------
-      function showGuardrail(row){
+      /** What the checker is told to look for, as the rows of the config card. */
+      function configRows(row){
+        const c = row.config || {};
+        const tags = (v) => v.map(x => `<span class="tag">${esc(x)}</span>`).join('');
+        const rows = [];
+        if(row.guardrail_type === 'Topic'){
+          rows.push(['Topics', Array.isArray(c.topics) && c.topics.length ? tags(c.topics)
+            : `<span class="${c.validation ? 'faint' : 'st-red'}">none configured</span>`]);
+          rows.push(['Mode', c.mode === 'allow' ? 'Allow — only these topics' : 'Restrict — these topics']);
+        }
+        if(Array.isArray(c.entities) && c.entities.length) rows.push(['Entities', tags(c.entities)]);
+        if(typeof c.language === 'string' && c.language) rows.push(['Language', esc(c.language)]);
+        if(typeof c.validation === 'string' && c.validation) rows.push(['Validator', `<span class="mono">${esc(c.validation)}</span>`]);
+        if(c.patterns && typeof c.patterns === 'object' && Object.keys(c.patterns).length) rows.push(['Patterns', tags(Object.keys(c.patterns))]);
+        return rows;
+      }
+
+      function closeInspector(){
+        selectedId = null; painted = null;
+        const layout = document.getElementById('grLayout'), insp = document.getElementById('grInspector');
+        if(layout) layout.classList.add('collapsed');
+        if(insp) insp.innerHTML = '';
+      }
+
+      /**
+       * Redraw the inspector when the table reloads with a newer copy of the
+       * guardrail it shows.
+       *
+       * The table replaces its rows on every refresh but only calls onSelect on
+       * a click, so after Enable, Disable, Tune or Edit the inspector kept the
+       * old status, threshold and action — and its Tune button opened on them
+       * and posted them back. A panel the reader closed stays closed.
+       */
+      function resync(rows){
+        if(selectedId == null) return;
+        const cur = (rows || []).find(x => x.id === selectedId);
+        if(cur && JSON.stringify(cur) !== painted) showGuardrail(cur, true);
+      }
+
+      function showGuardrail(row, keepClosed){
         const insp = document.getElementById('grInspector');
         if(!insp || !row) return;
         selectedId = row.id;
-        document.getElementById('grLayout').classList.remove('collapsed');
+        painted = JSON.stringify(row);
+        if(!keepClosed) document.getElementById('grLayout').classList.remove('collapsed');
         insp.innerHTML = `
           <div class="insp-head"><div class="grow">
-            <div class="insp-title">${esc(row.name)} ${statusText(row.status, row.status === 'Active' ? 'green' : row.status === 'Tuning' ? 'amber' : 'gray')}</div>
+            <div class="insp-title">${esc(row.name)} ${grStatusCell(row)}</div>
             <div class="insp-sub">${esc(row.guardrail_type)} · ${esc(row.coverage)}</div></div>
             <button class="icon-btn insp-close" id="grClose">${ICONS.x}</button></div>
+          ${grNotEnforced(row) ? `<div class="insp-section"><div class="quote" style="border-color:rgba(239,68,68,.4)">
+            <b style="color:#B91C1C">Not enforced</b><div class="small dim" style="margin-top:3px">${esc(grReason(row))}</div></div></div>` : ''}
           ${inspSection('Configuration','settings', kv([
             ['Action', badge(row.action, row.action === 'Block' ? 'red' : row.action === 'Mask' ? 'amber' : 'gray')],
             ['Scope', esc(row.scope) + (row.scope_ref ? ` · <span class="mono">${esc(row.scope_ref)}</span>` : '')],
             ['Coverage', esc(row.coverage)],
             ['Threshold', row.threshold == null ? dash : Number(row.threshold).toFixed(2) + ' (confidence)'],
+            ...configRows(row),
             ['Added Latency', ms(row.added_latency_ms)],
             ['Owner', row.owner_name ? esc(row.owner_name) : dash],
             ['Updated', row.updated_at ? fmtDateTime(ts(row.updated_at)) : dash],
-          ]) + (row.checker_supported === false
-            ? `<div class="small" style="margin-top:8px;color:var(--amber,#b58900)">This deployment's content checker does not implement the ${esc(row.guardrail_type)} validation, so this rule is recorded but never enforced at ingest. Agents can still report its verdicts through the SDK.</div>`
-            : ''))}
+          ]) + (row.enforcement === 'shadow' && row.not_enforced_reason
+            ? `<div class="small faint" style="margin-top:8px">${esc(row.not_enforced_reason)}</div>` : ''))}
           ${inspSection('Activity (30d)','chart', `<div class="grid g2" style="gap:8px">
             ${[['Triggers', num(row.triggers_30d)], ['Blocked', num(row.blocked_30d)],
                ['Masked', num(row.masked_30d)],
@@ -660,10 +823,14 @@
             <div id="grEvents"><div class="card-loading" style="height:90px"></div></div></div>
           <div class="insp-section"><div class="grid g2" style="gap:8px">
             <button class="btn sm primary" id="grTest"${gate('operator','Testing a guardrail requires the operator role.')}>${ICONS.beaker}Test</button>
-            <button class="btn sm" id="grTune"${gate('admin','Tuning a guardrail requires the admin role.')}>${ICONS.sliders}Tune</button></div></div>`;
+            <button class="btn sm" id="grTune"${gate('admin','Tuning a guardrail requires the admin role.')}>${ICONS.sliders}Tune</button>
+            <button class="btn sm" id="grEdit"${gate('admin','Editing a guardrail requires the admin role.')}>${ICONS.edit}Edit</button>
+            <button class="btn sm danger" id="grDelete"${gate('admin','Deleting a guardrail requires the admin role.')}>${ICONS.trash}Delete</button></div></div>`;
         insp.querySelector('#grClose').addEventListener('click', ()=>document.getElementById('grLayout').classList.add('collapsed'));
         insp.querySelector('#grTest').addEventListener('click', ()=>openTest(row));
         insp.querySelector('#grTune').addEventListener('click', ()=>openTune(row));
+        insp.querySelector('#grEdit').addEventListener('click', ()=>openEdit(row));
+        insp.querySelector('#grDelete').addEventListener('click', ()=>remove(row));
         insp.querySelector('#grEvExport').addEventListener('click', async () => {
           try { await API.guardrails.eventsExport({ guardrail_id: row.id }); toast('success','Export complete','Detections exported to CSV.'); }
           catch (err) { toast('error','Export failed', errText(err)); }
@@ -699,16 +866,23 @@
       }
 
       // ---- actions ---------------------------------------------------------
-      async function toggle(r, on){
-        if(!allowed('operator','Enabling or disabling a guardrail requires the operator role.')) return;
+      /** Move a guardrail between Active, Tuning (shadow) and Disabled. */
+      async function setStatus(r, to){
+        if(!allowed('operator','Changing a guardrail\'s status requires the operator role.')) return;
+        const verb = to === 'Active' ? API.guardrails.enable : to === 'Tuning' ? API.guardrails.shadow : API.guardrails.disable;
         try {
-          const res = await Store.mutate(() => on ? API.guardrails.enable(r.id) : API.guardrails.disable(r.id),
-            { event:'guardrails:changed' });
-          toast(on ? 'success' : 'warn', on ? 'Guardrail enabled' : 'Guardrail disabled', res.message || r.name);
+          const res = await Store.mutate(() => verb(r.id), { event:'guardrails:changed' });
+          const state = (res.data && res.data.enforcement) || null;
+          // Enable can succeed and still protect nothing; the person who just
+          // pressed it is the one who needs to hear that, so it is not a success.
+          if(to === 'Active' && GR_NOT_ENFORCED.includes(state)) toast('warn','Enabled, but not enforced', res.message || r.name, 8000);
+          else if(to === 'Active') toast('success','Guardrail enabled', res.message || r.name);
+          else if(to === 'Tuning') toast('info','Guardrail is tuning', res.message || r.name);
+          else toast('warn','Guardrail disabled', res.message || r.name);
           table.refresh();
           loadSummary();
         } catch (err) {
-          toast('error', on ? 'Could not enable' : 'Could not disable', errText(err));
+          toast('error', to === 'Active' ? 'Could not enable' : to === 'Tuning' ? 'Could not start tuning' : 'Could not disable', errText(err));
         }
       }
 
@@ -779,10 +953,12 @@
                 if(Number.isNaN(threshold) || threshold < 0 || threshold > 1){
                   toast('error','Threshold out of range','Enter a threshold between 0 and 1.'); return;
                 }
-                const body = {
-                  threshold,
-                  action: modal.querySelector('#tuAction').value,
-                };
+                // The server applies any action it is sent, so one the admin
+                // did not touch stays out of the request: a form opened on an
+                // older copy of the row must not put its old action back.
+                const body = { threshold };
+                const action = modal.querySelector('#tuAction').value;
+                if(action !== r.action) body.action = action;
                 const reason = modal.querySelector('#tuReason').value.trim();
                 if(reason) body.reason = reason;
                 close();
@@ -799,45 +975,93 @@
         });
       }
 
+      // ---- create, edit, delete ---------------------------------------------
+      /** The form New Guardrail and Edit Guardrail share; `r` is the row being edited. */
+      function guardrailForm(r){
+        const v = r || { name:'', guardrail_type:GR_TYPES[0], action:GR_ACTIONS[0], status:'Active', scope:'Global', scope_ref:'' };
+        const opts = (list, sel, label) => list.map(x =>
+          `<option value="${esc(x)}" ${x === sel ? 'selected' : ''}>${esc(label ? label(x) : x)}</option>`).join('');
+        return `<div class="form-row"><label>NAME</label><input class="input" id="gfName" value="${esc(v.name)}" placeholder="e.g. Regulated Advice Filter"></div>
+          <div class="grid g2">
+            <div class="form-row"><label>TYPE</label><select class="filter-select w-100" id="gfType" style="height:34px">${opts(GR_TYPES, v.guardrail_type, t => t + (GR_ENFORCEABLE.includes(t) ? '' : ' — recorded only'))}</select></div>
+            <div class="form-row"><label>ACTION</label><select class="filter-select w-100" id="gfAction" style="height:34px">${opts(GR_ACTIONS, v.action)}</select></div>
+          </div>
+          <div class="small faint" id="gfTypeHint" style="margin:-2px 0 8px"></div>
+          <div id="gfConfig"></div>
+          <div class="grid g2">
+            <div class="form-row"><label>SCOPE</label><select class="filter-select w-100" id="gfScope" style="height:34px">${opts(GR_SCOPES, v.scope)}</select></div>
+            <div class="form-row"><label>THRESHOLD (0–1)</label><input class="input" id="gfThreshold" type="number" min="0" max="1" step="0.01" value="${r ? esc(String(r.threshold)) : '0.80'}"></div>
+          </div>
+          <div class="form-row" id="gfRefRow"><label>SCOPE REFERENCE</label>
+            <input class="input" id="gfRef" value="${esc(v.scope_ref || '')}" placeholder="Agent id, or environment name"></div>
+          <div class="form-row"><label>STATUS</label><select class="filter-select w-100" id="gfStatus" style="height:34px">${opts(GR_STATUS, v.status, s => GR_STATUS_LABEL[s] || s)}</select></div>`;
+      }
+
+      function wireGuardrailForm(modal, r){
+        const scope = modal.querySelector('#gfScope'), refRow = modal.querySelector('#gfRefRow');
+        const paintRef = ()=>{ refRow.style.display = scope.value === 'Global' ? 'none' : ''; };
+        scope.addEventListener('change', paintRef); paintRef();
+        // The person choosing an unenforceable type deserves to know now, and
+        // what the checker is told to look for depends on the type chosen.
+        const type = modal.querySelector('#gfType'), hint = modal.querySelector('#gfTypeHint');
+        const paintType = ()=>{
+          hint.textContent = GR_ENFORCEABLE.includes(type.value)
+            ? 'Enforced at ingest by the inline content checker.'
+            : 'Recorded only: the content checker on this deployment does not implement this validation, so it cannot block or mask at ingest. Agents can still report its verdicts through the SDK.';
+          modal.querySelector('#gfConfig').innerHTML = grConfigFields(type.value, r ? r.config : null);
+        };
+        type.addEventListener('change', paintType); paintType();
+      }
+
+      /** What the form holds, or null after saying which field needs attention. */
+      function readGuardrailForm(modal, r){
+        const name = modal.querySelector('#gfName').value.trim();
+        if(!name){ toast('error','Name required','Give the guardrail a name.'); return null; }
+        // min/max on a number input do not stop typed values, and a blank one
+        // must not quietly become a default the admin never chose.
+        const threshold = parseFloat(modal.querySelector('#gfThreshold').value);
+        if(Number.isNaN(threshold) || threshold < 0 || threshold > 1){
+          toast('error','Threshold out of range','Enter a threshold between 0 and 1.'); return null;
+        }
+        const scope = modal.querySelector('#gfScope').value;
+        const ref = modal.querySelector('#gfRef').value.trim();
+        if(scope !== 'Global' && !ref){
+          toast('error','Scope reference required', `Name the ${scope === 'Agent' ? 'agent id' : 'environment'} this guardrail applies to.`);
+          return null;
+        }
+        const type = modal.querySelector('#gfType').value;
+        const config = grReadConfig(modal, type, r ? r.config : null, r ? r.guardrail_type : null);
+        if(!config) return null;
+        return {
+          name, guardrail_type: type,
+          action: modal.querySelector('#gfAction').value,
+          status: modal.querySelector('#gfStatus').value,
+          threshold, scope, scope_ref: scope === 'Global' ? null : ref, config,
+        };
+      }
+
+      /** Say what the saved guardrail actually does to live content. */
+      function announce(title, g){
+        if(grNotEnforced(g)) toast('warn', `${title}, but not enforced`, grReason(g), 8000);
+        else if(g.status === 'Tuning') toast('success', title, `${g.name} records detections across ${g.coverage}; nothing is enforced while it is tuning.`);
+        else if(g.status === 'Disabled') toast('success', title, `${g.name} is saved but disabled.`);
+        else toast('success', title, `${g.name} is enforcing across ${g.coverage}.`);
+      }
+
       document.getElementById('grNew').addEventListener('click', () => {
         if(!allowed('admin','Creating a guardrail requires the admin role.')) return;
         openModal({
           title:'New Guardrail', icon:'shieldCheck',
-          body:`<div class="form-row"><label>NAME</label><input class="input" id="ngName" placeholder="e.g. Regulated Advice Filter"></div>
-            <div class="grid g2">
-              <div class="form-row"><label>TYPE</label><select class="filter-select w-100" id="ngType" style="height:34px">${GR_TYPES.map(t=>`<option value="${t}">${t}${GR_ENFORCEABLE.includes(t) ? '' : ' — recorded only'}</option>`).join('')}</select></div>
-              <div class="form-row"><label>ACTION</label><select class="filter-select w-100" id="ngAction" style="height:34px">${GR_ACTIONS.map(a=>`<option>${a}</option>`).join('')}</select></div>
-            </div>
-            <div class="grid g2">
-              <div class="form-row"><label>SCOPE</label><select class="filter-select w-100" id="ngScope" style="height:34px">${GR_SCOPES.map(s=>`<option>${s}</option>`).join('')}</select></div>
-              <div class="form-row"><label>THRESHOLD</label><input class="input" id="ngThreshold" type="number" min="0" max="1" step="0.01" value="0.80"></div>
-            </div>
-            <div class="form-row" id="ngRefRow" style="display:none"><label>SCOPE REFERENCE</label>
-              <input class="input" id="ngRef" placeholder="Agent id, or environment name"></div>
-            <div class="small faint" id="ngTypeHint" style="margin-top:2px"></div>`,
+          body: guardrailForm(null),
           footer:[
             { label:'Cancel' },
             { label:'Create Guardrail', cls:'primary', onClick: async (close, modal) => {
-                const name = modal.querySelector('#ngName').value.trim();
-                if(!name){ toast('error','Name required','Give the guardrail a name before creating it.'); return; }
-                const scope = modal.querySelector('#ngScope').value;
-                const body = {
-                  name,
-                  guardrail_type: modal.querySelector('#ngType').value,
-                  action: modal.querySelector('#ngAction').value,
-                  status: 'Active',
-                  threshold: parseFloat(modal.querySelector('#ngThreshold').value) || 0.8,
-                  scope,
-                  config: {},
-                };
-                const ref = modal.querySelector('#ngRef').value.trim();
-                if(scope !== 'Global' && ref) body.scope_ref = ref;
+                const body = readGuardrailForm(modal, null);
+                if(!body) return;
                 close();
                 try {
                   const created = await Store.mutate(() => API.guardrails.create(body), { event:'guardrails:changed' });
-                  toast('success','Guardrail created', GR_ENFORCEABLE.includes(created.guardrail_type)
-                    ? `${created.name} is enforcing across ${created.coverage}.`
-                    : `${created.name} is recorded; this deployment's checker cannot enforce it.`);
+                  announce('Guardrail created', created);
                   table.refresh();
                   loadSummary();
                 } catch (err) {
@@ -845,18 +1069,62 @@
                 }
               } },
           ],
-          onOpen(modal){
-            const scope = modal.querySelector('#ngScope'), row = modal.querySelector('#ngRefRow');
-            scope.addEventListener('change', ()=>{ row.style.display = scope.value === 'Global' ? 'none' : ''; });
-            // The person creating an unenforceable type deserves to know now.
-            const type = modal.querySelector('#ngType'), hint = modal.querySelector('#ngTypeHint');
-            const paintHint = ()=>{ hint.textContent = GR_ENFORCEABLE.includes(type.value)
-              ? 'Enforced at ingest by the inline content checker.'
-              : 'Recorded only: the content checker on this deployment does not implement this validation, so it cannot block or mask at ingest. Agents can still report its verdicts through the SDK.'; };
-            type.addEventListener('change', paintHint); paintHint();
-          },
+          onOpen(modal){ wireGuardrailForm(modal, null); },
         });
       });
+
+      function openEdit(r){
+        if(!allowed('admin','Editing a guardrail requires the admin role.')) return;
+        openModal({
+          title:'Edit Guardrail — ' + r.name, icon:'edit',
+          body: guardrailForm(r),
+          footer:[
+            { label:'Cancel' },
+            { label:'Save Changes', cls:'primary', onClick: async (close, modal) => {
+                const form = readGuardrailForm(modal, r);
+                if(!form) return;
+                // Only what changed is sent, so the audit trail names the fields
+                // that moved. `config` always travels whole: the server replaces it.
+                const same = (a, b) => JSON.stringify(a == null ? null : a) === JSON.stringify(b == null ? null : b);
+                const body = {};
+                Object.keys(form).forEach(k => { if(!same(form[k], k === 'config' ? (r.config || {}) : r[k])) body[k] = form[k]; });
+                close();
+                if(!Object.keys(body).length){ toast('info','Nothing to save','No field was changed.'); return; }
+                // Refused with 409 if someone else saved this guardrail since it was read.
+                if(r.updated_at) body.expected_updated_at = r.updated_at;
+                try {
+                  const updated = await Store.mutate(() => API.guardrails.update(r.id, body), { event:'guardrails:changed' });
+                  announce('Guardrail updated', updated);
+                } catch (err) {
+                  toast('error','Could not save the guardrail', errText(err));
+                }
+                // Also after a refusal: a 409 means the row on screen is stale.
+                table.refresh();
+                loadSummary();
+              } },
+          ],
+          onOpen(modal){ wireGuardrailForm(modal, r); },
+        });
+      }
+
+      function remove(r){
+        if(!allowed('admin','Deleting a guardrail requires the admin role.')) return;
+        confirmModal({
+          title:'Delete Guardrail', danger:true, confirmLabel:'Delete',
+          msg:`Delete ${r.name}? Its recorded detections are deleted with it; the audit trail is kept. To stop enforcing it and keep its history, disable it instead.`,
+          onConfirm: async () => {
+            try {
+              await Store.mutate(() => API.guardrails.remove(r.id), { event:'guardrails:changed' });
+              toast('success','Guardrail deleted', r.name);
+              if(selectedId === r.id) closeInspector();
+              table.refresh();
+              loadSummary();
+            } catch (err) {
+              toast('error','Could not delete the guardrail', errText(err));
+            }
+          },
+        });
+      }
     },
   };
 
@@ -871,6 +1139,11 @@
   function resultColor(result){
     return result === 'Passed' ? 'green' : result === 'Warning' || result === 'Running' || result === 'Queued' ? 'amber'
       : result === 'Never Run' ? 'gray' : 'red';
+  }
+  /** How a run ended, as opposed to the pass-rate verdict `resultColor` paints. */
+  function runStatusColor(status){
+    return status === 'Passed' ? 'green' : status === 'Running' || status === 'Queued' ? 'amber'
+      : status === 'Cancelled' ? 'gray' : 'red';
   }
 
   SCREENS['testing'] = {
@@ -955,7 +1228,10 @@
         ],
         source: (params) => API.testing.list(params),
         exportSource: (params) => API.testing.export(params),
-        onLoad: (rows) => { loadSummary(); fillOwners(rows); },
+        // The KPI cards are workspace-wide — no page, sort, filter or search
+        // changes them — and the summary reads two windows of runs, so it is
+        // asked for once with the screen and again after a change.
+        onLoad: fillOwners,
         autoSelectFirst: true,
         onSelect: showSuite,
         rowActions: r => [
@@ -971,8 +1247,29 @@
       const wrap = document.getElementById('tsTableWrap');
       wrap.insertBefore(table.filterEl, wrap.firstChild);
       wrap.insertBefore(table.el, document.getElementById('tsAlt'));
-      document.getElementById('tsSearch').addEventListener('input', e => { if(activeTab === 0) table.search(e.target.value); });
-      document.getElementById('tsExport').addEventListener('click', () => table.export());
+      /* The header's Search and Export belong to whichever tab is showing. They
+         used to be wired to the suites table alone, so Export on the Test Runs
+         tab downloaded the suites CSV (and said so in a success toast) while the
+         runs export had no control anywhere. A tab with no server-side CSV
+         disables the button rather than exporting something else. */
+      let activeTable = null;
+      function setActive(t, label, exportable){
+        activeTable = t || null;
+        const box = document.getElementById('tsSearch'), exp = document.getElementById('tsExport');
+        if(box){
+          box.disabled = !activeTable;
+          box.value = activeTable ? (activeTable.state.query || '') : '';
+          box.placeholder = activeTable ? `Search ${label}…` : 'Nothing to search on this tab';
+        }
+        if(exp){
+          exp.disabled = !(activeTable && exportable);
+          exp.title = exp.disabled ? 'This tab has no CSV export.' : '';
+        }
+      }
+      setActive(table, 'test suites', true);
+      document.getElementById('tsSearch').addEventListener('input', e => { if(activeTable) activeTable.search(e.target.value); });
+      document.getElementById('tsExport').addEventListener('click', () => { if(activeTable) activeTable.export(); });
+      loadSummary();
 
       function fillOwners(rows){
         const sel = table.filterEl && table.filterEl.querySelector('[data-fi="3"]');
@@ -1002,7 +1299,9 @@
         const suitesOn = i === 0;
         table.el.style.display = suitesOn ? '' : 'none';
         table.filterEl.style.display = suitesOn ? '' : 'none';
-        if(suitesOn) return;
+        if(suitesOn){ setActive(table, 'test suites', true); return; }
+        // Each tab that holds a table claims the header controls for it.
+        setActive(null);
         if(i === 1) tabRuns(alt);
         else if(i === 2) tabDatasets(alt);
         else if(i === 3) tabEvaluations(alt);
@@ -1018,8 +1317,15 @@
             // The suite name lives on the joined suite, so the run query cannot order by it.
             { key:'suite_name', label:'Suite', sortable:false, render:r => `<span class="cell-main">${esc(r.suite_name || '—')}</span>` },
             { key:'trigger', label:'Trigger', render:r => badge(r.trigger, 'gray') },
-            // The verdict the server orders by is the run's status column.
-            { key:'status', label:'Result', render:r => statusText(r.result, resultColor(r.result)) },
+            // Two different facts. `status` is how the run ended — Failed when
+            // any case failed — and is what the server sorts and filters on, so
+            // it is what this column shows. `result` is the pass-rate verdict
+            // (90% of cases passing reads Passed): shown as `status` it made a
+            // green "Passed" row vanish under Status = Passed and turn up under
+            // Failed. The verdict gets its own column, and only once there is one.
+            { key:'status', label:'Status', render:r => statusText(r.status, runStatusColor(r.status)) },
+            { key:'result', label:'Verdict', sortable:false, render:r =>
+                r.status === 'Passed' || r.status === 'Failed' ? badge(r.result, resultColor(r.result)) : dash },
             { key:'pass_rate', label:'Pass Rate', align:'right', cls:'num', render:r => r.pass_rate == null ? dash : pct(r.pass_rate) },
             { key:'total_cases', label:'Cases', align:'right', cls:'num', render:r => `${num(r.passed)} / ${num(r.total_cases)}` },
             { key:'regression_count', label:'Regressions', align:'right', cls:'num', sortable:false, render:r => num(r.regression_count) },
@@ -1039,6 +1345,7 @@
         });
         host.appendChild(t.filterEl);
         host.appendChild(t.el);
+        setActive(t, 'test runs', true);
       }
 
       function openRunDetail(row){
@@ -1378,6 +1685,7 @@
         }
         toast('info','Suite queued', `${r.name} — run ${started.run_ref}.`);
         table.refresh();
+        loadSummary();
         pollers.push(progressModal({
           title:'Run Progress — ' + r.name, icon:'play',
           poll: () => API.testing.progress(r.id, started.id),
@@ -1398,6 +1706,7 @@
           const res = await Store.mutate(() => API.testing.promoteBaseline(r.id, runId || null), { event:'testing:changed' });
           toast('success','Baseline promoted', res.message || `${r.name} has a new baseline.`);
           table.refresh();
+          loadSummary();
           if(activeTab === 4) switchTab(4);
           if(selected && selected.id === r.id) API.testing.get(r.id).then(showSuite).catch(()=>{});
         } catch (err) {

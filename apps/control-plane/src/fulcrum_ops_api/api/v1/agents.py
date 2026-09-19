@@ -394,12 +394,14 @@ async def run_agent(
     payload: AgentRunRequest,
     request: Request,
 ) -> ActionResult:
-    """Trigger one execution from the console.
+    """Record a requested execution and return its `run_id`.
 
-    The invocation is recorded as an open run in the telemetry engine and
-    appears on Live Runs immediately as `Running`; the agent's runtime completes
-    it through the ingest API. Refused with 412 unless the agent is active,
-    provisioned and permitted by policy. Requires the operator role.
+    The request is written as an open run in the telemetry engine and appears
+    on Live Runs immediately as `Running`. Nothing is dispatched to the agent's
+    runtime: hand `run_id` to it, and have it report the run under that id
+    through the ingest API. A request no runtime reports on stays open.
+    Refused with 412 unless the agent is active, provisioned and permitted by
+    policy. Requires the operator role.
     """
     accepted = await service.trigger_run(session, principal, agent_id, payload, request=request)
     return ActionResult(

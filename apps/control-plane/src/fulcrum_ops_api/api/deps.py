@@ -17,7 +17,7 @@ import datetime as dt
 from typing import Annotated
 
 from fastapi import Depends, Header, Request
-from sqlalchemy import select
+from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..core import ratelimit
@@ -28,6 +28,7 @@ from ..core.security import (
     decode_session_token,
     parse_api_key,
 )
+from ..db.base import stamp
 from ..db.session import get_session
 from ..models.identity import ApiKey, Membership, Role, User, Workspace
 
@@ -79,6 +80,39 @@ def _bearer(authorization: str | None) -> str | None:
     return value.strip()
 
 
+#: An API key's ``last_used_at`` is not rewritten more often than this. The
+#: console shows it to the minute at best ("2 minutes ago").
+KEY_TOUCH_INTERVAL = dt.timedelta(seconds=60)
+
+
+async def _note_key_used(session: AsyncSession, key: ApiKey, request: Request) -> None:
+    """Record that the key was presented -- at most once a minute per key.
+
+    This used to be two attribute writes on every authenticated request, under a
+    comment saying ingest had a separate path that batched them. It never had:
+    ingest resolves its caller through this same dependency. So every batch,
+    every ``GET /ingest/config`` poll and every SDK prompt read was a write
+    transaction ending in ``UPDATE api_keys`` -- some 17,000 a day from one
+    agent's five-second poller -- and a fleet flushing in parallel with one key
+    queued on that row's lock from the statement until the commit. It also moved
+    ``updated_at`` each time, which is a statement that somebody edited the key.
+
+    A key that was noted within the last minute is left alone, so an otherwise
+    read-only request stays read-only. The address is not a reason to write
+    sooner: a fleet behind several addresses would flip it on every request and
+    put the write straight back.
+    """
+    now = dt.datetime.now(dt.UTC)
+    if key.last_used_at is not None and now - key.last_used_at < KEY_TOUCH_INTERVAL:
+        return
+    await stamp(
+        session,
+        [key],
+        last_used_at=now,
+        last_used_ip=request.client.host if request.client else None,
+    )
+
+
 async def _principal_from_api_key(
     token: str, session: AsyncSession, request: Request
 ) -> Principal | None:
@@ -99,10 +133,7 @@ async def _principal_from_api_key(
     if workspace is None or workspace.status != "active":
         raise Unauthenticated("The workspace for this key is not active.")
 
-    # Cheap last-used tracking; a write per request is acceptable at our volume
-    # because ingest uses a separate hot path that batches this update.
-    key.last_used_at = dt.datetime.now(dt.UTC)
-    key.last_used_ip = request.client.host if request.client else None
+    await _note_key_used(session, key, request)
 
     return Principal(
         workspace_id=workspace.id,
@@ -125,36 +156,38 @@ async def _principal_from_session(
     except SessionTokenError as exc:
         raise Unauthenticated("Your session has expired. Sign in again.") from exc
 
-    user = await session.get(User, claims["sub"])
+    # The account, the workspace and the membership that joins them, in one
+    # statement. They were three round trips in a row (four with the header
+    # override), paid before any handler work by every console request -- and a
+    # screen opens with six or eight of those in parallel. The header override
+    # allows switching workspace within the session, but only to one the user
+    # actually belongs to, which the membership join decides either way.
+    wanted = (
+        Workspace.slug == workspace_override
+        if workspace_override
+        else Workspace.id == claims["ws"]
+    )
+    row = (
+        await session.execute(
+            select(User, Workspace, Membership)
+            .select_from(User)
+            .outerjoin(Workspace, wanted)
+            .outerjoin(
+                Membership,
+                and_(Membership.user_id == User.id, Membership.workspace_id == Workspace.id),
+            )
+            .where(User.id == claims["sub"])
+        )
+    ).first()
+    user, workspace, membership = row if row is not None else (None, None, None)
+
     if user is None or not user.is_active:
         raise Unauthenticated("This account is no longer active.")
-
-    workspace_id = claims["ws"]
-    if workspace_override:
-        # Allow switching workspace within the session, but only to one the
-        # user actually belongs to.
-        ws = (
-            await session.execute(
-                select(Workspace).where(Workspace.slug == workspace_override)
-            )
-        ).scalar_one_or_none()
-        if ws is None:
-            raise PermissionDenied("Unknown workspace.")
-        workspace_id = ws.id
-
-    membership = (
-        await session.execute(
-            select(Membership).where(
-                Membership.user_id == user.id,
-                Membership.workspace_id == workspace_id,
-            )
-        )
-    ).scalar_one_or_none()
-    if membership is None:
+    if workspace is None and workspace_override:
+        raise PermissionDenied("Unknown workspace.")
+    if workspace is None or membership is None:
         raise PermissionDenied("You do not have access to this workspace.")
-
-    workspace = await session.get(Workspace, workspace_id)
-    if workspace is None or workspace.status != "active":
+    if workspace.status != "active":
         raise Unauthenticated("The workspace is not active.")
 
     return Principal(

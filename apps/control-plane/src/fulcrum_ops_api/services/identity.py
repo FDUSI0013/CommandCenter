@@ -26,6 +26,7 @@ import datetime as dt
 import functools
 import json
 import shlex
+import time
 from collections.abc import Sequence
 from typing import Any, Final
 
@@ -42,6 +43,7 @@ from ..core.errors import (
     NotFound,
     PermissionDenied,
     PreconditionFailed,
+    RateLimited,
     Unauthenticated,
     ValidationFailed,
 )
@@ -53,6 +55,7 @@ from ..core.security import (
     issue_session_token,
     mint_api_key,
     needs_rehash,
+    off_loop,
     parse_api_key,
     verify_password,
 )
@@ -188,6 +191,14 @@ def _decoy_hash() -> str:
     process that merely imports this module.
     """
     return hash_password(f"decoy-{settings.secret_key}-{settings.service_name}")
+
+
+def _verify_against_decoy(password: str) -> bool:
+    """The unknown-address verification, as one unit of work for :func:`off_loop`.
+
+    Building the decoy is itself a hash, so it belongs on the worker thread too.
+    """
+    return verify_password(password, _decoy_hash())
 
 
 def _parse_role(value: str) -> Role:
@@ -446,6 +457,70 @@ async def _primary_membership(
     return row[0], row[1]
 
 
+#: Sign-in attempts inside the current minute: ``key -> (window start, count)``.
+#: Process memory, per worker, exactly as :mod:`core.ratelimit` keeps its own --
+#: and for the reason given there. That limiter cannot do this job: it is keyed
+#: by the credential, so it only ever runs *after* authentication has succeeded,
+#: and sign-in is the one route where the expensive part comes before.
+_sign_in_windows: dict[str, tuple[int, int]] = {}
+_SIGN_IN_PRUNE_ABOVE: Final[int] = 10_000
+
+
+def _throttle_sign_in(email: str, request: Request | None) -> None:
+    """Count one sign-in attempt; refuse it, unverified, when the minute is full.
+
+    Every attempt costs an argon2 verification -- for an unknown address too,
+    which is what keeps the route from enumerating accounts -- and nothing
+    bounded how many could be asked for. The lockout does not: it counts
+    failures against an account that exists, so a loop over made-up addresses
+    never trips it. A misconfigured client or a credential-stuffing run could
+    keep every worker hashing, with no credential at all.
+
+    Two windows, both checked before either is counted. The one per account
+    is what a person mistyping meets, and sits above the lockout's five so that
+    it never pre-empts the more useful message. The one per address is the one a
+    spray across many accounts meets; it is an order taller because an office
+    signs in from one address. The answer is the same 429 whether or not the
+    account exists.
+    """
+    if not settings.rate_limit_enabled:
+        return
+    now = int(time.time())
+    minute = now - (now % 60)
+    buckets = [(f"account:{email.strip().lower()}", settings.rate_limit_login_per_minute)]
+    if request is not None and request.client is not None:
+        buckets.append(
+            (f"address:{request.client.host}", settings.rate_limit_login_per_address_per_minute)
+        )
+
+    counts: dict[str, int] = {}
+    for key, limit in buckets:
+        if limit <= 0:
+            continue
+        window_start, count = _sign_in_windows.get(key, (minute, 0))
+        if window_start != minute:
+            count = 0
+        if count >= limit:
+            raise RateLimited(
+                retry_after_seconds=max(1, minute + 60 - now),
+                message="Too many sign-in attempts. Wait a minute and try again.",
+                details={"limit_per_minute": limit, "bucket": "sign_in"},
+            )
+        counts[key] = count + 1
+
+    if len(_sign_in_windows) > _SIGN_IN_PRUNE_ABOVE:
+        for stale_key, (start, _) in list(_sign_in_windows.items()):
+            if start != minute:
+                _sign_in_windows.pop(stale_key, None)
+    for key, count in counts.items():
+        _sign_in_windows[key] = (minute, count)
+
+
+def reset_sign_in_windows() -> None:
+    """Forget every sign-in window. Tests only."""
+    _sign_in_windows.clear()
+
+
 async def _reject_sign_in(
     session: AsyncSession,
     *,
@@ -504,15 +579,16 @@ async def login(
     upgraded in place — the plaintext is available exactly here and nowhere
     else, so this is the only moment a rehash is possible.
     """
+    _throttle_sign_in(email, request)
     user = (await session.execute(select(User).where(User.email == email))).scalar_one_or_none()
 
     if user is None or not user.password_hash:
         # Pay the verification cost anyway: a fast "no" for unknown addresses
         # would enumerate the tenant by stopwatch.
-        verify_password(password, _decoy_hash())
+        await off_loop(_verify_against_decoy, password)
         raise await _reject_sign_in(session, reason="unknown or password-less account")
 
-    password_ok = verify_password(password, user.password_hash)
+    password_ok = await off_loop(verify_password, password, user.password_hash)
 
     locked_until = _as_utc(user.locked_until)
     if locked_until is not None and locked_until > _now():
@@ -543,7 +619,7 @@ async def login(
     user.locked_until = None
     user.last_login_at = _now()
     if needs_rehash(user.password_hash):
-        user.password_hash = hash_password(password)
+        user.password_hash = await off_loop(hash_password, password)
 
     token, expires_at = issue_session(user=user, workspace=workspace, role=role)
     await audit.record(
@@ -689,19 +765,21 @@ async def change_password(
     user = await session.get(User, principal.user_id)
     if user is None or not user.is_active:
         raise Unauthenticated("This account is no longer active.")
-    if not user.password_hash or not verify_password(current_password, user.password_hash):
+    if not user.password_hash or not await off_loop(
+        verify_password, current_password, user.password_hash
+    ):
         raise ValidationFailed(
             "Your current password is incorrect.",
             details={"fields": [{"field": "current_password", "message": "incorrect"}]},
         )
-    if verify_password(new_password, user.password_hash):
+    if await off_loop(verify_password, new_password, user.password_hash):
         raise ValidationFailed("The new password must differ from the current one.")
 
     local_part = user.email.split("@", 1)[0]
     if local_part and local_part.lower() in new_password.lower():
         raise ValidationFailed("The password must not contain your email address.")
 
-    user.password_hash = hash_password(new_password)
+    user.password_hash = await off_loop(hash_password, new_password)
     user.failed_login_count = 0
     user.locked_until = None
 
@@ -1180,7 +1258,9 @@ async def create_member(
             full_name=payload.full_name,
             job_title=payload.job_title,
             team=payload.team,
-            password_hash=hash_password(payload.password) if payload.password else None,
+            password_hash=(
+                await off_loop(hash_password, payload.password) if payload.password else None
+            ),
             is_active=True,
         )
         session.add(user)
@@ -1294,7 +1374,7 @@ async def update_member(
         # An admin setting a member's credential: the console's "Set Password"
         # action for accounts created without one, or a reset. Clearing the
         # lockout alongside, or the fresh password would bounce off it.
-        user.password_hash = hash_password(changes["password"])
+        user.password_hash = await off_loop(hash_password, changes["password"])
         user.failed_login_count = 0
         user.locked_until = None
 
@@ -2217,7 +2297,7 @@ async def provision_user(
             full_name=full_name,
             job_title=job_title,
             team=team,
-            password_hash=hash_password(password) if password else None,
+            password_hash=await off_loop(hash_password, password) if password else None,
             is_active=True,
         )
         session.add(user)

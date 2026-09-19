@@ -754,3 +754,34 @@ async def test_a_sync_is_bookkeeping_and_does_not_move_the_concurrency_token(adm
     assert saved.status_code == 200, (
         "Configure was open while somebody pressed Sync Now; that is not a conflicting edit"
     )
+
+
+async def test_what_a_syncs_probe_measured_does_not_move_the_token_either(
+    admin_client, db, endpoints
+):
+    # The usual tile: it has an endpoint, so its sync re-probes it, and the
+    # latency it measures differs from the last one nearly every time.
+    tile = await _connection(
+        admin_client, name="Probed", kind="Custom REST API",
+        config={"endpoint_url": f"{endpoints}/ok"},
+    )
+    await db.execute(
+        update(Connection)
+        .where(Connection.id == tile["id"])
+        .values(
+            status="Connected", health="Healthy", latency_ms=987_654,
+            updated_at=dt.datetime.now(dt.UTC) - dt.timedelta(hours=1),
+        )
+    )
+    opened = (await admin_client.get(f"/api/v1/connections/{tile['id']}")).json()
+
+    synced = (await admin_client.post(f"/api/v1/connections/{tile['id']}/sync")).json()
+    assert synced["ok"] is True, synced
+
+    shown = (await admin_client.get(f"/api/v1/connections/{tile['id']}")).json()
+    assert shown["latency_ms"] == synced["data"]["latency_ms"] != 987_654, (
+        "the measurement is still recorded on the tile"
+    )
+    assert shown["updated_at"] == opened["updated_at"], (
+        "a measurement is an observation about the tile, not an edit of it"
+    )

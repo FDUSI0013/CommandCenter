@@ -34,6 +34,7 @@ from fulcrum_ops_api.models.operations import (
     DeploymentStageStatus,
     DeploymentStatus,
 )
+from fulcrum_ops_api.models.registry import Environment
 from fulcrum_ops_api.schemas.deployments import DeploymentCreate
 from fulcrum_ops_api.services import deployments as deployments_service
 
@@ -652,3 +653,344 @@ async def test_a_pipeline_that_is_merely_mid_stage_is_left_to_its_runner(
 
     stages = await stage_statuses(admin_client, deployment_id)
     assert stages["Automated Tests"] == DeploymentStageStatus.RUNNING.value
+
+
+# ---------------------------------------------------------------------------
+# 133 - a rollback undoes nothing until it lands; an environment counts what
+#       it is serving, not every success it ever had
+# ---------------------------------------------------------------------------
+
+
+async def through_the_gate(admin_client, as_role, deployment_id: str, *, approved: bool = True):
+    """A second person decides the gate; wait for the release to come to rest."""
+    await wait_for(
+        lambda: stage_statuses(admin_client, deployment_id),
+        lambda s: s["Approval"] == DeploymentStageStatus.RUNNING.value,
+    )
+    async with as_role(Role.APPROVER) as reviewer:
+        decided = await reviewer.post(
+            f"/api/v1/deployments/{deployment_id}/approve", json={"approved": approved}
+        )
+    assert decided.status_code == 200, decided.text
+    final = DeploymentStatus.SUCCEEDED if approved else DeploymentStatus.HALTED
+    await wait_for(lambda: status_of(admin_client, deployment_id), lambda s: s == final.value)
+
+
+async def a_live_release_with_a_predecessor(factory, workspace, environment, **fields):
+    await factory.deployment(
+        workspace,
+        environment,
+        version="v1.9.0",
+        status=DeploymentStatus.SUCCEEDED.value,
+        **fields,
+    )
+    return await factory.deployment(
+        workspace,
+        environment,
+        version="v2.0.0",
+        status=DeploymentStatus.SUCCEEDED.value,
+        **fields,
+    )
+
+
+async def test_a_release_is_rolled_back_when_its_rollback_lands_not_when_it_is_asked_for(
+    admin_client, as_role, db, factory, workspace, instant_pipeline
+):
+    environment = await factory.environment(workspace, name="Production East")
+    live = await a_live_release_with_a_predecessor(factory, workspace, environment)
+
+    asked = await admin_client.post(
+        f"/api/v1/deployments/{live.id}/rollback", json={"reason": "Error rate spiked"}
+    )
+    assert asked.status_code == 200, asked.text
+    rollback_id = asked.json()["data"]["deployment_id"]
+    await wait_for(
+        lambda: stage_statuses(admin_client, rollback_id),
+        lambda s: s["Approval"] == DeploymentStageStatus.RUNNING.value,
+    )
+
+    # v2.0.0 is still serving: its rollback is waiting for an approver.
+    assert await status_of(admin_client, live.id) == DeploymentStatus.SUCCEEDED.value
+    waiting = (await admin_client.get("/api/v1/deployments/summary")).json()
+    assert waiting["rolled_back_deployments"] == 0
+    assert waiting["rollbacks_executed"] == 0
+
+    await through_the_gate(admin_client, as_role, rollback_id)
+
+    assert await status_of(admin_client, live.id) == DeploymentStatus.ROLLED_BACK.value
+    landed = (await admin_client.get("/api/v1/deployments/summary")).json()
+    assert landed["rolled_back_deployments"] == 1
+    assert landed["rollbacks_executed"] == 1
+    on_record = await db.scalars(
+        select(AuditEvent).where(
+            AuditEvent.action == "deployment.rolled_back", AuditEvent.entity_id == live.id
+        )
+    )
+    assert len(on_record) == 1
+    assert "v1.9.0" in (on_record[0].detail or "")
+
+
+async def test_a_rollback_that_was_refused_leaves_the_release_live_and_can_be_tried_again(
+    admin_client, as_role, factory, workspace, instant_pipeline
+):
+    environment = await factory.environment(workspace, name="Production East")
+    live = await a_live_release_with_a_predecessor(factory, workspace, environment)
+
+    first = await admin_client.post(f"/api/v1/deployments/{live.id}/rollback", json={})
+    assert first.status_code == 200, first.text
+    await through_the_gate(
+        admin_client, as_role, first.json()["data"]["deployment_id"], approved=False
+    )
+
+    assert await status_of(admin_client, live.id) == DeploymentStatus.SUCCEEDED.value, (
+        "the rollback never happened, so the release it was to undo is still the live one"
+    )
+
+    again = await admin_client.post(f"/api/v1/deployments/{live.id}/rollback", json={})
+    assert again.status_code == 200, again.text
+    await through_the_gate(admin_client, as_role, again.json()["data"]["deployment_id"])
+    assert await status_of(admin_client, live.id) == DeploymentStatus.ROLLED_BACK.value
+
+
+async def test_an_environment_counts_the_releases_it_serves_not_every_success_it_had(
+    admin_client, as_role, db, factory, workspace, instant_pipeline
+):
+    environment = await factory.environment(workspace, name="Production East")
+    bot = await factory.agent(workspace, name="Support Bot")
+    await a_live_release_with_a_predecessor(factory, workspace, environment, agent_id=bot.id)
+    # What the old bookkeeping left on a row: one for every success, for ever.
+    await db.execute(
+        update(Environment)
+        .where(Environment.id == environment.id)
+        .values(active_deployment_count=12, updated_at=Environment.updated_at)
+    )
+    before = await db.get(Environment, environment.id)
+
+    async def serving() -> int:
+        read = await admin_client.get(f"/api/v1/environments/{environment.id}")
+        return read.json()["active_deployment_count"]
+
+    assert await serving() == 1, "two releases of one agent: the newer replaced the older"
+
+    # A third release of the same agent replaces the second...
+    third = await admin_client.post(
+        "/api/v1/deployments",
+        json={"environment_id": environment.id, "version": "v2.1.0", "agent_id": bot.id},
+    )
+    assert third.status_code == 201, third.text
+    await through_the_gate(admin_client, as_role, third.json()["id"])
+    assert await serving() == 1
+
+    after = await db.get(Environment, environment.id)
+    assert after.active_deployment_count == 1, "the stored counter is put right as well"
+    assert after.updated_at == before.updated_at, (
+        "bookkeeping moved the token an open Edit Environment form is holding"
+    )
+
+    # ...a platform release is served alongside it...
+    platform = await admin_client.post(
+        "/api/v1/deployments", json={"environment_id": environment.id, "version": "p-7"}
+    )
+    await through_the_gate(admin_client, as_role, platform.json()["id"])
+    assert await serving() == 2
+
+    # ...and rolling the agent back swaps its release for the previous one.
+    undone = await admin_client.post(f"/api/v1/deployments/{third.json()['id']}/rollback", json={})
+    assert undone.status_code == 200, undone.text
+    await through_the_gate(admin_client, as_role, undone.json()["data"]["deployment_id"])
+    assert await serving() == 2
+    listed = await admin_client.get("/api/v1/environments")
+    assert [row["active_deployment_count"] for row in listed.json()["items"]] == [2]
+
+
+async def test_an_environment_with_a_live_release_is_deleted_by_taking_it_offline_first(
+    admin_client, db, factory, workspace
+):
+    """Once anything had succeeded in it an environment could never be deleted:
+    nothing ever lowered the counter the guard read."""
+    environment = await factory.environment(workspace, name="Staging West")
+    await factory.deployment(workspace, environment, status=DeploymentStatus.SUCCEEDED.value)
+
+    serving = await admin_client.delete(f"/api/v1/environments/{environment.id}")
+    assert serving.status_code == 409, serving.text
+    assert "offline" in serving.text.lower()
+
+    retired = await admin_client.patch(
+        f"/api/v1/environments/{environment.id}", json={"status": "Offline"}
+    )
+    assert retired.status_code == 200, retired.text
+    gone = await admin_client.delete(f"/api/v1/environments/{environment.id}")
+    assert gone.status_code == 204, gone.text
+    assert await db.get(Environment, environment.id) is None
+
+
+# ---------------------------------------------------------------------------
+# 135 - a progress stream holds no connection, and idles while the gate is shut
+# ---------------------------------------------------------------------------
+
+
+class ProgressStream:
+    """GET /deployments/{id}/stream, held open the way the watch modal holds it.
+
+    The HTTP client the other tests use reads a response to its end, and a
+    release parked at its gate has none for a quarter of an hour; so the
+    application is driven over ASGI directly, by a caller that hangs up when
+    the test is done.
+    """
+
+    def __init__(self, app, token: str, deployment_id: str) -> None:
+        path = f"/api/v1/deployments/{deployment_id}/stream"
+        self._app = app
+        self._scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "GET",
+            "scheme": "http",
+            "path": path,
+            "raw_path": path.encode(),
+            "query_string": b"",
+            "root_path": "",
+            "headers": [
+                (b"host", b"control-plane.test"),
+                (b"accept", b"text/event-stream"),
+                (b"authorization", f"Bearer {token}".encode()),
+            ],
+            "client": ("127.0.0.1", 50000),
+            "server": ("control-plane.test", 80),
+        }
+        self.status: int | None = None
+        self._frames: asyncio.Queue[str] = asyncio.Queue()
+        self._hang_up = asyncio.Event()
+        self._asked = False
+        self._task: asyncio.Task | None = None
+
+    async def _receive(self) -> dict:
+        if not self._asked:
+            self._asked = True
+            return {"type": "http.request", "body": b"", "more_body": False}
+        await self._hang_up.wait()
+        return {"type": "http.disconnect"}
+
+    async def _send(self, message: dict) -> None:
+        if message["type"] == "http.response.start":
+            self.status = message["status"]
+        elif message["type"] == "http.response.body" and message.get("body"):
+            await self._frames.put(message["body"].decode())
+
+    async def __aenter__(self) -> ProgressStream:
+        self._task = asyncio.ensure_future(self._app(self._scope, self._receive, self._send))
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        self._hang_up.set()
+        assert self._task is not None
+        await asyncio.wait_for(self._task, timeout=10)
+
+    async def snapshot(self, *, within: float = 5.0) -> dict:
+        """The next data frame, skipping keep-alives."""
+        async with asyncio.timeout(within):
+            while True:
+                text = await self._frames.get()
+                if text.startswith("data: "):
+                    return json.loads(text[len("data: ") :])
+
+
+async def waiting_for_its_approver(db, factory, workspace, environment) -> str:
+    return await left_by_a_restart(
+        db,
+        factory,
+        workspace,
+        environment,
+        Build=(DeploymentStageStatus.COMPLETED.value, 29),
+        Automated_Tests=(DeploymentStageStatus.COMPLETED.value, 28),
+        Security_Scan=(DeploymentStageStatus.COMPLETED.value, 27),
+        Approval=(DeploymentStageStatus.RUNNING.value, 26),
+    )
+
+
+async def test_an_open_progress_stream_holds_no_database_connection(
+    app, admin, db, db_engine, factory, workspace
+):
+    """The request's session stayed checked out -- idle, inside the transaction
+    authentication opened -- until the stream ended, and a release waiting for
+    its approver keeps a tab streaming for as long as the tab is open."""
+    environment = await factory.environment(workspace, name="Production East")
+    deployment_id = await waiting_for_its_approver(db, factory, workspace, environment)
+    held = 0
+
+    def taken(*_args: object) -> None:
+        nonlocal held
+        held += 1
+
+    def given_back(*_args: object) -> None:
+        nonlocal held
+        held -= 1
+
+    pool = db_engine.sync_engine.pool
+    event.listen(pool, "checkout", taken)
+    event.listen(pool, "checkin", given_back)
+    try:
+        token = session_token(admin, workspace, Role.ADMIN)
+        async with ProgressStream(app, token, deployment_id) as stream:
+            first = await stream.snapshot()
+            await asyncio.sleep(0.3)  # the poll's own short session has come and gone
+            assert stream.status == 200
+            assert first["awaiting_approval"] is True
+            assert held == 0, "the stream is open and a connection is still checked out"
+    finally:
+        event.remove(pool, "checkout", taken)
+        event.remove(pool, "checkin", given_back)
+
+
+async def test_a_stream_idles_while_the_gate_is_shut_and_asks_once_per_poll(
+    db, db_engine, factory, workspace, admin
+):
+    """Every pipeline parks at its gate, for minutes to hours; an open tab cost
+    two queries a second for all of it."""
+    environment = await factory.environment(workspace, name="Production East")
+    parked = await waiting_for_its_approver(db, factory, workspace, environment)
+    principal = principal_for(workspace, admin, Role.ADMIN)
+    statements: list[str] = []
+
+    def asked(_conn, _cursor, statement, *_rest: object) -> None:
+        statements.append(statement)
+
+    async def watch(deployment_id: str, seconds: float) -> list[dict]:
+        seen: list[dict] = []
+        stream = deployments_service.stream_progress(principal, deployment_id, poll_seconds=0.02)
+        try:
+            async with asyncio.timeout(seconds):
+                async for payload in stream:
+                    seen.append(payload)
+        except TimeoutError:
+            pass
+        finally:
+            await stream.aclose()
+        return seen
+
+    event.listen(db_engine.sync_engine, "before_cursor_execute", asked)
+    try:
+        at_the_gate = await watch(parked, 0.6)
+    finally:
+        event.remove(db_engine.sync_engine, "before_cursor_execute", asked)
+
+    assert len(at_the_gate) == 1, "nothing can change until a person decides"
+    assert at_the_gate[0]["awaiting_approval"] is True
+    assert [stage["name"] for stage in at_the_gate[0]["stages"]] == [
+        "Build",
+        "Automated Tests",
+        "Security Scan",
+        "Approval",
+        "Deploy",
+    ]
+    assert len(statements) == 1, statements
+
+    # A pipeline that is moving is still followed closely.
+    staging = await factory.environment(workspace, name="Staging")
+    moving = await left_by_a_restart(
+        db, factory, workspace, staging, Build=(DeploymentStageStatus.RUNNING.value, 0)
+    )
+    in_flight = await watch(moving, 0.6)
+    assert len(in_flight) > 3
+    assert in_flight[0]["awaiting_approval"] is False
