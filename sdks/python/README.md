@@ -12,8 +12,19 @@ Fulcrum Ops control plane.
 - Python 3.9+.
 
 ```bash
-pip install fulcrum-ops
+pip install --extra-index-url https://controlplane.fdprod.net/pypi/simple fulcrum-ops
 ```
+
+The package is served by the control plane it reports to, not by the public
+index: it is that deployment's client, versioned with the API it speaks to, and
+any agent that can report telemetry can already reach the host. `--extra-index-url`
+rather than `--index-url`, so the one dependency (`httpx`) still comes from
+wherever you normally get packages. To pin it for a project, put the same line in
+`requirements.txt` as `--extra-index-url https://controlplane.fdprod.net/pypi/simple`
+followed by `fulcrum-ops==1.0.1`.
+
+Replace the host if your control plane lives somewhere else; every deployment
+serves its own matching build at `/pypi/simple`.
 
 ---
 

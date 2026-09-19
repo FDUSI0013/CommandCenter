@@ -120,6 +120,27 @@
 		}
 	}
 
+	# The Python SDK, as a package index pip can install from.
+	#
+	# Served here rather than from the public index: the SDK is this deployment's
+	# client, it is versioned with the API it talks to, and an agent that reports
+	# to this control plane can always reach this host. A wheel is a fixed
+	# artefact -- a version is never rebuilt -- so unlike the console it is
+	# immutable and cached for a year.
+	#
+	# It needs its own block because the console's fallback below rewrites
+	# anything it does not recognise to index.html: without this, pip would
+	# download the console's HTML and report a corrupt archive.
+	handle /pypi/* {
+		root * /srv/fulcrum-ops
+		@wheel path *.whl *.tar.gz
+		header @wheel Cache-Control "public, max-age=31536000, immutable"
+		header @wheel Content-Type "application/octet-stream"
+		# A missing package is a 404, never the console's index page.
+		try_files {path} {path}/index.html
+		file_server
+	}
+
 	# The console: static files, SPA fallback to index.html.
 	#
 	# The assets have fixed names — js/app.js, not js/app.<hash>.js — so a

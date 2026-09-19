@@ -349,13 +349,17 @@ fulcrum_ops.flush()</code></pre>
 <p>The package is <code>fulcrum-ops</code> (import name <code>fulcrum_ops</code>). It needs Python
 3.9 or newer and has exactly one runtime dependency, <code>httpx</code>.</p>
 
-<p>It is published to the workspace's private package index (AWS CodeArtifact
-domain <code>fulcrum-ops</code>, repository <code>fulcrum-python</code>). Point pip at it
-once per shell, then install by name:</p>
+<p>The control plane serves it: the SDK is its client, versioned with the API it
+speaks to, and anything that can report telemetry can already reach the host. No
+credentials and no extra login &mdash; just point pip at the index alongside your
+usual one, so the SDK's single dependency (<code>httpx</code>) still resolves normally:</p>
 
-<pre><code>aws codeartifact login --tool pip --domain fulcrum-ops --repository fulcrum-python
-pip install fulcrum-ops                           # from the private index
-pip install "fulcrum-ops[openai]"                 # with a provider extra</code></pre>
+<pre><code>pip install --extra-index-url https://controlplane.fdprod.net/pypi/simple fulcrum-ops
+pip install --extra-index-url https://controlplane.fdprod.net/pypi/simple "fulcrum-ops[openai]"</code></pre>
+
+<p>Every deployment serves its own matching build at <code>/pypi/simple</code>, so use
+the host your agents report to. The wheel is immutable: a version is published
+once and never rebuilt.</p>
 
 <p>Extras: <code>openai</code>, <code>anthropic</code>, <code>langchain</code>, <code>dev</code>.
 None of the provider packages is a hard dependency — the wrappers import lazily.
