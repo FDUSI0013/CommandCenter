@@ -74,6 +74,31 @@
     return (err && err.message) || 'The request failed.';
   }
 
+  /**
+   * Show a refused request inside the dialog that made it.
+   *
+   * These dialogs used to close before they asked, so a 409 or a 422 threw away
+   * everything typed into them. They now close only on success; a refusal lands
+   * here with the form intact — under the field the server named when it named
+   * one (`anchor` is that field's selector), otherwise at the foot of the form.
+   */
+  function modalError(modal, text, anchor){
+    const body = modal.querySelector('.modal-body');
+    if(!body) return;
+    let box = body.querySelector('[data-merr]');
+    if(!box){
+      box = document.createElement('div');
+      box.setAttribute('data-merr', '');
+      box.className = 'small st-red';
+      box.style.marginTop = '6px';
+    }
+    const field = anchor ? body.querySelector(anchor) : null;
+    const row = field ? field.closest('.form-row') : null;
+    (row || body).appendChild(box);
+    box.textContent = text;
+    if(field && typeof field.focus === 'function') field.focus();
+  }
+
   /** Disable a control the signed-in role may not use, and say why on hover. */
   function gate(role, why){
     return Store.session.can(role) ? '' : ` disabled title="${esc(why)}"`;
@@ -140,6 +165,12 @@
   const AL_SEVERITIES = ['Critical','High','Medium','Low','Info'];
   const AL_STATUS = ['Open','Investigating','Acknowledged','Resolved','Muted'];
   const AL_CHANNELS = ['Teams','Email','PagerDuty','Slack','Webhook'];
+  /* What an alert rule does, said once. A rule neither watches nor raises: the
+     server matches an arriving alert to it on source + severity alone. Static
+     text — no user value goes in here. */
+  const RULE_HELP = 'A rule matches on <b>Source + Severity</b>. While it is enabled, matching alerts carry its name; '
+    + 'while it is disabled, alerts a screen raises arrive muted and reopen when the rule is enabled, edited or deleted. '
+    + 'A rule raises nothing itself, and its channels and throttle are recorded but nothing is delivered yet.';
 
   const sevColor = (s) => s === 'Critical' || s === 'High' ? 'red' : s === 'Medium' ? 'amber' : s === 'Low' ? 'green' : 'blue';
   const alStatusColor = (s) => s === 'Open' ? 'red' : s === 'Investigating' ? 'amber'
@@ -148,11 +179,15 @@
   SCREENS['alerts'] = {
     title:'Alerts',
     render(main){
-      let selectedId = null, selectedRow = null;
+      // `painted` is the alert the inspector last drew, kept so a repaint needs no request.
+      let selectedId = null, selectedRow = null, painted = null;
       const members = memberDirectory();
 
+      /* The subtitle names only what raises an alert today: quota and budget
+         thresholds, and whatever posts to the alerts API. Connections, tests,
+         deployments and guardrails do not raise yet, so they are not promised. */
       main.innerHTML = `
-        ${pageHead({title:'Alerts', sub:'Operational alerts across connections, policies, quotas, secrets, tests, and deployments.',
+        ${pageHead({title:'Alerts', sub:'Operational alerts raised by quota and budget thresholds, and by anything that reports through the alerts API.',
           actions:`${searchBox('alSearch','Search alerts…')}
           <button class="btn" id="alExport">${ICONS.download}Export</button>
           <button class="btn" id="alRules">${ICONS.sliders}Alert Rules</button>
@@ -231,17 +266,29 @@
         exportSource: (params) => API.alerts.export(params),
         autoSelectFirst: true,
         onSelect: showAlert,
-        rowActions: r => [
-          { label:'Acknowledge', icon:'check', onClick:()=>acknowledge(r) },
-          { label:'Resolve', icon:'checkCircle', onClick:()=>resolve(r) },
-          { label:'Assign…', icon:'users', onClick:()=>openAssign(r) },
-          { label:'Open Source Screen', icon:'external', onClick:()=>APP.go(APP.sourceRoute(r.source)) },
-          { sep:true },
-          // A muted alert offers the way back; anything else offers the mute.
-          ...(r.status === 'Muted'
-            ? [{ label:'Unmute', icon:'bell', onClick:()=>unmute(r) }]
-            : [{ label:'Mute for 24h', icon:'clock', onClick:()=>mute(r, 1440) }]),
-        ],
+        /* The menu offers what the alert's status allows. A resolved alert is
+           closed — every triage verb answers 409 on it — so it keeps only the
+           way to its source. "Start Investigating" is the one thing in the
+           product that produces the Investigating state the KPI card and the
+           Status filter both count. */
+        rowActions: r => {
+          const go = { label:'Open Source Screen', icon:'external', onClick:()=>APP.go(APP.sourceRoute(r.source)) };
+          if(r.status === 'Resolved') return [go];
+          const muted = r.status === 'Muted';
+          return [
+            ...(r.status === 'Open' ? [{ label:'Start Investigating', icon:'search', onClick:()=>investigate(r) }] : []),
+            // Acknowledging a muted alert would end the mute by the back door; Unmute is the way out.
+            ...(r.status === 'Open' || r.status === 'Investigating'
+              ? [{ label:'Acknowledge', icon:'check', onClick:()=>acknowledge(r) }] : []),
+            { label:'Resolve', icon:'checkCircle', onClick:()=>resolve(r) },
+            { label:'Assign…', icon:'users', onClick:()=>openAssign(r) },
+            go,
+            { sep:true },
+            // A muted alert offers the way back; anything else offers the mute.
+            muted ? { label:'Unmute', icon:'bell', onClick:()=>unmute(r) }
+                  : { label:'Mute for 24h', icon:'clock', onClick:()=>mute(r, 1440) },
+          ];
+        },
       });
 
       const wrap = document.getElementById('alTableWrap');
@@ -251,15 +298,27 @@
       document.getElementById('alExport').addEventListener('click', () => table.export());
 
       /* Only the inspector names people, so the directory arriving late repaints
-         that panel rather than re-asking the server for the whole page of rows. */
-      members.load().then(() => { if(selectedRow) showAlert(selectedRow); });
+         that panel from the alert it already holds — it used to fetch the same
+         alert a second time on every visit. When the alert is still in flight
+         there is nothing to do: it will be painted with the names in hand. */
+      members.load().then(() => {
+        const insp = document.getElementById('alInspector');
+        if(insp && painted && painted.id === selectedId) paintAlert(insp, painted);
+      });
       loadSummary();
 
-      /** Everything an alert action changes: the row, the cards and the badge. */
+      /**
+       * Everything an alert action changes: the row and the cards.
+       *
+       * The sidebar badge is not re-read here. Every action goes through
+       * Store.mutate, and the app shell already answers its 'mutation' event
+       * with Store.refreshBadges(); asking again from this screen made one
+       * Acknowledge click three /alerts/summary reads and two
+       * /approvals/summary reads.
+       */
       function afterChange(){
         table.refresh();
         loadSummary();
-        Store.refreshBadges();
       }
 
       // ---- actions ---------------------------------------------------------
@@ -275,6 +334,19 @@
         }
       }
 
+      /** Open → Investigating: somebody is working it, nobody has claimed it yet. */
+      async function investigate(r){
+        if(!allowed('operator','Moving an alert to Investigating requires the operator role.')) return;
+        try {
+          await Store.mutate(() => API.alerts.update(r.id, { status: 'Investigating' }), { event:'alerts:changed' });
+          toast('info','Investigating', `${r.title} is marked as being worked.`);
+          afterChange();
+          if(selectedId === r.id) showAlert(r);
+        } catch (err) {
+          toast('error','Could not start investigating', errText(err));
+        }
+      }
+
       function resolve(r){
         if(!allowed('operator','Resolving an alert requires the operator role.')) return;
         openModal({
@@ -286,16 +358,16 @@
             { label:'Cancel' },
             { label:'Resolve', cls:'primary', onClick: async (close, modal) => {
                 const note = modal.querySelector('#alResNote').value.trim();
-                close();
                 try {
                   const res = await Store.mutate(() => API.alerts.resolve(r.id, note ? { resolution_note: note } : {}),
                     { event:'alerts:changed' });
+                  close();
                   const mttr = res.data && res.data.mttr_seconds;
                   toast('success','Resolved', mttr == null ? (res.message || r.title) : `${r.title} — resolved in ${fmtDur(mttr)}.`);
                   afterChange();
                   if(selectedId === r.id) showAlert(r);
                 } catch (err) {
-                  toast('error','Could not resolve', errText(err));
+                  modalError(modal, errText(err));
                 }
               } },
           ],
@@ -318,9 +390,20 @@
 
       async function unmute(r){
         if(!allowed('operator','Unmuting an alert requires the operator role.')) return;
+        /* PATCH can only put a muted alert back to Open. One that had been
+           acknowledged before the mute must not come back unclaimed — it would
+           re-count in the Open card and the red badge and need acknowledging a
+           second time — so it is acknowledged again, which the server treats as
+           a status move only: the first acknowledged_at and its owner are kept,
+           and time-to-acknowledge does not move. */
+        const claimed = !!r.acknowledged_at;
         try {
-          await Store.mutate(() => API.alerts.update(r.id, { status: 'Open' }), { event:'alerts:changed' });
-          toast('info','Unmuted', `${r.title} is open again.`);
+          await Store.mutate(async () => {
+            const a = await API.alerts.update(r.id, { status: 'Open' });
+            if(claimed) await API.alerts.acknowledge(r.id);
+            return a;
+          }, { event:'alerts:changed' });
+          toast('info','Unmuted', claimed ? `${r.title} is back in the acknowledged queue.` : `${r.title} is open again.`);
           afterChange();
           if(selectedId === r.id) showAlert(r);
         } catch (err) {
@@ -351,15 +434,15 @@
             { label:'Assign', cls:'primary', onClick: async (close, modal) => {
                 const id = modal.querySelector('#alAssignee').value;
                 const note = modal.querySelector('#alAssignNote').value.trim();
-                close();
                 try {
                   const res = await Store.mutate(() => API.alerts.assign(r.id, note ? { assignee_user_id: id, note } : { assignee_user_id: id }),
                     { event:'alerts:changed' });
+                  close();
                   toast('success','Assigned', `${r.title} → ${members.name(id) || 'the assignee'}. ${res.message || ''}`.trim());
                   afterChange();
                   if(selectedId === r.id) showAlert(r);
                 } catch (err) {
-                  toast('error','Could not assign', errText(err));
+                  modalError(modal, errText(err));
                 }
               } },
           ],
@@ -409,8 +492,35 @@
       }
 
       function paintAlert(insp, a){
+        painted = a;
         const meta = a.event_metadata || {};
         const metaKeys = Object.keys(meta);
+        const muted = a.status === 'Muted', closed = a.status === 'Resolved';
+        /* Two things mute an alert and they end differently. An operator's mute
+           carries a muted_until deadline; a switched-off alert rule's carries
+           the rule's id and no deadline — it lifts when the rule is enabled,
+           edited away from this alert, or deleted, so there is no date to show. */
+        const ruleMute = muted && meta.silenced_by_rule_id && !meta.muted_until;
+        const muteRows = !muted ? [] : ruleMute
+          ? [['Muted', '<span class="dim">By rule — reopens when the rule is enabled</span>'],
+             ['Mute Reason', meta.mute_reason ? esc(String(meta.mute_reason)) : dash]]
+          : [['Muted Until', meta.muted_until ? `${at(meta.muted_until)} (${until(meta.muted_until)})` : dash],
+             ['Muted By', meta.muted_by ? esc(String(meta.muted_by)) : dash]];
+        /* The buttons follow the status: nothing to triage on a resolved alert
+           (each verb answers 409), and a muted one offers the way back rather
+           than a second mute that would only push its deadline out. */
+        const op = (why) => gate('operator', why);
+        const buttons = [
+          closed ? '' : `<button class="btn sm success" id="alResolveBtn"${op('Resolving an alert requires the operator role.')}>${ICONS.checkCircle}Resolve</button>`,
+          a.status === 'Open' ? `<button class="btn sm" id="alInvBtn"${op('Moving an alert to Investigating requires the operator role.')}>${ICONS.search}Investigate</button>` : '',
+          a.status === 'Open' || a.status === 'Investigating'
+            ? `<button class="btn sm" id="alAckBtn"${op('Acknowledging an alert requires the operator role.')}>${ICONS.check}Acknowledge</button>` : '',
+          `<button class="btn sm" id="alGoBtn">${ICONS.external}Open Source</button>`,
+          closed ? '' : `<button class="btn sm" id="alAssignBtn"${op('Assigning an alert requires the operator role.')}>${ICONS.users}Assign</button>`,
+          closed ? '' : muted
+            ? `<button class="btn sm" id="alUnmuteBtn"${op('Unmuting an alert requires the operator role.')}>${ICONS.bell}Unmute</button>`
+            : `<button class="btn sm" id="alMuteBtn"${op('Muting an alert requires the operator role.')}>${ICONS.clock}Mute 24h</button>`,
+        ].join('');
         insp.innerHTML = `
           <div class="insp-head"><div class="grow">
             <div class="flex" style="gap:8px">${badge(a.severity, sevColor(a.severity))}${statusText(a.status, alStatusColor(a.status))}</div>
@@ -424,8 +534,11 @@
             ['Last Occurrence', a.last_occurred_at ? `${at(a.last_occurred_at)} (${relTime(ts(a.last_occurred_at))})` : dash],
             ['Occurrences', String(a.occurrence_count == null ? 1 : a.occurrence_count)],
             ['Deduplicated On', a.dedupe_key ? `<span class="mono">${esc(a.dedupe_key)}</span>` : '<span class="faint">not deduplicated</span>'],
+            // Present only when an alert rule matched this alert's source and severity.
+            ...(meta.alert_rule ? [['Governed By', `Rule <b>${esc(String(meta.alert_rule))}</b>`]] : []),
           ]))}
           ${inspSection('Triage','users', kv([
+            ...muteRows,
             ['Assigned To', a.assigned_to_user_id ? members.cell(a.assigned_to_user_id) : '<span class="faint">unassigned</span>'],
             ['Acknowledged', a.acknowledged_at ? `${at(a.acknowledged_at)}` : '<span class="faint">not yet</span>'],
             ['Acknowledged By', a.acknowledged_by_user_id ? members.cell(a.acknowledged_by_user_id) : dash],
@@ -441,19 +554,19 @@
             3. Apply the standard remediation for this alert class.<br>
             4. Resolve with a closing note so the next responder sees what was done.</div>
             <div class="small faint mt">Generic triage guidance — this deployment has no per-rule runbook.</div>`)}
-          <div class="insp-section"><div class="grid g2" style="gap:8px">
-            <button class="btn sm success" id="alResolveBtn"${gate('operator','Resolving an alert requires the operator role.')}>${ICONS.checkCircle}Resolve</button>
-            <button class="btn sm" id="alAckBtn"${gate('operator','Acknowledging an alert requires the operator role.')}>${ICONS.check}Acknowledge</button>
-            <button class="btn sm" id="alGoBtn">${ICONS.external}Open Source</button>
-            <button class="btn sm" id="alAssignBtn"${gate('operator','Assigning an alert requires the operator role.')}>${ICONS.users}Assign</button>
-            <button class="btn sm" id="alMuteBtn"${gate('operator','Muting an alert requires the operator role.')}>${ICONS.clock}Mute 24h</button></div></div>`;
+          <div class="insp-section"><div class="grid g2" style="gap:8px">${buttons}</div>
+            ${closed ? '<div class="small faint mt">This alert is resolved — it is kept as evidence and cannot be triaged again.</div>' : ''}</div>`;
 
-        insp.querySelector('#alClose').addEventListener('click', ()=>document.getElementById('alLayout').classList.add('collapsed'));
-        insp.querySelector('#alResolveBtn').addEventListener('click', ()=>resolve(a));
-        insp.querySelector('#alAckBtn').addEventListener('click', ()=>acknowledge(a));
-        insp.querySelector('#alGoBtn').addEventListener('click', ()=>APP.go(APP.sourceRoute(a.source)));
-        insp.querySelector('#alAssignBtn').addEventListener('click', ()=>openAssign(a));
-        insp.querySelector('#alMuteBtn').addEventListener('click', ()=>mute(a, 1440));
+        // Which buttons exist depends on the status, so each is wired only if it was drawn.
+        const wire = (id, fn) => { const b = insp.querySelector(id); if(b) b.addEventListener('click', fn); };
+        wire('#alClose', ()=>document.getElementById('alLayout').classList.add('collapsed'));
+        wire('#alResolveBtn', ()=>resolve(a));
+        wire('#alInvBtn', ()=>investigate(a));
+        wire('#alAckBtn', ()=>acknowledge(a));
+        wire('#alGoBtn', ()=>APP.go(APP.sourceRoute(a.source)));
+        wire('#alAssignBtn', ()=>openAssign(a));
+        wire('#alMuteBtn', ()=>mute(a, 1440));
+        wire('#alUnmuteBtn', ()=>unmute(a));
       }
 
       // ---- alert rules ------------------------------------------------------
@@ -490,10 +603,10 @@
             if(!modal.querySelector('#alRulesBody')) return;
             if(!(page.items || []).length){
               body.innerHTML = emptyBlock('sliders','No alert rules are defined yet',
-                'A rule records the condition a source screen raises its alerts on, and who should hear about them. The screens raise the alerts; the rule is the paper trail reviewers audit against.');
+                'A rule governs the alerts one source raises at one severity: enabled, those alerts carry its name; disabled, they arrive muted. A rule raises nothing itself, and its channels and throttle are recorded but nothing is delivered yet.');
               return;
             }
-            body.innerHTML = `<table class="tbl"><thead><tr><th>Rule</th><th>Condition</th><th>Source</th>
+            body.innerHTML = `<div class="small faint" style="margin-bottom:8px">${RULE_HELP}</div><table class="tbl"><thead><tr><th>Rule</th><th>Condition</th><th>Source</th>
                 <th>Severity</th><th>Channels</th><th class="right">Throttle</th><th>Status</th><th></th></tr></thead><tbody>
               ${page.items.map((r,i) => `<tr style="cursor:default">
                 <td><div class="cell-main">${esc(r.name)}</div>${r.description ? `<div class="cell-sub">${esc(r.description)}</div>` : ''}</td>
@@ -532,24 +645,27 @@
               <input class="input" id="arName" value="${esc(r.name || '')}" placeholder="e.g. Connection down"></div>
             <div class="grid g2">
               <div class="form-row"><label>SOURCE SCREEN</label>
-                <input class="input" id="arSource" value="${esc(r.source || '')}" placeholder="e.g. Connection Center"></div>
+                <input class="input" id="arSource" value="${esc(r.source || '')}" placeholder="e.g. Quota, Cost &amp; Capacity"></div>
               <div class="form-row"><label>SEVERITY</label>
                 <select class="filter-select w-100" id="arSev" style="height:34px">${AL_SEVERITIES.map(s =>
                   `<option ${s === (r.severity || 'Medium') ? 'selected' : ''}>${s}</option>`).join('')}</select></div>
             </div>
+            <div class="small faint" style="margin:-4px 0 10px">Source + Severity are the match. The source must equal the
+              label the raising screen puts on its alerts (the Source column of the alert table); upper and lower case do not matter.</div>
             <div class="form-row"><label>DESCRIPTION</label>
-              <input class="input" id="arDesc" value="${esc(r.description || '')}" placeholder="What this rule watches for"></div>
+              <input class="input" id="arDesc" value="${esc(r.description || '')}" placeholder="What this rule is for"></div>
             <div class="form-row"><label>CONDITION (JSON)</label>
               <textarea class="input" id="arCond" rows="3" style="font-family:var(--mono,monospace);font-size:12px">${esc(JSON.stringify(r.condition || {}, null, 0))}</textarea>
-              <div class="small faint" style="margin-top:4px">Stored exactly as written — the source screen evaluates its own shape.</div></div>
+              <div class="small faint" style="margin-top:4px">Documentation only — stored exactly as written for reviewers, and never evaluated.</div></div>
             <div class="grid g2">
               <div class="form-row"><label>NOTIFY CHANNELS</label>
                 <input class="input" id="arChan" value="${esc((r.notify_channels || []).join(', '))}" placeholder="${esc(AL_CHANNELS.join(', '))}"></div>
               <div class="form-row"><label>THROTTLE (MINUTES)</label>
                 <input class="input" id="arThrottle" value="${r.throttle_minutes == null ? 60 : r.throttle_minutes}"></div>
             </div>
+            <div class="small faint" style="margin:-4px 0 10px">Channels and throttle are recorded on the rule, but nothing is delivered yet — no message leaves this deployment.</div>
             <label class="flex" style="gap:8px;align-items:center;margin-top:4px">
-              <input type="checkbox" id="arEnabled" ${r.enabled === false ? '' : 'checked'}><span class="small">Enabled</span></label>`,
+              <input type="checkbox" id="arEnabled" ${r.enabled === false ? '' : 'checked'}><span class="small">Enabled — a disabled rule mutes the alerts it matches as screens raise them</span></label>`,
           footer:[
             { label:'Cancel' },
             { label: rule ? 'Save Rule' : 'Create Rule', cls:'primary', onClick: async (close, modal) => {
@@ -568,18 +684,31 @@
                   throttle_minutes: isNaN(throttle) ? 60 : throttle,
                   enabled: modal.querySelector('#arEnabled').checked,
                 };
-                close();
+                /* Asked first, closed on success: a duplicate name (409) or a
+                   throttle past a week (422) used to discard the whole form. */
                 try {
                   await Store.mutate(() => rule ? API.alerts.rules.update(rule.id, body) : API.alerts.rules.create(body),
                     { event:'alerts:changed' });
-                  toast('success', rule ? 'Rule saved' : 'Rule created', `${name} watches ${source}.`);
-                  if(after) after();
+                  close();
+                  toast('success', rule ? 'Rule saved' : 'Rule created', `${name} governs ${body.severity} alerts from ${source}.`);
+                  ruleWritten(after);
                 } catch (err) {
-                  toast('error', rule ? 'Could not save the rule' : 'Could not create the rule', errText(err));
+                  modalError(modal, errText(err));
                 }
               } },
           ],
         });
+      }
+
+      /**
+       * A rule write can move alerts, not just the rule: enabling, editing or
+       * deleting one reopens the alerts it had silenced. So besides the rule
+       * list, the queue and the cards behind the dialog are read again (the
+       * sidebar badge follows the mutation on its own).
+       */
+      function ruleWritten(after){
+        if(after) after();
+        afterChange();
       }
 
       async function toggleRule(rule, after){
@@ -587,8 +716,9 @@
         try {
           await Store.mutate(() => API.alerts.rules.update(rule.id, { enabled: !rule.enabled }), { event:'alerts:changed' });
           toast('success', rule.enabled ? 'Rule disabled' : 'Rule enabled',
-            rule.enabled ? `${rule.name} is retired from ${rule.source}.` : `${rule.name} applies to ${rule.source} again.`);
-          if(after) after();
+            rule.enabled ? `${rule.severity} alerts that ${rule.source} raises will now arrive muted.`
+                         : `${rule.name} governs ${rule.source} again. Alerts it had silenced are reopened.`);
+          ruleWritten(after);
         } catch (err) {
           toast('error','Could not change the rule', errText(err));
         }
@@ -598,12 +728,12 @@
         if(!allowed('admin','Deleting an alert rule requires the admin role.')) return;
         confirmModal({
           title:'Delete Alert Rule', confirmLabel:'Delete', danger:true,
-          msg:`Delete "${rule.name}"? Alerts it already raised are evidence and are kept.`,
+          msg:`Delete "${rule.name}"? Alerts it governed are evidence and are kept; any it had silenced are reopened.`,
           onConfirm: async () => {
             try {
               await Store.mutate(() => API.alerts.rules.remove(rule.id), { event:'alerts:changed' });
-              toast('success','Rule deleted', `${rule.name} no longer raises alerts.`);
-              if(after) after();
+              toast('success','Rule deleted', `${rule.name} deleted. Alerts it had silenced are reopened.`);
+              ruleWritten(after);
             } catch (err) {
               toast('error','Could not delete the rule', errText(err));
             }
@@ -621,13 +751,22 @@
   const exStatusColor = (s) => s === 'Ready' ? 'green' : s === 'Failed' ? 'red'
     : s === 'Generating' ? 'amber' : s === 'Expired' ? 'gray' : 'blue';
   const fmtColor = (f) => ({ CSV:'green', JSON:'purple', XLSX:'blue', PDF:'red', Parquet:'cyan' })[f] || 'gray';
+  /* The formats the generator can write are a property of the build, not of the
+     workspace, so they are asked for once and kept for the life of the page. */
+  let exFormats = null;
 
   SCREENS['exports'] = {
     title:'Exports',
     render(main){
       const members = memberDirectory();
-      let formats = ['CSV'], datasets = [];
+      /* `datasets` and `deliveryAvailable` arrive with the summary, so the
+         picker costs no request of its own. `deliveryAvailable` stays null until
+         the summary answers: only a plain `false` hides the recipients field. */
+      let formats = exFormats || ['CSV'], datasets = [], deliveryAvailable = null;
       const timers = [];
+      const datasetOf = (screen) => datasets.find(d => d.source_screen === screen) || null;
+      /** An inventory (agents, secrets, budgets…) has no time axis: the server ignores `days` for it. */
+      const isWindowed = (screen) => { const d = datasetOf(screen); return !d || d.windowed !== false; };
 
       main.innerHTML = `
         ${pageHead({title:'Exports', sub:'Generate and download platform data exports for reporting, audit, and BI.',
@@ -656,6 +795,8 @@
                 sub: `${fmtFull(s.ready)} downloadable now` },
             ]);
             fillScreens(s.source_screens || []);
+            if(Array.isArray(s.datasets) && s.datasets.length) datasets = s.datasets;
+            deliveryAvailable = s.delivery_available === false ? false : (s.delivery_available === true ? true : deliveryAvailable);
           })
           .catch(err => { host.innerHTML = ''; host.appendChild(screenError(err, loadSummary, 'the export summary')); });
       }
@@ -680,7 +821,9 @@
           { key:'export_format', label:'Format', render:r => badge(r.export_format, fmtColor(r.export_format)) },
           { key:'row_count', label:'Rows', align:'right', cls:'num', render:r => num(r.row_count) },
           { key:'size_bytes', label:'Size', align:'right', cls:'num', render:r => `<span class="dim">${bytes(r.size_bytes)}</span>` },
-          { key:'requested_by', label:'Requested By', sortable:false, render:r => members.cell(r.requested_by_user_id) },
+          // Tagged with the id so the names can be filled in where they stand (see members.load below).
+          { key:'requested_by', label:'Requested By', sortable:false,
+            render:r => `<span data-exmember="${esc(r.requested_by_user_id || '')}">${members.cell(r.requested_by_user_id)}</span>` },
           { key:'requested_at', label:'Created', render:r => when(r.requested_at) },
           { key:'status', label:'Status', render:r => statusText(r.status, exStatusColor(r.status))
               + (r.is_expired ? ' <span class="badge bg-gray" title="Retention has lapsed">expired</span>' : '') },
@@ -712,10 +855,16 @@
       wrap.appendChild(table.el);
       document.getElementById('exSearch').addEventListener('input', e => table.search(e.target.value));
 
-      members.load().then(() => table.refresh());
+      /* The table loads itself on construction. When the member names arrive
+         after its rows, the cells already drawn are filled in where they stand —
+         this used to refresh the table, a second GET /exports for the same page. */
+      members.load().then(() => {
+        wrap.querySelectorAll('[data-exmember]').forEach(el => { el.innerHTML = members.cell(el.dataset.exmember || null); });
+      });
       loadSummary();
-      API.exports.datasets().then(list => { datasets = list || []; }).catch(() => { datasets = []; });
-      API.exports.formats().then(list => { if((list || []).length) formats = list; }).catch(() => {});
+      if(!exFormats){
+        API.exports.formats().then(list => { if((list || []).length){ exFormats = list; formats = list; } }).catch(() => {});
+      }
 
       function refreshAll(){ table.refresh(); loadSummary(); }
 
@@ -830,8 +979,12 @@
       }
 
       // ---- new export -------------------------------------------------------
-      document.getElementById('exNew').addEventListener('click', () => {
+      document.getElementById('exNew').addEventListener('click', async () => {
         if(!allowed('member','Requesting an export requires the member role.')) return;
+        // The summary normally brought the datasets; ask directly only when it has not (yet, or at all).
+        if(!datasets.length){
+          try { const list = await API.exports.datasets(); datasets = Array.isArray(list) ? list : []; } catch (_) { datasets = []; }
+        }
         if(!datasets.length){
           toast('error','No datasets available','The control plane did not offer any exportable dataset.');
           return;
@@ -845,11 +998,12 @@
             <div class="grid g2">
               <div class="form-row"><label>FORMAT</label>
                 <select class="filter-select w-100" id="nexFmt" style="height:34px">${formats.map(f => `<option>${esc(f)}</option>`).join('')}</select></div>
-              <div class="form-row"><label>TIME RANGE</label>
+              <div class="form-row"><label id="nexDaysLabel">TIME RANGE</label>
                 <select class="filter-select w-100" id="nexDays" style="height:34px">
                   <option value="1">Last 24 hours</option><option value="7">Last 7 days</option>
                   <option value="30" selected>Last 30 days</option><option value="90">Last 90 days</option>
-                  <option value="">All time</option></select></div>
+                  <option value="">All time</option></select>
+                <div class="small faint" id="nexDaysNote" style="margin-top:4px"></div></div>
             </div>
             <div class="form-row"><label>NAME</label><input class="input" id="nexName" placeholder="Defaults to the dataset and today's date"></div>`,
           footer:[
@@ -857,26 +1011,37 @@
             { label:'Generate Export', cls:'primary', onClick: async (close, modal) => {
                 const ds = modal.querySelector('#nexDs').value;
                 const fmt = modal.querySelector('#nexFmt').value;
-                const days = modal.querySelector('#nexDays').value;
+                // An inventory has no time axis, so no window is sent for it.
+                const days = isWindowed(ds) ? modal.querySelector('#nexDays').value : '';
                 const name = modal.querySelector('#nexName').value.trim() || `${ds} — ${fmtDate(Date.now())}`;
                 const body = { name, source_screen: ds, export_format: fmt, filters: days ? { days: Number(days) } : {} };
-                close();
                 try {
                   const job = await Store.mutate(() => API.exports.create(body), { event:'exports:changed' });
+                  close();
                   toast('info','Export queued', `${job.name} — ${job.export_ref}`);
                   refreshAll();
                   watchJob(job);
                 } catch (err) {
-                  toast('error','Could not queue the export', errText(err));
+                  modalError(modal, errText(err));
                 }
               } },
           ],
           onOpen(modal){
             const sel = modal.querySelector('#nexDs');
             const note = modal.querySelector('#nexCols');
+            const daysSel = modal.querySelector('#nexDays');
+            const daysLabel = modal.querySelector('#nexDaysLabel');
+            const daysNote = modal.querySelector('#nexDaysNote');
             const paintCols = () => {
-              const d = datasets.find(x => x.source_screen === sel.value);
+              const d = datasetOf(sel.value);
               note.textContent = d ? `Columns: ${d.columns.join(', ')}` : '';
+              /* The window is measured on one column, and the server says which
+                 ("Raised At", "Occurred At"). An inventory has none: every record
+                 is exported, so the control is switched off rather than ignored. */
+              const windowed = isWindowed(sel.value);
+              daysSel.disabled = !windowed;
+              daysLabel.textContent = windowed && d && d.time_label ? `TIME RANGE — ${String(d.time_label).toUpperCase()}` : 'TIME RANGE';
+              daysNote.textContent = windowed ? '' : 'This dataset is an inventory — every record is exported, whatever the time range.';
             };
             sel.addEventListener('change', paintCols);
             paintCols();
@@ -889,10 +1054,16 @@
        *
        * The bar is the server's own three-stage status, not a timer: Queued,
        * Generating, then Ready or Failed. Polling stops the moment the job is
-       * terminal or the modal is closed.
+       * terminal or the modal is closed — and after ten minutes regardless: a
+       * window left open on a stuck job used to ask every 1.2 s for ever. The
+       * server brings every job to a terminal state on its own (an interrupted
+       * one is failed within about a quarter of an hour), so nothing is lost by
+       * no longer watching; the history table shows where it ended up.
        */
+      const WATCH_LIMIT_MS = 10 * 60 * 1000;
       function watchJob(job){
         let timer = null, closed = false;
+        const startedAt = Date.now();
         const handle = openModal({
           title:'Generating Export', icon:'download',
           body:`<div id="exJobBody"><div class="card-loading" style="height:120px"></div></div>`,
@@ -926,6 +1097,12 @@
                   j.status === 'Ready'
                     ? `${j.name} — ${fmtFull(j.row_count)} rows, ${bytes(j.size_bytes)}.`
                     : (j.error || 'The generator reported a failure.'));
+                return;
+              }
+              if(Date.now() - startedAt > WATCH_LIMIT_MS){
+                stop();
+                body.insertAdjacentHTML('beforeend', `<div class="quote mt">${ICONS.info} Still ${esc(String(j.status).toLowerCase())} after ten minutes.
+                  This window has stopped checking; the export carries on in the background and its row in the history shows how it ends.</div>`);
                 return;
               }
               timer = setTimeout(()=>tick(modal), 1200);
@@ -993,8 +1170,12 @@
                 'A schedule re-runs a dataset on a cron cadence and files the result here.');
               return;
             }
+            /* No transport exists on a build that reports delivery_available
+               false, so a Recipients column would promise mail nobody receives.
+               It stays only while a legacy schedule still holds a list. */
+            const showRcpt = deliveryAvailable !== false || page.items.some(x => (x.recipients || []).length);
             body.innerHTML = `<table class="tbl"><thead><tr><th>Schedule</th><th>Dataset</th><th>Format</th><th>Cron</th>
-                <th>Next Run</th><th>Last Run</th><th>Recipients</th><th>Status</th><th></th></tr></thead><tbody>
+                <th>Next Run</th><th>Last Run</th>${showRcpt ? `<th${deliveryAvailable === false ? ' title="Delivery is not configured on this deployment — nothing is sent"' : ''}>Recipients</th>` : ''}<th>Status</th><th></th></tr></thead><tbody>
               ${page.items.map((s,i) => `<tr style="cursor:default">
                 <td class="cell-main">${esc(s.name)}</td>
                 <td class="dim">${esc(s.source_screen)}</td>
@@ -1002,7 +1183,7 @@
                 <td class="mono small">${esc(s.cron)}</td>
                 <td class="dim nowrap">${s.next_run_at ? esc(fmtDateTime(ts(s.next_run_at))) : '—'}</td>
                 <td class="dim nowrap">${s.last_run_at ? esc(relTime(ts(s.last_run_at))) : '—'}</td>
-                <td class="dim">${(s.recipients || []).length ? esc(s.recipients.join(', ')) : '—'}</td>
+                ${showRcpt ? `<td class="${deliveryAvailable === false ? 'faint' : 'dim'}">${(s.recipients || []).length ? esc(s.recipients.join(', ')) : '—'}</td>` : ''}
                 <td>${statusText(s.enabled ? 'Active' : 'Paused', s.enabled ? 'green' : 'gray')}</td>
                 <td class="right"><button class="icon-btn" data-schedmenu="${i}">${ICONS.dots}</button></td></tr>`).join('')}
               </tbody></table>
@@ -1025,11 +1206,35 @@
           .catch(err => { body.innerHTML = ''; body.appendChild(screenError(err, ()=>loadSchedules(modal), 'the export schedules')); });
       }
 
-      function editSchedule(sched, after){
+      /** The same filters, whatever order their keys were written in. */
+      function sameFilters(a, b){
+        const norm = (o) => JSON.stringify(Object.keys(o || {}).sort().map(k => [k, o[k]]));
+        return norm(a) === norm(b);
+      }
+
+      async function editSchedule(sched, after){
         // "Schedule Weekly" seeds a schedule that has no id yet — only an id means an edit.
         const isEdit = !!(sched && sched.id);
         if(!allowed('operator', isEdit ? 'Editing a schedule requires the operator role.' : 'Scheduling an export requires the operator role.')) return;
+        // The summary normally brought the datasets; ask directly only when it has not.
+        if(!datasets.length){
+          try { const list = await API.exports.datasets(); datasets = Array.isArray(list) ? list : []; } catch (_) { datasets = []; }
+        }
         const s = sched || {};
+        /* The filters this schedule already carries are the starting point, and
+           only `days` has a control here. The editor used to rebuild them from
+           that one box on every save: an all-time schedule reopened showing 7 and
+           was saved as seven days, "Schedule Weekly" ignored the window of the
+           job it was seeded from, and a filter set through the API (a status, a
+           severity) was dropped the first time anyone saved from the console.
+           Seven days is the default only for a schedule started from nothing. */
+        const base = { ...(s.filters || {}) };
+        const daysValue = base.days != null ? String(base.days) : (sched ? '' : '7');
+        const carried = Object.keys(base).filter(k => k !== 'days');
+        /* Nothing on this build sends a file anywhere, and the API refuses a new
+           recipient with a 422. The field is shown, switched off, only so a
+           legacy schedule's list stays visible; it is never sent from here. */
+        const noDelivery = deliveryAvailable === false;
         const dsOptions = datasets.length
           ? datasets.map(d => `<option ${d.source_screen === s.source_screen ? 'selected' : ''}>${esc(d.source_screen)}</option>`).join('')
           : `<option>${esc(s.source_screen || '')}</option>`;
@@ -1047,40 +1252,92 @@
             <div class="grid g2">
               <div class="form-row"><label>CRON (UTC)</label>
                 <input class="input" id="esCron" value="${esc(s.cron || '0 6 * * 1')}" placeholder="0 6 * * 1"></div>
-              <div class="form-row"><label>TIME RANGE (DAYS)</label>
-                <input class="input" id="esDays" value="${esc(String((s.filters && s.filters.days) || 7))}"></div>
+              <div class="form-row"><label id="esDaysLabel">TIME RANGE (DAYS)</label>
+                <input class="input" id="esDays" value="${esc(daysValue)}" placeholder="All time">
+                <div class="small faint" id="esDaysNote" style="margin-top:4px"></div></div>
             </div>
+            ${carried.length ? `<div class="small faint" style="margin:-4px 0 10px">Also filtered on ${carried.map(k =>
+              `<span class="mono">${esc(k)}=${esc(String(base[k]))}</span>`).join(', ')} — kept as they are.</div>` : ''}
             <div class="form-row"><label>RECIPIENTS</label>
-              <input class="input" id="esRcpt" value="${esc((s.recipients || []).join(', '))}" placeholder="ops@example.com, audit@example.com"></div>
+              <input class="input" id="esRcpt" value="${esc((s.recipients || []).join(', '))}"${noDelivery
+                ? ' disabled placeholder="Not available"' : ' placeholder="ops@example.com, audit@example.com"'}>
+              ${noDelivery ? '<div class="small faint" style="margin-top:4px">Delivery is not configured on this deployment — files are collected from the Exports screen.</div>' : ''}</div>
             <label class="flex" style="gap:8px;align-items:center;margin-top:4px">
               <input type="checkbox" id="esEnabled" ${s.enabled === false ? '' : 'checked'}><span class="small">Enabled</span></label>
-            <div class="small faint" style="margin-top:6px">The cron expression is evaluated in UTC; the first firing is computed when it is saved.</div>`,
+            <div class="small faint" style="margin-top:6px">Five cron fields, evaluated in UTC; the first firing is computed when it is saved.</div>`,
+          onOpen(modal){
+            const sel = modal.querySelector('#esDs');
+            const daysEl = modal.querySelector('#esDays');
+            const paintWindow = () => {
+              const d = datasetOf(sel.value);
+              const windowed = isWindowed(sel.value);
+              daysEl.disabled = !windowed;
+              modal.querySelector('#esDaysLabel').textContent = windowed && d && d.time_label
+                ? `${String(d.time_label).toUpperCase()} IN THE LAST (DAYS)` : 'TIME RANGE (DAYS)';
+              modal.querySelector('#esDaysNote').textContent = windowed
+                ? 'Blank means all time.' : 'This dataset is an inventory — every record is exported.';
+            };
+            sel.addEventListener('change', paintWindow);
+            paintWindow();
+          },
           footer:[
             { label:'Cancel' },
             { label: isEdit ? 'Save Schedule' : 'Create Schedule', cls:'primary', onClick: async (close, modal) => {
                 const name = modal.querySelector('#esName').value.trim();
                 const cron = modal.querySelector('#esCron').value.trim();
-                if(!name || !cron){ toast('error','Cannot save','A schedule needs a name and a cron expression.'); return; }
-                const days = parseInt(modal.querySelector('#esDays').value, 10);
-                const body = {
-                  name, cron,
-                  source_screen: modal.querySelector('#esDs').value,
+                if(!name){ modalError(modal, 'A schedule needs a name.', '#esName'); return; }
+                if(!cron){ modalError(modal, 'A schedule needs a cron expression.', '#esCron'); return; }
+                const source = modal.querySelector('#esDs').value;
+                const filters = { ...base };
+                const daysText = modal.querySelector('#esDays').value.trim();
+                if(!isWindowed(source) || !daysText){
+                  delete filters.days;
+                } else {
+                  const days = Number(daysText);
+                  if(!Number.isInteger(days) || days < 1){
+                    modalError(modal, 'The time range is a whole number of days, or blank for all time.', '#esDays');
+                    return;
+                  }
+                  filters.days = days;
+                }
+                const full = {
+                  name, cron, source_screen: source,
                   export_format: modal.querySelector('#esFmt').value,
-                  filters: isNaN(days) ? {} : { days },
-                  recipients: modal.querySelector('#esRcpt').value.split(',').map(x => x.trim()).filter(Boolean),
+                  filters,
                   enabled: modal.querySelector('#esEnabled').checked,
                 };
-                close();
+                if(!noDelivery){
+                  full.recipients = modal.querySelector('#esRcpt').value.split(',').map(x => x.trim()).filter(Boolean);
+                }
+                /* An edit sends only what changed, so pausing a schedule or
+                   renaming it never rewrites its filters or its recipients. */
+                let body = full;
+                if(isEdit){
+                  body = {};
+                  ['name','cron','source_screen','export_format','enabled'].forEach(k => { if(full[k] !== s[k]) body[k] = full[k]; });
+                  if(!sameFilters(filters, s.filters)) body.filters = filters;
+                  if(full.recipients && full.recipients.join(',') !== (s.recipients || []).join(',')) body.recipients = full.recipients;
+                  if(!Object.keys(body).length){ close(); toast('info','Nothing changed', name); return; }
+                }
+                /* Asked first, closed on success. A cron that never fires, a sixth
+                   cron field or a refused recipient is a 422 that names its field;
+                   it is shown under that field with everything typed still there. */
                 try {
                   const saved = await Store.mutate(() => isEdit
                     ? API.exports.schedules.update(sched.id, body)
                     : API.exports.schedules.create(body), { event:'exports:changed' });
+                  close();
                   toast('success', isEdit ? 'Schedule saved' : 'Schedule created',
-                    saved.next_run_at ? `Next run ${fmtDateTime(ts(saved.next_run_at))}.` : `${name} is paused until enabled.`);
+                    saved.next_run_at ? `Next run ${fmtDateTime(ts(saved.next_run_at))}.`
+                      : saved.enabled === false ? `${name} is paused until enabled.` : `${name} has no upcoming run.`);
                   loadSummary();
                   if(after) after();
                 } catch (err) {
-                  toast('error', isEdit ? 'Could not save the schedule' : 'Could not create the schedule', errText(err));
+                  const named = (err && err.details && (err.details.field
+                    || ((err.details.fields || [])[0] || {}).field)) || '';
+                  const anchor = /cron/.test(named) ? '#esCron' : /recipients/.test(named) ? '#esRcpt'
+                    : /filters|days/.test(named) ? '#esDays' : /name/.test(named) ? '#esName' : null;
+                  modalError(modal, errText(err), anchor);
                 }
               } },
           ],
@@ -1243,7 +1500,15 @@
       document.getElementById('liExport').addEventListener('click', async () => {
         try {
           if(activeTab === 5){
-            await API.audit.export({ source_screen:'Licensing & Entitlements', page_size: 500 });
+            /* The export replays the grid's search and order. It carries no
+               page_size: the route shares the list parameters, which cap at 200,
+               so the 500 this used to send was refused with a 422 before the
+               handler — which exports every matching row anyway — ever ran. */
+            const p = activeTable ? activeTable.params() : {};
+            const q = { source_screen:'Licensing & Entitlements' };
+            if(p.q) q.q = p.q;
+            if(p.sort) q.sort = p.sort;
+            await API.audit.export(q);
             toast('success','Export complete','Licensing audit trail exported to CSV.');
             return;
           }
@@ -1541,98 +1806,223 @@
                 };
                 if(expires) payload.expires_at = new Date(expires + 'T00:00:00Z').toISOString();
                 if(po) payload.purchase_order_ref = po;
-                close();
+                // Asked first: an end date that is not in the future (422) or a workspace already licensed (409) keeps the form.
                 try {
                   const lic = await Store.mutate(() => API.licensing.tenants.create(payload), { event:'licensing:changed' });
+                  close();
                   toast('success','License issued', `${lic.plan_name || 'Plan'} · ${fmtFull(lic.seats_purchased)} seats.`);
                   licenseLoaded = false; license = lic;
                   loadSummary();
                   if(after) after();
                 } catch (err) {
-                  toast('error','Could not issue the licence', errText(err));
+                  modalError(modal, errText(err));
                 }
               } },
           ],
         });
       }
 
+      /**
+       * One licence, and everything an owner can do to it.
+       *
+       * The dialog is painted from a fresh read, and painted again after each of
+       * its own actions. It used to be drawn once and left: after Suspend it
+       * still showed Active and a Suspend button (a second click was a 409),
+       * Reactivate never appeared until it was closed and reopened, and a second
+       * Purchase Seats quoted the pool as it had been before the first.
+       */
       function manageTenant(lic, after){
-        openModal({
+        let repaint = () => {};
+        const changed = () => { repaint(); if(after) after(); };
+        const handle = openModal({
           title:'Manage Tenant — ' + (lic.tenant_name || lic.tenant_workspace_id), icon:'globe', wide:true,
           body:`<div class="card-loading" style="height:180px"></div>`,
           footer:[{ label:'Close' }],
           onOpen(modal){
             const mb = modal.querySelector('.modal-body');
-            API.licensing.tenants.get(lic.id)
-              .then(l => {
-                mb.innerHTML = kv([
-                  ['Plan', `${esc(l.plan_name || '—')} ${badge(l.plan_tier || '—', tierColor[l.plan_tier] || 'gray')}`],
-                  ['Status', statusText(l.status, licColor(l.status))],
-                  ['Seats', `${fmtFull(l.seats_assigned)} assigned of ${fmtFull(l.seats_purchased)} · ${fmtFull(l.seats_available)} free`],
-                  ['Seat Utilisation', l.seat_utilization_pct == null ? dash : barPct(l.seat_utilization_pct, l.seat_utilization_pct >= 85 ? 'amber' : 'green')],
-                  ['Token Capacity', num(l.included_tokens)],
-                  ['Run Capacity', num(l.included_runs)],
-                  ['Term', `${day(l.starts_at)} → ${l.expires_at ? day(l.expires_at) : 'open-ended'}`],
-                  ['Days to Renewal', l.days_until_expiry == null ? dash : String(l.days_until_expiry)],
-                  ['Auto Renew', l.auto_renew ? badge('Yes','green') : badge('No','gray')],
-                  ['Billing Contact', l.billing_contact_email ? esc(l.billing_contact_email) : dash],
-                  ['Purchase Order', l.purchase_order_ref ? `<span class="mono">${esc(l.purchase_order_ref)}</span>` : dash],
-                  ...(l.suspended_at ? [['Suspended', `${at(l.suspended_at)} — ${esc(l.suspended_reason || 'no reason recorded')}`]] : []),
-                ]) + `<div class="quote mt">${ICONS.info} Changes to tenant entitlements take effect on the next entitlement check and are audited.</div>
-                  <div class="flex mt" style="gap:8px;flex-wrap:wrap">
-                    <button class="btn sm primary" id="mtUpgrade"${gate('owner','Changing a plan requires the owner role.')}>${ICONS.arrowUp}Change Plan</button>
-                    <button class="btn sm" id="mtSeats"${gate('owner','Purchasing seats requires the owner role.')}>${ICONS.plus}Purchase Seats</button>
-                    ${l.status === 'Suspended'
-                      ? `<button class="btn sm success" id="mtReactivate"${gate('owner','Reactivating a licence requires the owner role.')}>${ICONS.checkCircle}Reactivate</button>`
-                      : `<button class="btn sm danger" id="mtSuspend"${gate('owner','Suspending a licence requires the owner role.')}>${ICONS.xCircle}Suspend</button>`}
-                    <button class="btn sm" id="mtUsage">${ICONS.gauge}Usage &amp; Limits</button>
-                  </div>`;
-                const up = mb.querySelector('#mtUpgrade');
-                if(up) up.addEventListener('click', ()=>changePlan(l, after));
-                const sb = mb.querySelector('#mtSeats');
-                if(sb) sb.addEventListener('click', ()=>purchaseSeats(l, after));
-                const su = mb.querySelector('#mtSuspend');
-                if(su) su.addEventListener('click', ()=>suspendLicense(l, after));
-                const re = mb.querySelector('#mtReactivate');
-                if(re) re.addEventListener('click', ()=>reactivateLicense(l, after));
-                mb.querySelector('#mtUsage').addEventListener('click', ()=>{ license = l; licenseLoaded = true; goTab(3); });
-              })
-              .catch(err => { mb.innerHTML = ''; mb.appendChild(screenError(err, null, 'this tenant licence')); });
+            repaint = () => {
+              if(!mb.isConnected) return;
+              mb.innerHTML = `<div class="card-loading" style="height:180px"></div>`;
+              API.licensing.tenants.get(lic.id)
+                .then(l => { if(mb.isConnected) paint(mb, l); })
+                .catch(err => { if(!mb.isConnected) return; mb.innerHTML = ''; mb.appendChild(screenError(err, repaint, 'this tenant licence')); });
+            };
+            repaint();
           },
         });
+
+        function paint(mb, l){
+          // Revoked and Expired are terminal: the API refuses to amend, suspend or revoke them.
+          const terminal = l.status === 'Revoked' || l.status === 'Expired';
+          const owner = (why) => gate('owner', why);
+          mb.innerHTML = kv([
+            ['Plan', `${esc(l.plan_name || '—')} ${badge(l.plan_tier || '—', tierColor[l.plan_tier] || 'gray')}`],
+            ['Status', statusText(l.status, licColor(l.status))],
+            ['Seats', `${fmtFull(l.seats_assigned)} assigned of ${fmtFull(l.seats_purchased)} · ${fmtFull(l.seats_available)} free`],
+            ['Seat Utilisation', l.seat_utilization_pct == null ? dash : barPct(l.seat_utilization_pct, l.seat_utilization_pct >= 85 ? 'amber' : 'green')],
+            ['Token Capacity', num(l.included_tokens)],
+            ['Run Capacity', num(l.included_runs)],
+            ['Term', `${day(l.starts_at)} → ${l.expires_at ? day(l.expires_at) : 'open-ended'}`],
+            ['Days to Renewal', l.days_until_expiry == null ? dash : String(l.days_until_expiry)],
+            ['Auto Renew', l.auto_renew ? badge('Yes','green') : badge('No','gray')],
+            ['Billing Contact', l.billing_contact_email ? esc(l.billing_contact_email) : dash],
+            ['Purchase Order', l.purchase_order_ref ? `<span class="mono">${esc(l.purchase_order_ref)}</span>` : dash],
+            ...(l.suspended_at ? [['Suspended', `${at(l.suspended_at)} — ${esc(l.suspended_reason || 'no reason recorded')}`]] : []),
+          ]) + `<div class="quote mt">${ICONS.info} ${terminal
+              ? `This licence is ${esc(String(l.status).toLowerCase())} and can no longer be amended. A new licence can be issued for the workspace.`
+              : 'Changes to tenant entitlements take effect on the next entitlement check and are audited.'}</div>
+            <div class="flex mt" style="gap:8px;flex-wrap:wrap">
+              ${terminal ? '' : `<button class="btn sm primary" id="mtUpgrade"${owner('Amending a licence requires the owner role.')}>${ICONS.arrowUp}Amend License</button>
+              <button class="btn sm" id="mtSeats"${owner('Purchasing seats requires the owner role.')}>${ICONS.plus}Purchase Seats</button>`}
+              ${terminal ? '' : l.status === 'Suspended'
+                ? `<button class="btn sm success" id="mtReactivate"${owner('Reactivating a licence requires the owner role.')}>${ICONS.checkCircle}Reactivate</button>`
+                : `<button class="btn sm danger" id="mtSuspend"${owner('Suspending a licence requires the owner role.')}>${ICONS.xCircle}Suspend</button>`}
+              <button class="btn sm" id="mtUsage">${ICONS.gauge}Usage &amp; Limits</button>
+              ${terminal ? '' : `<button class="btn sm danger" id="mtRevoke"${owner('Revoking a licence requires the owner role.')}>${ICONS.x}Revoke</button>`}
+              <button class="btn sm danger" id="mtDelete"${owner('Deleting a licence requires the owner role.')}>${ICONS.trash}Delete</button>
+            </div>`;
+          const wire = (id, fn) => { const b = mb.querySelector(id); if(b) b.addEventListener('click', fn); };
+          wire('#mtUpgrade', ()=>changePlan(l, changed));
+          wire('#mtSeats', ()=>purchaseSeats(l, changed));
+          wire('#mtSuspend', ()=>suspendLicense(l, changed));
+          wire('#mtReactivate', ()=>reactivateLicense(l, changed));
+          wire('#mtRevoke', ()=>revokeLicense(l, changed));
+          // A deleted licence leaves nothing to repaint: the dialog goes with it.
+          wire('#mtDelete', ()=>deleteLicense(l, () => { handle.close(); if(after) after(); }));
+          wire('#mtUsage', ()=>{ license = l; licenseLoaded = true; handle.close(); goTab(3); });
+        }
       }
 
+      /** `2026-12-31` for a date input, from the instant the server holds. */
+      const isoDay = (v) => v ? new Date(v).toISOString().slice(0, 10) : '';
+
+      /**
+       * Amend a licence: its plan, its seat pool, its term and who is billed.
+       *
+       * This was "Change Plan" and knew only the plan and the seats, which left
+       * no way in the console to move an end date — and a suspended licence whose
+       * term has lapsed is refused reactivation with "Extend expires_at before
+       * reactivating it". The term, the seats, the contact and the renewal flag
+       * are sent only when changed: the API judges the term only when a date is
+       * in the request.
+       */
       async function changePlan(lic, after){
-        if(!allowed('owner','Changing a plan requires the owner role.')) return;
+        if(!allowed('owner','Amending a licence requires the owner role.')) return;
         let plans = { items: [] };
         try { plans = await API.licensing.plans.list({ page_size: 100, status:'Active' }); }
         catch (err) { toast('error','Could not load plans', errText(err)); return; }
+        // The plan a licence is on may since have left the Active list; it must still be selectable as "no change".
+        const held = plans.items.some(p => p.id === lic.plan_id) ? ''
+          : `<option value="${esc(lic.plan_id || '')}" selected>${esc(lic.plan_name || 'Current plan')} — current</option>`;
+        const expiresDay = isoDay(lic.expires_at);
         openModal({
-          title:'Change Plan', icon:'arrowUp',
-          body:`<div class="form-row"><label>NEW PLAN</label>
-              <select class="filter-select w-100" id="cpPlan" style="height:34px">${plans.items.map(p =>
+          title:'Amend License', icon:'arrowUp',
+          body:`<div class="form-row"><label>PLAN</label>
+              <select class="filter-select w-100" id="cpPlan" style="height:34px">${held}${plans.items.map(p =>
                 `<option value="${esc(p.id)}" ${p.id === lic.plan_id ? 'selected' : ''}>${esc(p.name)} — ${esc(p.tier)}</option>`).join('')}</select></div>
-            <div class="form-row"><label>SEATS PURCHASED</label>
-              <input class="input" id="cpSeats" value="${esc(String(lic.seats_purchased))}">
-              <div class="small faint" style="margin-top:4px">Cannot drop below the ${fmtFull(lic.seats_assigned)} seat(s) already assigned.</div></div>`,
+            <div class="grid g2">
+              <div class="form-row"><label>SEATS PURCHASED</label>
+                <input class="input" id="cpSeats" value="${esc(String(lic.seats_purchased))}">
+                <div class="small faint" style="margin-top:4px">Cannot drop below the ${fmtFull(lic.seats_assigned)} seat(s) already assigned.</div></div>
+              <div class="form-row"><label>EXPIRES</label>
+                <input class="input" id="cpExpires" type="date" value="${esc(expiresDay)}">
+                <div class="small faint" style="margin-top:4px">${lic.expires_at ? `Currently ${day(lic.expires_at)}.` : 'Currently open-ended.'} A new date must be in the future.</div></div>
+            </div>
+            <div class="form-row"><label>BILLING CONTACT</label>
+              <input class="input" id="cpBilling" type="email" value="${esc(lic.billing_contact_email || '')}" placeholder="billing@example.com"></div>
+            <label class="flex" style="gap:8px;align-items:center;margin-top:4px">
+              <input type="checkbox" id="cpRenew" ${lic.auto_renew ? 'checked' : ''}><span class="small">Auto-renew</span></label>`,
           footer:[
             { label:'Cancel' },
             { label:'Apply Change', cls:'primary', onClick: async (close, modal) => {
-                const seats = parseInt(modal.querySelector('#cpSeats').value, 10);
-                const payload = { plan_id: modal.querySelector('#cpPlan').value };
-                if(!isNaN(seats)) payload.seats_purchased = seats;
-                close();
+                const payload = {};
+                const planId = modal.querySelector('#cpPlan').value;
+                /* The plan is always named, even when it has not moved: the API
+                   re-resolves the licence's entitlements from whichever plan the
+                   request names, which is the way back for a licence still
+                   carrying limits from a plan it left long ago. */
+                if(planId) payload.plan_id = planId;
+                const seatsText = modal.querySelector('#cpSeats').value.trim();
+                const seats = Number(seatsText);
+                if(!seatsText || !Number.isInteger(seats) || seats < 0){
+                  modalError(modal, 'Seats purchased is a whole number.', '#cpSeats'); return;
+                }
+                if(seats !== lic.seats_purchased) payload.seats_purchased = seats;
+                const expires = modal.querySelector('#cpExpires').value;
+                if(expires !== expiresDay){
+                  if(!expires){ modalError(modal, 'Pick the date the term ends.', '#cpExpires'); return; }
+                  // End of that day, UTC: a licence that "expires on the 31st" is good through the 31st.
+                  const end = new Date(expires + 'T23:59:59Z');
+                  if(isNaN(end.getTime())){ modalError(modal, 'That is not a date — use YYYY-MM-DD.', '#cpExpires'); return; }
+                  payload.expires_at = end.toISOString();
+                }
+                const renew = modal.querySelector('#cpRenew').checked;
+                if(renew !== !!lic.auto_renew) payload.auto_renew = renew;
+                const billing = modal.querySelector('#cpBilling').value.trim();
+                if(billing !== (lic.billing_contact_email || '')) payload.billing_contact_email = billing || null;
+                if(!Object.keys(payload).length){ close(); toast('info','Nothing changed', lic.plan_name || 'The licence is as it was.'); return; }
                 try {
                   const l = await Store.mutate(() => API.licensing.tenants.update(lic.id, payload), { event:'licensing:changed' });
-                  toast('success','License updated', `${l.plan_name || 'Plan'} · ${fmtFull(l.seats_purchased)} seats.`);
+                  close();
+                  toast('success','License updated', `${l.plan_name || 'Plan'} · ${fmtFull(l.seats_purchased)} seats${l.expires_at ? ` · to ${fmtDate(ts(l.expires_at))}` : ''}.`);
                   license = l; licenseLoaded = true;
                   loadSummary();
                   if(after) after();
                 } catch (err) {
-                  toast('error','Could not change the plan', errText(err));
+                  const f = Object.keys((err && err.fieldErrors) || {})[0] || '';
+                  modalError(modal, errText(err), /expires|starts/.test(f) ? '#cpExpires' : /seats/.test(f) ? '#cpSeats'
+                    : /billing/.test(f) ? '#cpBilling' : null);
                 }
               } },
           ],
+        });
+      }
+
+      /** Revocation is terminal: seats are released, the row stays as history, and the workspace can be sold a new licence. */
+      function revokeLicense(lic, after){
+        if(!allowed('owner','Revoking a licence requires the owner role.')) return;
+        openModal({
+          title:'Revoke License', icon:'x',
+          body:`<p style="margin:0 0 10px">Revoking is permanent. Every seat on this licence is released and it can no longer be
+              amended or reactivated; the workspace is then unlicensed until a new licence is issued. Revoking does not stop
+              agents reporting — an unlicensed workspace is not refused. To stop service and bring it back later, suspend instead.</p>
+            <div class="form-row"><label>REASON (OPTIONAL)</label><input class="input" id="rvReason" maxlength="1000" placeholder="e.g. Contract terminated"></div>`,
+          footer:[
+            { label:'Cancel' },
+            { label:'Revoke License', cls:'danger', onClick: async (close, modal) => {
+                const reason = modal.querySelector('#rvReason').value.trim();
+                try {
+                  const res = await Store.mutate(() => API.licensing.revoke(lic.id, reason ? { reason } : {}), { event:'licensing:changed' });
+                  close();
+                  toast('warn','License revoked', res.message);
+                  licenseLoaded = false;
+                  loadSummary();
+                  if(after) after();
+                } catch (err) {
+                  modalError(modal, errText(err));
+                }
+              } },
+          ],
+        });
+      }
+
+      function deleteLicense(lic, after){
+        if(!allowed('owner','Deleting a licence requires the owner role.')) return;
+        confirmModal({
+          title:'Delete License', confirmLabel:'Delete', danger:true,
+          msg:`Delete the ${lic.plan_name || ''} licence for "${lic.tenant_name || lic.tenant_workspace_id}"? A licence with invoices against it cannot be deleted — suspend or revoke it instead.`,
+          onConfirm: async () => {
+            try {
+              await Store.mutate(() => API.licensing.tenants.remove(lic.id), { event:'licensing:changed' });
+              toast('success','License deleted', lic.plan_name || lic.id);
+              licenseLoaded = false; license = null;
+              loadSummary();
+              if(after) after();
+            } catch (err) {
+              // The 409 says why (invoices exist) and what to do instead; it is shown as the server wrote it.
+              toast('error','Could not delete the licence', errText(err));
+            }
+          },
         });
       }
 
@@ -1657,9 +2047,9 @@
                 const payload = { seats };
                 if(po) payload.purchase_order_ref = po;
                 if(note) payload.note = note;
-                close();
                 try {
                   const res = await Store.mutate(() => API.licensing.purchaseSeats(lic.id, payload), { event:'licensing:changed' });
+                  close();
                   const d = res.data || {};
                   toast('success','Seats purchased', res.message
                     || `${fmtFull(d.seats_purchased)} seats now on the licence, ${fmtFull(d.seats_available)} free.`);
@@ -1667,7 +2057,7 @@
                   loadSummary();
                   if(after) after();
                 } catch (err) {
-                  toast('error','Could not purchase seats', errText(err));
+                  modalError(modal, errText(err));
                 }
               } },
           ],
@@ -1678,7 +2068,9 @@
         if(!allowed('owner','Suspending a licence requires the owner role.')) return;
         openModal({
           title:'Suspend License', icon:'xCircle',
-          body:`<p style="margin:0 0 10px">New seat assignment is blocked from this moment and entitlement enforcement starts refusing.</p>
+          body:`<p style="margin:0 0 10px">From this moment no new seat can be assigned, and agent telemetry for this workspace is
+              <b>refused</b> (HTTP 402) and dropped by the SDKs until the licence is reactivated — it is not queued, so what agents
+              report while suspended is lost.</p>
             <div class="form-row"><label>REASON</label><input class="input" id="slReason" placeholder="e.g. Non-payment"></div>
             <label class="flex" style="gap:8px;align-items:center">
               <input type="checkbox" id="slRelease"><span class="small">Also release the ${fmtFull(lic.seats_assigned)} seat(s) already held</span></label>`,
@@ -1687,16 +2079,16 @@
             { label:'Suspend', cls:'danger', onClick: async (close, modal) => {
                 const reason = modal.querySelector('#slReason').value.trim();
                 const release = modal.querySelector('#slRelease').checked;
-                close();
                 try {
                   const res = await Store.mutate(() => API.licensing.suspend(lic.id, { reason: reason || null, release_seats: release }),
                     { event:'licensing:changed' });
+                  close();
                   toast('warn','License suspended', res.message);
                   licenseLoaded = false;
                   loadSummary();
                   if(after) after();
                 } catch (err) {
-                  toast('error','Could not suspend', errText(err));
+                  modalError(modal, errText(err));
                 }
               } },
           ],
@@ -1912,7 +2304,8 @@
           rowId:'id', pageSize:10, pageSizes:[10,25,50], itemName:'invoices',
           searchPlaceholder:'Search invoices…',
           defaultSort:{ key:'period_start', dir:-1 },
-          emptyText:'No invoice has been raised against this workspace yet',
+          // Nothing in this product raises an invoice: they arrive from the billing system, and none has.
+          emptyText:'Invoices are raised by the billing system, and none has been synced to this workspace',
           filters:[
             { key:'status', label:'Status', param:'status', options:INVOICE_STATUS, allLabel:'All Status' },
           ],
@@ -2028,29 +2421,125 @@
         <div id="wsTabs"></div>
         <div id="wsBody" class="mt"></div>`;
 
-      const tabs = [{ label:'API Access Tokens' }, { label:'Users' }, { label:'Profile' }];
-      const panels = [renderKeys, renderUsers, renderProfile];
-      const initial = param === 'profile' ? 2 : param === 'users' ? 1 : 0;
-      tabBar('wsTabs', tabs, (i) => panels[i](), initial);
-      panels[initial]();
+      /* A tab is offered only to a role that can read it: the key list needs
+         operator and the roster needs admin, so a member or viewer who opened
+         Settings used to land on two 403 panels. Everybody has a profile, and
+         that is where anyone without the asked-for tab lands. */
+      const offered = [
+        { key:'keys', label:'API Access Tokens', role:'operator', panel:renderKeys },
+        { key:'users', label:'Users', role:'admin', panel:renderUsers },
+        { key:'profile', label:'Profile', role:null, panel:renderProfile },
+      ].filter(t => !t.role || Store.session.can(t.role));
+      const wanted = param === 'profile' ? 'profile' : param === 'users' ? 'users' : 'keys';
+      const found = offered.findIndex(t => t.key === wanted);
+      const initial = found >= 0 ? found : offered.findIndex(t => t.key === 'profile');
+      tabBar('wsTabs', offered.map(t => ({ label:t.label })), (i) => offered[i].panel(), initial);
+      offered[initial].panel();
 
       // ---- profile ----------------------------------------------------------
+      /**
+       * Your own record, editable, and your own password.
+       *
+       * This was a read-only card that sent people to "a workspace admin on the
+       * Users roster" — which had no way to edit a name either — and nothing in
+       * the console reached POST /auth/change-password, so a member handed an
+       * initial password by an admin kept it for good.
+       */
       function renderProfile(){
         const body = document.getElementById('wsBody');
         const u = Store.session.user || {};
         const w = Store.session.workspace || {};
-        body.innerHTML = `<div class="card" style="max-width:640px;padding:20px">
-          ${kv([
-            ['Name', esc(u.full_name || '—')],
-            ['Email', `<span class="mono">${esc(u.email || '—')}</span>`],
-            ['Job Title', u.job_title ? esc(u.job_title) : dash],
-            ['Team', u.team ? esc(u.team) : dash],
-            ['Role', badge(Store.session.role || '—', 'purple')],
-            ['Workspace', `${esc(w.name || '—')} <span class="faint small mono">${esc(w.slug || '')}</span>`],
-          ])}
-          <div class="quote mt">${ICONS.info} Profile fields are managed by a workspace admin on the
-          Users roster; this panel shows what the server holds for your session.</div>
+        body.innerHTML = `<div class="grid g2" style="gap:16px;align-items:start;max-width:980px">
+          <div class="card" style="padding:20px">
+            <div class="card-title" style="margin-bottom:12px">Profile</div>
+            <div class="form-row"><label>FULL NAME</label>
+              <input class="input" id="pfName" maxlength="160" value="${esc(u.full_name || '')}"></div>
+            <div class="grid g2">
+              <div class="form-row"><label>JOB TITLE</label>
+                <input class="input" id="pfTitle" maxlength="120" value="${esc(u.job_title || '')}"></div>
+              <div class="form-row"><label>TEAM</label>
+                <input class="input" id="pfTeam" maxlength="120" value="${esc(u.team || '')}"></div>
+            </div>
+            ${kv([
+              ['Email', `<span class="mono">${esc(u.email || '—')}</span>`],
+              ['Role', badge(Store.session.role || '—', 'purple')],
+              ['Workspace', `${esc(w.name || '—')} <span class="faint small mono">${esc(w.slug || '')}</span>`],
+            ])}
+            <div class="small faint mt">Email identifies the account and the role is granted by an admin; neither is self-service.</div>
+            <div class="small st-red mt" id="pfErr"></div>
+            <button class="btn primary mt" id="pfSave">${ICONS.check}Save Profile</button>
+          </div>
+          <div class="card" style="padding:20px">
+            <div class="card-title" style="margin-bottom:12px">Change Password</div>
+            <div class="form-row"><label>CURRENT PASSWORD</label>
+              <input class="input" id="pwCurrent" type="password" autocomplete="current-password"></div>
+            <div class="form-row"><label>NEW PASSWORD</label>
+              <input class="input" id="pwNew" type="password" autocomplete="new-password">
+              <div class="small faint" style="margin-top:4px">At least 12 characters, with a letter and a digit or symbol.</div></div>
+            <div class="form-row"><label>CONFIRM NEW PASSWORD</label>
+              <input class="input" id="pwConfirm" type="password" autocomplete="new-password"></div>
+            <div class="small st-red" id="pwErr"></div>
+            <button class="btn primary mt" id="pwSave">${ICONS.key}Change Password</button>
+            <div class="small faint mt">This device stays signed in. The current password is always asked for, so an open session alone cannot take the account over.</div>
+          </div>
         </div>`;
+
+        const pfErr = body.querySelector('#pfErr'), pwErr = body.querySelector('#pwErr');
+
+        body.querySelector('#pfSave').addEventListener('click', async (e) => {
+          const btn = e.currentTarget;
+          pfErr.textContent = '';
+          const full_name = body.querySelector('#pfName').value.trim();
+          if(!full_name){ pfErr.textContent = 'Your name cannot be blank.'; return; }
+          // Only what changed is sent; an emptied title or team is cleared, not left as it was.
+          const patch = {};
+          if(full_name !== (u.full_name || '')) patch.full_name = full_name;
+          const job_title = body.querySelector('#pfTitle').value.trim();
+          if(job_title !== (u.job_title || '')) patch.job_title = job_title || null;
+          const team = body.querySelector('#pfTeam').value.trim();
+          if(team !== (u.team || '')) patch.team = team || null;
+          if(!Object.keys(patch).length){ toast('info','Nothing changed','Your profile is as the server holds it.'); return; }
+          btn.disabled = true;
+          try {
+            await Store.mutate(() => API.auth.updateProfile(patch), { event:'profile:changed' });
+            await Store.session.refresh();
+            // The sidebar card is drawn once at sign-in; bring it in line with what was just saved.
+            const me = Store.session.user || {};
+            const card = document.getElementById('userCard');
+            if(card){
+              const nameEl = card.querySelector('.user-name'), avatarEl = card.querySelector('.avatar'), roleEl = card.querySelector('.user-role');
+              if(nameEl) nameEl.textContent = me.full_name || me.email || '';
+              if(avatarEl && me.initials) avatarEl.textContent = me.initials;
+              if(roleEl && me.job_title) roleEl.textContent = me.job_title;
+            }
+            toast('success','Profile saved', me.full_name || full_name);
+            if(document.getElementById('pfSave')) renderProfile();
+          } catch (err) {
+            pfErr.textContent = errText(err);
+            btn.disabled = false;
+          }
+        });
+
+        body.querySelector('#pwSave').addEventListener('click', async (e) => {
+          const btn = e.currentTarget;
+          pwErr.textContent = '';
+          const current_password = body.querySelector('#pwCurrent').value;
+          const new_password = body.querySelector('#pwNew').value;
+          if(!current_password){ pwErr.textContent = 'Type your current password.'; return; }
+          if(!new_password){ pwErr.textContent = 'Type a new password.'; return; }
+          if(new_password !== body.querySelector('#pwConfirm').value){ pwErr.textContent = 'The new password and its confirmation do not match.'; return; }
+          btn.disabled = true;
+          try {
+            const res = await Store.mutate(() => API.auth.changePassword({ current_password, new_password }), { event:'profile:changed' });
+            toast('success','Password changed', res.message || 'This device stays signed in.');
+            ['#pwCurrent','#pwNew','#pwConfirm'].forEach(id => { const f = body.querySelector(id); if(f) f.value = ''; });
+          } catch (err) {
+            // A wrong current password and a weak new one both come back as the server worded them.
+            pwErr.textContent = errText(err);
+          } finally {
+            btn.disabled = false;
+          }
+        });
       }
 
       // ---- users ------------------------------------------------------------
@@ -2090,7 +2579,8 @@
         const table = dataTable({
           columns:[
             { key:'full_name', label:'Person', render:r => ownerCell(r.full_name, r.email)
-                + (r.is_current_user ? ' <span class="badge bg-purple">you</span>' : '') },
+                + (r.is_current_user ? ' <span class="badge bg-purple">you</span>' : '')
+                + (r.shared_account ? ' <span class="badge bg-gray" title="This account also belongs to another workspace, so only its role and membership can be changed here">shared</span>' : '') },
             { key:'role', label:'Role', render:r => badge(r.role, ROLE_COLORS[r.role] || 'gray') },
             { key:'job_title', label:'Job Title', render:r => r.job_title ? esc(r.job_title) : dash },
             { key:'team', label:'Team', render:r => r.team ? esc(r.team) : dash },
@@ -2114,9 +2604,16 @@
           ],
           source: (params) => API.auth.users.list(params),
           exportSource: (params) => API.auth.users.export(params),
+          /* An account that also belongs to another workspace is not this
+             workspace's to rewrite: the API refuses (403) a password, a name, a
+             title or a team on it, and leaves only the role and the membership.
+             Your own password goes through Profile, where the current one is
+             asked for. The menu offers only what will be accepted. */
           rowActions: r => [
             { label:'Change Role', icon:'shield', onClick:()=>changeRole(r) },
-            { label:'Set Password', icon:'key', onClick:()=>setPassword(r) },
+            ...(r.shared_account ? [] : [{ label:'Edit Member', icon:'edit', onClick:()=>editMember(r) }]),
+            ...(r.shared_account || r.is_current_user ? [] : [{ label:'Set Password', icon:'key', onClick:()=>setPassword(r) }]),
+            ...(r.is_current_user ? [{ label:'Change My Password', icon:'key', onClick:()=>APP.go('settings/profile') }] : []),
             { sep:true },
             { label:'Remove From Workspace', icon:'trash', danger:true, onClick:()=>removeMember(r) },
           ],
@@ -2160,8 +2657,8 @@
               <div class="form-row"><label>INITIAL PASSWORD</label>
                 <input class="input" id="usPassword" type="text" placeholder="Leave blank to create the account without sign-in">
                 <div class="small faint" style="margin-top:4px">Shown in clear so you can pass it on. They can sign in with it
-                  immediately — tell them to change it. An address the platform already knows is joined to this workspace
-                  instead, and keeps its existing password.</div></div>`,
+                  immediately — ask them to change it under Profile &amp; Preferences. An address the platform already knows is
+                  joined to this workspace instead, and keeps its existing password.</div></div>`,
             footer:[
               { label:'Cancel' },
               { label:'Add Member', cls:'primary', onClick: async (close, modal) => {
@@ -2176,16 +2673,16 @@
                     team: modal.querySelector('#usTeam').value.trim() || null,
                   };
                   if(password) payload.password = password;
-                  close();
                   try {
                     const member = await Store.mutate(() => API.auth.users.create(payload), { event:'members:changed' });
+                    close();
                     toast('success','Member added',
                       member.password_set
                         ? `${member.full_name} can sign in as ${member.email}.`
                         : `${member.full_name} was added without a password and cannot sign in yet.`);
                     refreshAll();
                   } catch (err) {
-                    toast('error','Could not add the member', errText(err));
+                    modalError(modal, errText(err));
                   }
                 } },
             ],
@@ -2222,6 +2719,47 @@
           });
         }
 
+        /** Name, title and team — the display fields nobody could edit once the member existed. */
+        function editMember(r){
+          if(!allowed('admin','Editing a member requires the admin role.')) return;
+          openModal({
+            title:'Edit Member — ' + r.full_name, icon:'edit',
+            body:`<div class="form-row"><label>FULL NAME</label>
+                <input class="input" id="emName" maxlength="160" value="${esc(r.full_name || '')}"></div>
+              <div class="grid g2">
+                <div class="form-row"><label>JOB TITLE</label>
+                  <input class="input" id="emTitle" maxlength="120" value="${esc(r.job_title || '')}"></div>
+                <div class="form-row"><label>TEAM</label>
+                  <input class="input" id="emTeam" maxlength="120" value="${esc(r.team || '')}"></div>
+              </div>
+              <div class="small faint">The email address identifies the account and cannot be changed. The role has its own action.</div>`,
+            footer:[
+              { label:'Cancel' },
+              { label:'Save Member', cls:'primary', onClick: async (close, modal) => {
+                  const full_name = modal.querySelector('#emName').value.trim();
+                  if(!full_name){ modalError(modal, 'A member needs a name.', '#emName'); return; }
+                  const patch = {};
+                  if(full_name !== (r.full_name || '')) patch.full_name = full_name;
+                  const job_title = modal.querySelector('#emTitle').value.trim();
+                  if(job_title !== (r.job_title || '')) patch.job_title = job_title || null;
+                  const team = modal.querySelector('#emTeam').value.trim();
+                  if(team !== (r.team || '')) patch.team = team || null;
+                  if(!Object.keys(patch).length){ close(); toast('info','Nothing changed', r.full_name); return; }
+                  try {
+                    await Store.mutate(() => API.auth.users.update(r.id, patch), { event:'members:changed' });
+                    close();
+                    toast('success','Member saved', full_name);
+                    if(r.is_current_user) Store.session.refresh().catch(() => {});
+                    refreshAll();
+                  } catch (err) {
+                    // A 403 here (a shared account) already says what to do instead.
+                    modalError(modal, errText(err));
+                  }
+                } },
+            ],
+          });
+        }
+
         function setPassword(r){
           if(!allowed('admin','Setting a password requires the admin role.')) return;
           openModal({
@@ -2234,14 +2772,15 @@
               { label:'Cancel' },
               { label:'Set Password', cls:'primary', onClick: async (close, modal) => {
                   const password = modal.querySelector('#usPw').value;
-                  if(!password){ toast('error','Cannot set','Type a password first.'); return; }
-                  close();
+                  if(!password){ modalError(modal, 'Type a password first.', '#usPw'); return; }
                   try {
                     await Store.mutate(() => API.auth.users.update(r.id, { password }), { event:'members:changed' });
+                    close();
                     toast('success','Password set', `${r.full_name} can sign in with it now.`);
                     refreshAll();
                   } catch (err) {
-                    toast('error','Could not set the password', errText(err));
+                    // Too short (422), a shared account or your own (403): each message says what to do.
+                    modalError(modal, errText(err), '#usPw');
                   }
                 } },
             ],
@@ -2359,17 +2898,20 @@
                   const days = (u.daily || []).filter(d => d.calls > 0);
                   body.innerHTML = kv([
                     ['Status', statusText(u.status, akStatusColor(u.status))],
-                    ['Total Calls (all time)', num(u.total_calls)],
-                    [`Calls (last ${u.window_days}d)`, num(u.calls_in_window)],
-                    ['Ingest Calls', num(u.ingest_calls)],
-                    ['Records Ingested', num(u.ingest_records)],
+                    /* These two count audited operations (a key minted, a policy
+                       changed), not requests. Telemetry is not audited and not
+                       metered per key, so a busy ingest key reads 0 here; Last
+                       Used is the sign that it is live. */
+                    ['Audited operations (all time)', num(u.total_calls)],
+                    [`Audited operations (last ${u.window_days}d)`, num(u.calls_in_window)],
                     ['First Seen', at(u.first_seen_at)],
                     ['Last Used', u.last_used_at ? `${at(u.last_used_at)} <span class="mono small faint">${esc(u.last_used_ip || '')}</span>` : dash],
                   ])
                   + ((u.by_action || []).length
                       ? `<div class="small faint mt">By operation (last ${u.window_days}d)</div>`
                         + hbars(u.by_action.map(a => ({ label:a.action, value:a.count, display:fmtFull(a.count), color:'blue' })), { labelW:160 })
-                      : `<div class="small faint mt">This key has not performed an audited operation in the window.</div>`)
+                      : `<div class="small faint mt">No audited operation in the window. That is normal for a key that only reports telemetry.</div>`)
+                  + `<div class="small faint mt">Ingest volume is not metered per key; Last Used (refreshed at most once a minute) shows the key is live.</div>`
                   + (days.length
                       ? `<div class="small faint mt">Active days</div>`
                         + hbars(days.slice(-10).map(d => ({ label:d.date, value:d.calls, display:fmtFull(d.calls), color:'purple' })), { labelW:110 })
@@ -2490,10 +3032,15 @@
                   <input class="input mono" id="akToken" readonly value="${esc(created.token)}" style="flex:1">
                   ${copyBtn('akCopyToken', created.token)}
                 </div></div>
-              ${(created.snippets || []).map((s, i) => `
+              ${/* The snippets are the server's, shown whole and unedited. They now
+                   name the agent the key may report for — and, for a key that
+                   cannot register one, say the name must already be in the Agent
+                   Registry. That line sits seventh in the SDK snippets, below the
+                   fold of the six rows this box used to be capped at. */
+                (created.snippets || []).map((s, i) => `
                 <div class="form-row"><label>${esc(s.label)}</label>
                   <div class="flex" style="gap:8px;align-items:flex-start">
-                    <textarea class="input mono small" readonly rows="${Math.min(6, (s.code.match(/\n/g) || []).length + 1)}" style="flex:1;font-size:12px">${esc(s.code)}</textarea>
+                    <textarea class="input mono small" readonly wrap="off" rows="${Math.min(16, (String(s.code || '').match(/\n/g) || []).length + 1)}" style="flex:1;font-size:12px">${esc(s.code || '')}</textarea>
                     ${copyBtn('akCopySnip' + i, s.code)}
                   </div></div>`).join('')}`,
             footer:[{ label:'Done' }],
