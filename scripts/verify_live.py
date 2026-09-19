@@ -41,10 +41,11 @@ def load_key(args: argparse.Namespace) -> str:
     if os.environ.get("FULCRUM_OPS_API_KEY"):
         return os.environ["FULCRUM_OPS_API_KEY"]
     if args.key_file:
-        for line in open(args.key_file, encoding="utf-8"):
-            name, _, value = line.strip().partition("=")
-            if name == args.key_name and value:
-                return value.strip().strip('"')
+        with open(args.key_file, encoding="utf-8") as handle:
+            for line in handle:
+                name, _, value = line.strip().partition("=")
+                if name == args.key_name and value:
+                    return value.strip().strip('"')
     sys.exit("no API key: set FULCRUM_OPS_API_KEY, or pass --key-file and --key-name")
 
 

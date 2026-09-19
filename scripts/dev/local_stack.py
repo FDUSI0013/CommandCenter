@@ -29,14 +29,13 @@ os.environ.update(
     FULCRUM_OPS_STATIC_DIR=str((cp / ".." / "web").resolve()),
 )
 
-import uvicorn  # noqa: E402
-from engine_double import EngineDouble  # noqa: E402
-from factories import Factory  # noqa: E402
-
-from fulcrum_ops_api.db import session as db_session  # noqa: E402
-from fulcrum_ops_api.db.base import Base  # noqa: E402
-from fulcrum_ops_api.main import create_app  # noqa: E402
-from fulcrum_ops_api.models.identity import Role  # noqa: E402
+import uvicorn
+from engine_double import EngineDouble
+from factories import Factory
+from fulcrum_ops_api.db import session as db_session
+from fulcrum_ops_api.db.base import Base
+from fulcrum_ops_api.main import create_app
+from fulcrum_ops_api.models.identity import Role
 
 
 async def seed(double: EngineDouble) -> str:
