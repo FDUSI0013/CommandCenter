@@ -55,8 +55,10 @@ MAX_SIMILARITY: Final[float] = 0.90
 DEFAULT_MIN_CLUSTER_SIZE: Final[int] = 2
 
 #: Rows one clustering pass will consider. Beyond this the caller narrows the
-#: window: the algorithm is quadratic in the number of clusters, not the rows,
-#: but the read still has to be bounded.
+#: window. The grouping compares a comment only with the leaders it shares a
+#: word with and runs off the event loop, but its worst case — every comment
+#: sharing one word and nothing else — is still rows x clusters, and the read
+#: has to be bounded either way.
 MAX_ANALYZE_ROWS: Final[int] = 2000
 
 
@@ -125,6 +127,13 @@ class FeedbackRead(BaseModel):
     tags: list[str] = Field(default_factory=list)
     scored_in_telemetry: bool = Field(
         False, description="True when the rating was written onto the trace"
+    )
+    pii_scrubbed: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Kinds of identifier removed from the comment at capture — email, "
+            "phone, ssn, card. Never the values"
+        ),
     )
     created_at: dt.datetime
 
@@ -219,11 +228,18 @@ class FeedbackExample(BaseModel):
 
 
 class ClusterRead(BaseModel):
-    """One theme the clustering pass found."""
+    """One theme the clustering pass found, or found new reports of.
+
+    ``size``, ``negative_share``, ``avg_rating`` and the first/last seen times
+    describe the theme over the window — every row that wears the label, not
+    only the ones this pass added, which are counted in ``new_members``. The
+    keywords, agents, sources and examples are drawn from the new members.
+    """
 
     cluster_id: str
     theme: str
     size: int
+    new_members: int = Field(0, description="Rows this pass put into the theme")
     keywords: list[str] = Field(default_factory=list)
     negative_share: float = Field(description="Share of the cluster that reads negative, 0-1")
     avg_rating: float | None = None
@@ -234,8 +250,23 @@ class ClusterRead(BaseModel):
     suggested_issue_title: str
     suggested_severity: IssueSeverity
     meets_auto_issue_threshold: bool = Field(
-        description="True when the cluster is at or over the SLA rules' threshold"
+        description=(
+            "True when the theme's negative reports that no issue answers for "
+            "reached the SLA rules' threshold — which is when the pass opens one"
+        )
     )
+    issue_auto_opened: bool = Field(
+        False, description="True when this pass opened `open_issue_id` under that rule"
+    )
+    open_issue_id: str | None = Field(
+        None,
+        description=(
+            "Issue open for this theme, whether it was already or this pass opened "
+            "it. The theme's unlinked reports are linked to it, so offer the issue, "
+            "not Create Issue"
+        ),
+    )
+    open_issue_ref: str | None = None
     examples: list[FeedbackExample] = Field(default_factory=list)
 
 
@@ -260,6 +291,12 @@ class AnalyzeResult(BaseModel):
     analysed: int
     clustered: int
     unclustered: int
+    linked_to_issues: int = Field(
+        0, description="Reports this pass attached to the issue open for their theme"
+    )
+    issues_auto_opened: int = Field(
+        0, description="Issues this pass opened under the auto-issue threshold"
+    )
     clusters: list[ClusterRead] = Field(default_factory=list)
     window_days: int
     similarity: float
@@ -543,19 +580,41 @@ class SlaRules(BaseModel):
     ``business_hours_only`` makes the triage clock run Monday to Friday inside
     ``business_day_start_hour``..``business_day_end_hour`` UTC, which is how the
     "4 business hours" the console shows is actually measured.
+
+    What the service acts on: the business-hours clock and ``severity_sla`` set
+    every issue's due date, ``routing`` picks its team, and ``auto_issue_threshold``
+    opens issues from the clustering pass. ``triage_sla_hours`` and the two
+    escalation fields are the team's stated targets — stored, audited and shown,
+    but nothing sweeps for a breach or notifies the contact, and no reader
+    should present them as if something did.
     """
 
-    triage_sla_hours: int = Field(4, ge=1, le=720)
+    triage_sla_hours: int = Field(
+        4,
+        ge=1,
+        le=720,
+        description="Target for first triage of negative feedback. A target: not swept for",
+    )
     business_hours_only: bool = True
     business_day_start_hour: int = Field(9, ge=0, le=23)
     business_day_end_hour: int = Field(17, ge=1, le=24)
     auto_issue_threshold: int = Field(
-        5, ge=2, le=1000, description="Similar reports that justify opening an issue"
+        5,
+        ge=2,
+        le=1000,
+        description=(
+            "Similar negative reports, not yet behind an issue, at which the "
+            "clustering pass opens one itself"
+        ),
     )
     routing: IssueRouting = IssueRouting.AGENT_OWNER_TEAM
     routing_team: str | None = Field(None, max_length=120)
-    escalation_contact: str = Field("CX lead", max_length=120)
-    escalate_after_hours: int = Field(8, ge=1, le=720)
+    escalation_contact: str = Field(
+        "CX lead", max_length=120, description="Who a breach goes to. Nobody is notified by us"
+    )
+    escalate_after_hours: int = Field(
+        8, ge=1, le=720, description="When a breach is theirs. A target: not swept for"
+    )
     severity_sla: SeveritySla = Field(default_factory=SeveritySla)
 
     @model_validator(mode="after")
@@ -570,7 +629,13 @@ class SlaRules(BaseModel):
 
 
 class CollectionSettings(BaseModel):
-    """The Collection Settings card, validated."""
+    """The Collection Settings card, validated.
+
+    ``pii_scrubbing`` is the one switch the service itself obeys: while it is on,
+    every comment is scrubbed at capture. The rest describe how the customer's
+    own application and review process gather feedback; they are recorded here
+    so the team has one place to state them, and nothing samples runs for review.
+    """
 
     in_app_rating_prompt: bool = True
     in_app_rating_trigger: str = Field("After each session", max_length=80)
@@ -578,7 +643,13 @@ class CollectionSettings(BaseModel):
     support_ticket_ingestion: bool = False
     support_ticket_system: str | None = Field(None, max_length=80)
     manual_review_sample_percent: float = Field(5.0, ge=0, le=100)
-    pii_scrubbing: bool = True
+    pii_scrubbing: bool = Field(
+        True,
+        description=(
+            "Replace email addresses, phone numbers, SSNs and card numbers in a "
+            "comment before it is stored, exported or mirrored to telemetry"
+        ),
+    )
 
     @model_validator(mode="after")
     def _check(self) -> CollectionSettings:

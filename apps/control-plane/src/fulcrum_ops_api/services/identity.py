@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import datetime as dt
 import functools
+import json
+import shlex
 from collections.abc import Sequence
 from typing import Any, Final
 
@@ -843,7 +845,44 @@ async def update_preferences(
 # ---------------------------------------------------------------------------
 
 
-def _member_row(membership: Membership, user: User, principal: Principal) -> dict[str, Any]:
+#: The half of a member edit that lands on the *account* rather than on the
+#: membership. An account is platform-wide — one person, many memberships — so
+#: these are this workspace's to change only while the account is in no other.
+ACCOUNT_FIELDS: Final[tuple[str, ...]] = (
+    "full_name",
+    "job_title",
+    "team",
+    "avatar_initials",
+    "is_active",
+)
+
+#: Account columns that cannot hold NULL. A PATCH that sends one as ``null``
+#: means "no change", not "blank it" — written through, it failed the insert
+#: constraint and answered 500.
+_ACCOUNT_FIELDS_REQUIRED: Final[frozenset[str]] = frozenset({"full_name", "is_active"})
+
+
+async def _shared_accounts(
+    session: AsyncSession, workspace_id: str, user_ids: set[str]
+) -> set[str]:
+    """Which of these accounts also belong to a workspace other than this one.
+
+    Every membership counts, including one in a suspended workspace: it can be
+    reactivated, and the person's role there comes back with it.
+    """
+    if not user_ids:
+        return set()
+    rows = await session.execute(
+        select(Membership.user_id)
+        .where(Membership.user_id.in_(user_ids), Membership.workspace_id != workspace_id)
+        .distinct()
+    )
+    return set(rows.scalars().all())
+
+
+def _member_row(
+    membership: Membership, user: User, principal: Principal, *, shared: bool = False
+) -> dict[str, Any]:
     return {
         "id": user.id,
         "membership_id": membership.id,
@@ -858,7 +897,16 @@ def _member_row(membership: Membership, user: User, principal: Principal) -> dic
         "joined_at": _as_utc(membership.created_at),
         "password_set": bool(user.password_hash),
         "is_current_user": user.id == principal.user_id,
+        "shared_account": shared,
     }
+
+
+async def _member_read(
+    session: AsyncSession, membership: Membership, user: User, principal: Principal
+) -> dict[str, Any]:
+    """One member's row, including whether the account is shared with another tenant."""
+    shared = await _shared_accounts(session, principal.workspace_id, {user.id})
+    return _member_row(membership, user, principal, shared=user.id in shared)
 
 
 def _members_stmt(
@@ -905,11 +953,12 @@ async def _attach_users(
         .scalars()
         .all()
     }
+    shared = await _shared_accounts(session, principal.workspace_id, set(users))
     rows: list[dict[str, Any]] = []
     for membership in memberships:
         user = users.get(membership.user_id)
         if user is not None:
-            rows.append(_member_row(membership, user, principal))
+            rows.append(_member_row(membership, user, principal, shared=user.id in shared))
     return rows
 
 
@@ -1010,7 +1059,7 @@ async def get_member(session: AsyncSession, principal: Principal, user_id: str) 
     if user_id != principal.user_id:
         principal.require(Role.ADMIN)
     membership, user = await _membership_for(session, principal, user_id)
-    return _member_row(membership, user, principal)
+    return await _member_read(session, membership, user, principal)
 
 
 async def _count_role(session: AsyncSession, workspace_id: str, role: Role) -> int:
@@ -1048,6 +1097,59 @@ async def _assert_not_last_owner(
         return
     raise PreconditionFailed(
         f"Cannot {action} the only owner of this workspace. Promote another owner first."
+    )
+
+
+async def _assert_account_is_ours(
+    session: AsyncSession, principal: Principal, user: User, fields: Sequence[str]
+) -> None:
+    """Refuse an account-level edit of an account this workspace does not solely hold.
+
+    Accounts are platform-wide and :func:`create_member` joins an existing one to
+    a workspace without asking its holder. So "is a member here" says nothing
+    about whose the credential is: an admin of any workspace could add the owner
+    of another by email, set that account's password from the member table, and
+    sign in as them — landing, by :func:`_primary_membership`, in the *other*
+    tenant with the role held there. Deactivating did the same damage in one
+    request. The rule that closes it is the one ``create_member`` already states
+    for a password — an existing credential belongs to its owner — applied to
+    every write that reaches the account: they are an admin's to make only while
+    this workspace is the account's only one.
+
+    Whoever created the account is deliberately not a way in. Nothing records
+    it, and it would not be safe if something did: the takeover works just as
+    well on an account one tenant created and another later made an owner.
+
+    Your own password is never set from here either. The account menu asks for
+    the current one, so that a borrowed session cannot be turned into the
+    account; the member table would be the way round it.
+    """
+    if "password" in fields and user.id == principal.user_id:
+        raise PermissionDenied(
+            "Change your own password from the account menu, which asks for the current one.",
+            details={"fields": ["password"], "reason": "own_account"},
+        )
+    if not await _shared_accounts(session, principal.workspace_id, {user.id}):
+        return
+
+    if "password" in fields:
+        message = (
+            f"{user.email} also belongs to another workspace, so their password is theirs "
+            "to change (account menu, Change Password) and not this workspace's to set."
+        )
+    elif "is_active" in fields:
+        message = (
+            f"{user.email} also belongs to another workspace, and deactivating the account "
+            "would lock them out of all of them. To end their access here, remove them from "
+            "this workspace instead."
+        )
+    else:
+        message = (
+            f"{user.email} also belongs to another workspace, so their profile is theirs to "
+            "edit and not this workspace's. Their role here can still be changed."
+        )
+    raise PermissionDenied(
+        message, details={"fields": sorted(fields), "reason": "shared_account"}
     )
 
 
@@ -1129,7 +1231,7 @@ async def create_member(
     )
     await session.flush()
     await session.refresh(membership)
-    return _member_row(membership, user, principal)
+    return await _member_read(session, membership, user, principal)
 
 
 async def update_member(
@@ -1142,19 +1244,38 @@ async def update_member(
 ) -> dict[str, Any]:
     """Edit a member's record, their role, or their ability to sign in.
 
-    Deactivating an account blocks it platform-wide, so the last owner cannot
-    be deactivated and nobody can deactivate themselves out of the console.
-    Requires the admin role.
+    The role belongs to the membership and is this workspace's to set. The
+    name, the active flag and the password belong to the *account*, which is
+    platform-wide, so they are this workspace's to change only while the account
+    is in no other workspace (:func:`_assert_account_is_ours`). Deactivating
+    blocks sign-in everywhere, so the last owner cannot be deactivated and
+    nobody can deactivate themselves out of the console. Requires the admin
+    role.
     """
     principal.require(Role.ADMIN)
     membership, user = await _membership_for(session, principal, user_id)
 
     changes = payload.model_dump(exclude_unset=True)
+    for field in _ACCOUNT_FIELDS_REQUIRED:
+        if field in changes and changes[field] is None:
+            del changes[field]
     if not changes:
-        return _member_row(membership, user, principal)
+        return await _member_read(session, membership, user, principal)
 
     new_role = _parse_role(changes["role"]) if changes.get("role") is not None else None
     _assert_may_manage(principal, Role(membership.role), new_role)
+
+    # Only what would actually move is judged: a form that sends the whole
+    # record back to change a role has not asked to edit the account.
+    account_changes = [
+        field
+        for field in ACCOUNT_FIELDS
+        if field in changes and changes[field] != getattr(user, field)
+    ]
+    if changes.get("password"):
+        account_changes.append("password")
+    if account_changes:
+        await _assert_account_is_ours(session, principal, user, account_changes)
 
     if new_role is not None and new_role.value != membership.role:
         await _assert_not_last_owner(session, principal, membership, action="demote")
@@ -1165,7 +1286,7 @@ async def update_member(
             raise PreconditionFailed("You cannot deactivate your own account.")
         await _assert_not_last_owner(session, principal, membership, action="deactivate")
 
-    for field in ("full_name", "job_title", "team", "avatar_initials", "is_active"):
+    for field in ACCOUNT_FIELDS:
         if field in changes:
             setattr(user, field, changes[field])
 
@@ -1192,7 +1313,7 @@ async def update_member(
         request=request,
     )
     await session.flush()
-    return _member_row(membership, user, principal)
+    return await _member_read(session, membership, user, principal)
 
 
 async def change_member_role(
@@ -1210,7 +1331,7 @@ async def change_member_role(
     new_role = _parse_role(payload.role)
     previous = Role(membership.role)
     if new_role is previous:
-        return _member_row(membership, user, principal)
+        return await _member_read(session, membership, user, principal)
 
     _assert_may_manage(principal, previous, new_role)
     await _assert_not_last_owner(session, principal, membership, action="demote")
@@ -1230,7 +1351,7 @@ async def change_member_role(
         request=request,
     )
     await session.flush()
-    return _member_row(membership, user, principal)
+    return await _member_read(session, membership, user, principal)
 
 
 async def remove_member(
@@ -1492,36 +1613,72 @@ async def _load_key(session: AsyncSession, principal: Principal, key_id: str) ->
     return key
 
 
-def _snippets(minted: MintedApiKey, workspace: Workspace) -> list[ApiKeySnippet]:
+def _snippets(
+    minted: MintedApiKey,
+    workspace: Workspace,
+    *,
+    agent_name: str | None = None,
+    environment: str | None = None,
+    may_register: bool = False,
+) -> list[ApiKeySnippet]:
     """Copy-ready setup for each way a customer connects an agent.
 
     The plaintext key is interpolated here because this is the one response
     that carries it; every other read shows the display hint instead.
+
+    "Copy-ready" is a promise about the first minute: pasted as it stands, the
+    code has to import, and what it reports has to be accepted. So the snippets
+    are written against the SDKs' real signatures (``tests/test_audit_identity``
+    executes the Python one against the SDK in this repository), and they name
+    the agent this key can actually report for. A key bound to an agent is
+    refused for any other name; an unbound key without the ``admin`` scope is
+    refused for a name the Agent Registry does not hold, so the placeholder
+    says so instead of inventing a name that would be rejected on every batch.
     """
     base_url = f"{settings.public_base_url.rstrip('/')}{settings.api_prefix}"
     token = minted.token
+
+    if agent_name:
+        agent, agent_note = agent_name, "the agent this key is bound to"
+    elif may_register:
+        agent, agent_note = "my-agent", "any name: this key registers it on first report"
+    else:
+        agent, agent_note = (
+            "YOUR-AGENT-NAME",
+            "must match an agent in the Agent Registry: this key cannot register one",
+        )
+    # A JSON string literal is a valid literal in both languages, whatever
+    # quotes or backslashes the agent's display name holds.
+    agent_literal = json.dumps(agent)
+    environment_literal = json.dumps(environment) if environment else None
+
+    exports = [
+        f"export FULCRUM_OPS_API_KEY={token}",
+        f"export FULCRUM_OPS_BASE_URL={base_url}",
+        f"export FULCRUM_OPS_WORKSPACE={workspace.slug}",
+    ]
+    if agent_name:
+        exports.append(f"export FULCRUM_OPS_AGENT={shlex.quote(agent_name)}")
+    if environment:
+        exports.append(f"export FULCRUM_OPS_ENVIRONMENT={shlex.quote(environment)}")
+
     return [
-        ApiKeySnippet(
-            language="bash",
-            label="Environment",
-            code=(
-                f"export FULCRUM_OPS_API_KEY={token}\n"
-                f"export FULCRUM_OPS_BASE_URL={base_url}\n"
-                f"export FULCRUM_OPS_WORKSPACE={workspace.slug}"
-            ),
-        ),
+        ApiKeySnippet(language="bash", label="Environment", code="\n".join(exports)),
         ApiKeySnippet(
             language="python",
             label="Python SDK",
             code=(
-                "from fulcrum_ops import FulcrumOps\n\n"
+                "from fulcrum_ops import FulcrumOps, trace\n\n"
                 "client = FulcrumOps(\n"
                 f'    api_key="{token}",\n'
                 f'    base_url="{base_url}",\n'
-                ")\n\n"
-                "@client.trace(agent=\"support-copilot\")\n"
+                f"    agent={agent_literal},  # {agent_note}\n"
+                + (f"    environment={environment_literal},\n" if environment_literal else "")
+                + ")\n\n\n"
+                "@trace\n"
                 "def handle(question: str) -> str:\n"
-                "    return answer(question)"
+                "    # Your agent's work. The arguments and the return value are the run.\n"
+                '    return f"You asked: {question}"'
             ),
         ),
         ApiKeySnippet(
@@ -1532,8 +1689,15 @@ def _snippets(minted: MintedApiKey, workspace: Workspace) -> list[ApiKeySnippet]
                 "const client = new FulcrumOps({\n"
                 f'  apiKey: "{token}",\n'
                 f'  baseUrl: "{base_url}",\n'
-                "});\n\n"
-                'await client.trace({ agent: "support-copilot" }, () => handle(question));'
+                f"  agent: {agent_literal}, // {agent_note}\n"
+                + (f"  environment: {environment_literal},\n" if environment_literal else "")
+                + "});\n\n"
+                "export async function handle(question: string): Promise<string> {\n"
+                '  return client.trace({ name: "handle", input: { question } }, async () => {\n'
+                "    // Your agent's work. What it returns is recorded as the run's output.\n"
+                "    return `You asked: ${question}`;\n"
+                "  });\n"
+                "}"
             ),
         ),
         ApiKeySnippet(
@@ -1639,7 +1803,15 @@ async def create_api_key(
     return ApiKeyCreated(
         **read.model_dump(),
         token=minted.token,
-        snippets=_snippets(minted, workspace),
+        snippets=_snippets(
+            minted,
+            workspace,
+            agent_name=agent_name,
+            environment=key.environment,
+            # The test ingest applies before it registers a name it has never
+            # seen; ``admin`` is the one such scope this route can grant.
+            may_register="admin" in key.scopes,
+        ),
     )
 
 

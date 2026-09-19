@@ -28,6 +28,8 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import difflib
+import logging
+import secrets
 from collections.abc import Awaitable, Mapping, Sequence
 from typing import Any, Final, TypeVar
 
@@ -37,6 +39,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..api.common import ListParams
 from ..api.deps import Principal
+from ..core.config import settings
 from ..core.errors import (
     Conflict,
     ModelUnavailable,
@@ -45,11 +48,15 @@ from ..core.errors import (
     TelemetryBackendUnavailable,
     ValidationFailed,
 )
+from ..core.ttlcache import SingleFlightCache
 from ..engine import (
     EngineBadRequest,
     EngineClient,
+    EngineError,
     EngineNotFound,
+    EngineTimeout,
     EngineUnavailable,
+    deadline,
     get_engine_client,
 )
 from ..models.governance import AuditEvent
@@ -78,7 +85,9 @@ from ..schemas.prompts import (
     render_template,
     template_variables,
 )
-from . import audit, model_runner
+from . import audit, evaluations, model_runner
+
+log = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
@@ -338,19 +347,31 @@ async def _lifecycle(
     return latest
 
 
+#: The audit actions that cut a commit, as opposed to the ones that judge it.
+AUTHORING_ACTIONS: Final[frozenset[str]] = frozenset(
+    {"prompt.created", "prompt.version_created", "prompt.restored"}
+)
+
+
 async def _version_states(
     session: AsyncSession, principal: Principal, prompt_id: str
-) -> dict[str, PromptStatus]:
-    """The state each commit was left in, rebuilt from the audit trail.
+) -> tuple[dict[str, PromptStatus], dict[str, str]]:
+    """The state each commit was left in and who cut it, from the audit trail.
 
     Every lifecycle row records the commit it applied to, so the version pipe
     can show that v0.1.0 was approved and later superseded rather than showing
     the state it happened to be cut in. Commits with no lifecycle row against
     them are absent, and fall back to what the commit's own metadata recorded.
+
+    The author comes from here too. The registry sits behind this service with
+    its own sign-in switched off, so the ``created_by`` it records is its one
+    built-in user on every commit, whoever made it. The person is in the row
+    written when the commit was cut -- and only that row: a review, an approval
+    or a block names the same commit, and would make the approver its author.
     """
     rows = (
         await session.execute(
-            select(AuditEvent.action, AuditEvent.event_metadata)
+            select(AuditEvent.action, AuditEvent.event_metadata, AuditEvent.actor)
             .where(
                 AuditEvent.workspace_id == principal.workspace_id,
                 AuditEvent.entity_type == ENTITY_TYPE,
@@ -362,12 +383,16 @@ async def _version_states(
     ).all()
 
     states: dict[str, PromptStatus] = {}
-    for action, metadata in rows:
+    authors: dict[str, str] = {}
+    for action, metadata, actor in rows:
         state = LIFECYCLE_ACTIONS.get(action)
         commit = (metadata or {}).get("commit")
-        if state is not None and isinstance(commit, str) and commit:
-            states[commit] = state
-    return states
+        if state is None or not isinstance(commit, str) or not commit:
+            continue
+        states[commit] = state
+        if action in AUTHORING_ACTIONS and actor:
+            authors.setdefault(commit, actor)
+    return states, authors
 
 
 def _assert_transition(current: PromptStatus, target: PromptStatus, name: str) -> None:
@@ -400,29 +425,45 @@ async def _agents(
     return {name: (agent_id, project) for name, agent_id, project in rows}
 
 
+#: (engine project, window in days) -> (runs, errors) over that window.
+#:
+#: One of these is a 30-day aggregation over the project's traces, and the
+#: screen asked for one per owning agent from the table, again from the KPI row
+#: that loads beside it, again from the export, and again after every keystroke
+#: in the search box and every lifecycle click -- on the box that also runs the
+#: store. A 30-day count does not move meaningfully in a minute, so the figure
+#: is remembered for ``prompt_stats_cache_seconds`` and the callers that arrive
+#: together share one read. Per process; a failure is never remembered.
+_stats: SingleFlightCache[tuple[int, int | None]] = SingleFlightCache(
+    ttl=lambda: settings.prompt_stats_cache_seconds, max_entries=1024
+)
+
+
 async def _project_stats(
     client: EngineClient, projects: Sequence[str], *, window_days: int
 ) -> dict[str, tuple[int, int | None]]:
     """Trace count and error count per project over the window."""
     if not projects:
         return {}
-    now = dt.datetime.now(dt.UTC)
-    since = now - dt.timedelta(days=window_days)
-    payloads = await asyncio.gather(
+
+    async def measure(project: str) -> tuple[int, int | None]:
+        now = dt.datetime.now(dt.UTC)
+        since = now - dt.timedelta(days=window_days)
+        payload = await _call(
+            client.get_trace_stats(project_name=project, from_time=since, to_time=now),
+            action="reading run statistics",
+        )
+        runs = _stat_value(payload, _TRACE_COUNT_NAMES)
+        errors = _stat_value(payload, _ERROR_COUNT_NAMES)
+        return int(runs or 0), int(errors) if errors is not None else None
+
+    measured = await asyncio.gather(
         *(
-            _call(
-                client.get_trace_stats(project_name=project, from_time=since, to_time=now),
-                action="reading run statistics",
-            )
+            _stats.get((project, window_days), lambda project=project: measure(project))
             for project in projects
         )
     )
-    stats: dict[str, tuple[int, int | None]] = {}
-    for project, payload in zip(projects, payloads, strict=True):
-        runs = _stat_value(payload, _TRACE_COUNT_NAMES)
-        errors = _stat_value(payload, _ERROR_COUNT_NAMES)
-        stats[project] = (int(runs or 0), int(errors) if errors is not None else None)
-    return stats
+    return dict(zip(projects, measured, strict=True))
 
 
 def _success_rate(runs: int, errors: int | None) -> float | None:
@@ -578,6 +619,112 @@ async def _scan(client: EngineClient, principal: Principal) -> tuple[list[dict[s
     return collected, engine_total
 
 
+#: How many head reads one listing puts on the registry at a time.
+HEAD_READ_CONCURRENCY: Final[int] = 8
+
+#: How many head reads may find the store unavailable before one listing stops
+#: asking. One poisoned row is tolerated; a store that is down is not asked two
+#: thousand more times, each with its own timeout and retries.
+HEAD_READ_FAILURES_TOLERATED: Final[int] = 3
+
+#: How long one head is remembered. Long, because the key below cannot go stale;
+#: bounded, so a registry that ever broke that promise heals by itself.
+HEAD_MEMORY_SECONDS: Final[float] = 900.0
+
+#: (prompt id, version_count, last_updated_at) -> the head version.
+#:
+#: The registry's listing is its public view of a prompt: id, name, description,
+#: tags, timestamps and ``version_count``. The head version -- the template, the
+#: commit and the metadata this service stamps the agent, environment and
+#: version label into -- is only on the single-prompt read. Without it every
+#: table row, KPI, filter and CSV column built from the head was blank, while
+#: the inspector (which reads one prompt) looked right.
+#:
+#: The key comes from the listing row rather than from forgetting on write:
+#: there are several worker processes, and a commit through one cannot clear
+#: another's memory. Versions are append-only and a restore is a new commit, so
+#: ``version_count`` rises on every head change and an entry can only be reused
+#: for the head it was read for. Steady state is therefore no extra registry
+#: calls at all. Per process and single-flight -- the table and its KPI row ask
+#: together -- and a failure is never remembered.
+_heads: SingleFlightCache[dict[str, Any]] = SingleFlightCache(
+    ttl=lambda: HEAD_MEMORY_SECONDS, max_entries=4096
+)
+
+
+async def _with_heads(
+    client: EngineClient, rows: Sequence[Mapping[str, Any]]
+) -> list[Mapping[str, Any]]:
+    """Listing rows, each joined with its head version.
+
+    A row whose head cannot be read -- deleted since the listing, or the store
+    timing out -- stays headless and shapes to nulls, which the console prints
+    as "—": one bad prompt must not cost the workspace its whole table. The
+    reads still running when the request's deadline passes are left to finish,
+    so the next request finds their answers instead of starting them again.
+    """
+    found: dict[str, dict[str, Any]] = {}
+    gate = asyncio.Semaphore(HEAD_READ_CONCURRENCY)
+    failures = 0
+
+    async def read(row: Mapping[str, Any]) -> None:
+        prompt_id = str(row["id"])
+        key = (
+            prompt_id,
+            str(_first(row, ("version_count", "versions_count"))),
+            str(_first(row, ("last_updated_at", "updated_at"))),
+        )
+
+        async def fetch() -> dict[str, Any]:
+            # The gate is taken here, not around the lookup, so a remembered
+            # head is never queued behind the reads of the ones that are not.
+            nonlocal failures
+            async with gate:
+                if failures >= HEAD_READ_FAILURES_TOLERATED:
+                    raise EngineUnavailable("the registry stopped answering head reads")
+                try:
+                    payload = await client.get_prompt(prompt_id)
+                except EngineUnavailable:
+                    failures += 1
+                    raise
+            return _head_version(payload) if isinstance(payload, dict) else {}
+
+        try:
+            head = await _heads.get(key, fetch)
+        except EngineError:
+            return
+        if head:
+            found[prompt_id] = head
+
+    headless = [
+        row
+        for row in rows
+        if row.get("id")
+        and not _head_version(row)
+        and _first(row, ("version_count", "versions_count")) != 0
+    ]
+    if headless:
+        try:
+            async with deadline(what="reading prompt heads"):
+                await asyncio.gather(*(read(row) for row in headless))
+        except EngineTimeout:
+            pass  # the rows not reached stay headless; the rest are kept
+
+    return [
+        {**row, "latest_version": found[str(row.get("id"))]}
+        if str(row.get("id")) in found
+        else row
+        for row in rows
+    ]
+
+
+async def _workspace_rows(principal: Principal) -> list[Mapping[str, Any]]:
+    """Every prompt of this workspace as the table needs it: listed, with heads."""
+    client = get_engine_client()
+    rows, _engine_total = await _scan(client, principal)
+    return await _with_heads(client, rows)
+
+
 async def _hydrate(
     session: AsyncSession,
     principal: Principal,
@@ -677,7 +824,7 @@ async def list_prompts(
     window_days: int = DEFAULT_WINDOW_DAYS,
 ) -> tuple[list[PromptRead], int]:
     """One page of the workspace's prompts, joined with their run statistics."""
-    rows, _engine_total = await _scan(get_engine_client(), principal)
+    rows = await _workspace_rows(principal)
     shaped, _projects = await _hydrate(
         session, principal, rows, window_days=window_days
     )
@@ -697,7 +844,7 @@ async def export_prompts(
     window_days: int = DEFAULT_WINDOW_DAYS,
 ) -> list[PromptRead]:
     """Every prompt the current filters select, unpaged, for the CSV download."""
-    rows, _engine_total = await _scan(get_engine_client(), principal)
+    rows = await _workspace_rows(principal)
     shaped, _projects = await _hydrate(
         session, principal, rows, window_days=window_days
     )
@@ -765,6 +912,7 @@ def _shape_version(
     head_commit: str | None,
     live_status: PromptStatus,
     states: Mapping[str, PromptStatus] | None = None,
+    authors: Mapping[str, str] | None = None,
 ) -> PromptVersionDetail:
     meta = _metadata(row)
     template = str(_first(row, ("template",), "") or "")
@@ -787,12 +935,30 @@ def _shape_version(
     else:
         status = None
 
+    # Who cut the commit: the audit row first, then what this service stamped on
+    # the commit, and the registry's own ``created_by`` only for a commit that
+    # has neither. The order matters for a restore, which copies the restored
+    # version's metadata -- its stamped author is whoever wrote the original,
+    # not whoever brought it back.
+    stamped = meta.get("author")
+    author = (
+        (authors or {}).get(commit)
+        or (stamped if isinstance(stamped, str) and stamped else None)
+        or _first(row, ("created_by", "author"))
+    )
+    # A prompt's first commit is made by the create call, which has nowhere to
+    # put a change description; its note is in the metadata stamped beside it.
+    noted = meta.get("change_note")
+    change_note = _first(row, ("change_description", "change_note")) or (
+        noted if isinstance(noted, str) and noted else None
+    )
+
     return PromptVersionDetail(
         commit=commit,
         version=meta.get("version") if isinstance(meta.get("version"), str) else None,
         status=status,
-        change_note=_first(row, ("change_description", "change_note")),
-        author=_first(row, ("created_by", "author")),
+        change_note=change_note,
+        author=author,
         created_at=_instant(_first(row, ("created_at",))),
         estimated_tokens=estimate_tokens(template),
         is_head=is_head,
@@ -808,10 +974,14 @@ async def list_versions(
     """Commit history for one prompt, newest first."""
     prompt = await get_prompt(session, principal, prompt_id, with_stats=False)
     rows = await _version_rows(prompt_id)
-    states = await _version_states(session, principal, prompt_id)
+    states, authors = await _version_states(session, principal, prompt_id)
     shaped = [
         _shape_version(
-            row, head_commit=prompt.commit, live_status=prompt.status, states=states
+            row,
+            head_commit=prompt.commit,
+            live_status=prompt.status,
+            states=states,
+            authors=authors,
         )
         for row in rows
     ]
@@ -834,16 +1004,28 @@ async def get_version(
     """One commit, template included."""
     prompt = await get_prompt(session, principal, prompt_id, with_stats=False)
     row = await _find_version(prompt_id, commit)
-    states = await _version_states(session, principal, prompt_id)
+    states, authors = await _version_states(session, principal, prompt_id)
     return _shape_version(
-        row, head_commit=prompt.commit, live_status=prompt.status, states=states
+        row,
+        head_commit=prompt.commit,
+        live_status=prompt.status,
+        states=states,
+        authors=authors,
     )
 
 
-async def _find_version(prompt_id: str, commit: str) -> dict[str, Any]:
-    """Resolve a commit by its hash, its id or its human version label."""
+async def _find_version(
+    prompt_id: str, commit: str, *, rows: Sequence[dict[str, Any]] | None = None
+) -> dict[str, Any]:
+    """Resolve a commit by its hash, its id or its human version label.
+
+    ``rows`` is the history when the caller already holds it: a diff resolves
+    two commits, and walking every page of the history once per side was the
+    same registry read made twice.
+    """
     needle = commit.strip()
-    rows = await _version_rows(prompt_id)
+    if rows is None:
+        rows = await _version_rows(prompt_id)
     for row in rows:
         candidates = {
             str(row.get("commit", "")),
@@ -865,8 +1047,9 @@ async def diff(
 ) -> PromptDiff:
     """Unified diff of two commits' templates."""
     prompt = await get_prompt(session, principal, prompt_id, with_stats=False)
-    left = await _find_version(prompt_id, from_commit)
-    right = await _find_version(prompt_id, to_commit)
+    history = await _version_rows(prompt_id)
+    left = await _find_version(prompt_id, from_commit, rows=history)
+    right = await _find_version(prompt_id, to_commit, rows=history)
 
     left_text = str(_first(left, ("template",), "") or "")
     right_text = str(_first(right, ("template",), "") or "")
@@ -909,7 +1092,7 @@ async def summarise(
     session: AsyncSession, principal: Principal, *, window_days: int = DEFAULT_WINDOW_DAYS
 ) -> PromptsSummary:
     """The five KPI cards above the table."""
-    rows, _engine_total = await _scan(get_engine_client(), principal)
+    rows = await _workspace_rows(principal)
     shaped, projects_total = await _hydrate(
         session, principal, rows, window_days=window_days
     )
@@ -949,10 +1132,16 @@ def _commit_metadata(
     version: str | None,
     change_note: str | None,
 ) -> dict[str, Any]:
-    """What we stamp on a commit so a later read can rebuild the table row."""
+    """What we stamp on a commit so a later read can rebuild the table row.
+
+    The author is stamped because the registry cannot know it: every commit
+    reaches it from this service, so its own ``created_by`` is the same on all
+    of them.
+    """
     metadata: dict[str, Any] = {
         "workspace": _namespace(principal),
         "status": PromptStatus.DRAFT.value,
+        "author": principal.actor,
     }
     if agent:
         metadata["agent"] = agent
@@ -992,27 +1181,30 @@ async def create_prompt(
     qualified = _qualify(principal, payload.name)
     client = get_engine_client()
 
-    existing, _engine_total = await _scan(client, principal)
-    if any(str(row.get("name", "")) == qualified for row in existing):
-        raise Conflict(f"A prompt named '{payload.name}' already exists.")
-
+    # The registry keeps names unique and answers 409 for a second prompt of the
+    # same name. Walking the whole registry first, to ask the question it is
+    # about to answer anyway, cost up to twenty page reads per create and still
+    # raced with a create made in between.
     version = payload.version or "v0.1.0"
-    created = await _call(
-        client.create_prompt(
-            qualified,
-            description=payload.description,
-            template=payload.template,
-            metadata=_commit_metadata(
-                principal,
-                agent=payload.agent,
-                environment=payload.environment.value,
-                version=version,
-                change_note=payload.change_note or "Initial draft",
+    try:
+        created = await _call(
+            client.create_prompt(
+                qualified,
+                description=payload.description,
+                template=payload.template,
+                metadata=_commit_metadata(
+                    principal,
+                    agent=payload.agent,
+                    environment=payload.environment.value,
+                    version=version,
+                    change_note=payload.change_note or "Initial draft",
+                ),
+                tags=payload.tags or None,
             ),
-            tags=payload.tags or None,
-        ),
-        action="creating a prompt",
-    )
+            action="creating a prompt",
+        )
+    except Conflict as exc:
+        raise Conflict(f"A prompt named '{payload.name}' already exists.") from exc
     prompt_id = str(_first(created or {}, ("id", "prompt_id"), ""))
     if not prompt_id:
         # The registry accepted the create but will not name the row; without an
@@ -1173,7 +1365,7 @@ async def transition(
     else:
         principal.require(Role.OPERATOR)
 
-    prompt = await get_prompt(session, principal, prompt_id, with_stats=False)
+    prompt = await get_prompt(session, principal, prompt_id)
     _assert_transition(prompt.status, target, prompt.name)
 
     action = {
@@ -1182,7 +1374,7 @@ async def transition(
         PromptStatus.BLOCKED: "prompt.blocked",
     }[target]
 
-    await audit.record(
+    event = await audit.record(
         session,
         principal=principal,
         action=action,
@@ -1205,7 +1397,17 @@ async def transition(
     )
     await session.flush()
 
-    updated = await get_prompt(session, principal, prompt_id)
+    # A transition changes nothing in the registry: the prompt is the one read
+    # above, in the state the row just written puts it in. Reading it a second
+    # time asked the registry and the audit trail for what is already known.
+    updated = prompt.model_copy(
+        update={
+            "status": target,
+            "owner": event.actor,
+            "status_changed_at": event.occurred_at,
+            "status_changed_by": event.actor,
+        }
+    )
     label = f"{updated.name} {updated.version}" if updated.version else updated.name
     messages = {
         PromptStatus.IN_REVIEW: f"{label} submitted for review.",
@@ -1222,6 +1424,33 @@ async def transition(
 # ---------------------------------------------------------------------------
 # Test
 # ---------------------------------------------------------------------------
+
+
+async def _body_under_test(
+    prompt: PromptRead, requested: str | None
+) -> tuple[str, str | None, str | None]:
+    """The template to run or test, with the commit and version label it is.
+
+    With no commit asked for, that is the head -- which the prompt just read
+    already carries, template included. Both callers used to walk the prompt's
+    entire version history, templates and all, to take its first row. The label
+    is the one this service stamps into a commit's metadata; a version row has
+    no ``version`` field of its own, so reading that reported none.
+    """
+    if not requested and prompt.template:
+        return prompt.template, prompt.commit, prompt.version
+    if requested:
+        row = await _find_version(prompt.id, requested)
+    else:
+        # A prompt read that came back without its head's body: ask the history.
+        rows = await _version_rows(prompt.id)
+        row = rows[0] if rows else {}
+    label = _metadata(row).get("version")
+    return (
+        str(_first(row, ("template",), "") or ""),
+        str(_first(row, ("commit", "id"), "") or "") or None,
+        label if isinstance(label, str) else None,
+    )
 
 
 async def execute_prompt(
@@ -1248,13 +1477,7 @@ async def execute_prompt(
         raise ModelUnavailable(model_runner.requirement())
 
     prompt = await get_prompt(session, principal, prompt_id, with_stats=False)
-
-    if payload.commit:
-        row = await _find_version(prompt_id, payload.commit)
-    else:
-        rows = await _version_rows(prompt_id)
-        row = rows[0] if rows else {}
-    template = str(_first(row, ("template",), prompt.template or "") or "")
+    template, commit, version = await _body_under_test(prompt, payload.commit)
     if not template:
         raise PreconditionFailed(f"'{prompt.name}' has no template to run.")
 
@@ -1287,8 +1510,8 @@ async def execute_prompt(
     return PromptExecuteResult(
         prompt_id=prompt_id,
         name=prompt.name,
-        commit=str(_first(row, ("commit", "id"), None) or "") or None,
-        version=str(_first(row, ("version",), "") or "") or None,
+        commit=commit,
+        version=version,
         rendered=rendered,
         missing_variables=missing,
         unresolved_placeholders=list(unresolved),
@@ -1301,6 +1524,20 @@ async def execute_prompt(
         finish_reason=run.finish_reason,
         truncated=run.finish_reason == "length",
     )
+
+
+async def _discard_dataset(client: EngineClient, dataset_id: str | None) -> None:
+    """Best-effort removal of a dataset this request created and could not fill.
+
+    The failure that brought us here is the one the caller is told about; a
+    second failure while tidying up is logged and otherwise ignored.
+    """
+    if not dataset_id:
+        return
+    try:
+        await client.delete_dataset(dataset_id)
+    except EngineError:
+        log.warning("could not remove the unfilled prompt-test dataset %s", dataset_id)
 
 
 async def test_prompt(
@@ -1316,19 +1553,16 @@ async def test_prompt(
     The adapter exposes no completion path, so this endpoint does not execute a
     model. What it does do is real: it renders the stored template against each
     supplied variable set, reports every missing variable and every placeholder
-    that stayed unresolved, then persists the rendered cases as a dataset and
-    opens an experiment against the tested commit so the engine's evaluation
-    path scores them. ``scored`` says which of those two happened.
+    that stayed unresolved, then persists the rendered cases as a dataset in
+    this workspace's evaluation namespace and opens an experiment against the
+    tested commit. ``recorded`` says whether that second half happened.
+    ``scored`` stays false: no experiment items and no evaluator are attached
+    here, so nothing has scored the run until an evaluation is run against the
+    dataset.
     """
     principal.require(Role.MEMBER)
     prompt = await get_prompt(session, principal, prompt_id, with_stats=False)
-
-    if payload.commit:
-        row = await _find_version(prompt_id, payload.commit)
-    else:
-        rows = await _version_rows(prompt_id)
-        row = rows[0] if rows else {}
-    template = str(_first(row, ("template",), prompt.template or "") or "")
+    template, commit, version = await _body_under_test(prompt, payload.commit)
     if not template:
         raise PreconditionFailed(f"'{prompt.name}' has no template to test.")
 
@@ -1352,29 +1586,36 @@ async def test_prompt(
         )
 
     passed = sum(1 for case in cases if case.ok)
-    commit = str(_first(row, ("commit", "id"), prompt.commit or "") or "") or None
 
     dataset_id = experiment_id = None
     dataset_name = experiment_name = None
-    scored = False
+    recorded = False
     detail = (
         "Rendered locally. The telemetry adapter exposes no completion endpoint, so "
         "no model was executed."
     )
 
     if payload.score:
+        # A second's resolution is not unique: a double-click, or two members
+        # testing the same prompt, asked for the same name and the loser got 409.
         stamp = dt.datetime.now(dt.UTC).strftime("%Y%m%d-%H%M%S")
-        dataset_name = payload.dataset_name or _qualify(
-            principal, f"{prompt.name}-test-{stamp}"
-        )
-        experiment_name = payload.experiment_name or _qualify(
-            principal, f"{prompt.name}-test-{stamp}"
-        )
+        default_name = f"{prompt.name}-test-{stamp}-{secrets.token_hex(2)}"
+        dataset_name = payload.dataset_name or default_name
+        experiment_name = payload.experiment_name or default_name
+        # Named the way the Evaluations screen names its own datasets, so the
+        # recorded cases are listed there -- where they can be scored, and
+        # deleted -- and so a name a caller supplies cannot land outside this
+        # workspace's namespace. The namespace never reaches the client.
+        engine_dataset = evaluations.engine_name(principal, dataset_name)
+        engine_experiment = evaluations.engine_name(principal, experiment_name)
+        # The engine requires a provenance on every case and answers 422
+        # without one; ours arrive by hand from the console or through a key.
+        source = "sdk" if principal.kind == "api_key" else "manual"
         client = get_engine_client()
 
         dataset = await _call(
             client.create_dataset(
-                dataset_name,
+                engine_dataset,
                 description=(
                     f"Prompt test for {prompt.name}"
                     + (f" at {commit}" if commit else "")
@@ -1384,47 +1625,56 @@ async def test_prompt(
         )
         dataset_id = str(_first(dataset or {}, ("id", "dataset_id"), "")) or None
 
-        await _call(
-            client.create_dataset_items_batch(
-                [
-                    {
-                        "data": {
-                            "case": case.index,
-                            "variables": payload.cases[case.index]
-                            if case.index < len(payload.cases)
-                            else {},
-                            "rendered_prompt": case.rendered,
-                            "missing_variables": case.missing_variables,
-                            "unresolved_placeholders": case.unresolved_placeholders,
+        try:
+            await _call(
+                client.create_dataset_items_batch(
+                    [
+                        {
+                            "source": source,
+                            "data": {
+                                "case": case.index,
+                                "input": case.rendered,
+                                "variables": payload.cases[case.index]
+                                if case.index < len(payload.cases)
+                                else {},
+                                "rendered_prompt": case.rendered,
+                                "missing_variables": case.missing_variables,
+                                "unresolved_placeholders": case.unresolved_placeholders,
+                            },
                         }
-                    }
-                    for case in cases
-                ],
-                dataset_name=dataset_name,
-            ),
-            action="storing the test cases",
-        )
-
-        experiment = await _call(
-            client.create_experiment(
-                experiment_name,
-                dataset_name=dataset_name,
-                metadata={
-                    "prompt_id": prompt.id,
-                    "prompt": prompt.name,
-                    "commit": commit,
-                    "version": prompt.version,
-                    "source": SOURCE_SCREEN,
-                },
-            ),
-            action="opening the test experiment",
-        )
+                        for case in cases
+                    ],
+                    dataset_name=engine_dataset,
+                ),
+                action="storing the test cases",
+            )
+            experiment = await _call(
+                client.create_experiment(
+                    engine_experiment,
+                    dataset_name=engine_dataset,
+                    metadata={
+                        "prompt_id": prompt.id,
+                        "prompt": prompt.name,
+                        "commit": commit,
+                        "version": version,
+                        "source": SOURCE_SCREEN,
+                    },
+                ),
+                action="opening the test experiment",
+            )
+        except Exception:
+            # The dataset was made a moment ago by this call (an existing name
+            # answers 409 above and never reaches here) and nothing will ever
+            # fill it: every failed attempt used to leave one behind.
+            await _discard_dataset(client, dataset_id)
+            raise
         experiment_id = str(_first(experiment or {}, ("id",), "")) or None
-        scored = True
+        recorded = True
         detail = (
-            "Rendered locally, then stored as a dataset with an experiment opened "
-            "against it so the engine's evaluation path scores the run. The adapter "
-            "exposes no completion endpoint, so no model was executed here."
+            f"Rendered locally, then stored as the dataset '{dataset_name}' with an "
+            "experiment opened against the tested commit. Nothing has scored it: no "
+            "model was executed here and no evaluator is attached, so run an "
+            "evaluation against that dataset to score it."
         )
 
     await audit.record(
@@ -1442,7 +1692,7 @@ async def test_prompt(
             "passed": passed,
             "dataset": dataset_name,
             "experiment": experiment_name,
-            "scored": scored,
+            "recorded": recorded,
         },
         request=request,
     )
@@ -1452,12 +1702,15 @@ async def test_prompt(
         prompt_id=prompt.id,
         name=prompt.name,
         commit=commit,
-        version=prompt.version,
+        version=version,
         variables=declared,
         cases=cases,
         passed=passed,
         failed=len(cases) - passed,
-        scored=scored,
+        recorded=recorded,
+        # Nothing here attaches experiment items or an evaluator, so nothing
+        # has been scored; saying otherwise was a claim about work never done.
+        scored=False,
         dataset_id=dataset_id,
         dataset_name=dataset_name,
         experiment_id=experiment_id,

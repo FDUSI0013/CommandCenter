@@ -33,8 +33,23 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..api.common import ListParams, apply_filters, apply_search, apply_sort, paginate
 from ..api.deps import Principal
-from ..core.errors import Conflict, NotFound, PreconditionFailed, ValidationFailed
-from ..engine import get_engine_client
+from ..core.config import settings
+from ..core.errors import (
+    Conflict,
+    NotFound,
+    PreconditionFailed,
+    TelemetryBackendUnavailable,
+    ValidationFailed,
+)
+from ..core.ttlcache import SingleFlightCache
+from ..engine import (
+    EngineBadRequest,
+    EngineError,
+    EngineNotFound,
+    EngineTimeout,
+    deadline,
+    get_engine_client,
+)
 from ..models.governance import AuditEvent
 from ..models.identity import Role, User
 from ..models.registry import (
@@ -588,16 +603,44 @@ async def export_configurations(
     return await hydrate(session, principal, rows)
 
 
+def _configuration_stmt(
+    principal: Principal, configuration_id: str, *, lock: bool = False
+) -> Select:
+    stmt = _scoped(principal).where(Configuration.id == configuration_id)
+    if lock:
+        # FOR NO KEY UPDATE, not FOR UPDATE: inserting a revision takes a
+        # key-share lock on this row through its foreign key, and the stronger
+        # lock would make every writer queue behind every such insert as well.
+        # populate_existing, because the point of waiting for the lock is to
+        # see what the transaction that held it committed.
+        stmt = stmt.with_for_update(key_share=True).execution_options(
+            populate_existing=True
+        )
+    return stmt
+
+
 async def get_configuration(
-    session: AsyncSession, principal: Principal, configuration_id: str
+    session: AsyncSession,
+    principal: Principal,
+    configuration_id: str,
+    *,
+    lock: bool = False,
 ) -> Configuration:
     """Load one configuration, or raise :class:`NotFound`.
 
     A row in another workspace raises the same 404 as a row that never existed —
     a 403 would confirm the id is real.
+
+    ``lock`` is for the verbs that decide something from the row and then write
+    it -- which revision is current, which label comes next. Two of those on
+    one configuration at the same moment each read the state the other was
+    about to change: both demoted the same previous revision and both flagged
+    their own as current. The row lock makes the second wait for the first to
+    commit and then read what it left. (SQLite, which the tests run on, has one
+    writer at a time and renders no lock clause.)
     """
     configuration = (
-        await session.execute(_scoped(principal).where(Configuration.id == configuration_id))
+        await session.execute(_configuration_stmt(principal, configuration_id, lock=lock))
     ).scalar_one_or_none()
     if configuration is None:
         raise NotFound(f"Configuration '{configuration_id}' does not exist.")
@@ -614,13 +657,30 @@ async def read_configuration(
 async def _current_version(
     session: AsyncSession, principal: Principal, configuration_id: str
 ) -> ConfigurationVersion | None:
+    """The revision flagged current -- the latest published one if several are.
+
+    Nothing in the schema stops two rows of one configuration carrying the
+    flag, and two activations racing each other have produced exactly that.
+    Insisting on one row here turned that into a 500 from every verb on the
+    configuration, including the ones that would have repaired it; the next
+    ``_publish`` clears every stale flag it finds.
+    """
     return (
-        await session.execute(
-            _versions_scoped(principal, configuration_id).where(
-                ConfigurationVersion.is_current.is_(True)
+        (
+            await session.execute(
+                _versions_scoped(principal, configuration_id)
+                .where(ConfigurationVersion.is_current.is_(True))
+                .order_by(
+                    ConfigurationVersion.published_at.desc().nulls_last(),
+                    ConfigurationVersion.created_at.desc(),
+                    ConfigurationVersion.id.desc(),
+                )
+                .limit(1)
             )
         )
-    ).scalar_one_or_none()
+        .scalars()
+        .first()
+    )
 
 
 async def _version_by_label(
@@ -902,6 +962,71 @@ _ERROR_COUNT_NAMES: Final[tuple[str, ...]] = (
 )
 
 
+#: How many of one request's per-project reads are on the store at a time. A
+#: "Production" environment configuration binds every production agent, and the
+#: panel used to start one 30-day aggregate per agent, all at once.
+USAGE_ENGINE_CONCURRENCY: Final[int] = 6
+
+#: (workspace, project, window) -> (runs, errors) as the engine reported them,
+#: or None where the engine holds no such project. Per project rather than per
+#: configuration, so a Model and an Environment configuration that bind the same
+#: agent share one read, and a change to which agents are bound shows at once.
+_usage_memory: SingleFlightCache[tuple[int | None, int | None] | None] = SingleFlightCache(
+    ttl=lambda: settings.configuration_usage_cache_seconds, max_entries=2048
+)
+
+
+def _telemetry_unavailable(exc: EngineError) -> TelemetryBackendUnavailable:
+    """Translate an adapter failure into the API's typed 503.
+
+    The adapter's classes are not ``AppError``s: one that escapes a service
+    reaches the catch-all handler and the operator reads "An unexpected error
+    occurred" where every other screen says the telemetry store is down. The
+    adapter's exception stays on as the cause.
+    """
+    if isinstance(exc, EngineTimeout):
+        return TelemetryBackendUnavailable(
+            "The telemetry store did not answer in time. Retry in a moment."
+        )
+    if isinstance(exc, EngineBadRequest):
+        # 503 either way, but the code says retrying will not help.
+        return TelemetryBackendUnavailable(
+            f"The telemetry store rejected the request (status {exc.status}).",
+            code="telemetry_rejected",
+        )
+    return TelemetryBackendUnavailable()
+
+
+async def _project_run_counts(
+    workspace_id: str, project_name: str, window_days: int
+) -> tuple[int | None, int | None] | None:
+    """One bound project's run and error counts over the window.
+
+    None means the engine holds no project of that name -- an agent whose
+    project was deleted upstream has no runs to attribute, and that is not an
+    outage. Anything else the engine cannot answer is raised, never zeroed.
+    """
+
+    async def compute() -> tuple[int | None, int | None] | None:
+        now = _now()
+        try:
+            stats = await get_engine_client().get_trace_stats(
+                project_name=project_name,
+                from_time=now - dt.timedelta(days=window_days),
+                to_time=now,
+            )
+        except EngineNotFound:
+            return None
+        count = _stat_value(stats, _TRACE_COUNT_NAMES)
+        failures = _stat_value(stats, _ERROR_COUNT_NAMES)
+        return (
+            int(count) if count is not None else None,
+            int(failures) if failures is not None else None,
+        )
+
+    return await _usage_memory.get((workspace_id, project_name, window_days), compute)
+
+
 async def usage(
     session: AsyncSession,
     principal: Principal,
@@ -912,8 +1037,9 @@ async def usage(
     """Impact & Usage plus Linked Configurations for one configuration.
 
     Run counts come from the telemetry engine for the bound agents' projects.
-    If the engine is unreachable the adapter's error propagates: an outage must
-    not be rendered as zero traffic.
+    If the engine cannot answer, the request fails with the typed 503
+    (``telemetry_unavailable``): an outage must not be rendered as zero traffic,
+    and it must not be rendered as a bug in this service either.
     """
     configuration = await get_configuration(session, principal, configuration_id)
     current = await _current_version(session, principal, configuration_id)
@@ -923,36 +1049,6 @@ async def usage(
     agents: list[Agent] = []
     if stmt is not None:
         agents = list((await session.execute(stmt)).scalars().all())
-
-    project_names = sorted(
-        {agent.engine_project_name for agent in agents if agent.engine_project_name}
-    )
-    runs: int | None = None
-    errors: int | None = None
-    if project_names:
-        now = _now()
-        client = get_engine_client()
-        payloads = await asyncio.gather(
-            *(
-                client.get_trace_stats(
-                    project_name=name,
-                    from_time=now - dt.timedelta(days=window_days),
-                    to_time=now,
-                )
-                for name in project_names
-            )
-        )
-        runs = 0
-        for stats in payloads:
-            count = _stat_value(stats, _TRACE_COUNT_NAMES)
-            failures = _stat_value(stats, _ERROR_COUNT_NAMES)
-            runs += int(count or 0)
-            if failures is not None:
-                errors = int(failures) + (errors or 0)
-
-    success_rate: float | None = None
-    if runs and errors is not None:
-        success_rate = round(max(0.0, (runs - errors) / runs) * 100, 1)
 
     link_states = await _resolve_links(session, principal, payload)
     by_name: dict[str, Any] = {}
@@ -968,6 +1064,50 @@ async def usage(
             )
         ).all()
         by_name = {row.name: row for row in resolved_rows}
+
+    project_names = sorted(
+        {agent.engine_project_name for agent in agents if agent.engine_project_name}
+    )
+    runs: int | None = None
+    errors: int | None = None
+    answered = 0
+    if project_names:
+        # Everything this panel needs from our own database has been read. End
+        # the transaction so the pooled connection goes back *before* the wait
+        # on the telemetry store, not after it: held across a slow aggregate, a
+        # few open Usage tabs are enough to drain a worker's pool. Rows stay
+        # loaded (``expire_on_commit=False``).
+        await session.commit()
+
+        gate = asyncio.Semaphore(USAGE_ENGINE_CONCURRENCY)
+        workspace_id = principal.workspace_id
+
+        async def read(name: str) -> tuple[int | None, int | None] | None:
+            async with gate:
+                return await _project_run_counts(workspace_id, name, window_days)
+
+        try:
+            # Bounding concurrency means reads queue, and a queue behind a slow
+            # store can outlast the console's 30 s; the deadline makes this API
+            # the one that answers. Reads already shared through the memory
+            # finish on their own and are there for the retry.
+            async with deadline(what="configuration usage"):
+                counts = await asyncio.gather(*(read(name) for name in project_names))
+        except EngineError as exc:
+            raise _telemetry_unavailable(exc) from exc
+
+        for measured in counts:
+            if measured is None:
+                continue
+            answered += 1
+            count, failures = measured
+            runs = (runs or 0) + (count or 0)
+            if failures is not None:
+                errors = failures + (errors or 0)
+
+    success_rate: float | None = None
+    if runs and errors is not None:
+        success_rate = round(max(0.0, (runs - errors) / runs) * 100, 1)
 
     links = [
         ConfigurationLink(
@@ -992,7 +1132,7 @@ async def usage(
         success_rate=success_rate,
         error_count_30d=errors,
         window_days=window_days,
-        telemetry_available=bool(project_names),
+        telemetry_available=answered > 0,
         links=links,
     )
 
@@ -1010,6 +1150,54 @@ async def _assert_name_free(
         stmt = stmt.where(Configuration.id != exclude_id)
     if (await session.execute(stmt)).scalar_one_or_none() is not None:
         raise Conflict(f"A configuration named '{name}' already exists.")
+
+
+async def _next_free_version(
+    session: AsyncSession, principal: Principal, configuration: Configuration
+) -> str:
+    """The label the next revision takes: the next minor nothing holds yet.
+
+    ``next_version`` is a pure function of the *live* label, and a draft does
+    not move the live label -- so a drafted v1.2.0 sat on exactly the label the
+    next rollback or import computed, and the unique index on
+    (configuration, version) answered with a 500. Every label the configuration
+    has ever used is read, not just the live one: activating a draft can leave
+    ``current_version`` below labels that are already in the table.
+    """
+    taken = {
+        label
+        for (label,) in (
+            await session.execute(
+                select(ConfigurationVersion.version).where(
+                    ConfigurationVersion.workspace_id == principal.workspace_id,
+                    ConfigurationVersion.configuration_id == configuration.id,
+                )
+            )
+        ).all()
+    }
+    candidate = next_version(configuration.current_version)
+    while candidate in taken:
+        candidate = next_version(candidate)
+    return candidate
+
+
+async def _flush_version(
+    session: AsyncSession, configuration_name: str, version: str
+) -> None:
+    """Write a new revision row, answering a lost race for its label with 409.
+
+    Looking for a free label and then inserting it is two steps, and four
+    workers can take them at the same moment. The unique index decides who won;
+    the loser is told so instead of being handed an opaque 500.
+    """
+    try:
+        await session.flush()
+    except IntegrityError as exc:
+        await session.rollback()
+        raise Conflict(
+            f"Version '{version}' of '{configuration_name}' was created by someone "
+            "else at the same moment. Reload and try again."
+        ) from exc
 
 
 def _new_version_row(
@@ -1042,12 +1230,37 @@ async def _publish(
     configuration: Configuration,
     version_row: ConfigurationVersion,
 ) -> None:
-    """Make one revision the live one, demoting whichever held the flag."""
-    previous = await _current_version(session, principal, configuration.id)
-    if previous is not None and previous.id != version_row.id:
+    """Make one revision the live one, demoting whichever held the flag.
+
+    *Every* row that holds it, not the first one found: a configuration that
+    ended up with two current revisions is put right by its next activation.
+
+    Callers load the configuration with ``lock=True`` first, so two activations
+    of one configuration take turns. The demotion is flushed before the
+    promotion on purpose. The unit of work orders its UPDATEs by primary key,
+    and these keys are random, so without the flush about half of all
+    activations promote first -- which a unique index on "the current revision"
+    (the constraint this table should have) refuses, because for one statement
+    two rows hold the flag.
+    """
+    holders = (
+        (
+            await session.execute(
+                _versions_scoped(principal, configuration.id).where(
+                    ConfigurationVersion.is_current.is_(True),
+                    ConfigurationVersion.id != version_row.id,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for previous in holders:
         previous.is_current = False
         if previous.status == ConfigurationStatus.ACTIVE.value:
             previous.status = ConfigurationStatus.DEPRECATED.value
+    if holders:
+        await session.flush()
 
     version_row.is_current = True
     version_row.status = ConfigurationStatus.ACTIVE.value
@@ -1157,6 +1370,109 @@ async def create_configuration(
     return configuration
 
 
+async def _assert_not_linked_to(
+    session: AsyncSession, principal: Principal, configuration: Configuration
+) -> None:
+    """Refuse a rename while another configuration's live body links to the name.
+
+    Links are resolved *by name*, and an unresolved link is an error-severity
+    finding. Renaming 'PII Guard' therefore left every configuration that named
+    it failing validation: none of them could be given an activated version,
+    rolled back or restored until somebody hand-edited each body. Archived
+    dependents count too -- restore re-validates the body, so a broken link
+    there is a configuration that can never come back.
+
+    Bodies are read and walked here rather than matched with a JSON query: the
+    row count is one per configuration, and the link block's shape (a name or a
+    list of names per slot) does not reduce to one portable SQL predicate.
+    """
+    rows = (
+        await session.execute(
+            select(Configuration.id, Configuration.name, ConfigurationVersion.payload)
+            .join(
+                ConfigurationVersion,
+                ConfigurationVersion.configuration_id == Configuration.id,
+            )
+            .where(
+                Configuration.workspace_id == principal.workspace_id,
+                ConfigurationVersion.workspace_id == principal.workspace_id,
+                ConfigurationVersion.is_current.is_(True),
+            )
+            .order_by(Configuration.name)
+        )
+    ).all()
+    dependents = [
+        {"configuration_id": row.id, "name": row.name, "slot": slot}
+        for row in rows
+        for slot, linked in declared_links(row.payload or {})
+        if linked == configuration.name
+    ]
+    if not dependents:
+        return
+    names = sorted({entry["name"] for entry in dependents})
+    raise Conflict(
+        f"'{configuration.name}' is linked from {', '.join(repr(name) for name in names)}. "
+        "A link names its target, so renaming it would leave "
+        f"{'that configuration' if len(names) == 1 else 'those configurations'} failing "
+        "validation. Remove or repoint the link first.",
+        details={"dependents": dependents},
+    )
+
+
+async def _refuse_edit_that_invalidates(
+    session: AsyncSession,
+    principal: Principal,
+    configuration: Configuration,
+    *,
+    config_type: str,
+    environment: str,
+) -> None:
+    """Refuse a type or environment edit the live body does not survive.
+
+    The rules a body is held to depend on both: the declared field list is
+    keyed on the type, and ``required_in_production`` on the environment. An
+    Edit that moved an Active Development model into Production published a body
+    nobody had validated against Production's rules -- the one thing this module
+    promises cannot happen.
+
+    Only the errors the edit *introduces* refuse it. A row that is already
+    invalid for some other reason must stay editable, or an environment that was
+    set wrongly could never be corrected.
+    """
+    current = await _current_version(session, principal, configuration.id)
+    body = (current.payload or {}) if current is not None else {}
+    link_states = await _resolve_links(session, principal, body)
+
+    def errors(as_type: str, in_environment: str) -> dict[tuple[str, str], ConfigurationFinding]:
+        return {
+            (finding.field, finding.code): finding
+            for finding in _validate_body(
+                config_type=as_type,
+                environment=in_environment,
+                payload=body,
+                link_states=link_states,
+            )
+            if finding.severity is FindingSeverity.ERROR
+        }
+
+    before = errors(configuration.config_type, configuration.environment)
+    after = errors(config_type, environment)
+    introduced = [finding for key, finding in after.items() if key not in before]
+    if not introduced:
+        return
+    label = current.version if current is not None else "its current version"
+    raise ValidationFailed(
+        f"'{configuration.name}' {label} does not pass validation as a {config_type} "
+        f"configuration in {environment}. Activate a version that does, then make "
+        "this change.",
+        details={
+            "findings": [finding.model_dump(mode="json") for finding in introduced],
+            "error_count": len(introduced),
+            "warning_count": 0,
+        },
+    )
+
+
 async def update_configuration(
     session: AsyncSession,
     principal: Principal,
@@ -1165,9 +1481,18 @@ async def update_configuration(
     *,
     request: Request | None = None,
 ) -> Configuration:
-    """Edit identity fields. Bodies never move through here — cut a version."""
+    """Edit identity fields. Bodies never move through here — cut a version.
+
+    Identity is not inert, though. The type and the environment decide which
+    rules the live body is held to, and the name is what other configurations
+    link to -- so a change to any of the three is checked against the body and
+    the links it would affect before it is written. Drafts are exempt from the
+    body check: a Draft is allowed to be invalid, that is what makes it one.
+    """
     principal.require(Role.OPERATOR)
-    configuration = await get_configuration(session, principal, configuration_id)
+    configuration = await get_configuration(
+        session, principal, configuration_id, lock=True
+    )
 
     if configuration.status == ConfigurationStatus.ARCHIVED.value:
         raise PreconditionFailed(
@@ -1184,18 +1509,42 @@ async def update_configuration(
             )
 
     changes = payload.model_dump(exclude_unset=True, exclude={"expected_updated_at"})
+    # These four columns are not nullable: an explicit null is "no change", not
+    # a value. (It used to reach the flush and come back as a name conflict.)
+    for field in ("name", "config_type", "environment", "impact"):
+        if field in changes and changes[field] is None:
+            del changes[field]
     if not changes:
         return configuration
-
-    if "name" in changes and changes["name"] != configuration.name:
-        await _assert_name_free(
-            session, principal, changes["name"], exclude_id=configuration.id
-        )
 
     for field in ("config_type", "environment", "impact"):
         value = changes.get(field)
         if value is not None and not isinstance(value, str):
             changes[field] = value.value
+
+    # The Edit dialog always sends name, type and environment, changed or not,
+    # so every check below asks whether the value *moved*, never whether it was
+    # sent -- otherwise a description edit would re-validate the row, and a row
+    # that is already invalid could not be edited at all.
+    if "name" in changes and changes["name"] != configuration.name:
+        await _assert_name_free(
+            session, principal, changes["name"], exclude_id=configuration.id
+        )
+        await _assert_not_linked_to(session, principal, configuration)
+
+    moved = [
+        field
+        for field in ("config_type", "environment")
+        if field in changes and changes[field] != getattr(configuration, field)
+    ]
+    if moved and configuration.status != ConfigurationStatus.DRAFT.value:
+        await _refuse_edit_that_invalidates(
+            session,
+            principal,
+            configuration,
+            config_type=changes.get("config_type", configuration.config_type),
+            environment=changes.get("environment", configuration.environment),
+        )
 
     for field, value in changes.items():
         setattr(configuration, field, value)
@@ -1301,14 +1650,21 @@ async def create_version(
 ) -> tuple[ConfigurationVersion, ConfigurationValidationReport]:
     """Cut a new revision, validating it before it is allowed to go live."""
     principal.require(Role.OPERATOR)
-    configuration = await get_configuration(session, principal, configuration_id)
+    configuration = await get_configuration(
+        session, principal, configuration_id, lock=True
+    )
     if configuration.status == ConfigurationStatus.ARCHIVED.value:
         raise PreconditionFailed(
             f"'{configuration.name}' is archived. Restore it before cutting a version."
         )
 
     current = await _current_version(session, principal, configuration.id)
-    version = payload.version or next_version(configuration.current_version)
+    # A caller that names no label gets one that is free. The next minor of the
+    # live label is taken as soon as somebody drafts it, and a caller who never
+    # chose a label cannot be expected to resolve a 409 about one.
+    version = payload.version or await _next_free_version(
+        session, principal, configuration
+    )
     body = (
         payload.payload
         if payload.payload is not None
@@ -1342,7 +1698,7 @@ async def create_version(
         is_current=False,
     )
     session.add(row)
-    await session.flush()
+    await _flush_version(session, configuration.name, version)
 
     if payload.activate:
         await _publish(session, principal, configuration, row)
@@ -1373,6 +1729,84 @@ async def create_version(
     return row, report
 
 
+async def activate_version(
+    session: AsyncSession,
+    principal: Principal,
+    configuration_id: str,
+    version: str,
+    *,
+    request: Request | None = None,
+) -> tuple[ConfigurationVersion, ConfigurationValidationReport]:
+    """Publish a revision that was drafted earlier.
+
+    A revision cut with ``activate=false``, and every revision an import leaves
+    behind, is a Draft -- and until this verb existed nothing could make one
+    live: the only way to publish was to cut yet another revision. The gate is
+    the one ``create_version`` applies when it activates: operator role, not
+    archived, and the body validated against the rules as they stand *now*,
+    which may have moved since the draft was written.
+
+    Only a Draft can be activated. A revision that has been live before goes
+    back into service through ``rollback``, which republishes its body as a new
+    revision (and asks for the admin role); activating it in place would rewrite
+    the record of what was live and when.
+    """
+    principal.require(Role.OPERATOR)
+    configuration = await get_configuration(
+        session, principal, configuration_id, lock=True
+    )
+    if configuration.status == ConfigurationStatus.ARCHIVED.value:
+        raise PreconditionFailed(
+            f"'{configuration.name}' is archived. Restore it before activating a version."
+        )
+
+    row = await _version_by_label(session, principal, configuration.id, version)
+    if row.status != ConfigurationStatus.DRAFT.value:
+        if row.is_current and row.status == ConfigurationStatus.ACTIVE.value:
+            raise PreconditionFailed(
+                f"Version {row.version} is already current for '{configuration.name}'."
+            )
+        if row.is_current:
+            raise PreconditionFailed(
+                f"'{configuration.name}' {row.version} is {row.status.lower()}. "
+                "Restore the configuration to bring it back into service."
+            )
+        raise PreconditionFailed(
+            f"Version {row.version} of '{configuration.name}' has been live before. "
+            "Roll back to it instead: a rollback republishes its body as a new version "
+            "and keeps the record of what was live and when."
+        )
+
+    report = await _validate_row(
+        session, principal, configuration, version=row.version, payload=row.payload or {}
+    )
+    _refuse_invalid(report, configuration.name)
+
+    previous_version = configuration.current_version
+    await _publish(session, principal, configuration, row)
+    configuration.updated_by = principal.actor
+
+    await audit.record(
+        session,
+        principal=principal,
+        action="configuration.version_activated",
+        entity_type=ENTITY_TYPE,
+        entity_id=configuration.id,
+        entity_label=configuration.name,
+        source_screen=SOURCE_SCREEN,
+        detail=f"Version {row.version} activated",
+        metadata={
+            "version": row.version,
+            "previous_version": previous_version,
+            "warnings": report.warning_count,
+        },
+        request=request,
+    )
+    await session.flush()
+    await session.refresh(row)
+    return row, report
+
+
 async def rollback(
     session: AsyncSession,
     principal: Principal,
@@ -1387,7 +1821,9 @@ async def rollback(
     it carried, and the rollback lands as the next version on top.
     """
     principal.require(Role.ADMIN)
-    configuration = await get_configuration(session, principal, configuration_id)
+    configuration = await get_configuration(
+        session, principal, configuration_id, lock=True
+    )
     current = await _current_version(session, principal, configuration.id)
 
     if payload.version:
@@ -1411,7 +1847,7 @@ async def rollback(
             f"Version {target.version} is already current for '{configuration.name}'."
         )
 
-    version = next_version(configuration.current_version)
+    version = await _next_free_version(session, principal, configuration)
     body = dict(target.payload or {})
     report = await _validate_row(
         session, principal, configuration, version=version, payload=body
@@ -1433,7 +1869,7 @@ async def rollback(
         is_current=False,
     )
     session.add(row)
-    await session.flush()
+    await _flush_version(session, configuration.name, version)
     await _publish(session, principal, configuration, row)
     configuration.updated_by = principal.actor
 
@@ -1479,7 +1915,9 @@ async def deprecate(
 ) -> Configuration:
     """Retire a configuration. Agents migrate at their next deploy."""
     principal.require(Role.ADMIN)
-    configuration = await get_configuration(session, principal, configuration_id)
+    configuration = await get_configuration(
+        session, principal, configuration_id, lock=True
+    )
     target = (
         ConfigurationStatus.ARCHIVED if payload.archive else ConfigurationStatus.DEPRECATED
     )
@@ -1526,7 +1964,9 @@ async def restore(
 ) -> Configuration:
     """Bring a deprecated or archived configuration back into service."""
     principal.require(Role.ADMIN)
-    configuration = await get_configuration(session, principal, configuration_id)
+    configuration = await get_configuration(
+        session, principal, configuration_id, lock=True
+    )
     _assert_transition(configuration, ConfigurationStatus.ACTIVE)
 
     current = await _current_version(session, principal, configuration.id)
@@ -1720,7 +2160,14 @@ async def import_bundle(
                     )
                 )
                 continue
-            version = next_version(target.current_version)
+            # A draft does not move the live label, so "the next minor of the
+            # live label" is taken by the draft the previous import left behind
+            # -- or by this bundle's own earlier item of the same name. Ask for
+            # a label that is free, and write the row now: the session does not
+            # autoflush, so a row left pending is invisible to the next item's
+            # lookup and would only collide later, at a flush that blames
+            # something else.
+            version = await _next_free_version(session, principal, target)
             session.add(
                 _new_version_row(
                     target,
@@ -1735,6 +2182,14 @@ async def import_bundle(
                 )
             )
             target.updated_by = principal.actor
+            try:
+                await session.flush()
+            except IntegrityError as exc:
+                await session.rollback()
+                raise Conflict(
+                    f"Version '{version}' of '{item.name}' was created by someone else "
+                    "while the bundle was importing. Nothing was imported; retry the file."
+                ) from exc
             versioned.append(target.id)
             continue
 
@@ -1813,6 +2268,7 @@ async def import_bundle(
 
 __all__ = [
     "EXPORT_COLUMNS",
+    "activate_version",
     "build_bundle",
     "clone_configuration",
     "create_configuration",

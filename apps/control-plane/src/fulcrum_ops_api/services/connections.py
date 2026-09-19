@@ -19,22 +19,26 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import datetime as dt
+import re
 import time
 from collections.abc import Sequence
 from typing import Any, Final
 
 import httpx
 from fastapi import Request
-from sqlalchemy import Select, case, func, select
+from sqlalchemy import Select, case, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import set_committed_value
 
 from ..api.common import ListParams, apply_filters, apply_search, apply_sort, paginate
 from ..api.deps import Principal
 from ..core.errors import Conflict, NotFound, PreconditionFailed
+from ..core.ttlcache import SingleFlightCache
 from ..engine import EngineError, get_engine_client
 from ..models.identity import Role
 from ..models.registry import (
+    Agent,
     Connection,
     ConnectionActivity,
     ConnectionStatus,
@@ -55,6 +59,7 @@ from ..schemas.connections import (
     ConnectionToolCall,
     ConnectionTraffic,
     ConnectionUpdate,
+    is_link_local_host,
 )
 from . import audit
 from . import metrics as telemetry
@@ -64,9 +69,41 @@ ENTITY_TYPE: Final[str] = "connection"
 
 #: A probe is a health check, not a workload: it must fail fast enough that
 #: "Test All Connections" over a few dozen tiles still feels instant.
-PROBE_TIMEOUT_SECONDS: Final[float] = 5.0
+#: Bounds the whole probe -- connect, redirects and the wait for the status line
+#: together -- not just each read. Not ``Final``: tests shorten it.
+PROBE_TIMEOUT_SECONDS: float = 5.0
 PROBE_CONNECT_TIMEOUT_SECONDS: Final[float] = 2.0
+PROBE_MAX_REDIRECTS: Final[int] = 3
 PROBE_USER_AGENT: Final[str] = "fulcrum-ops-control-plane/1.0 (connection-probe)"
+
+#: Exactly the diagnostics the probe used to write over the operator's note.
+#: A note that is nothing but one of these was never the operator's, so the
+#: next probe clears it; anything else is theirs and is left alone.
+_PROBE_WRITTEN_NOTE: Final[re.Pattern[str]] = re.compile(
+    r"HTTP \d{3} in \d+ms|No response within \d+s|Endpoint unreachable \(\w+\)"
+)
+
+#: Feed events whose details are what a probe saw. The newest of them on a tile
+#: is that tile's standing diagnostic (``status_detail``).
+_PROBE_EVENTS: Final[tuple[str, ...]] = (
+    "Connection Test",
+    "Connection Failed",
+    "Connection Restored",
+    "Sync Completed",
+    "Sync Failed",
+)
+
+#: Agents registered on a connection's platform. There is no agent-to-connection
+#: foreign key -- ``Agent.platform == Connection.kind`` *is* the link, the same one
+#: the traffic view reads through -- so the number is counted where it is asked
+#: for. The ``linked_agent_count`` column was meant to hold it and nothing ever
+#: wrote it: every tile said "Agents Using 0" and the delete guard never fired.
+_LINKED_AGENTS: Final[Any] = (
+    select(func.count(Agent.id))
+    .where(Agent.workspace_id == Connection.workspace_id, Agent.platform == Connection.kind)
+    .correlate(Connection)
+    .scalar_subquery()
+)
 
 SORTABLE: Final[dict[str, Any]] = {
     "name": Connection.name,
@@ -75,7 +112,7 @@ SORTABLE: Final[dict[str, Any]] = {
     "health": Connection.health,
     "last_sync_at": Connection.last_sync_at,
     "latency_ms": Connection.latency_ms,
-    "linked_agent_count": Connection.linked_agent_count,
+    "linked_agent_count": _LINKED_AGENTS,
     "syncs_today": Connection.syncs_today,
     "enabled": Connection.enabled,
     "created_at": Connection.created_at,
@@ -111,11 +148,31 @@ def _as_utc(value: dt.datetime) -> dt.datetime:
     return value.astimezone(dt.UTC)
 
 
+class _RefusedTarget(Exception):
+    """The probe was pointed, directly or by a redirect, somewhere it will not go."""
+
+
+async def _refuse_link_local(request: httpx.Request) -> None:
+    # Runs for every hop, so an outside URL that redirects to the instance
+    # metadata address is refused just as the address itself is on write.
+    if is_link_local_host(request.url.host):
+        raise _RefusedTarget(request.url.host)
+
+
 def _probe_client() -> httpx.AsyncClient:
     return httpx.AsyncClient(
+        event_hooks={"request": [_refuse_link_local]},
         timeout=httpx.Timeout(PROBE_TIMEOUT_SECONDS, connect=PROBE_CONNECT_TIMEOUT_SECONDS),
         follow_redirects=True,
-        headers={"accept": "*/*", "user-agent": PROBE_USER_AGENT},
+        # A health endpoint that bounces more than a few times is misconfigured,
+        # and the library's default of twenty hops is twenty sets of timeouts.
+        max_redirects=PROBE_MAX_REDIRECTS,
+        # An MCP server answers 406 to a caller that will not take an event
+        # stream, which would read as a Warning on a healthy tile.
+        headers={
+            "accept": "application/json, text/event-stream, */*",
+            "user-agent": PROBE_USER_AGENT,
+        },
     )
 
 
@@ -130,16 +187,44 @@ def _endpoint_for(connection: Connection) -> str | None:
 
 
 async def _probe(client: httpx.AsyncClient, url: str) -> ProbeResult:
-    """GET the endpoint once and time it. Never raises."""
+    """GET the endpoint once and time it. Never raises.
+
+    The answer is the status line: the probe is over the moment the headers
+    arrive, and the body is never read. Reading it is what made a healthy
+    endpoint that *streams* -- an MCP server's event stream, a large download --
+    either time out between keep-alives and show as Disconnected, or never
+    finish at all, because the library's timeouts bound each read rather than
+    the request. The deadline around the whole exchange is what bounds it:
+    redirects, a trickle of header bytes and all.
+    """
     started = time.perf_counter()
     try:
-        response = await client.get(url)
-    except httpx.TimeoutException:
+        async with asyncio.timeout(PROBE_TIMEOUT_SECONDS):
+            async with client.stream("GET", url) as response:
+                status_code = response.status_code
+                latency_ms = int(round((time.perf_counter() - started) * 1000))
+    # The builtin is the deadline above; the library's own timeouts are not
+    # subclasses of it.
+    except (TimeoutError, httpx.TimeoutException):
         return ProbeResult(
             reachable=False,
             http_status=None,
             latency_ms=None,
             detail=f"No response within {PROBE_TIMEOUT_SECONDS:.0f}s",
+        )
+    except _RefusedTarget:
+        return ProbeResult(
+            reachable=False,
+            http_status=None,
+            latency_ms=None,
+            detail="Endpoint is, or redirects to, a link-local (instance metadata) address",
+        )
+    except httpx.TooManyRedirects:
+        return ProbeResult(
+            reachable=False,
+            http_status=None,
+            latency_ms=None,
+            detail=f"Endpoint redirected more than {PROBE_MAX_REDIRECTS} times",
         )
     except httpx.TransportError as exc:
         return ProbeResult(
@@ -149,12 +234,11 @@ async def _probe(client: httpx.AsyncClient, url: str) -> ProbeResult:
             detail=f"Endpoint unreachable ({type(exc).__name__})",
         )
 
-    latency_ms = int(round((time.perf_counter() - started) * 1000))
     return ProbeResult(
         reachable=True,
-        http_status=response.status_code,
+        http_status=status_code,
         latency_ms=latency_ms,
-        detail=f"HTTP {response.status_code} in {latency_ms}ms",
+        detail=f"HTTP {status_code} in {latency_ms}ms",
     )
 
 
@@ -201,6 +285,14 @@ def _record_probe(
 
     Testing deliberately does not touch ``last_sync_at``: a reachability check
     moved no data, and the Last Sync column has to keep meaning what it says.
+
+    Nor does it touch ``note``. That column is the operator's free text -- the
+    NOTE box in Configure, a search column on the grid -- and the probe used to
+    write its diagnostic there: a healthy test erased "rotate the key before
+    October" and a failing one replaced it with "HTTP 503 in 120ms". What the
+    probe saw is on the activity row below, and a tile reads it back from there
+    as ``status_detail``. The one exception is a note the old probe itself left
+    behind, which is cleared.
     """
     was_connected = connection.status == ConnectionStatus.CONNECTED.value
     status, health, activity_status = _verdict(probe)
@@ -208,7 +300,8 @@ def _record_probe(
     connection.status = status.value
     connection.health = health.value
     connection.latency_ms = probe.latency_ms
-    connection.note = None if activity_status is ActivityStatus.SUCCESS else probe.detail
+    if connection.note and _PROBE_WRITTEN_NOTE.fullmatch(connection.note.strip()):
+        connection.note = None
     connection.updated_by = principal.actor
 
     if not probe.reachable:
@@ -240,29 +333,73 @@ def _record_probe(
     )
 
 
-def _record_sync(
-    session: AsyncSession, connection: Connection, principal: Principal
-) -> ConnectionSyncOutcome:
-    """Stamp a completed sync onto the tile and append the activity row."""
-    now = dt.datetime.now(dt.UTC)
-    previous = connection.last_sync_at
-    if previous is None or _as_utc(previous).date() != now.date():
-        # The counter is "today", so it rolls over rather than growing forever.
-        connection.syncs_today = 1
-    else:
-        connection.syncs_today += 1
-    connection.last_sync_at = now
-    connection.updated_by = principal.actor
+def _start_of_today(now: dt.datetime) -> dt.datetime:
+    """Midnight UTC: where "syncs today" starts counting from."""
+    return now.astimezone(dt.UTC).replace(hour=0, minute=0, second=0, microsecond=0)
 
-    detail = (
-        f"Synchronised at {now.strftime('%H:%M:%SZ')} "
-        f"({connection.syncs_today} sync(s) today)"
-    )
+
+async def _record_sync(
+    session: AsyncSession, connection: Connection, probe: ProbeResult | None
+) -> ConnectionSyncOutcome:
+    """Record what one sync found, on the tile and in the feed.
+
+    A sync used to bump a counter and report success having looked at nothing.
+    It now reconciles the two things this service can actually observe about an
+    integration -- how many agents run on its platform, and whether its endpoint
+    still answers (``probe``; None when no endpoint is configured) -- and the
+    feed row carries those numbers. An endpoint that does not answer means no
+    sync happened: the tile goes Disconnected, as a failed test would make it,
+    and neither Last Sync nor the counter moves.
+    """
+    now = dt.datetime.now(dt.UTC)
+    agents = connection.linked_agent_count
+    counted = f"{agents} agent(s) on this platform"
+
+    if probe is None:
+        activity_status = ActivityStatus.SUCCESS
+        detail = f"{counted}. No endpoint configured; recorded agent count only"
+    else:
+        status, health, activity_status = _verdict(probe)
+        connection.status = status.value
+        connection.health = health.value
+        connection.latency_ms = probe.latency_ms
+        detail = f"{counted}, {probe.detail}"
+
+    synced = probe is None or probe.reachable
+    syncs_today = connection.syncs_today
+    if synced:
+        # Rollover and increment in one statement. Read-modify-write in Python
+        # lost a sync whenever two workers synced the same tile together, and a
+        # rollover decided outside the statement races just the same. This is
+        # bookkeeping, not an edit, so ``updated_at`` -- the token Configure
+        # sends back -- is named, to itself, which keeps ``onupdate`` from firing.
+        syncs_today = (
+            await session.execute(
+                update(Connection)
+                .where(Connection.id == connection.id)
+                .values(
+                    syncs_today=case(
+                        (
+                            Connection.last_sync_at >= _start_of_today(now),
+                            Connection.syncs_today + 1,
+                        ),
+                        else_=1,
+                    ),
+                    last_sync_at=now,
+                    updated_at=Connection.updated_at,
+                )
+                .returning(Connection.syncs_today)
+                .execution_options(synchronize_session=False)
+            )
+        ).scalar_one()
+        set_committed_value(connection, "syncs_today", syncs_today)
+        set_committed_value(connection, "last_sync_at", now)
+
     session.add(
         _activity_row(
             connection,
-            event="Sync Completed",
-            status=ActivityStatus.SUCCESS,
+            event="Sync Completed" if synced else "Sync Failed",
+            status=activity_status,
             details=detail,
             occurred_at=now,
         )
@@ -271,8 +408,14 @@ def _record_sync(
     return ConnectionSyncOutcome(
         connection_id=connection.id,
         name=connection.name,
-        synced_at=now,
-        syncs_today=connection.syncs_today,
+        synced=synced,
+        status=activity_status,
+        synced_at=now if synced else None,
+        syncs_today=syncs_today,
+        linked_agent_count=agents,
+        reachable=None if probe is None else probe.reachable,
+        http_status=None if probe is None else probe.http_status,
+        latency_ms=None if probe is None else probe.latency_ms,
         detail=detail,
     )
 
@@ -284,6 +427,86 @@ def _record_sync(
 
 def _scoped(principal: Principal) -> Select:
     return select(Connection).where(Connection.workspace_id == principal.workspace_id)
+
+
+async def _attach_linked_agents(
+    session: AsyncSession, principal: Principal, connections: Sequence[Connection]
+) -> None:
+    """Put the derived agent count on rows that are about to be read or guarded.
+
+    One grouped statement for the whole page. The value is set as *committed*
+    state, so serialising a tile never queues an UPDATE of the unused column --
+    a GET must not write. A refresh reloads the stored zero, so callers that
+    refresh attach again afterwards.
+    """
+    kinds = {connection.kind for connection in connections}
+    if not kinds:
+        return
+    counts = {
+        platform: int(count)
+        for platform, count in (
+            await session.execute(
+                select(Agent.platform, func.count(Agent.id))
+                .where(Agent.workspace_id == principal.workspace_id, Agent.platform.in_(kinds))
+                .group_by(Agent.platform)
+            )
+        ).all()
+    }
+    for connection in connections:
+        set_committed_value(connection, "linked_agent_count", counts.get(connection.kind, 0))
+
+
+async def _attach_status_detail(
+    session: AsyncSession, principal: Principal, connections: Sequence[Connection]
+) -> None:
+    """Put what the last probe saw on rows about to be read, unless it was clean.
+
+    The probe used to leave this in ``note``, over whatever the operator had
+    written there. It has no column of its own, and the feed already holds it:
+    the newest probe-bearing row of each tile, found through the
+    (connection, occurred_at) index in one statement for the whole page. It is a
+    plain attribute on the instance, never persistent state, so it cannot be
+    written back.
+    """
+    ids = [connection.id for connection in connections]
+    if not ids:
+        return
+    probed = (
+        ConnectionActivity.workspace_id == principal.workspace_id,
+        ConnectionActivity.connection_id.in_(ids),
+        ConnectionActivity.event.in_(_PROBE_EVENTS),
+    )
+    newest = (
+        select(
+            ConnectionActivity.connection_id.label("connection_id"),
+            func.max(ConnectionActivity.occurred_at).label("occurred_at"),
+        )
+        .where(*probed)
+        .group_by(ConnectionActivity.connection_id)
+        .subquery()
+    )
+    rows = (
+        await session.execute(
+            select(
+                ConnectionActivity.connection_id,
+                ConnectionActivity.status,
+                ConnectionActivity.details,
+            )
+            .join(
+                newest,
+                (ConnectionActivity.connection_id == newest.c.connection_id)
+                & (ConnectionActivity.occurred_at == newest.c.occurred_at),
+            )
+            .where(*probed)
+        )
+    ).all()
+    seen = {
+        connection_id: details
+        for connection_id, status, details in rows
+        if status != ActivityStatus.SUCCESS.value
+    }
+    for connection in connections:
+        connection.status_detail = seen.get(connection.id)
 
 
 async def list_connections(
@@ -309,7 +532,10 @@ async def list_connections(
         },
     )
     stmt = apply_sort(stmt, params, SORTABLE, default=Connection.name, default_desc=False)
-    return await paginate(session, stmt, params)
+    rows, total = await paginate(session, stmt, params)
+    await _attach_linked_agents(session, principal, rows)
+    await _attach_status_detail(session, principal, rows)
+    return rows, total
 
 
 async def get_connection(
@@ -325,6 +551,8 @@ async def get_connection(
     ).scalar_one_or_none()
     if connection is None:
         raise NotFound(f"Connection '{connection_id}' does not exist.")
+    await _attach_linked_agents(session, principal, [connection])
+    await _attach_status_detail(session, principal, [connection])
     return connection
 
 
@@ -422,11 +650,36 @@ async def summarise(session: AsyncSession, principal: Principal) -> ConnectionsS
                 _count_where(Connection.enabled.is_(False)).label("disabled"),
                 func.max(Connection.last_sync_at).label("last_sync_at"),
                 func.avg(Connection.latency_ms).label("avg_latency_ms"),
-                func.coalesce(func.sum(Connection.syncs_today), 0).label("syncs_today"),
-                func.coalesce(func.sum(Connection.linked_agent_count), 0).label("agents"),
+                # The counter is only reset by the next sync, so on a day nobody
+                # has synced it still holds the last day's total. A tile counts
+                # towards "today" only if it was last synced today.
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (
+                                Connection.last_sync_at
+                                >= _start_of_today(dt.datetime.now(dt.UTC)),
+                                Connection.syncs_today,
+                            ),
+                            else_=0,
+                        )
+                    ),
+                    0,
+                ).label("syncs_today"),
             ).where(workspace)
         )
     ).one()
+
+    # Agents, not tile-counts added up: two connections of one kind share their
+    # agents, and a sum would count each of those agents twice.
+    linked_agents = (
+        await session.execute(
+            select(func.count(Agent.id)).where(
+                Agent.workspace_id == principal.workspace_id,
+                Agent.platform.in_(select(Connection.kind).where(workspace)),
+            )
+        )
+    ).scalar_one()
 
     grouped = (
         await session.execute(
@@ -459,7 +712,7 @@ async def summarise(session: AsyncSession, principal: Principal) -> ConnectionsS
             round(float(totals.avg_latency_ms), 1) if totals.avg_latency_ms is not None else None
         ),
         syncs_today=int(totals.syncs_today or 0),
-        linked_agents=int(totals.agents or 0),
+        linked_agents=int(linked_agents or 0),
         health_breakdown=breakdown,
     )
 
@@ -533,6 +786,7 @@ async def create_connection(
     # refresh explicitly so the caller never triggers implicit IO while
     # serialising it.
     await session.refresh(connection)
+    await _attach_linked_agents(session, principal, [connection])
     return connection
 
 
@@ -615,6 +869,7 @@ async def update_connection(
     # ``updated_at`` is a server-side onupdate: the UPDATE expired it rather
     # than refetching it, so read it back before the caller serialises the row.
     await session.refresh(connection)
+    await _attach_linked_agents(session, principal, [connection])
     return connection
 
 
@@ -629,11 +884,25 @@ async def delete_connection(
     principal.require(Role.ADMIN)
     connection = await get_connection(session, principal, connection_id)
 
+    # Agents are linked to a *kind*, not to a tile, so what must not happen is
+    # the last tile of a kind going while agents still run on that platform --
+    # their traffic would have nowhere to be read. A duplicate can always go.
+    # (The old wording said "detach them", and there has never been a detach.)
     if connection.linked_agent_count > 0:
-        raise PreconditionFailed(
-            f"'{connection.name}' is still used by {connection.linked_agent_count} agent(s). "
-            "Detach them before removing it."
-        )
+        siblings = (
+            await session.execute(
+                select(func.count(Connection.id)).where(
+                    Connection.workspace_id == principal.workspace_id,
+                    Connection.kind == connection.kind,
+                    Connection.id != connection.id,
+                )
+            )
+        ).scalar_one()
+        if not siblings:
+            raise PreconditionFailed(
+                f"{connection.linked_agent_count} agent(s) still run on {connection.kind}. "
+                f"Move or retire them, or keep one {connection.kind} connection."
+            )
 
     label = connection.name
     kind = connection.kind
@@ -678,6 +947,10 @@ async def test_connection(
             f"Set one of {', '.join(ENDPOINT_CONFIG_KEYS)} in its config first."
         )
 
+    # The probe is a network wait of up to PROBE_TIMEOUT_SECONDS. End the read
+    # transaction first so the pooled connection is not held, idle, across it;
+    # the loaded row stays usable and the writes below open a new transaction.
+    await session.commit()
     async with _probe_client() as client:
         probe = await _probe(client, endpoint)
 
@@ -705,7 +978,7 @@ async def sync_connection(
     *,
     request: Request | None = None,
 ) -> ConnectionSyncOutcome:
-    """Record a completed sync: bump the counter, stamp the time, log the feed row."""
+    """Reconcile one tile: count its platform's agents, re-probe it, record both."""
     principal.require(Role.OPERATOR)
     connection = await get_connection(session, principal, connection_id)
 
@@ -716,7 +989,15 @@ async def sync_connection(
             f"'{connection.name}' is disconnected. Test it successfully before syncing."
         )
 
-    outcome = _record_sync(session, connection, principal)
+    probe: ProbeResult | None = None
+    endpoint = _endpoint_for(connection)
+    if endpoint is not None:
+        # As in test_connection: no pooled connection is held across the probe.
+        await session.commit()
+        async with _probe_client() as client:
+            probe = await _probe(client, endpoint)
+
+    outcome = await _record_sync(session, connection, probe)
     await audit.record(
         session,
         principal=principal,
@@ -759,6 +1040,8 @@ async def test_all(
 
     outcomes: list[ConnectionTestOutcome] = []
     if targets:
+        # As in test_connection: no pooled connection is held across the probes.
+        await session.commit()
         async with _probe_client() as client:
             probes = await asyncio.gather(*(_probe(client, url) for _, url in targets))
         for (connection, _), probe in zip(targets, probes, strict=True):
@@ -792,22 +1075,52 @@ async def test_all(
 async def sync_all(
     session: AsyncSession, principal: Principal, *, request: Request | None = None
 ) -> tuple[list[ConnectionSyncOutcome], BulkActionSummary]:
-    """Sync every connected tile. Disconnected and disabled tiles are skipped."""
+    """Sync every connected tile. Disconnected and disabled tiles are skipped.
+
+    The endpoints are probed together over one client, exactly as ``test_all``
+    probes them: one after another would be up to a probe timeout per tile.
+    """
     principal.require(Role.OPERATOR)
     connections = (
         (await session.execute(_scoped(principal).order_by(Connection.name.asc())))
         .scalars()
         .all()
     )
+    await _attach_linked_agents(session, principal, connections)
 
     summary = BulkActionSummary(requested=len(connections))
-    outcomes: list[ConnectionSyncOutcome] = []
+    targets: list[Connection] = []
     for connection in connections:
         if not connection.enabled or connection.status == ConnectionStatus.DISCONNECTED.value:
             summary.skipped += 1
             continue
-        outcomes.append(_record_sync(session, connection, principal))
-        summary.succeeded += 1
+        targets.append(connection)
+
+    probes: dict[str, ProbeResult] = {}
+    probed = [
+        (connection, endpoint)
+        for connection in targets
+        if (endpoint := _endpoint_for(connection)) is not None
+    ]
+    if probed:
+        await session.commit()  # no pooled connection is held across the probes
+        async with _probe_client() as client:
+            results = await asyncio.gather(*(_probe(client, url) for _, url in probed))
+        probes = {
+            connection.id: result
+            for (connection, _), result in zip(probed, results, strict=True)
+        }
+
+    outcomes: list[ConnectionSyncOutcome] = []
+    for connection in targets:
+        outcome = await _record_sync(session, connection, probes.get(connection.id))
+        outcomes.append(outcome)
+        if not outcome.synced:
+            summary.failed += 1
+        elif outcome.status is ActivityStatus.SUCCESS:
+            summary.succeeded += 1
+        else:
+            summary.warned += 1
 
     await audit.record(
         session,
@@ -816,7 +1129,10 @@ async def sync_all(
         entity_type=ENTITY_TYPE,
         entity_label=f"{summary.requested} connection(s)",
         source_screen=SOURCE_SCREEN,
-        detail=f"{summary.succeeded} synchronised, {summary.skipped} skipped",
+        detail=(
+            f"{summary.succeeded} synchronised, {summary.warned} with a warning, "
+            f"{summary.failed} unreachable, {summary.skipped} skipped"
+        ),
         metadata=summary.model_dump(),
         request=request,
     )
@@ -829,10 +1145,49 @@ async def sync_all(
 
 #: Spans to scan for one traffic view. A busy workspace is capped rather than
 #: paged forever; the response says when the cap was hit so the totals are read
-#: as a floor rather than a count.
+#: as a floor rather than a count. The cap is shared out between the platform's
+#: agents -- never less than one page each -- because projects are read in name
+#: order and one shared counter let the alphabetically first agent spend it all.
 MAX_TRAFFIC_SPANS: Final[int] = 2000
 TRAFFIC_PAGE_SIZE: Final[int] = 200
 DEFAULT_TRAFFIC_WINDOW_DAYS: Final[int] = 30
+#: Engine reads one traffic view keeps in flight at once.
+TRAFFIC_CONCURRENCY: Final[int] = 4
+#: The console stops listening at 30 s. A scan that has not finished well inside
+#: that answers with what it has, marked as a floor, rather than running on
+#: against the store for a caller who has gone. Not ``Final``: tests shorten it.
+TRAFFIC_DEADLINE_SECONDS: float = 20.0
+#: How long one platform's folded traffic is served before it is scanned again.
+#: The modal re-asks on every window change and every reopen; the answer moves
+#: slowly. A scan the deadline cut short is held like any other: asking a store
+#: that is already slow again at once only lengthens its queue. Zero switches
+#: the memory off.
+TRAFFIC_CACHE_SECONDS: float = 60.0
+
+#: The engine's span types this view reads. There is no retrieval type, so data
+#: access is recognised by name among the general spans -- which is why that pass
+#: cannot be narrowed further in the store and is given the smaller budget.
+_TOOL_SPANS: Final[str] = "tool"
+_GENERAL_SPANS: Final[str] = "general"
+
+
+@dataclasses.dataclass(frozen=True)
+class _TrafficScan:
+    """One platform's spans folded for one window -- everything but the tile's name."""
+
+    runs: int | None
+    tool_calls: tuple[ConnectionToolCall, ...]
+    data_flows: tuple[ConnectionDataFlow, ...]
+    truncated: bool
+    note: str | None
+
+
+#: key: (workspace, kind, window days, the projects scanned). The aggregates are
+#: remembered, not the response: two tiles of one kind differ only in id and
+#: name, and an agent added or retired changes the key rather than going stale.
+_traffic_scans: SingleFlightCache[_TrafficScan] = SingleFlightCache(
+    ttl=lambda: TRAFFIC_CACHE_SECONDS, max_entries=64
+)
 
 
 def _span_instant(value: Any) -> dt.datetime | None:
@@ -883,8 +1238,6 @@ async def connection_traffic(
         if attributable
         else []
     )
-    window = telemetry.resolve_window_days(window_days)
-
     empty = ConnectionTraffic(
         connection_id=connection.id,
         name=connection.name,
@@ -906,65 +1259,164 @@ async def connection_traffic(
     if not projects:
         return empty
 
+    # Everything this request needs from the database it has now read. The scan
+    # below waits on the telemetry store for seconds at a time; ending the read
+    # transaction first hands the pooled connection back instead of holding it,
+    # idle, for the length of the scan.
+    await session.commit()
+
+    key = (
+        principal.workspace_id,
+        connection.kind,
+        window_days,
+        tuple(project.project_id for project in projects),
+    )
+    scan = await _traffic_scans.get(key, lambda: _scan_traffic(projects, window_days))
+
+    return ConnectionTraffic(
+        connection_id=connection.id,
+        name=connection.name,
+        kind=connection.kind,
+        window_days=window_days,
+        agents=len(projects),
+        runs=scan.runs,
+        tool_calls=list(scan.tool_calls),
+        data_flows=list(scan.data_flows),
+        truncated=scan.truncated,
+        attributable=True,
+        note=scan.note,
+    )
+
+
+async def _scan_traffic(
+    projects: Sequence[telemetry.AgentProject], window_days: int
+) -> _TrafficScan:
+    """Fold the tool and data spans of one platform's agents over one window.
+
+    Four things keep this inside the time a person will wait for a modal:
+
+    * the store does the filtering -- each read asks for one span type, with
+      payloads truncated and attachments stripped, because only a span's name,
+      duration, start and error are ever read here. Unfiltered, every llm span
+      came back with its full prompt and completion and was dropped in Python;
+    * every agent gets its own share of the cap and the agents are read side by
+      side, a few at a time, instead of one after another;
+    * the run count is one statistics read, taken alongside the scan. The full
+      rollup also asks for token totals, one call per agent, which nothing here
+      shows;
+    * the whole scan has a deadline. Past it the answer is whatever has been
+      folded so far, marked as a floor -- and a run count that did not arrive is
+      reported as unknown, never as zero.
+    """
     client = get_engine_client()
+    window = telemetry.resolve_window_days(window_days)
+    budget = max(TRAFFIC_PAGE_SIZE, MAX_TRAFFIC_SPANS // len(projects))
+    gate = asyncio.Semaphore(TRAFFIC_CONCURRENCY)
     tools: dict[str, dict[str, Any]] = {}
     data: dict[str, dict[str, Any]] = {}
-    scanned = 0
-    truncated = False
 
-    for project in projects:
+    def fold(row: dict[str, Any]) -> None:
+        # The type is checked again here although the store was asked for it: a
+        # store that ignored the filter must cost time, not correctness.
+        kind = str(row.get("type") or "").lower()
+        name = str(row.get("name") or "").strip()
+        if not name:
+            return
+        if kind == _TOOL_SPANS:
+            slot = tools.setdefault(
+                name, {"calls": 0, "errors": 0, "ms": 0.0, "timed": 0, "last": None}
+            )
+        elif kind in {"retrieval", _GENERAL_SPANS} and _looks_like_data(name):
+            slot = data.setdefault(
+                name, {"calls": 0, "docs": 0, "ms": 0.0, "timed": 0, "last": None}
+            )
+        else:
+            return
+
+        duration = row.get("duration")
+        moment = _span_instant(row.get("start_time"))
+        slot["calls"] += 1
+        if row.get("error_info"):
+            slot["errors"] = slot.get("errors", 0) + 1
+        if isinstance(duration, (int, float)):
+            slot["ms"] += float(duration)
+            slot["timed"] += 1
+        if moment and (slot["last"] is None or moment > slot["last"]):
+            slot["last"] = moment
+
+    async def read(project: telemetry.AgentProject, span_type: str, limit: int) -> bool:
+        """Fold one agent's spans of one type. True when some were left unread."""
+        scanned = 0
         page = 1
-        while scanned < MAX_TRAFFIC_SPANS:
-            try:
+        while True:
+            async with gate:
                 payload = await client.list_spans(
                     project_id=project.project_id,
+                    span_type=span_type,
                     page=page,
                     size=TRAFFIC_PAGE_SIZE,
+                    truncate=True,
+                    strip_attachments=True,
                     from_time=window.start,
                     to_time=window.end,
                 )
-            except EngineError as exc:
-                raise telemetry.telemetry_unavailable(exc) from exc
             rows = telemetry._records(payload)
-            if not rows:
-                break
             for row in rows:
-                scanned += 1
-                kind = str(row.get("type") or "").lower()
-                name = str(row.get("name") or "").strip()
-                if not name:
-                    continue
-                duration = row.get("duration")
-                moment = _span_instant(row.get("start_time"))
-                failed = bool(row.get("error_info"))
-
-                if kind == "tool":
-                    slot = tools.setdefault(
-                        name, {"calls": 0, "errors": 0, "ms": 0.0, "timed": 0, "last": None}
-                    )
-                elif kind in {"retrieval", "general"} and _looks_like_data(name):
-                    slot = data.setdefault(
-                        name, {"calls": 0, "docs": 0, "ms": 0.0, "timed": 0, "last": None}
-                    )
-                else:
-                    continue
-
-                slot["calls"] += 1
-                if failed:
-                    slot["errors"] = slot.get("errors", 0) + 1
-                if isinstance(duration, (int, float)):
-                    slot["ms"] += float(duration)
-                    slot["timed"] += 1
-                if moment and (slot["last"] is None or moment > slot["last"]):
-                    slot["last"] = moment
+                fold(row)
+            scanned += len(rows)
             if len(rows) < TRAFFIC_PAGE_SIZE:
-                break
+                return False
+            total = payload.get("total") if isinstance(payload, dict) else None
+            if isinstance(total, int) and not isinstance(total, bool) and scanned >= total:
+                return False  # a full last page that was also the last of them
+            if scanned >= limit:
+                return True
             page += 1
-        if scanned >= MAX_TRAFFIC_SPANS:
-            truncated = True
-            break
 
-    rollups = await telemetry.project_rollups(client, projects, window.start, window.end)
+    async def count_runs() -> int:
+        stats = await telemetry._stats_by_project(
+            client, {project.project_id for project in projects}, window.start, window.end
+        )
+        return sum(
+            int(
+                telemetry._measure(
+                    stats.get(project.project_id, {}),
+                    "trace_count",
+                    "traces",
+                    "total_traces",
+                    "run_count",
+                )
+                or 0
+            )
+            for project in projects
+        )
+
+    counting = asyncio.ensure_future(count_runs())
+    reads = [
+        asyncio.ensure_future(read(project, span_type, limit))
+        for project in projects
+        for span_type, limit in (
+            (_TOOL_SPANS, budget),
+            (_GENERAL_SPANS, max(TRAFFIC_PAGE_SIZE, budget // 2)),
+        )
+    ]
+    out_of_time = False
+    try:
+        async with asyncio.timeout(TRAFFIC_DEADLINE_SECONDS):
+            await asyncio.gather(counting, *reads)
+    except TimeoutError:
+        out_of_time = True
+    except EngineError as exc:
+        raise telemetry.telemetry_unavailable(exc) from exc
+    finally:
+        # Whatever is still queued behind the gate stops here. An exchange
+        # already on the wire is shielded by the client and ends on its own.
+        for job in (counting, *reads):
+            job.cancel()
+        await asyncio.gather(counting, *reads, return_exceptions=True)
+
+    def landed(job: asyncio.Future[Any]) -> bool:
+        return job.done() and not job.cancelled() and job.exception() is None
 
     def mean(slot: dict[str, Any]) -> float | None:
         return round(slot["ms"] / slot["timed"], 1) if slot["timed"] else None
@@ -996,17 +1448,17 @@ async def connection_traffic(
     ]
     data_rows.sort(key=lambda row: -row.operations)
 
-    return ConnectionTraffic(
-        connection_id=connection.id,
-        name=connection.name,
-        kind=connection.kind,
-        window_days=window_days,
-        agents=len(projects),
-        runs=sum(rollup.runs for rollup in rollups),
-        tool_calls=tool_rows,
-        data_flows=data_rows,
-        truncated=truncated,
-        attributable=True,
+    return _TrafficScan(
+        runs=counting.result() if landed(counting) else None,
+        tool_calls=tuple(tool_rows),
+        data_flows=tuple(data_rows),
+        truncated=out_of_time or any(job.result() for job in reads if landed(job)),
+        note=(
+            "The telemetry store was slow to answer, so only part of this window was "
+            "read. These totals are a floor."
+            if out_of_time
+            else None
+        ),
     )
 
 

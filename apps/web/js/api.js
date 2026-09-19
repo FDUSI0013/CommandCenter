@@ -15,6 +15,7 @@
 
   const BASE = (window.FULCRUM_API_BASE || '/api/v1').replace(/\/$/, '');
   const TIMEOUT_MS = 30000;
+  const PROMPT_RUN_TIMEOUT_MS = 135000;
 
   let apiKey = null;
   let workspace = null;
@@ -57,9 +58,12 @@
     return s ? `?${s}` : '';
   }
 
-  async function request(method, path, { body, params, signal, raw } = {}) {
+  /* `timeoutMs` is per call because one ceiling cannot fit every request: a
+     prompt run waits on a model for longer than any list should be allowed to
+     hang, and the stream's session probe must answer far sooner. */
+  async function request(method, path, { body, params, signal, raw, timeoutMs } = {}) {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+    const timer = setTimeout(() => controller.abort(), timeoutMs || TIMEOUT_MS);
     if (signal) signal.addEventListener('abort', () => controller.abort());
 
     const headers = { 'Accept': 'application/json' };
@@ -103,7 +107,7 @@
   }
 
   const get = (p, params, opts) => request('GET', p, { params, ...(opts || {}) });
-  const post = (p, body, params) => request('POST', p, { body, params });
+  const post = (p, body, params, opts) => request('POST', p, { body, params, ...(opts || {}) });
   const put = (p, body) => request('PUT', p, { body });
   const patch = (p, body) => request('PATCH', p, { body });
   const del = (p, body) => request('DELETE', p, { body });
@@ -119,6 +123,14 @@
       action: (id, verb, body) => post(`${base}/${encodeURIComponent(id)}/${verb}`, body || {}),
     };
   }
+
+  /* Owner pickers need names, not the roster. GET /workspaces/users is the
+     admin-only who-has-access list, so an operator creating a configuration or
+     a knowledge source was offered "No members loaded". The directory carries
+     only id, full_name and initials of active members and is open to the people
+     who fill these pickers in. Wrapped as a page because the callers read
+     `.items`. */
+  const memberPicker = () => get('/workspaces/users/directory').then(items => ({ items: items || [] }));
 
   /**
    * Download an export as a real file. The server streams CSV/JSON with a
@@ -141,9 +153,29 @@
   /**
    * Server-sent events with automatic reconnect and backoff. Used by Live Runs
    * and by any screen that wants push updates. Returns a handle with .close().
+   *
+   * Two things an open stream must not do, both learned in production:
+   *
+   *   - Outlive its session. EventSource cannot see a status code, so a 401
+   *     looks like any other drop and an expired tab reconnected every 30 s for
+   *     ever (~2,500 refused requests a day, each). Before every reconnect the
+   *     session is probed once with a request that CAN see the status; a 401
+   *     ends the stream and takes the normal re-gate path (onUnauthorized).
+   *   - Run for nobody. Each open stream makes the server poll the telemetry
+   *     store every few seconds, so a tab left in the background cost as much
+   *     as one being watched. A tab hidden for longer than a short grace period
+   *     parks its stream; becoming visible reconnects and calls `onResume`, so
+   *     the screen can re-read what it missed while parked.
    */
-  function stream(path, { onMessage, onOpen, onError, params, events } = {}) {
-    let es = null, closed = false, attempt = 0, timer = null;
+  const STREAM_HIDDEN_GRACE_MS = 15000;
+  const STREAM_PROBE_TIMEOUT_MS = 8000;
+
+  function stream(path, { onMessage, onOpen, onError, onResume, params, events } = {}) {
+    let es = null, closed = false, parked = false, attempt = 0, timer = null, hideTimer = null;
+    // Bumped whenever the connection is torn down, so a probe that was in
+    // flight across a park, a resume or a close() cannot schedule a reconnect
+    // for a connection that is no longer the current one.
+    let generation = 0;
 
     function parse(evt, handler) {
       if (!evt.data) return;
@@ -151,8 +183,15 @@
       catch (_) { /* a malformed frame must not kill the stream */ }
     }
 
+    function drop() {
+      generation += 1;
+      if (timer) { clearTimeout(timer); timer = null; }
+      if (es) { es.close(); es = null; }
+    }
+
     function connect() {
-      if (closed) return;
+      if (closed || parked) return;
+      drop();
       es = new EventSource(`${BASE}${path}${qs(params)}`, { withCredentials: true });
       es.onopen = () => { attempt = 0; if (onOpen) onOpen(); };
       // Named server events (the run stream sends `open` and `run`) do not
@@ -163,22 +202,64 @@
       es.onmessage = (evt) => { if (onMessage) parse(evt, onMessage); };
       es.onerror = () => {
         if (closed) return;
-        es.close();
+        drop();
         if (onError) onError();
-        // 1s, 2s, 4s … capped at 30s so a long outage does not hammer the API.
-        const delay = Math.min(30000, 1000 * Math.pow(2, attempt++));
-        timer = setTimeout(connect, delay);
+        reconnect();
       };
     }
-    connect();
 
-    return {
-      close() {
-        closed = true;
-        if (timer) clearTimeout(timer);
-        if (es) es.close();
-      },
-    };
+    async function reconnect() {
+      const mine = generation;
+      let sessionEnded = false;
+      try {
+        await request('GET', '/auth/status', { timeoutMs: STREAM_PROBE_TIMEOUT_MS });
+      } catch (err) {
+        // request() has already run the onUnauthorized hook for a 401. Any
+        // other failure (network, 5xx, timeout) is the outage backoff is for.
+        sessionEnded = Boolean(err && err.status === 401);
+      }
+      if (sessionEnded) { shut(); return; }
+      if (closed || parked || mine !== generation) return;
+      // 1s, 2s, 4s … capped at 30s so a long outage does not hammer the API,
+      // and spread ±20% so every tab does not come back in the same instant.
+      const delay = Math.min(30000, 1000 * Math.pow(2, attempt++)) * (0.8 + Math.random() * 0.4);
+      timer = setTimeout(connect, delay);
+    }
+
+    function park() {
+      hideTimer = null;
+      if (closed || !document.hidden) return;
+      parked = true;
+      drop();
+    }
+
+    function onVisibility() {
+      if (closed) return;
+      if (document.hidden) {
+        if (!parked && !hideTimer) hideTimer = setTimeout(park, STREAM_HIDDEN_GRACE_MS);
+        return;
+      }
+      if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
+      if (!parked) return;
+      parked = false;
+      attempt = 0;
+      connect();
+      if (onResume) onResume();
+    }
+
+    function shut() {
+      closed = true;
+      if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
+      document.removeEventListener('visibilitychange', onVisibility);
+      drop();
+    }
+
+    document.addEventListener('visibilitychange', onVisibility);
+    connect();
+    // Opened by a tab that is already in the background: same grace, then park.
+    if (document.hidden) onVisibility();
+
+    return { close: shut };
   }
 
   window.API = {
@@ -245,13 +326,17 @@
       versions: (id) => get(`/agents/${encodeURIComponent(id)}/versions`),
       /** Commit a new prompt version from the Agent Detail configuration tab. */
       createVersion: (id, body) => post(`/agents/${encodeURIComponent(id)}/versions`, body),
-      /** Members who may own an agent — the New/Edit Agent owner picker. */
+      /** Members who may own an agent — the New/Edit Agent owner picker. Those
+       *  dialogs are admin-only and show each member's team, so this one reads
+       *  the roster; the operator-level pickers below read memberPicker(). */
       owners: (params) => get('/workspaces/users', params),
       versionDiff: (id, params) => get(`/agents/${encodeURIComponent(id)}/versions/diff`, params),
       /** The configuration manifest itself — Copy JSON and Export Configuration. */
       configuration: (id) => get(`/agents/${encodeURIComponent(id)}/export`),
-      activate: (id) => post(`/agents/${encodeURIComponent(id)}/activate`, {}),
-      deactivate: (id) => post(`/agents/${encodeURIComponent(id)}/deactivate`, {}),
+      // The body carries {reason}: the dialogs promise it is recorded, and the
+      // server writes it to the audit row, so it must not be dropped here.
+      activate: (id, body) => post(`/agents/${encodeURIComponent(id)}/activate`, body || {}),
+      deactivate: (id, body) => post(`/agents/${encodeURIComponent(id)}/deactivate`, body || {}),
       exportConfig: (id) => download(`/agents/${encodeURIComponent(id)}/export`),
       run: (id, body) => post(`/agents/${encodeURIComponent(id)}/run`, body || {}),
       clone: (id, body) => post(`/agents/${encodeURIComponent(id)}/clone`, body || {}),
@@ -283,8 +368,13 @@
       comment: (id, body) => post(`/approvals/${encodeURIComponent(id)}/comments`, body),
       comments: (id) => get(`/approvals/${encodeURIComponent(id)}/comments`),
       rules: collection('/approvals/rules'),
-      /** Members a rule may route to — the New Approval Rule approver picker. */
+      /** Members a rule may route to — the New Approval Rule approver picker.
+       *  Admin-only like the dialog itself: it shows each member's role. */
       approvers: (params) => get('/workspaces/users', params),
+      /** Who an escalation may be routed to: a bare [{id, full_name, initials}]
+       *  from the names-only directory. The roster above is admin-only, and the
+       *  people who escalate are approvers and operators. */
+      reviewers: () => get('/workspaces/users/directory'),
       export: (params) => download('/approvals/export', params),
     }),
     audit: {
@@ -319,10 +409,15 @@
       /** Load a bundle back in — the Import dialog. */
       importBundle: (body) => post('/configurations/import', body),
       /** Members who may own a configuration — the New/Edit owner picker. */
-      owners: (params) => get('/workspaces/users', params),
+      owners: () => memberPicker(),
     }),
     prompts: Object.assign(collection('/prompts'), {
-      execute: (id, body) => post(`/prompts/${encodeURIComponent(id)}/execute`, body || {}),
+      /* A run waits on a model. The server allows the model 60 s (120 s once
+         prompt_studio_timeout_seconds is raised) on top of the engine reads it
+         makes first, and it bills and audits the run whether or not anyone is
+         still listening — so the browser must outwait it, not give up at 30 s
+         and invite a second, paid, click. */
+      execute: (id, body) => post(`/prompts/${encodeURIComponent(id)}/execute`, body || {}, null, { timeoutMs: PROMPT_RUN_TIMEOUT_MS }),
       summary: () => get('/prompts/summary'),
       versions: (id) => get(`/prompts/${encodeURIComponent(id)}/versions`),
       createVersion: (id, body) => post(`/prompts/${encodeURIComponent(id)}/versions`, body),
@@ -348,7 +443,7 @@
       /** The dimensions behind the inspector's grounding gauge. */
       grounding: (id, params) => get(`/knowledge/${encodeURIComponent(id)}/grounding`, params),
       /** Members who may own a source — the Add Source owner picker. */
-      owners: (params) => get('/workspaces/users', params),
+      owners: () => memberPicker(),
     }),
     secrets: Object.assign(collection('/secrets'), {
       summary: () => get('/secrets/summary'),
@@ -359,7 +454,7 @@
       accessLog: (id, params) => get(`/secrets/${encodeURIComponent(id)}/access-log`, params),
       export: (params) => download('/secrets/export', params),
       /** Members who may own a credential — the Add / Edit Access owner picker. */
-      owners: (params) => get('/workspaces/users', params),
+      owners: () => memberPicker(),
     }),
 
     // ---- operations ------------------------------------------------------
@@ -407,7 +502,7 @@
       /** One store's backup history — the Restore picker. */
       storeBackups: (id, params) => get(`/memory/${encodeURIComponent(id)}/backups`, params),
       /** Members who may own a store — the Create Store owner picker. */
-      owners: (params) => get('/workspaces/users', params),
+      owners: () => memberPicker(),
     }),
     environments: Object.assign(collection('/environments'), {
       restart: (id) => post(`/environments/${encodeURIComponent(id)}/restart`, {}),

@@ -15,7 +15,7 @@ from __future__ import annotations
 import datetime as dt
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, Query, Request
 from fastapi import status as http_status
 from fastapi.responses import StreamingResponse
 
@@ -37,6 +37,7 @@ from ...schemas.approvals import (
     ApprovalTrigger,
 )
 from ...services import approvals as service
+from ...services import deployments as deployments_service
 from ..common import ListParams, Page, list_params, to_csv
 from ..deps import CurrentPrincipal, Db
 
@@ -187,7 +188,9 @@ async def list_rules(
     scope: Annotated[PolicyScope | None, Query(description="What the rule attaches to")] = None,
     trigger: Annotated[ApprovalTrigger | None, Query(description="What makes it fire")] = None,
 ) -> Page[ApprovalRuleRead]:
-    """The rules that turn an agent action into a request in this queue."""
+    """The rules new requests are filed under: each sets the SLA and names the
+    approvers for the requests that fall under its trigger. `requests_30d`,
+    `approved_pct` and `last_triggered_at` say how often that has happened."""
     items, total = await service.list_rules(
         session,
         principal,
@@ -320,8 +323,16 @@ async def create_request(
     data: ApprovalRequestCreate,
     request: Request,
 ) -> ApprovalRequestRead:
-    """Open a request. Its SLA deadline is derived from the risk level unless
-    `sla_minutes` overrides it, and the reference is allocated automatically."""
+    """Open a request. The reference is allocated automatically.
+
+    A request that falls under an approval rule in force is filed under it
+    (`policy_id`), and the response names the rule's `approvers`. The SLA
+    deadline is `sla_minutes` when given, else the rule's, else the risk level's.
+    A request falls under a rule when it names it as `policy_id`; when the rule's
+    trigger is financial and the request's amount (`payload.amount`, else
+    `impact.financial`) is above the rule's threshold; or when its `action` or
+    `payload.trigger` is the rule's trigger label.
+    """
     return await service.create_request(session, principal, data, request=request)
 
 
@@ -364,14 +375,28 @@ async def approve_request(
     session: Db,
     request_id: str,
     request: Request,
+    background: BackgroundTasks,
     data: ApprovalDecisionRequest | None = None,
 ) -> ApprovalDecisionResponse:
     """Approve. Requires the approver role; returns the follow-on action to carry
-    out when the request's payload names one."""
+    out when the request's payload names one.
+
+    Approving the request a release is parked on resumes that release: its
+    Approval stage is marked approved here and the pipeline carries on.
+    """
     body = data or ApprovalDecisionRequest()
-    return await service.approve_request(
+    decision, resume_deployment_id = await service.approve_request(
         session, principal, request_id, note=body.note, request=request
     )
+    if resume_deployment_id is not None:
+        # The runner works on its own session, so the approved stage has to be
+        # committed before it is allowed to look: a task scheduled first races
+        # this request's COMMIT, sees the gate still shut, and exits for good.
+        await session.commit()
+        background.add_task(
+            deployments_service.run_pipeline, resume_deployment_id, principal.workspace_id
+        )
+    return decision
 
 
 @router.post(
@@ -386,7 +411,10 @@ async def reject_request(
     request: Request,
     data: ApprovalDecisionRequest | None = None,
 ) -> ApprovalDecisionResponse:
-    """Reject. The note is mandatory — it is quoted verbatim in the audit trail."""
+    """Reject. The note is mandatory — it is quoted verbatim in the audit trail.
+
+    Rejecting the request a release is parked on halts that release.
+    """
     body = data or ApprovalDecisionRequest()
     return await service.reject_request(
         session, principal, request_id, note=body.note, request=request

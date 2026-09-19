@@ -35,12 +35,18 @@ workspace has not seen before, which is what lets a new service start reporting
 without anyone visiting the console first. Without it, report under an agent
 that already exists or the rows come back rejected.
 
-**2. Put the key in the environment.**
+**2. Put the key *and the address* in the environment.** Both are required.
 
 ```bash
 export FULCRUM_OPS_API_KEY=fo_live_…
 export FULCRUM_OPS_BASE_URL=https://controlplane.example.com/api/v1
 ```
+
+`FULCRUM_OPS_BASE_URL` has no useful default. Left out, the SDK falls back to
+`http://127.0.0.1:8080/api/v1` — a control plane running on your own machine —
+and says so in one `WARNING` on the `fulcrum_ops` logger when the client is
+built, because a key with nowhere to go is a mistake: nothing reaches your
+console, and the key and your prompts are posted to whatever owns that port.
 
 **3. Trace something.**
 
@@ -96,8 +102,37 @@ workspace, so `workspace` only needs setting for a key that serves more than one
 **With no key found, the SDK disables itself.** `@trace` still runs your
 function and returns its value, nothing is queued, and nothing is sent. That is
 deliberate: a missing environment variable in a developer's shell must not
-change what the program does. Pass `enabled=True` to make that case loud
-instead, or check `client.stats()["enabled"]`.
+change what the program does. It is said once per process, at `WARNING`, so a
+mistyped variable name does not pass for a quiet console; set
+`FULCRUM_OPS_DISABLED=1` (or pass `enabled=False`) to switch reporting off on
+purpose and silence it. `client.stats()["enabled"]` tells you which you got.
+
+`environment=` labels the runs this process reports, and it is where an agent
+the control plane has never seen is first filed. For an agent that is already
+registered, the environment set in the console is the one policies, quotas and
+guardrail scope go by.
+
+Behind a TLS-inspecting proxy, or anywhere the default trust store is not the
+right one, hand the SDK the HTTP client to use. It must be a **synchronous**
+`httpx.Client`; the SDK never closes a client it did not build:
+
+```python
+import ssl, httpx, truststore          # truststore (Python 3.10+): the OS trust store
+
+client = FulcrumOps(
+    http_client=httpx.Client(
+        verify=truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT),
+        follow_redirects=True,         # httpx does not follow redirects unless told to
+        timeout=30.0,
+    ),
+)
+```
+
+Without `follow_redirects=True` an `http://` address behind a proxy that
+upgrades to `https://` answers every request with a 308. The SDK follows a
+same-host redirect itself and says so once; it never follows one to another
+host, because the request carries your API key. Set `base_url` to the final
+address and neither happens.
 
 `FulcrumOps` is also a context manager, which is the right shape for a script:
 
@@ -111,8 +146,8 @@ with FulcrumOps(agent="nightly-job") as client:
 
 | Variable | Argument | Default |
 | --- | --- | --- |
-| `FULCRUM_OPS_API_KEY` | `api_key` | — (SDK disables itself) |
-| `FULCRUM_OPS_BASE_URL` | `base_url` | `http://127.0.0.1:8080/api/v1` |
+| `FULCRUM_OPS_API_KEY` | `api_key` | — (SDK disables itself, and says so) |
+| `FULCRUM_OPS_BASE_URL` | `base_url` | **required** — falls back to `http://127.0.0.1:8080/api/v1` with a warning |
 | `FULCRUM_OPS_WORKSPACE` | `workspace` | from the key |
 | `FULCRUM_OPS_ENVIRONMENT` | `environment` | — |
 | `FULCRUM_OPS_AGENT` | `agent` | — |
@@ -132,7 +167,9 @@ with FulcrumOps(agent="nightly-job") as client:
 Decorate a function and every call to it is reported. The first decorated call
 in a context opens a **trace**; every decorated call nested inside it opens a
 child **span**. Nothing is passed between them — `contextvars` carries the
-parent link, which is thread-local for threads and task-local for asyncio.
+parent link, which is thread-local for threads and task-local for asyncio (see
+[Threads and executors](#threads-and-executors) for the one hop it does not
+cross by itself).
 
 ```python
 from fulcrum_ops import trace
@@ -167,6 +204,68 @@ not the microsecond it took to build the generator object. Yielded values are
 recorded up to a cap and the rest are counted, because a stream of ten thousand
 tokens is not telemetry.
 
+### `type=` on the outermost call
+
+A trace cannot carry a model, tokens or a cost; only a span can. So when the
+*outermost* decorated call names a `type` other than `general`, the decorator
+opens the run **and** a root span of that type inside it, and the whole
+integration can be one line:
+
+```python
+import fulcrum_ops
+from fulcrum_ops import trace
+
+@trace(name="underwriting_insight", type="llm")
+def get_insight(self, email):
+    reply = call_the_model(email)
+    fulcrum_ops.current_span().set_model(reply.model, "azure").set_usage(
+        prompt_tokens=reply.usage.input_tokens,
+        completion_tokens=reply.usage.output_tokens,
+    )
+    return reply.output_text
+```
+
+`type="llm"` only *labels* the step. The model, the token counts and the cost
+come from one of two places — report them yourself as above, or let a
+[provider wrapper](#provider-wrappers) read them off the response. Pick one: do
+both and the run's totals count every token twice. With a wrapper in place, a
+plain `@trace` on the entry point is all it needs.
+
+### `fulcrum_ops.current_span()` and `current_trace()`
+
+`fulcrum_ops.current_span()` is the innermost open span, found through the
+execution context — no client, no argument passing. It **never returns `None`**:
+with reporting off, a run that was not sampled in, a plain `@trace` root (a run
+with no step), or a call from outside anything traced, it hands back a
+`NoopSpan` that accepts `set_model`, `set_usage`, `set_output`, `log`, `score`
+and the rest and records nothing, so the line above cannot raise inside your
+agent. It is falsy, so `if fulcrum_ops.current_span():` still tells you whether
+anything is listening. `fulcrum_ops.current_trace()` is the run, or `None`.
+
+### Conversations: `thread_id`
+
+Runs that share a `thread_id` are one session. The Sessions, Conversation State
+and Memory views are built from threads, so an agent that never names one shows
+runs and no sessions. A decorator is evaluated once, which makes a string there
+the same thread for every call — pass a callable, which is given the function's
+own arguments, or name the thread from inside once the code knows it:
+
+```python
+@trace(name="underwriting_insight", type="llm",
+       thread_id=lambda self, email, **_: email.conversation_id)
+def get_insight(self, email): ...
+
+@trace
+def handle(payload: dict) -> str:
+    fulcrum_ops.set_thread_id(parse(payload).conversation_id)
+    ...
+```
+
+The decorated function keeps its own signature either way. A `thread_id`
+callable that raises costs that run its thread, never the call. An inner
+decorated step that can name the thread gives it to a run that has none.
+`Trace.set_thread_id(...)` is the same thing on a run you hold.
+
 ### `client.span(...)`
 
 ```python
@@ -188,7 +287,33 @@ file nobody correlates.
 
 Called with no trace open, `client.span(...)` opens one around itself, so a
 single instrumented function is still a complete run rather than an orphan the
-ingest path would drop.
+ingest path would drop. That run takes the span's input, output and failure as
+its own, so it does not list as a run that took nothing in and gave nothing back.
+Pass `thread_id=` to file that run under a conversation.
+
+### Threads and executors
+
+A new asyncio task starts with a copy of its creator's context, and so do
+`asyncio.to_thread` and the anyio/Starlette thread pool: spans opened there nest
+where you expect. A plain worker thread starts with an empty one, so work handed
+to `ThreadPoolExecutor.submit`/`map` or `loop.run_in_executor` cannot see the run
+it came from, and each step it opens becomes a run of its own. Carry it across:
+
+```python
+import fulcrum_ops
+
+with fulcrum_ops.TracedThreadPoolExecutor(max_workers=4) as pool:   # drop-in
+    pages = list(pool.map(extract, attachments))
+
+with ThreadPoolExecutor(4) as pool:                                 # or per callable
+    pages = list(pool.map(fulcrum_ops.propagate(extract), attachments))
+
+await loop.run_in_executor(None, fulcrum_ops.propagate(poll_once), mailbox)
+```
+
+`propagate(fn)` binds `fn` to the run and span that are open where `propagate`
+is called, and takes them down again after each call, because pool threads are
+reused. Only this SDK's own context travels.
 
 ### Long-running work
 
@@ -237,6 +362,20 @@ client.log_policy_violation("no-medical-advice", severity="high")
 `sample` goes through the same redaction rules as any other captured content —
 it is a slice of the text that tripped the rule, which makes it the single field
 most likely to carry exactly what redaction exists to remove.
+
+When the agent itself can tell an answer went wrong — a retrieval that returned
+nothing, a tool that answered nonsense — it can say so without waiting for a
+person to complain:
+
+```python
+fulcrum_ops.report_issue("Retrieval returned nothing", severity="High",
+                         detail="0 chunks for a question the index should cover.")
+```
+
+It travels as negative feedback (`feedback.submitted`, source *Agent Response
+Rating*) and lands in the Feedback inbox with the title leading the body; the
+title and severity also ride, structured, in the event's `detail`. The ingest
+contract has exactly three event kinds, and a row of any other kind is refused.
 
 ---
 
@@ -311,6 +450,16 @@ backoff and full jitter, honouring `Retry-After`. A `413` halves the batch and
 retries rather than dropping it, so one oversized trace does not take its
 neighbours down with it.
 
+Those in-request retries cover a blip of a few seconds. **An outage longer than
+that is waited out, not thrown away**: a batch that fails for a reason that can
+clear — no connection, a timeout, a 5xx, a 429 — goes back to the front of the
+queue, and the worker backs off (one flush interval, doubling to a minute, or
+whatever `Retry-After` said) before trying again. A deploy of the control plane
+costs you nothing. What *is* dropped: a batch the control plane refused for a
+reason retrying cannot change (a revoked key, a malformed body), a row that has
+been failing for ten minutes, whatever is still queued when the process closes
+during an outage, and anything past the queue ceiling.
+
 The queue is **bounded**. Past `max_queue_size` the *oldest* rows are dropped,
 because during an outage the freshest telemetry is the telemetry someone is
 waiting to look at, and an unbounded queue turns a control-plane outage into
@@ -328,8 +477,11 @@ client = FulcrumOps(
 )
 ```
 
-- `client.flush(timeout=10)` — send everything queued, now. Returns `False` on
-  timeout rather than raising.
+- `client.flush(timeout=10)` — send everything queued, now. `True` means it was
+  all handed to the control plane. `False` means it was not — the wait timed
+  out, or a batch could not be delivered and was kept for later or dropped — and
+  during an outage it comes back as soon as the attempt has failed, not after the
+  whole timeout. It never raises.
 - `client.close()` — flush, stop the worker, release the pool. Idempotent.
 - An `atexit` hook flushes every live client with a two-second bound, so a
   process on its way out never hangs on a control plane that is not answering.
@@ -338,13 +490,34 @@ Prefer an explicit `close()` in a short-lived process — a Lambda handler, a CL
 a test. Exit hooks are a safety net, not a guarantee: `os._exit()` and a fatal
 signal both skip them.
 
+In a **long-lived server, do not `flush()` per request.** The worker sends every
+`flush_interval_seconds` by itself, and a flush is a wait on the network that
+you would be putting on your user's request. Call `fulcrum_ops.shutdown()` once,
+on the way out:
+
+```python
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    fulcrum_ops.configure(agent="uw-bridge", environment="Production")
+    yield
+    fulcrum_ops.shutdown()
+```
+
+**Pre-forking servers** (gunicorn `--preload`, Celery prefork, `multiprocessing`
+with `fork`) are handled: a forked child gets a fresh worker thread and
+connection pool on its first report, and does not re-send what the parent had
+queued. An `http_client` you injected is yours to make fork-safe.
+
 `client.stats()` reports what happened:
 
 ```python
 {'submitted': 12, 'sent': 12, 'accepted': 11, 'rejected': 1, 'blocked': 0,
- 'dropped_overflow': 0, 'dropped_failed': 0, 'batches': 2, 'retries': 1,
- 'errors': 0, 'pending': 0, 'last_error': None, 'enabled': True, ...}
+ 'dropped_overflow': 0, 'dropped_failed': 0, 'requeued': 0, 'batches': 2,
+ 'retries': 1, 'errors': 0, 'pending': 0, 'last_error': None, 'enabled': True, ...}
 ```
+
+`requeued` rising with `pending` means the control plane is unreachable and rows
+are waiting for it; `dropped_failed` and `dropped_overflow` are what was lost.
 
 A batch is answered with HTTP 200 even when individual rows are refused, so
 `accepted`, `rejected` and `blocked` are where that shows up — not the status
@@ -384,7 +557,73 @@ survives past the point where anyone remembers doing it.
 Streaming is handled rather than skipped. A streamed call returns before the
 first token, so closing the span there would report a 12-second generation as
 taking 200 microseconds. The stream is wrapped instead, the span closes when it
-is exhausted, and the accumulated text is what the span records.
+is exhausted (or when you stop reading it), and the accumulated text is what the
+span records. The model and the token counts are read from the events that carry
+them — the Responses API's `response.completed`, Anthropic's `message_start` and
+`message_delta`, the final Chat Completions chunk. That last one only exists if
+you ask for it: pass `stream_options={"include_usage": True}`, or a streamed
+Chat Completions call reports its text and no tokens.
+
+What is traced, on sync and async clients alike:
+
+| | |
+| --- | --- |
+| OpenAI | `chat.completions.create` / `.parse` / `.stream`, `beta.chat.completions.parse` / `.stream`, `responses.create` / `.parse` / `.stream`, `completions.create`, `embeddings.create`, `moderations.create` |
+| Anthropic | `messages.create` / `.stream`, `beta.messages.create` / `.stream`, `completions.create` |
+| Both | the same methods through `client.with_options(...)`, `.copy(...)` and `.with_raw_response`; `.with_streaming_response` records the call and its duration, not the usage, because reading the body would take the stream away from you |
+
+A turn that only calls tools has no text; its span records the tool calls the
+model asked for instead of recording nothing.
+
+A wrapped call made with no trace open is a complete run of its own, with the
+call's input, output and failure on the run. The wrapper never touches the
+ambient context, so a call awaited under `asyncio.gather`, in a task, or inside
+`asyncio.to_thread` cannot leave a finished run behind for later spans to be
+lost on.
+
+The wrapper looks up the default client on each call, so it can be built at
+import time, before `fulcrum_ops.configure()` runs. Pass `fulcrum=` to pin it to
+a specific client.
+
+### The Responses API, Azure OpenAI and Azure AI Foundry
+
+`track_openai` reads a Responses API result the same way it reads a chat
+completion: `response.model`, `usage.input_tokens` / `usage.output_tokens`
+(reported as `prompt_tokens` / `completion_tokens`) and `output_text`. An
+`AzureOpenAI` client, and the client an Azure AI Foundry project hands out, are
+wrapped identically:
+
+```python
+import fulcrum_ops
+from fulcrum_ops import trace
+from fulcrum_ops.integrations import track_openai
+
+fulcrum_ops.configure(agent="uw-bridge", environment="Production")
+
+class AgentClient:
+    def __init__(self, project_client):
+        self._openai = track_openai(project_client.get_openai_client(), model="gpt-5")
+
+    @trace(name="underwriting_insight")          # plain: the wrapper supplies the llm step
+    def get_insight(self, email):
+        fulcrum_ops.set_thread_id(email.conversation_id)
+        response = self._openai.responses.create(
+            input=[{"role": "user", "content": email.body}],
+            extra_body={"agent_reference": {"name": "uw-agent", "type": "agent_reference"}},
+        )
+        return response.output_text
+```
+
+- **`provider`** is what cost is priced under, together with the model. It is
+  detected — `azure` for an `AzureOpenAI` client or an `*.openai.azure.com`,
+  `*.cognitiveservices.azure.com` or `*.services.ai.azure.com` endpoint, `openai`
+  otherwise; `bedrock` / `google_vertexai` for those Anthropic clients — and
+  `track_openai(client, provider="...")` overrides it.
+- **`model=`** is the fallback when neither the call nor the response names one.
+  A Foundry agent call is addressed by `agent_reference`, not by `model`, so the
+  request has nothing to offer; when the response names a model, that wins.
+- The call may run anywhere — `await asyncio.to_thread(agent.get_insight, email)`
+  keeps the run, because `to_thread` copies the context.
 
 For LangChain, pass the callback handler wherever callbacks are accepted:
 
@@ -394,6 +633,10 @@ from fulcrum_ops.integrations import FulcrumOpsCallbackHandler
 handler = FulcrumOpsCallbackHandler(agent="research-agent")
 chain.invoke(question, config={"callbacks": [handler]})
 ```
+
+The provider is taken from LangChain's own `ls_provider` metadata (`openai`,
+`azure`, `anthropic`, …), not from the class family name, so LangChain runs are
+priced under the same provider names as everything else.
 
 The outermost run becomes the trace; chains, models, tools and retrievers
 beneath it become spans of the matching type. The handler keeps its own
@@ -407,15 +650,24 @@ is long gone by the time its `on_llm_end` fires.
 
 On start-up the SDK reads `GET /ingest/config` on a background thread and adopts
 what it says: sampling, batching, the flush interval, the queue ceiling and the
-redaction rules. The fetch never blocks start-up, and it is revalidated with an
-ETag so a fleet restart costs one conditional request per process rather than
-one full read each.
+redaction rules. The fetch never blocks start-up.
+
+It is then **kept current**. The document says how long it is good for
+(`refresh_after_seconds`, five minutes as served) and the worker thread re-reads
+it when that is up, revalidated with an ETag so a refresh that finds nothing new
+is one `304`. A read that fails — the process started while the control plane was
+restarting — is tried again after 5 s, 30 s, a minute and so on, and reported to
+`on_error` once per outage. So a guardrail switched to *Mask*, or a sampling rate
+lowered in the console, reaches a running agent within minutes, without a
+redeploy. `bootstrap=False` turns all of it off.
 
 Where the document and your arguments disagree, the **stricter** value wins. The
 document expresses a limit the deployment enforces, not a preference you
 expressed: a workspace capped at 25% sampling is not raised to 100% by a
 constructor argument, and `capture_input=False` from the server cannot be
-switched back on locally.
+switched back on locally. Each refresh narrows from what *you* passed, so a limit
+the console later relaxes is relaxed here too — up to your own value, never past
+it.
 
 ```python
 document = client.config()   # raises if it cannot be read — this one is a lookup
@@ -426,7 +678,12 @@ print(document["workspace"], document["sampling_rate"])
 
 Rules from that document are applied **locally, before content leaves the
 process**. A rule that matches a credit card number means the number is never
-sent, not that it is scrubbed on arrival. Add your own on top:
+sent, not that it is scrubbed on arrival. That holds for a run that finished
+before the rules arrived, too: a queued row remembers which rules it was built
+under and is put through the current ones just before it is sent, and the first
+send of a process waits (on the worker thread, for at most five seconds) for the
+start-up read. If the control plane cannot be reached at all there are no server
+rules to apply, and your own still are. Add your own on top:
 
 ```python
 from fulcrum_ops import RedactionRule

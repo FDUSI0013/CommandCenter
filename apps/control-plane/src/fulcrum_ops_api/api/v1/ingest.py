@@ -156,8 +156,14 @@ async def ingest_traces(
     which is what lets a new service start reporting without a console visit.
 
     Governance runs before storage: a policy or guardrail set to Block refuses
-    the trace and says which control did it, Mask stores it without its content,
-    and everything else records the breach and lets it through.
+    the trace and says which control did it, Mask stores it with what matched
+    removed, and everything else records the breach and lets it through.
+
+    Ids are optional. One that is supplied must be a version 7 UUID, which is
+    what the SDKs mint: the telemetry store addresses nothing else, and a trace
+    it refuses comes back `telemetry_rejected` on its own row. When the trace is
+    stored but some of its spans are not, the row stays `accepted` and
+    `spans_rejected` counts them, with the cause in `reason`.
     """
     parsed = parse_batch(
         body, field="traces", item_model=TraceIn, max_items=MAX_TRACES_PER_BATCH

@@ -17,10 +17,13 @@ Three rules hold throughout:
   as the change itself, so the two commit or roll back together.
 
 The rollup columns on ``policies`` (``violations_30d``, ``blocked_30d``,
-``requests_30d``, ``approved_pct``) belong to the governance aggregation job
-and are never written here. The ``applies_*`` reach counters *are* refreshed on
-write, because scope is what changes them and a write is the one moment the new
-reach is known — that is a single COUNT on an admin action, not per page load.
+``requests_30d``, ``approved_pct``) are never computed per page load — counting
+a busy policy's violations for every row of every table render is too slow.
+They are recomputed in bulk by :func:`refresh_rollups`, which the platform
+scheduler calls on its own clock. The ``applies_*`` reach counters are refreshed
+on write, because a write is the one moment a new scope's reach is known, and
+again by the same sweep, because agents register themselves through ingest long
+after the policy that governs them was saved.
 """
 
 from __future__ import annotations
@@ -32,7 +35,8 @@ from collections.abc import Sequence
 from typing import Any, Final
 
 from fastapi import Request
-from sqlalchemy import Select, case, false, func, or_, select, true
+from sqlalchemy import Select, case, delete, false, func, or_, select, true, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import InstrumentedAttribute
 from sqlalchemy.sql.elements import ColumnElement
@@ -40,7 +44,10 @@ from sqlalchemy.sql.elements import ColumnElement
 from ..api.common import ListParams, apply_filters, apply_search, apply_sort, paginate
 from ..api.deps import Principal
 from ..core.errors import Conflict, NotFound, PreconditionFailed, ValidationFailed
+from ..db.base import stamp
 from ..models.governance import (
+    ApprovalRequest,
+    ApprovalStatus,
     Policy,
     PolicyBinding,
     PolicyCategory,
@@ -54,6 +61,8 @@ from ..models.governance import (
 from ..models.identity import Role
 from ..models.registry import Agent, AgentConnector, Connector, EnvironmentType
 from ..schemas.policies import (
+    KNOWN_SIGNALS,
+    SCORE_SIGNAL_PREFIX,
     PolicyAction,
     PolicyCondition,
     PolicyCreate,
@@ -63,6 +72,8 @@ from ..schemas.policies import (
     PolicyRules,
     PolicySummary,
     PolicyUpdate,
+    enforced_mode,
+    is_resolvable_signal,
 )
 from . import audit
 
@@ -85,6 +96,8 @@ DEFAULT_SAFETY_THRESHOLD: Final[float] = 0.82
 
 _VERSION_RE: Final[re.Pattern[str]] = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
 
+_ENFORCEMENT_VALUES: Final[frozenset[str]] = frozenset(e.value for e in PolicyEnforcement)
+
 _SEVERITY_FOR_RISK: Final[dict[RiskLevel, ViolationSeverity]] = {
     RiskLevel.LOW: ViolationSeverity.LOW,
     RiskLevel.MEDIUM: ViolationSeverity.MEDIUM,
@@ -101,6 +114,10 @@ SORTABLE: Final[dict[str, InstrumentedAttribute]] = {
     "risk_level": Policy.risk_level,
     "status": Policy.status,
     "enforcement": Policy.enforcement,
+    # Every header of the console's table has to be here: the table sends the
+    # key of whichever one was clicked, and an unknown key is a 422 that sticks
+    # until a different header is clicked.
+    "version": Policy.version,
     "modified": Policy.updated_at,
     "updated_at": Policy.updated_at,
     "created_at": Policy.created_at,
@@ -182,10 +199,18 @@ def _starter_rules(
     editor is ever opened. Those three answers describe exactly one condition,
     so the policy starts with that condition rather than with an empty body
     that would match nothing while claiming to be enforced.
+
+    It is a draft for a reviewer, which is why the callers never save it as
+    enforcing (see :func:`_status_for`). The guardrail draft addresses the
+    safety judge as a feedback score, because that is the only place a safety
+    score reaches the enforcement path from; and both drafts fail open, so a
+    trace that carries no such score is not a trace that failed it.
     """
     if category is PolicyCategory.GUARDRAILS:
         condition = PolicyCondition(
-            signal="safety_score", operator="lt", value=DEFAULT_SAFETY_THRESHOLD
+            signal=f"{SCORE_SIGNAL_PREFIX}safety_score",
+            operator="lt",
+            value=DEFAULT_SAFETY_THRESHOLD,
         )
     else:
         condition = PolicyCondition(
@@ -195,7 +220,139 @@ def _starter_rules(
         conditions=[condition],
         action=PolicyAction(mode=enforcement),
         severity=_SEVERITY_FOR_RISK[risk_level],
+        fail_mode="open",
     )
+
+
+def _status_for(requested: PolicyStatus, *, derived: bool) -> str:
+    """The status a new policy is saved with.
+
+    A policy whose rule body was derived rather than written is never saved as
+    enforcing. The derived clause is a guess from three dropdowns: with Block it
+    refused every trace from every agent at or above the chosen risk, the moment
+    somebody pressed Create on the form's defaults. It waits, inactive, until a
+    reviewer has read it and activated it on purpose.
+    """
+    if derived and requested not in (PolicyStatus.INACTIVE, PolicyStatus.PENDING_REVIEW):
+        return PolicyStatus.INACTIVE.value
+    return requested.value
+
+
+def _agreed_enforcement(data: PolicyCreate) -> PolicyEnforcement:
+    """The one enforcement a new policy carries, in its column and its rule body.
+
+    The same fact is stored twice: ``policies.enforcement`` is what the table
+    shows and ``rules.action.mode`` is what ingest applies. Stored apart, a
+    policy can read "Log Only" while it blocks. So a definition that states both
+    must state them alike, and one that leaves the field out takes the mode its
+    rule body names.
+    """
+    if data.rules is None or data.rules.action.mode is data.enforcement:
+        return data.enforcement
+    if "enforcement" not in data.model_fields_set:
+        return data.rules.action.mode
+    raise ValidationFailed(
+        f"'enforcement' says {data.enforcement.value} but the rule body's action.mode says "
+        f"{data.rules.action.mode.value}. They are the same setting: make them agree, or "
+        "send only one.",
+        details={
+            "field": "enforcement",
+            "enforcement": data.enforcement.value,
+            "rules.action.mode": data.rules.action.mode.value,
+        },
+    )
+
+
+def _stored_mode(rules: Any) -> str | None:
+    """``rules.action.mode`` as stored, or ``None`` when the body names none."""
+    action = rules.get("action") if isinstance(rules, dict) else None
+    mode = action.get("mode") if isinstance(action, dict) else None
+    return mode if isinstance(mode, str) and mode else None
+
+
+def _resolve_enforcement(
+    policy: Policy,
+    *,
+    column: PolicyEnforcement | None,
+    mode: PolicyEnforcement | None,
+) -> tuple[str, str]:
+    """Settle an edit's enforcement: what is enforced now, and what will be.
+
+    An edit can speak through the Enforcement field, through the rule body's
+    ``action.mode``, or both — and the console always sends both, the body
+    untouched. Each is compared with what is enforced *now*, so whichever one
+    the editor actually moved wins and the other is brought along. Only an edit
+    that moves them to different places is refused.
+    """
+    enforced = enforced_mode(policy.rules, policy.enforcement)
+    column_moved = column is not None and column.value != enforced
+    mode_moved = mode is not None and mode.value != enforced
+    if (
+        column is not None
+        and mode is not None
+        and column_moved
+        and mode_moved
+        and column is not mode
+    ):
+        raise ValidationFailed(
+            f"'enforcement' says {column.value} but the rule body's action.mode says "
+            f"{mode.value}. They are the same setting: change one, or make them agree.",
+            details={
+                "field": "enforcement",
+                "enforcement": column.value,
+                "rules.action.mode": mode.value,
+            },
+        )
+    if column is not None and column_moved:
+        return enforced, column.value
+    if mode is not None and mode_moved:
+        return enforced, mode.value
+    return enforced, enforced
+
+
+def _unresolvable_signals(rules: Any) -> list[str]:
+    """Signals in a rule body that the enforcement path can never resolve."""
+    conditions = rules.get("conditions") if isinstance(rules, dict) else None
+    if not isinstance(conditions, list):
+        return []
+    unknown: list[str] = []
+    for condition in conditions:
+        signal = str(condition.get("signal", "")) if isinstance(condition, dict) else ""
+        if signal.strip() and not is_resolvable_signal(signal) and signal not in unknown:
+            unknown.append(signal)
+    return unknown
+
+
+def _signal_details(unknown: Sequence[str]) -> dict[str, Any]:
+    return {
+        "field": "rules.conditions",
+        "unknown_signals": list(unknown),
+        "allowed": [*sorted(KNOWN_SIGNALS), f"{SCORE_SIGNAL_PREFIX}<name>"],
+    }
+
+
+def _assert_signals_known(rules: PolicyRules, *, stored: Any = None) -> None:
+    """Refuse a rule body that names a signal ingest does not resolve.
+
+    Checked when a body is written rather than in the schema, so a policy stored
+    before the vocabulary was enforced can still be read, renamed or switched
+    off. For the same reason a name the ``stored`` body already carries is let
+    through on an edit — the console sends the whole body back every time — and
+    is caught instead when somebody tries to activate it.
+    """
+    tolerated = set(_unresolvable_signals(stored))
+    unknown = [
+        signal
+        for signal in _unresolvable_signals(rules.model_dump(mode="json"))
+        if signal not in tolerated
+    ]
+    if unknown:
+        raise ValidationFailed(
+            f"Unknown signal {', '.join(repr(s) for s in unknown)}. A condition names a "
+            f"signal the enforcement path resolves, or a feedback score written as "
+            f"'{SCORE_SIGNAL_PREFIX}<name>'.",
+            details=_signal_details(unknown),
+        )
 
 
 async def _name_taken(
@@ -218,6 +375,24 @@ async def _assert_name_available(
             f"A policy named '{name}' already exists in this workspace.",
             details={"field": "name"},
         )
+
+
+async def _flush_named(session: AsyncSession, name: str) -> None:
+    """Flush a write that claims a policy name, answering a lost race as 409.
+
+    :func:`_assert_name_available` reads before the write, so two admins saving
+    the same name a moment apart both pass it; the unique constraint then
+    refuses the second flush. That is a conflict the caller can act on, not a
+    server error.
+    """
+    try:
+        await session.flush()
+    except IntegrityError as exc:  # someone claimed the name between check and flush
+        await session.rollback()
+        raise Conflict(
+            f"A policy named '{name}' already exists in this workspace.",
+            details={"field": "name"},
+        ) from exc
 
 
 async def _copy_name(session: AsyncSession, workspace_id: str, source_name: str) -> str:
@@ -304,15 +479,34 @@ async def _resolve_scope(
 
 
 async def _reach(
-    session: AsyncSession, workspace_id: str, scope: str, scope_ref: str | None
+    session: AsyncSession,
+    workspace_id: str,
+    scope: str,
+    scope_ref: str | None,
+    *,
+    policy_id: str | None = None,
 ) -> tuple[int, int, int]:
-    """Count the agents, environments and connectors a scope reaches.
+    """Count the agents, environments and connectors a policy reaches.
 
-    Two aggregate statements, run only on the write path. ``applies_tools`` is
-    deliberately not computed: there is no tool inventory in the control plane,
-    so that counter stays with the aggregation job that owns it.
+    Two aggregate statements, run on the write path and by
+    :func:`refresh_rollups`. ``applies_tools`` is deliberately not computed:
+    there is no tool inventory in the control plane, so nothing can count it and
+    the column keeps its default rather than being given an invented number.
+
+    Given ``policy_id``, agents explicitly bound to that policy count as well as
+    the ones its scope matches — the same union ingest enforces against.
     """
     clause = _scope_clause(scope, scope_ref)
+    if policy_id is not None:
+        clause = or_(
+            clause,
+            Agent.id.in_(
+                select(PolicyBinding.agent_id).where(
+                    PolicyBinding.policy_id == policy_id,
+                    PolicyBinding.workspace_id == workspace_id,
+                )
+            ),
+        )
 
     agents, environments = (
         await session.execute(
@@ -382,6 +576,16 @@ def _assert_enforceable(policy: Policy) -> None:
             "This policy has no conditions to evaluate. Add at least one rule before "
             "activating it.",
             details={"policy_id": policy.id},
+        )
+    # A stored body may predate the signal vocabulary. It stays readable, but it
+    # does not get switched on: a clause ingest cannot resolve is not a control.
+    unknown = _unresolvable_signals(policy.rules)
+    if unknown:
+        raise PreconditionFailed(
+            f"This policy names {', '.join(repr(s) for s in unknown)}, which the enforcement "
+            f"path does not resolve. Edit the rule body before activating it; a feedback "
+            f"score is written as '{SCORE_SIGNAL_PREFIX}<name>'.",
+            details={"policy_id": policy.id, **_signal_details(unknown)},
         )
 
 
@@ -646,6 +850,133 @@ async def summary(
 
 
 # ---------------------------------------------------------------------------
+# Rollups
+# ---------------------------------------------------------------------------
+
+
+async def refresh_rollups(
+    session: AsyncSession,
+    *,
+    workspace_id: str | None = None,
+    window_days: int = DEFAULT_WINDOW_DAYS,
+) -> int:
+    """Recompute the cached counters on ``policies``; returns the rows refreshed.
+
+    These columns feed the table's "Violations (30d)" column and its sort, the
+    inspector's 30-day summary, the CSV export, Agent Detail's policy rows and
+    the ordering of approval rules. Nothing used to write them, so all of those
+    read zero while the KPI cards beside them — which count the violation table
+    directly — did not.
+
+    Meant for the scheduler, not for a request: it is one UPDATE with correlated
+    counts over every policy (or one workspace's), plus a reach recount per
+    distinct scope target. Every statement names ``updated_at`` and sets it to
+    itself, because a counter moving is not an edit and must not invalidate the
+    optimistic-lock token an open edit form is holding. The caller commits.
+
+    ``last_evaluated_at`` and ``applies_tools`` are left alone: the enforcement
+    path reports no "evaluated" event and there is no tool inventory, so there
+    is nothing true to put in them.
+    """
+    cutoff = _window_start(window_days)
+
+    def _violations(*extra: ColumnElement[bool]) -> Any:
+        return (
+            select(func.count(PolicyViolation.id))
+            .where(
+                PolicyViolation.policy_id == Policy.id,
+                PolicyViolation.occurred_at >= cutoff,
+                *extra,
+            )
+            .scalar_subquery()
+        )
+
+    def _requests(*extra: ColumnElement[bool]) -> Any:
+        return (
+            select(func.count(ApprovalRequest.id))
+            .where(
+                ApprovalRequest.policy_id == Policy.id,
+                ApprovalRequest.requested_at >= cutoff,
+                *extra,
+            )
+            .scalar_subquery()
+        )
+
+    requests = _requests()
+    approved = _requests(ApprovalRequest.status == ApprovalStatus.APPROVED.value)
+
+    rollup = update(Policy).values(
+        violations_30d=_violations(),
+        blocked_30d=_violations(
+            PolicyViolation.action_taken == PolicyEnforcement.BLOCK.value
+        ),
+        requests_30d=requests,
+        # A whole percentage, rounded half up, in integer arithmetic so SQLite
+        # and Postgres agree. No requests means no rate, stored as 0.
+        approved_pct=case(
+            (requests > 0, (approved * 200 + requests) // (requests * 2)), else_=0
+        ),
+        updated_at=Policy.updated_at,
+    )
+    if workspace_id is not None:
+        rollup = rollup.where(Policy.workspace_id == workspace_id)
+    result = await session.execute(rollup.execution_options(synchronize_session=False))
+    refreshed = int(result.rowcount or 0)
+
+    # Reach drifts without any policy being touched: an agent that registers
+    # itself through ingest is governed by every Global policy from its first
+    # trace. One recount per distinct target, however many policies share it.
+    targets = select(Policy.workspace_id, Policy.scope, Policy.scope_ref).distinct()
+    if workspace_id is not None:
+        targets = targets.where(Policy.workspace_id == workspace_id)
+    for target_workspace, scope, scope_ref in (await session.execute(targets)).all():
+        agents, environments, connectors = await _reach(
+            session, target_workspace, scope, scope_ref
+        )
+        await session.execute(
+            update(Policy)
+            .where(
+                Policy.workspace_id == target_workspace,
+                Policy.scope == scope,
+                Policy.scope_ref.is_(None) if scope_ref is None else Policy.scope_ref == scope_ref,
+                or_(
+                    Policy.applies_agents != agents,
+                    Policy.applies_envs != environments,
+                    Policy.applies_connectors != connectors,
+                ),
+            )
+            .values(
+                applies_agents=agents,
+                applies_envs=environments,
+                applies_connectors=connectors,
+                updated_at=Policy.updated_at,
+            )
+            .execution_options(synchronize_session=False)
+        )
+
+    # A policy with explicit bindings reaches further than its scope target, so
+    # it cannot share a recount with its neighbours. There are few of them.
+    bound = select(Policy).where(
+        Policy.id.in_(select(PolicyBinding.policy_id).distinct())
+    )
+    if workspace_id is not None:
+        bound = bound.where(Policy.workspace_id == workspace_id)
+    for policy in (await session.execute(bound)).scalars().all():
+        agents, environments, connectors = await _reach(
+            session, policy.workspace_id, policy.scope, policy.scope_ref, policy_id=policy.id
+        )
+        await stamp(
+            session,
+            [policy],
+            applies_agents=agents,
+            applies_envs=environments,
+            applies_connectors=connectors,
+        )
+
+    return refreshed
+
+
+# ---------------------------------------------------------------------------
 # Writes
 # ---------------------------------------------------------------------------
 
@@ -668,8 +999,12 @@ async def create_policy(
         scope_ref=data.scope_ref,
         scope_label=data.scope_label,
     )
+    derived = data.rules is None
+    if data.rules is not None:
+        _assert_signals_known(data.rules)
+    enforcement = _agreed_enforcement(data)
     rules = data.rules or _starter_rules(
-        category=data.category, risk_level=data.risk_level, enforcement=data.enforcement
+        category=data.category, risk_level=data.risk_level, enforcement=enforcement
     )
     agents, environments, connectors = await _reach(
         session, principal.workspace_id, scope, scope_ref
@@ -684,8 +1019,8 @@ async def create_policy(
         scope_ref=scope_ref,
         scope_label=scope_label,
         risk_level=data.risk_level.value,
-        status=data.status.value,
-        enforcement=data.enforcement.value,
+        status=_status_for(data.status, derived=derived),
+        enforcement=enforcement.value,
         rules=rules.model_dump(mode="json"),
         version=data.version,
         owner_user_id=data.owner_user_id or principal.user_id,
@@ -696,7 +1031,7 @@ async def create_policy(
         updated_by=principal.actor,
     )
     session.add(policy)
-    await session.flush()
+    await _flush_named(session, data.name)
 
     await audit.record(
         session,
@@ -706,13 +1041,18 @@ async def create_policy(
         entity_id=policy.id,
         entity_label=policy.name,
         source_screen=SOURCE_SCREEN,
-        detail=f"Created as {policy.status} with {policy.enforcement} enforcement.",
+        detail=(
+            f"Created as {policy.status} with {policy.enforcement} enforcement."
+            + (" The rule body was derived and awaits review." if derived else "")
+        ),
         metadata={
             "category": policy.category,
             "scope": policy.scope,
             "scope_ref": policy.scope_ref,
             "risk_level": policy.risk_level,
             "applies_agents": policy.applies_agents,
+            "rules_derived": derived,
+            "requested_status": data.status.value,
         },
         request=request,
     )
@@ -752,7 +1092,6 @@ async def update_policy(
         ("category", data.category),
         ("risk_level", data.risk_level),
         ("status", data.status),
-        ("enforcement", data.enforcement),
     ):
         if attribute in fields and value is not None:
             previous = getattr(policy, attribute)
@@ -781,6 +1120,13 @@ async def update_policy(
                 f"{policy.scope}:{policy.scope_ref or '*'}",
                 f"{resolved_scope}:{resolved_ref or '*'}",
             )
+        elif "scope_label" not in fields and policy.scope_label:
+            # The console's form has no label field but sends scope and
+            # scope_ref with every save. Same target, nothing said about the
+            # label: a label somebody chose ("Finance Agents") is kept rather
+            # than quietly reset to the derived one. A real rescope still
+            # re-derives it, and an explicit null still resets it.
+            resolved_label = policy.scope_label
         policy.scope, policy.scope_ref, policy.scope_label = (
             resolved_scope,
             resolved_ref,
@@ -789,24 +1135,52 @@ async def update_policy(
     elif "scope_label" in fields:
         policy.scope_label = data.scope_label
 
-    if "rules" in fields and data.rules is not None:
-        rules = data.rules.model_dump(mode="json")
-        if rules != policy.rules:
-            policy.rules = rules
-            previous_version = policy.version
-            policy.version = _next_version(policy.version)
-            changed["rules"] = (previous_version, policy.version)
+    submitted = data.rules if "rules" in fields else None
+    enforced, target = _resolve_enforcement(
+        policy,
+        column=data.enforcement if "enforcement" in fields else None,
+        mode=submitted.action.mode if submitted is not None else None,
+    )
+    if enforced != target:
+        changed["enforcement"] = (enforced, target)
+    if policy.enforcement != target and target in _ENFORCEMENT_VALUES:
+        # Also brings an older row's label into line with what it enforces.
+        changed.setdefault("enforcement", (policy.enforcement, target))
+        policy.enforcement = target
+
+    rules: dict[str, Any] | None = None
+    if submitted is not None:
+        rules = submitted.model_dump(mode="json")
+        rules["action"]["mode"] = target
+    elif _stored_mode(policy.rules) not in (None, target):
+        # The dropdown alone moved. ``rules`` is a plain JSON column, so the body
+        # is replaced rather than mutated in place, which would not be persisted.
+        rules = copy.deepcopy(policy.rules)
+        rules["action"] = {**rules["action"], "mode": target}
+
+    if rules is not None and rules != policy.rules:
+        if submitted is not None:
+            _assert_signals_known(submitted, stored=policy.rules)
+        policy.rules = rules
+        previous_version = policy.version
+        policy.version = _next_version(policy.version)
+        changed["rules"] = (previous_version, policy.version)
 
     if rescoped:
         agents, environments, connectors = await _reach(
-            session, principal.workspace_id, policy.scope, policy.scope_ref
+            session, principal.workspace_id, policy.scope, policy.scope_ref, policy_id=policy.id
         )
         policy.applies_agents = agents
         policy.applies_envs = environments
         policy.applies_connectors = connectors
 
+    # Switching a policy on from the edit form is still an activation, so it
+    # answers to the same precondition as the Activate button.
+    if "status" in changed and policy.status == PolicyStatus.ACTIVE.value:
+        _assert_enforceable(policy)
+
     policy.updated_by = principal.actor
-    await session.flush()
+    await _flush_named(session, policy.name)
 
     await audit.record(
         session,
@@ -878,8 +1252,18 @@ async def delete_policy(
         request=request,
     )
 
-    await session.delete(policy)
-    await session.flush()
+    # ``session.delete`` would honour the ORM cascade on ``Policy.violations`` by
+    # loading every violation into memory and deleting the rows one at a time,
+    # and a policy that misfired for an afternoon owns hundreds of thousands of
+    # them. The foreign keys already say ON DELETE CASCADE (SET NULL for the
+    # approvals that cite it), so the row goes in one statement and the
+    # database takes the children with it.
+    await session.execute(
+        delete(Policy).where(
+            Policy.id == policy.id, Policy.workspace_id == principal.workspace_id
+        )
+    )
+    session.expunge(policy)
 
 
 async def activate_policy(
@@ -904,7 +1288,7 @@ async def activate_policy(
     policy.updated_by = principal.actor
 
     agents, environments, connectors = await _reach(
-        session, principal.workspace_id, policy.scope, policy.scope_ref
+        session, principal.workspace_id, policy.scope, policy.scope_ref, policy_id=policy.id
     )
     policy.applies_agents = agents
     policy.applies_envs = environments
@@ -987,6 +1371,164 @@ async def deactivate_policy(
     return policy, affected, bound
 
 
+async def _agent_in_workspace(
+    session: AsyncSession, principal: Principal, agent_id: str
+) -> tuple[str, str]:
+    """``(id, name)`` of an agent in the caller's workspace, or :class:`NotFound`."""
+    row = (
+        await session.execute(
+            select(Agent.id, Agent.name).where(
+                Agent.id == agent_id, Agent.workspace_id == principal.workspace_id
+            )
+        )
+    ).first()
+    if row is None:
+        raise NotFound(f"No agent with id '{agent_id}'.")
+    return row.id, row.name
+
+
+async def _binding(session: AsyncSession, policy: Policy, agent_id: str) -> PolicyBinding | None:
+    return (
+        await session.execute(
+            select(PolicyBinding).where(
+                PolicyBinding.policy_id == policy.id,
+                PolicyBinding.agent_id == agent_id,
+                PolicyBinding.workspace_id == policy.workspace_id,
+            )
+        )
+    ).scalar_one_or_none()
+
+
+async def _restamp_reach(session: AsyncSession, policy: Policy) -> None:
+    """Recount reach after a binding changed. Bookkeeping, not an edit."""
+    agents, environments, connectors = await _reach(
+        session, policy.workspace_id, policy.scope, policy.scope_ref, policy_id=policy.id
+    )
+    await stamp(
+        session,
+        [policy],
+        applies_agents=agents,
+        applies_envs=environments,
+        applies_connectors=connectors,
+    )
+
+
+async def list_bindings(
+    session: AsyncSession, principal: Principal, policy_id: str
+) -> list[tuple[PolicyBinding, str | None]]:
+    """A policy's explicit bindings, oldest first, each with its agent's name."""
+    policy = await _get(session, principal, policy_id)
+    rows = (
+        await session.execute(
+            select(PolicyBinding, Agent.name)
+            .outerjoin(Agent, Agent.id == PolicyBinding.agent_id)
+            .where(
+                PolicyBinding.policy_id == policy.id,
+                PolicyBinding.workspace_id == principal.workspace_id,
+            )
+            .order_by(PolicyBinding.bound_at, PolicyBinding.id)
+        )
+    ).all()
+    return [(binding, name) for binding, name in rows]
+
+
+async def bind_agent(
+    session: AsyncSession,
+    principal: Principal,
+    policy_id: str,
+    agent_id: str,
+    *,
+    request: Request | None = None,
+) -> tuple[Policy, int, int, bool]:
+    """Attach a policy to one agent, on top of whatever its scope matches.
+
+    Ingest has always honoured a binding; until this verb existed nothing could
+    create one. Returns the policy, agents affected, bindings, and whether a new
+    binding was made — binding an agent twice is a no-op, not an error, so a
+    console that retries does not have to care.
+    """
+    principal.require(Role.ADMIN)
+    policy = await _get(session, principal, policy_id)
+    _agent_id, agent_name = await _agent_in_workspace(session, principal, agent_id)
+
+    created = await _binding(session, policy, agent_id) is None
+    if created:
+        try:
+            # A savepoint, so losing the race to a second click costs this
+            # insert and not the request's whole transaction.
+            async with session.begin_nested():
+                session.add(
+                    PolicyBinding(
+                        workspace_id=principal.workspace_id,
+                        policy_id=policy.id,
+                        agent_id=agent_id,
+                        bound_by=principal.actor,
+                    )
+                )
+                await session.flush()
+        except IntegrityError:  # bound in the meantime: the outcome asked for
+            created = False
+
+    if created:
+        await _restamp_reach(session, policy)
+        await audit.record(
+            session,
+            principal=principal,
+            action="Policy bound to agent",
+            entity_type=ENTITY_TYPE,
+            entity_id=policy.id,
+            entity_label=policy.name,
+            source_screen=SOURCE_SCREEN,
+            detail=f"Bound to '{agent_name}'.",
+            metadata={"agent_id": agent_id, "agent_name": agent_name, "status": policy.status},
+            request=request,
+        )
+
+    bound = await _bound_agent_count(session, policy)
+    affected = await _agents_affected(session, policy)
+    return policy, affected, bound, created
+
+
+async def unbind_agent(
+    session: AsyncSession,
+    principal: Principal,
+    policy_id: str,
+    agent_id: str,
+    *,
+    request: Request | None = None,
+) -> tuple[Policy, int, int, bool]:
+    """Remove an explicit binding. The policy's scope still applies if it matches.
+
+    The agent is not looked up: a binding can outlive the agent it names, and
+    that is exactly the binding somebody needs to be able to remove.
+    """
+    principal.require(Role.ADMIN)
+    policy = await _get(session, principal, policy_id)
+
+    binding = await _binding(session, policy, agent_id)
+    removed = binding is not None
+    if binding is not None:
+        await session.delete(binding)
+        await session.flush()
+        await _restamp_reach(session, policy)
+        await audit.record(
+            session,
+            principal=principal,
+            action="Policy unbound from agent",
+            entity_type=ENTITY_TYPE,
+            entity_id=policy.id,
+            entity_label=policy.name,
+            source_screen=SOURCE_SCREEN,
+            detail=f"Binding to agent '{agent_id}' removed.",
+            metadata={"agent_id": agent_id, "status": policy.status},
+            request=request,
+        )
+
+    bound = await _bound_agent_count(session, policy)
+    affected = await _agents_affected(session, policy)
+    return policy, affected, bound, removed
+
+
 async def clone_policy(
     session: AsyncSession,
     principal: Principal,
@@ -1013,6 +1555,9 @@ async def clone_policy(
     agents, environments, connectors = await _reach(
         session, principal.workspace_id, source.scope, source.scope_ref
     )
+    # The copy is labelled with what its rule body enforces, so an older source
+    # whose label had drifted does not hand the drift on.
+    enforced = enforced_mode(source.rules, source.enforcement)
 
     clone = Policy(
         workspace_id=principal.workspace_id,
@@ -1024,7 +1569,7 @@ async def clone_policy(
         scope_label=source.scope_label,
         risk_level=source.risk_level,
         status=PolicyStatus.INACTIVE.value,
-        enforcement=source.enforcement,
+        enforcement=enforced if enforced in _ENFORCEMENT_VALUES else source.enforcement,
         rules=copy.deepcopy(source.rules or {}),
         version="v1.0.0",
         owner_user_id=principal.user_id or source.owner_user_id,
@@ -1035,7 +1580,7 @@ async def clone_policy(
         updated_by=principal.actor,
     )
     session.add(clone)
-    await session.flush()
+    await _flush_named(session, copy_name)
 
     await audit.record(
         session,
@@ -1129,12 +1674,42 @@ async def import_policies(
             )
             continue
 
+        derived = item.rules is None
+        try:
+            if item.rules is not None:
+                _assert_signals_known(item.rules)
+            enforcement = _agreed_enforcement(item)
+        except ValidationFailed as exc:
+            result.skipped += 1
+            result.issues.append(
+                PolicyImportIssue(index=index, name=item.name, reason=exc.message)
+            )
+            continue
+
         rules = item.rules or _starter_rules(
-            category=item.category, risk_level=item.risk_level, enforcement=item.enforcement
+            category=item.category, risk_level=item.risk_level, enforcement=enforcement
         )
-        status = PolicyStatus.ACTIVE.value if payload.activate else item.status.value
+        # ``activate`` forces a definition on, but never one whose rule body had
+        # to be derived: the file said nothing about what it should match.
+        requested = PolicyStatus.ACTIVE if payload.activate else item.status
+        status = _status_for(requested, derived=derived)
+        if status != requested.value:
+            result.issues.append(
+                PolicyImportIssue(
+                    index=index,
+                    name=item.name,
+                    reason=(
+                        f"Imported as {status}, not {requested.value}: the definition has no "
+                        "rule body, so a starter rule was derived. Review it, then activate."
+                    ),
+                )
+            )
         agents, environments, connectors = await _reach(
-            session, workspace_id, scope, scope_ref
+            session,
+            workspace_id,
+            scope,
+            scope_ref,
+            policy_id=target.id if target is not None else None,
         )
 
         if target is None:
@@ -1158,7 +1733,7 @@ async def import_policies(
         policy.scope_label = scope_label
         policy.risk_level = item.risk_level.value
         policy.status = status
-        policy.enforcement = item.enforcement.value
+        policy.enforcement = enforcement.value
         policy.rules = rules.model_dump(mode="json")
         policy.version = item.version if target is None else _next_version(policy.version)
         policy.owner_user_id = item.owner_user_id or principal.user_id
@@ -1167,7 +1742,9 @@ async def import_policies(
         policy.applies_connectors = connectors
         policy.updated_by = principal.actor
 
-        await session.flush()
+        # A lost race here fails the request, and the rollback takes the whole
+        # batch with it, which is the documented meaning of a Conflict on import.
+        await _flush_named(session, item.name)
         result.policy_ids.append(policy.id)
 
         await audit.record(

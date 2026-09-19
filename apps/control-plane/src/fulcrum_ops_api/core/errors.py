@@ -107,6 +107,26 @@ class TelemetryBackendUnavailable(AppError):
     status_code = status.HTTP_503_SERVICE_UNAVAILABLE
     code = "telemetry_unavailable"
     message = "The telemetry store is temporarily unavailable."
+    #: Sent as ``Retry-After``. A slow store is made slower by everything that
+    #: asks again at once -- the console's pollers, an SDK's flush loop -- and
+    #: both already honour this header, so say how long to stay away.
+    retry_after_seconds: int = 5
+
+
+class ServiceBusy(AppError):
+    """This process could not get a database connection in time.
+
+    Every pooled connection is checked out -- usually by requests waiting on
+    something slow -- and the wait for a free one (``database_pool_timeout_
+    seconds``) ran out. That used to surface as an opaque 500, which reads as a
+    bug and is not retried; it is load, it passes, and the caller should simply
+    come back.
+    """
+
+    status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    code = "busy"
+    message = "The service is busy. Retry shortly."
+    retry_after_seconds: int = 2
 
 
 class ModelUnavailable(AppError):
@@ -135,13 +155,26 @@ def _request_id(request: Request) -> str | None:
 
 async def app_error_handler(request: Request, exc: AppError) -> JSONResponse:
     headers = {}
-    if isinstance(exc, RateLimited):
-        headers["Retry-After"] = str(exc.retry_after_seconds)
+    # Any error that knows when it is worth coming back says so: the 429, and
+    # the two 503s that mean "slow right now" rather than "broken".
+    retry_after = getattr(exc, "retry_after_seconds", None)
+    if retry_after is not None:
+        headers["Retry-After"] = str(retry_after)
     return JSONResponse(
         status_code=exc.status_code,
         content=exc.to_payload(_request_id(request)),
         headers=headers,
     )
+
+
+async def database_busy_handler(request: Request, exc: Exception) -> JSONResponse:
+    """The connection pool's checkout timeout, answered as the 503 it is.
+
+    Registered for ``sqlalchemy.exc.TimeoutError`` in ``main``. It is not an
+    ``AppError`` -- the pool raises it from inside whichever dependency or
+    service touched the session first -- so it is translated here, once.
+    """
+    return await app_error_handler(request, ServiceBusy())
 
 
 async def http_error_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:

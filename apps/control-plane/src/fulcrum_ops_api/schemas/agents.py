@@ -2,10 +2,10 @@
 
 An agent is the control-plane half of a 1:1 pairing with a telemetry project:
 identity, ownership, risk and configuration live in our ``agents`` table, while
-every run counter, latency series and prompt version is read back from the
-telemetry engine at request time. That split is visible in the schemas below —
-:class:`AgentRead` is pure database state, :class:`AgentRunStats`,
-:class:`MetricSeries` and :class:`AgentVersionRead` are engine state, and
+every run counter and prompt version is read back from the telemetry engine at
+request time. That split is visible in the schemas below —
+:class:`AgentRead` is pure database state, :class:`AgentRunStats` and
+:class:`AgentVersionRead` are engine state, and
 :class:`AgentDetail` is the one payload that carries both so the detail screen
 opens in a single round trip.
 
@@ -70,22 +70,6 @@ def _clean_tags(tags: list[str]) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-class MetricPoint(BaseModel):
-    """One sample of a time series, at the start of its bucket."""
-
-    at: dt.datetime
-    value: float | None = Field(None, description="Null where the bucket held no runs")
-
-
-class MetricSeries(BaseModel):
-    """A named series the detail screen charts."""
-
-    name: str
-    unit: str = Field(description="Unit of `value`, e.g. 'seconds', 'runs', 'usd'")
-    interval: str = Field(description="Bucket width, e.g. 'HOURLY' or 'DAILY'")
-    points: list[MetricPoint] = Field(default_factory=list)
-
-
 class NamedScore(BaseModel):
     """One feedback/evaluation score averaged over the window."""
 
@@ -98,16 +82,33 @@ class AgentMetrics(BaseModel):
 
     Every field is nullable on purpose: an agent that has never run has no
     success rate, and reporting 0% would be a different — and wrong — claim.
+
+    Two sources meet here. The run figures come from the telemetry engine and
+    are null until it has been read for this agent. ``violations_30d`` and
+    ``escalations_30d`` are counted from our own violation records, so on the
+    detail payload they are always present and always current, whatever the
+    telemetry store is doing.
     """
 
-    runs_30d: int = 0
+    runs_30d: int | None = None
     success_rate_30d: float | None = Field(None, description="Percent, 0-100")
-    avg_latency_seconds: float | None = None
-    tokens_30d: int = 0
-    cost_30d: float = 0.0
-    tool_calls_30d: int = 0
-    escalations_30d: int = 0
-    violations_30d: int = 0
+    avg_latency_seconds: float | None = Field(
+        None,
+        description=(
+            "Mean run duration when the telemetry engine reports one; otherwise the "
+            "median, which is the figure it does measure"
+        ),
+    )
+    p50_latency_seconds: float | None = Field(None, description="Median run duration")
+    tokens_30d: int | None = None
+    cost_30d: float | None = None
+    tool_calls_30d: int | None = Field(None, description="Not measured yet; always null")
+    escalations_30d: int | None = Field(
+        None, description="Violations in the window that escalated or required approval"
+    )
+    violations_30d: int | None = Field(
+        None, description="Policy violations recorded against the agent in the window"
+    )
     eval_score: float | None = Field(None, description="Mean evaluation score, 0-1")
     computed_at: dt.datetime | None = Field(
         None, description="When these numbers were last read from the telemetry engine"
@@ -162,7 +163,21 @@ class AgentRead(BaseModel):
     environment: EnvironmentType
     status: AgentStatus
     risk: RiskLevel
-    policy_status: PolicyStatus
+    policy_status: PolicyStatus = Field(
+        description=(
+            "Blocked and Approval Required are the stored gate and refuse activation "
+            "and Run Agent. Warned is also reported for an Allowed agent whose runs a "
+            "policy intervened in during the last 30 days"
+        )
+    )
+    strongest_enforcement_30d: str | None = Field(
+        None,
+        description=(
+            "Strongest enforcement recorded against the agent's runs in the last 30 "
+            "days (Block, Require Approval, Escalate, Mask, Route, Throttle or Warn); "
+            "null when policy has not intervened. Informational: it is not a gate"
+        ),
+    )
 
     owner_user_id: str | None = None
     owner_name: str | None = Field(None, description="Resolved from the owning user")
@@ -179,7 +194,14 @@ class AgentRead(BaseModel):
     access_scope: str | None = None
 
     last_used_at: dt.datetime | None = None
-    health: int | None = Field(None, description="Composite health score, 0-100")
+    health: int | None = Field(
+        None,
+        description=(
+            "Composite health score, 0-100: the 30-day success rate, less 5 per policy "
+            "violation in the window (at most 30), less 10 per blocked connector grant. "
+            "Null until the agent has reported a run"
+        ),
+    )
 
     engine_project_id: str | None = Field(
         None, description="Telemetry project this agent's runs land in"
@@ -324,11 +346,27 @@ class AgentDetail(BaseModel):
     connectors: list[AgentConnectorRead] = Field(default_factory=list)
     policies: list[AgentPolicyBindingRead] = Field(default_factory=list)
     versions: list[AgentVersionRead] = Field(default_factory=list)
-    stats: AgentRunStats
-    latency_series: MetricSeries
+    stats: AgentRunStats | None = Field(
+        None,
+        description=(
+            "The window's run counters. Null when the telemetry store could not be "
+            "read for this response (see `telemetry_error`): not measured, which is "
+            "a different claim from zero"
+        ),
+    )
     telemetry_available: bool = Field(
         True,
         description="False when the agent has no telemetry project yet; stats are empty",
+    )
+    telemetry_error: str | None = Field(
+        None,
+        description=(
+            "Set when the agent has a telemetry project but the store failed or was "
+            "too slow for this response. The rest of the payload is our own data and "
+            "is complete; `stats` is null and/or `versions` is empty, and "
+            "`agent.metrics` holds the last figures that were measured, dated by "
+            "`computed_at`"
+        ),
     )
 
 

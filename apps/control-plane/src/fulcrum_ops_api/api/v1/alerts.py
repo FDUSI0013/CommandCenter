@@ -3,7 +3,7 @@
 One screen, two collections. The table at the top is the alert queue with the
 console's three dropdowns (Severity, Status, Source), its search box and its
 Export button; the modal behind the "Alert Rules" button is a full CRUD editor
-over the conditions that raise those alerts.
+over the rules that govern those alerts, matched to them by source and severity.
 
 The unread badge in the console's sidebar polls ``GET /alerts/summary``, so the
 ``open`` figure in that payload has to be exact rather than page-scoped — it is
@@ -239,11 +239,15 @@ async def create_rule(
     payload: AlertRuleCreate,
     request: Request,
 ) -> AlertRuleRead:
-    """Define a condition that raises alerts.
+    """Say what the workspace wants done with one kind of alert.
 
-    ``condition`` is stored exactly as written — each source screen evaluates
-    its own shape — and rule names are unique within a workspace, so a duplicate
-    answers 409. Requires the admin role.
+    A rule governs the alerts raised from its ``source`` screen at its
+    ``severity``; those two fields are the whole match. Each such alert names
+    the rule in its payload (``alert_rule``, ``alert_rule_id``). ``condition``
+    is stored exactly as written and is documentation: the screens decide when
+    something is wrong. ``notify_channels`` and ``throttle_minutes`` are kept
+    for delivery, which this API does not perform. Rule names are unique within
+    a workspace, so a duplicate answers 409. Requires the admin role.
     """
     rule = await service.create_rule(session, principal, payload, request=request)
     return AlertRuleRead.model_validate(await _refreshed(session, rule))
@@ -270,8 +274,11 @@ async def update_rule(
 ) -> AlertRuleRead:
     """Partially update a rule; omitted fields are left alone.
 
-    Disabling a rule with ``enabled: false`` stops it raising without losing its
-    definition. Requires the admin role.
+    Disabling a rule with ``enabled: false`` silences its source at its severity
+    without losing the definition: what the screen raises from then on is still
+    recorded, as a Muted alert, and is reopened when the rule is enabled again,
+    deleted, or moved elsewhere. Alerts posted by hand are never silenced.
+    Requires the admin role.
     """
     rule = await service.update_rule(session, principal, rule_id, payload, request=request)
     return AlertRuleRead.model_validate(await _refreshed(session, rule))
@@ -285,9 +292,10 @@ async def update_rule(
 async def delete_rule(
     principal: CurrentPrincipal, session: Db, rule_id: str, request: Request
 ) -> None:
-    """Remove a rule. Alerts it already raised are evidence and are kept.
+    """Remove a rule. Alerts it governed are evidence and are kept.
 
-    Requires the admin role.
+    Alerts a disabled rule had silenced are reopened, since nothing silences
+    them any more. Requires the admin role.
     """
     await service.delete_rule(session, principal, rule_id, request=request)
 

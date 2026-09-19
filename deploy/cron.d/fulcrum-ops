@@ -1,0 +1,28 @@
+# Fulcrum Ops — host jobs. This file is the source of truth; install it as root:
+#
+#   install -m 0644 -o root -g root /opt/fulcrum/deploy/cron.d/fulcrum-ops /etc/cron.d/fulcrum-ops
+#   rm -f /etc/cron.d/fulcrum-backup      # the earlier, backup-only file: it would run the dump twice
+#
+# cron silently ignores a file in /etc/cron.d that is group- or world-writable,
+# or whose name contains a dot — hence `install -m 0644` and no extension.
+#
+# PATH is set because cron's own is /usr/bin:/bin. The AWS CLI installs to
+# /usr/local/bin (or /snap/bin), so under the default the nightly backup could
+# not find it and — before backup.sh was changed to fail on that — reported
+# success every night without a single copy leaving the host.
+#
+# Each job is run through bash so it does not depend on the executable bit
+# surviving however the repository reached this host.
+
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
+
+# Restart containers that are running but no longer answering. Silent unless it acts.
+* * * * *   root  bash /opt/fulcrum/deploy/autoheal.sh >> /var/log/fulcrum-autoheal.log 2>&1
+
+# Nightly dump of the governance database (and the engine's registry), mirrored off the host.
+17 2 * * *  root  bash /opt/fulcrum/deploy/backup.sh >> /var/log/fulcrum-backup.log 2>&1
+
+# The control plane is built on this host, and every build leaves cache layers
+# behind: 22 GB of them by September 2026, on a disk the analytics store also
+# needs. Drop what has not been used for a week.
+41 3 * * 0  root  docker builder prune -f --filter until=168h >> /var/log/fulcrum-housekeeping.log 2>&1

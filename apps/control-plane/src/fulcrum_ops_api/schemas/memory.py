@@ -85,8 +85,14 @@ class SyncState(enum.StrEnum):
     NOT_PROVISIONED = "Not Provisioned"
 
 
+#: What a backup's manifest holds, and therefore everything a restore can put
+#: back. Conversation threads are not on this list: they are counted when the
+#: snapshot is taken and never copied, so no restore can bring one back.
+BACKUP_CAPTURES: Final[tuple[str, ...]] = ("retention_policy", "retention_days", "status")
+
+
 class BackupKind(enum.StrEnum):
-    """A backup is incremental exactly when an earlier one bounded its window."""
+    """Every snapshot taken now is Full; Incremental survives on older ledger rows."""
 
     FULL = "Full"
     INCREMENTAL = "Incremental"
@@ -105,7 +111,18 @@ class BackupStatus(enum.StrEnum):
 
 
 class MemoryStoreRead(BaseModel):
-    """One row of the Memory Stores table, plus what the inspector adds to it."""
+    """One row of the Memory Stores table, plus what the inspector adds to it.
+
+    Where the four measurements come from depends on who holds the records.
+
+    * A thread-backed store's ``record_count`` and ``active_session_count`` are
+      read live from the telemetry store, over the agents bound to it. They are
+      null when that read failed — not measured, which is not zero. Its
+      ``usage_percent`` is always null: the telemetry store has no notion of
+      provisioned capacity, so there is no share of it to report.
+    * Every other type reports what its own runtime last sent to
+      ``PATCH /memory/{id}``.
+    """
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -115,8 +132,8 @@ class MemoryStoreRead(BaseModel):
     environment: str
     status: MemoryStoreStatus
 
-    usage_percent: int = Field(0, ge=0, le=100)
-    record_count: int = 0
+    usage_percent: int | None = Field(None, ge=0, le=100)
+    record_count: int | None = None
     retention_policy: str | None = None
     retention_days: int | None = None
 
@@ -128,12 +145,19 @@ class MemoryStoreRead(BaseModel):
         None, description="System holding the records, e.g. 'Azure AI Search'"
     )
 
-    active_session_count: int = 0
+    active_session_count: int | None = None
     avg_retrieval_latency_ms: float | None = None
     last_backup_at: dt.datetime | None = None
     backup_count: int = Field(0, description="Backups taken of this store, all time")
     thread_backed: bool = Field(
         False, description="True when records are engine trace threads"
+    )
+    bound_agents: int | None = Field(
+        None,
+        description=(
+            "Agents whose memory policy names this store. They are the whole scope "
+            "of its records, purge and backup; null for stores that are not thread-backed"
+        ),
     )
 
     created_at: dt.datetime
@@ -149,16 +173,24 @@ class MemoryStoreRead(BaseModel):
         owner_name: str | None = None,
         owner_team: str | None = None,
         backup_count: int = 0,
+        live: tuple[int | None, int | None, int] | None = None,
     ) -> MemoryStoreRead:
-        """Build a row, folding in the two things that are not on the model."""
+        """Build a row, folding in what is not on the model.
+
+        ``live`` is ``(records, active sessions, bound agents)`` for a
+        thread-backed store. Its columns are never written by anything, so they
+        are not consulted: the row says what the telemetry store said, or null.
+        """
+        thread_backed = store.store_type in THREAD_BACKED_TYPES
+        records, sessions, bound = live if live is not None else (None, None, None)
         return cls(
             id=store.id,
             name=store.name,
             store_type=MemoryStoreType(store.store_type),
             environment=store.environment,
             status=MemoryStoreStatus(store.status),
-            usage_percent=store.usage_percent,
-            record_count=store.record_count,
+            usage_percent=None if thread_backed else store.usage_percent,
+            record_count=records if thread_backed else store.record_count,
             retention_policy=store.retention_policy,
             retention_days=store.retention_days,
             last_updated_at=store.last_updated_at,
@@ -166,11 +198,12 @@ class MemoryStoreRead(BaseModel):
             owner_name=owner_name,
             owner_team=owner_team,
             backend=store.backend,
-            active_session_count=store.active_session_count,
+            active_session_count=sessions if thread_backed else store.active_session_count,
             avg_retrieval_latency_ms=store.avg_retrieval_latency_ms,
             last_backup_at=store.last_backup_at,
             backup_count=backup_count,
-            thread_backed=store.store_type in THREAD_BACKED_TYPES,
+            thread_backed=thread_backed,
+            bound_agents=bound if thread_backed else None,
             created_at=store.created_at,
             updated_at=store.updated_at,
             created_by=store.created_by,
@@ -265,6 +298,11 @@ class MemoryBackupRead(BaseModel):
     Backups are recorded on the append-only audit trail rather than in a table
     of their own, so ``id`` is the audit event id and the record cannot be
     edited or deleted after the fact.
+
+    A backup is a snapshot of the store's *governed state* — its retention
+    policy and status — with a count of the conversation threads its agents held
+    at that moment. The threads themselves are not copied anywhere, which is
+    what ``threads_captured`` says on every row.
     """
 
     id: str
@@ -274,14 +312,27 @@ class MemoryBackupRead(BaseModel):
     created_by: str | None = None
     kind: BackupKind
     status: BackupStatus
-    record_count: int = Field(0, description="Threads captured in the snapshot")
+    record_count: int = Field(
+        0, description="Threads counted when the snapshot was taken. Counted, not copied"
+    )
     payload_bytes: int | None = Field(
-        None, description="Measured size of the exported payload"
+        None,
+        description=(
+            "Null: a snapshot exports nothing, so there is no payload to size. Older "
+            "rows carry the size of a listing that was measured and then discarded"
+        ),
     )
     window_from: dt.datetime | None = Field(
-        None, description="Start of the exported window; null for a full backup"
+        None, description="Start of the counted window on older rows; null otherwise"
     )
-    projects: int = Field(0, description="Engine projects the export spanned")
+    projects: int = Field(0, description="Engine projects the count spanned")
+    threads_captured: bool = Field(
+        False, description="Always false: no backup holds conversation threads"
+    )
+    captured: list[str] = Field(
+        default_factory=lambda: list(BACKUP_CAPTURES),
+        description="The store fields the snapshot holds, which is all a restore can put back",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -372,19 +423,34 @@ class RetentionPolicyUpdate(BaseModel):
 
 
 class MemoryPurgeRequest(BaseModel):
-    """Run the retention purge. The window comes from the policy, not the body."""
+    """Run the retention purge. The window comes from the policy, not the body.
+
+    A purge cannot be undone, so an empty body does not start one: the caller
+    names the store it means to purge in ``confirm``. The intended exchange is a
+    ``dry_run`` first — which needs no confirmation and answers with what would
+    go and whose it is — and then the real call carrying the store's name.
+    """
 
     reason: str | None = Field(None, max_length=500)
     dry_run: bool = Field(
         False, description="Count what is past retention without deleting anything"
     )
+    confirm: str | None = Field(
+        None,
+        max_length=160,
+        description=(
+            "The store's exact name. Required unless dry_run is set; a purge whose "
+            "confirm does not match the store is refused with 422 and deletes nothing."
+        ),
+    )
 
 
 class MemoryBackupRequest(BaseModel):
-    """Take a snapshot. Incremental unless the caller forces a full export."""
+    """Take a snapshot of the store's governed state."""
 
     full: bool = Field(
-        False, description="Export the whole store even when a previous backup exists"
+        False,
+        description="Accepted for compatibility and ignored: every snapshot is complete",
     )
     note: str | None = Field(None, max_length=500)
 
@@ -402,49 +468,110 @@ class MemoryRestoreRequest(BaseModel):
 
 
 class MemoryPurgeResult(BaseModel):
-    """What the purge actually removed."""
+    """What the purge actually removed, and whose it was.
+
+    A record is a conversation thread. One is past retention when its *last*
+    activity is older than the cutoff, and it is removed whole; a thread that is
+    still being written to keeps its early messages however old they are.
+    """
 
     store_id: str
     name: str
     dry_run: bool
-    cutoff: dt.datetime = Field(description="Records older than this were in scope")
+    cutoff: dt.datetime = Field(description="Records last active before this were in scope")
     retention_days: int
-    purged_records: int
-    remaining_records: int
-    usage_percent: int
-    projects: int = Field(0, description="Engine projects the purge swept")
-    capped: bool = Field(
-        False, description="True when the per-run cap stopped the sweep early"
+    candidate_records: int = Field(
+        0, description="Records this run found past retention, deleted or not"
     )
+    purged_records: int = Field(description="Records actually deleted; always 0 on a dry run")
+    purged_traces: int = Field(0, description="Traces those records were made of")
+    remaining_records: int | None = Field(
+        None,
+        description=(
+            "Records the store's agents still hold, counted after the run; null when "
+            "the telemetry store could not say"
+        ),
+    )
+    usage_percent: int | None = Field(
+        None, description="Always null here: the telemetry store reports no capacity figure"
+    )
+    projects: int = Field(0, description="Engine projects the purge swept")
+    agents: list[str] = Field(
+        default_factory=list,
+        description="Agents bound to the store; only their records were in scope",
+    )
+    capped: bool = Field(
+        False,
+        description="True when the per-run cap or the time budget stopped the sweep; run it again",
+    )
+    partial: bool = Field(
+        False,
+        description=(
+            "True when the telemetry store failed part way: what is reported here was "
+            "deleted and audited, the rest was not reached"
+        ),
+    )
+    message: str = Field("", description="The outcome in one sentence, for a toast")
 
 
 class MemoryBackupResult(BaseModel):
-    """What the snapshot captured, and where the manifest was recorded."""
+    """What the snapshot captured — and, as plainly, what it did not."""
 
     backup_id: str
     store_id: str
     name: str
     kind: BackupKind
     status: BackupStatus
-    record_count: int
-    payload_bytes: int
+    record_count: int = Field(
+        description="Threads the store's agents held at that moment. Counted, not copied"
+    )
+    payload_bytes: int | None = Field(
+        None, description="Always null: a snapshot exports nothing, so there is nothing to size"
+    )
     window_from: dt.datetime | None = None
     created_at: dt.datetime
     projects: int = 0
+    agents: list[str] = Field(
+        default_factory=list, description="Agents bound to the store, whose threads were counted"
+    )
+    threads_captured: bool = Field(
+        False, description="Always false: conversation threads are not copied by a backup"
+    )
+    captured: list[str] = Field(
+        default_factory=lambda: list(BACKUP_CAPTURES),
+        description="The store fields the snapshot holds, which is all a restore can put back",
+    )
+    notice: str = Field("", description="What was and was not captured, in a sentence")
 
 
 class MemoryRestoreResult(BaseModel):
-    """What the restore put back."""
+    """What the restore put back — governed state, never conversation threads."""
 
     backup_id: str
     store_id: str
     name: str
     restored_at: dt.datetime
-    record_count: int
-    usage_percent: int
+    record_count: int | None = Field(
+        None,
+        description=(
+            "Threads the store's agents hold now, read live. A restore does not "
+            "change it; null when the telemetry store could not say"
+        ),
+    )
+    usage_percent: int | None = Field(
+        None, description="Always null here: a restore does not touch measurements"
+    )
     retention_policy: str | None = None
     status: MemoryStoreStatus
     fields_restored: list[str] = Field(default_factory=list)
+    threads_restored: bool = Field(
+        False,
+        description=(
+            "Always false: a backup holds no threads, so records deleted since it "
+            "was taken stay deleted"
+        ),
+    )
+    notice: str = Field("", description="What was and was not restored, in a sentence")
 
 
 # ---------------------------------------------------------------------------
@@ -468,7 +595,12 @@ class MemorySummary(BaseModel):
         description="Engine threads touched inside the active-session window"
     )
     active_session_window_hours: int = ACTIVE_SESSION_WINDOW_HOURS
-    stored_memories: int = Field(description="Records across every store")
+    stored_memories: int = Field(
+        description=(
+            "Records across every store: conversation threads counted live for "
+            "thread-backed stores, plus what the other stores' runtimes reported"
+        )
+    )
     avg_retrieval_latency_ms: float | None = None
     state_sync_success_percent: float = Field(
         description=(

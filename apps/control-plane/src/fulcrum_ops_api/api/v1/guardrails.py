@@ -1,9 +1,9 @@
 """Guardrails routes.
 
-Thirteen endpoints back one screen: the five KPI cards, the eight-column table
+Fourteen endpoints back one screen: the five KPI cards, the eight-column table
 and its two filters, the CSV export, the New Guardrail modal, the per-row Test,
-Tune, Enable and Disable actions, and the recent-detections feed the inspector
-shows.
+Tune, Enable, Shadow and Disable actions, and the recent-detections feed the
+inspector shows.
 
 Handlers here only parse, delegate and shape. Workspace scoping, role checks,
 audit writes and every call to the engine's content checker live in
@@ -288,8 +288,12 @@ async def update_guardrail(
 ) -> GuardrailRead:
     """Partially update a guardrail, then re-publish it to the engine.
 
-    Send `expected_updated_at` to make the write conditional: if the row moved
-    since you read it the request is refused with 409. Requires the admin role.
+    `config` is what the checker is told to look for -- a Topic guardrail's
+    `topics` and `mode`, a PII guardrail's `entities` and `language` -- and it
+    replaces the stored config whole, so send the full object. A malformed value
+    answers 422 naming the key. Send `expected_updated_at` to make the write
+    conditional: if the row moved since you read it the request is refused with
+    409. Requires the admin role.
     """
     guardrail = await service.update_guardrail(
         session, principal, guardrail_id, payload, request=request
@@ -371,10 +375,50 @@ async def enable_guardrail(
     guardrail = await service.set_status(
         session, principal, guardrail_id, GuardrailStatus.ACTIVE, request=request
     )
+    # Active is a setting; whether anything is enforced is a separate fact, and
+    # the person who just pressed Enable is the one who needs to hear it.
+    enforcement, reason = service.enforcement_of(guardrail)
     return ActionResult(
-        message=f"{guardrail.name} is active.",
+        message=(
+            f"{guardrail.name} is active."
+            if reason is None
+            else f"{guardrail.name} is active, but not enforced. {reason}"
+        ),
         entity_id=guardrail.id,
-        data={"status": guardrail.status},
+        data={
+            "status": guardrail.status,
+            "enforcement": enforcement,
+            "not_enforced_reason": reason,
+        },
+    )
+
+
+@router.post(
+    "/{guardrail_id}/shadow",
+    response_model=ActionResult,
+    summary="Run a guardrail in shadow (Tuning)",
+)
+async def shadow_guardrail(
+    principal: CurrentPrincipal, session: Db, guardrail_id: str, request: Request
+) -> ActionResult:
+    """Put the guardrail into Tuning: checked and recorded, never enforced.
+
+    This is how a new rule is tried against production traffic: its detections
+    land in the feed as ``Log`` events while nothing is blocked or masked.
+    Refused with 412 when it is already tuning. Requires the operator role.
+    """
+    guardrail = await service.set_status(
+        session, principal, guardrail_id, GuardrailStatus.TUNING, request=request
+    )
+    enforcement, reason = service.enforcement_of(guardrail)
+    return ActionResult(
+        message=f"{guardrail.name} is tuning: detections are recorded, nothing is enforced.",
+        entity_id=guardrail.id,
+        data={
+            "status": guardrail.status,
+            "enforcement": enforcement,
+            "not_enforced_reason": reason,
+        },
     )
 
 
@@ -395,5 +439,5 @@ async def disable_guardrail(
     return ActionResult(
         message=f"{guardrail.name} is disabled.",
         entity_id=guardrail.id,
-        data={"status": guardrail.status},
+        data={"status": guardrail.status, "enforcement": "disabled"},
     )

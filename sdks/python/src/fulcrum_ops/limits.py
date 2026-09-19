@@ -55,6 +55,8 @@ MAX_EVENT_BODY_LENGTH = 4_000
 MAX_EVENT_SOURCE_LENGTH = 40
 MAX_SUBMITTED_BY_LENGTH = 160
 MAX_SAMPLE_LENGTH = 500
+#: An issue's title is a headline, not the report: the explanation goes in the body.
+MAX_ISSUE_TITLE_LENGTH = 200
 
 #: ``rating`` is an integer star count; anything outside the range is refused.
 MIN_RATING = 1

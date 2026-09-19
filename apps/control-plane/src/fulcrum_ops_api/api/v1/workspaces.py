@@ -265,9 +265,13 @@ async def update_member(
 ) -> MemberRead:
     """Edit a member's record, their role, or their ability to sign in.
 
-    Deactivation blocks the account platform-wide, so it is refused for the last
-    owner and for yourself. Only an owner may modify another owner. Requires the
-    admin role.
+    The role is this workspace's to set. The name, the password and the active
+    flag belong to the account, which is platform-wide: they answer 403 when the
+    account also belongs to another workspace (`shared_account` on the member
+    row), and a password for your own account is refused in favour of
+    `POST /auth/change-password`, which asks for the current one. Deactivation
+    is refused for the last owner and for yourself. Only an owner may modify
+    another owner. Requires the admin role.
     """
     row = await service.update_member(session, principal, user_id, payload, request=request)
     return MemberRead.model_validate(row)

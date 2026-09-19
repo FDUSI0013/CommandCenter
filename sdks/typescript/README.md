@@ -98,7 +98,20 @@ backend and forward from there.
 | `FULCRUM_OPS_WORKSPACE` | `workspace` | from the key |
 | `FULCRUM_OPS_ENVIRONMENT` | `environment` | — |
 | `FULCRUM_OPS_AGENT` | `agent` | — |
+| `FULCRUM_OPS_DISABLED` | `enabled: false` | unset (reporting is on when there is a key) |
+| `FULCRUM_OPS_TIMEOUT_MS` | `timeoutMs` | `30000` |
+| `FULCRUM_OPS_TIMEOUT_SECONDS` | `timeoutMs`, in seconds | — |
+| `FULCRUM_OPS_SAMPLING_RATE` | `samplingRate` | `1` |
+| `FULCRUM_OPS_CAPTURE_INPUT` | `captureInput` | `true` |
+| `FULCRUM_OPS_CAPTURE_OUTPUT` | `captureOutput` | `true` |
 | `FULCRUM_OPS_DEBUG` | `debug` | `false` |
+
+An option passed in code always wins over its variable. The names are shared
+with the Python SDK, so one block in a compose file or a Kubernetes manifest
+configures a mixed fleet: `FULCRUM_OPS_DISABLED=1` is the kill switch for both
+(CI, or the middle of an incident), and the timeout is read under Python's name
+and unit (`FULCRUM_OPS_TIMEOUT_SECONDS`) as well as this SDK's own, which wins
+when both are set. Booleans accept `1/0`, `true/false`, `yes/no`, `on/off`.
 
 ---
 
@@ -142,6 +155,35 @@ const plan = traced(async function plan(goal: string) { … });
 const act = traced(async function act(step: Step) { … });
 ```
 
+A trace has no type, model or token counters — only a span does. So give
+`traced()` any of `type`, `model`, `provider`, `usage` or `cost` and a call made
+at the root opens the run *and* the typed span that is its whole body, rather
+than a run with no steps; `fulcrum.currentSpan()` inside it is that span:
+
+```ts
+const callModel = traced(
+  async function callModel(prompt: string) {
+    const reply = await llm(prompt);
+    fulcrum.currentSpan()?.setModel(reply.model).setUsage(reply.usage);
+    return reply.text;
+  },
+  { type: 'llm', threadId: conversationId },
+);
+```
+
+The same holds for `fulcrum.span()` / `startSpan()` — and so for every call
+through a provider wrapper — when nothing is in scope: the trace opened to hold
+the span carries its input, output, metadata, tags and start time, and is in
+scope for whatever the body calls.
+
+### Ids
+
+Ids are minted for you as version 7 UUIDs. Supply your own (`id`) only to make
+a retry idempotent, and mint it with `newId()`: the telemetry store takes
+version 7 and nothing else, and refuses the whole request over one that is not,
+so any other id — a `crypto.randomUUID()` included — is replaced. Read the id
+in use back from `trace.id` / `span.id`.
+
 ### Long-running traces
 
 Open and close by hand when the start and end are far apart:
@@ -155,6 +197,8 @@ trace.end({ output: summary });
 
 With `streamSpans: true` each span is posted as it closes rather than waiting
 for its trace, so a job that runs for an hour shows progress while it runs.
+Sampling still applies to the run as a whole: the spans of a trace that was
+sampled out are not posted either.
 
 ---
 
@@ -219,15 +263,18 @@ Enqueueing is synchronous and cannot fail: a finished trace hands its payload
 over and returns. No promise, no throw, nothing on your hot path.
 
 The queue flushes when it reaches `maxItems`, when the pending body would
-exceed `maxBytes`, or every `flushIntervalMs`, whichever comes first. Failed
-sends are retried with exponential backoff and full jitter, honouring
-`Retry-After`. The queue is bounded: past `maxQueueSize` the *oldest* items are
+exceed `maxBytes`, when the traces waiting carry `maxSpans` spans between them,
+or every `flushIntervalMs`, whichever comes first — and each request is cut to
+fit all three, because the server refuses a request whole (413) past 1,000
+spans or 8 MB however few traces it holds. A request that is refused as too
+large anyway is halved and resent rather than dropped. Failed sends are retried
+with exponential backoff and full jitter, honouring `Retry-After`. The queue is bounded: past `maxQueueSize` the *oldest* items are
 dropped, because during an outage the freshest telemetry is the telemetry worth
 having.
 
 ```ts
 const fulcrum = new FulcrumOps({
-  batch: { maxItems: 100, maxBytes: 4_194_304, flushIntervalMs: 5_000, maxQueueSize: 10_000 },
+  batch: { maxItems: 100, maxBytes: 4_194_304, maxSpans: 1_000, flushIntervalMs: 5_000, maxQueueSize: 10_000 },
   retry: { maxAttempts: 3, backoffMs: 500, maxBackoffMs: 30_000 },
   onError: (error, { operation }) => log.warn({ operation, err: error }, 'telemetry dropped'),
 });
@@ -235,11 +282,21 @@ const fulcrum = new FulcrumOps({
 
 - `await fulcrum.flush()` — send everything queued, now.
 - `await fulcrum.close()` — flush and stop. Idempotent.
-- `flushOnExit` (default `true`) flushes on Node's `beforeExit` and on the
-  browser's `pagehide`/`beforeunload`.
+- `flushOnExit` (default `true`) flushes on Node's `beforeExit`, on `SIGTERM` /
+  `SIGINT`, and on the browser's `pagehide`/`beforeunload`.
+
+`SIGTERM` is how a container is stopped, so without that hook every deploy
+would lose the last few seconds of runs. It does not change how your process
+answers the signal. If you handle it yourself, the SDK starts a flush and
+leaves the shutdown to you — call `await fulcrum.close()` in your handler. If
+you do not, the flush gets two seconds at most and the signal is then raised
+again, so the process ends exactly as it would have.
 
 Prefer an explicit `close()` in a short-lived process. Exit hooks are a safety
-net, not a guarantee: `process.exit()` and a fatal signal both skip them.
+net, not a guarantee: `process.exit()` and `SIGKILL` both skip them. The
+start-up `/ingest/config` fetch never keeps a finished process alive: in the
+background it is one short attempt at a time, and the waits between retries do
+not hold the event loop.
 
 `getStats()` reports what happened — `pending`, `sent`, `accepted`, `rejected`,
 `blocked`, `dropped`, `failedBatches`, `sampledOut`. A batch is answered with
@@ -263,10 +320,20 @@ const openai = wrapOpenAI(new OpenAI(), fulcrum);
 
 The wrapper opens an `llm` span around `chat.completions.create`,
 `responses.create` and `embeddings.create`, records the model, token usage and
-output, and returns the provider's own value untouched. Streaming is handled
-properly rather than skipped: a streamed call resolves before the first token,
-so the span closes when the stream is exhausted — otherwise a 12-second
-generation would be reported as taking 40ms.
+output, and returns the provider's own value untouched — the provider's own
+promise and stream objects, so `.withResponse()`, `.asResponse()`, `.tee()`,
+`.toReadableStream()` and Anthropic's `stream.on(...)` / `finalMessage()` work
+as they do on an unwrapped client. Streaming is handled properly rather than
+skipped: a streamed call resolves before the first token, so the span closes
+when the stream is exhausted — otherwise a 12-second generation would be
+reported as taking 40ms. A stream handed out of the trace it was opened in (a
+chat route returning it to be piped) keeps its run open until it has been read.
+
+Token counters are recorded as `prompt_tokens` / `completion_tokens` whichever
+spelling the provider uses, as the Python SDK does. OpenAI sends no usage on a
+streamed Chat Completion unless asked; `wrapOpenAI(client, fulcrum, {
+streamUsage: true })` asks for it (it adds a final chunk with empty `choices`,
+which is why it is opt-in). The Responses API always reports usage.
 
 ```ts
 import Anthropic from '@anthropic-ai/sdk';

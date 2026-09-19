@@ -26,7 +26,7 @@ def test_every_batch_carries_the_sdk_envelope(client: FulcrumOps, stub: StubServ
 
     body = batches(stub, "traces")[0]
     assert body["sdk"] == "python"
-    assert body["sdk_version"] == "1.0.0"
+    assert body["sdk_version"] == "1.0.1"
     assert body["agent"] == "checkout-agent"
     assert isinstance(body["traces"], list)
 

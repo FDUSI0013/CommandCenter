@@ -4,7 +4,7 @@
 SDK_NAME = "python"
 
 #: Kept in step with ``pyproject.toml`` by hand; there is no build-time inlining.
-SDK_VERSION = "1.0.0"
+SDK_VERSION = "1.0.1"
 
 #: Sent as ``User-Agent`` on every request.
 USER_AGENT = "fulcrum-ops-sdk-{0}/{1}".format(SDK_NAME, SDK_VERSION)

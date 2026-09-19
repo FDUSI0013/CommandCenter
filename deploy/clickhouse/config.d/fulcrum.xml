@@ -115,8 +115,10 @@
          taxing every query with the writes. The rest below are the same kind of
          exhaust at smaller scale.
          Removing a log here stops it being written; it does not drop what is
-         already on disk. Reclaim that once, by hand, after deploying this:
-           TRUNCATE TABLE IF EXISTS system.processors_profile_log;  (and the others) -->
+         already on disk. Reclaim that once after deploying this, with
+         deploy/prune-analytics-system-logs.sh (deploy/README.md, Upgrades).
+         A remove on a log this server version does not have is ignored, so the
+         list can safely name more than any one release enables. -->
     <processors_profile_log remove="1"/>
     <query_metric_log remove="1"/>
     <query_thread_log remove="1"/>
@@ -132,6 +134,7 @@
     <zookeeper_connection_log remove="1"/>
     <blob_storage_log remove="1"/>
     <backup_log remove="1"/>
+    <s3queue_log remove="1"/>
 
     <!-- No outbound calls of any kind from the analytics store. -->
     <send_crash_reports>

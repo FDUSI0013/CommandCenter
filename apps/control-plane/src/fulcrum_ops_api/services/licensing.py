@@ -29,6 +29,7 @@ from __future__ import annotations
 import contextlib
 import datetime as dt
 import enum
+import logging
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any
 
@@ -76,6 +77,7 @@ from ..schemas.licensing import (
     LicensePlanCreate,
     LicensePlanRead,
     LicensePlanUpdate,
+    LicenseRevokeRequest,
     LicenseSuspendRequest,
     LicensingSummary,
     SeatAssignmentCreate,
@@ -89,7 +91,11 @@ from ..schemas.licensing import (
 )
 from . import audit
 
+log = logging.getLogger(__name__)
+
 SOURCE_SCREEN = "Licensing & Entitlements"
+#: ``UsageRecord.source`` for what the ingest path meters, batch by batch.
+USAGE_SOURCE_INGEST = "ingest"
 
 #: The KPI card is fixed at 30 days, and the renewal sweep uses the same horizon.
 EXPIRY_HORIZON_DAYS = 30
@@ -261,6 +267,19 @@ def _iso(value: dt.datetime | None) -> str:
     return value.astimezone(dt.UTC).isoformat()
 
 
+def _as_utc(value: dt.datetime | None) -> dt.datetime | None:
+    """A timestamp sent without an offset is UTC, which is how the column stores it.
+
+    Without this a term check between a stored (aware) date and a naive one from
+    a client raises ``TypeError`` and the request answers 500 instead of 422.
+    """
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=dt.UTC)
+    return value.astimezone(dt.UTC)
+
+
 def _days_until(value: dt.datetime | None, now: dt.datetime) -> int | None:
     if value is None:
         return None
@@ -329,13 +348,29 @@ async def _plan_or_404(session: AsyncSession, plan_id: str) -> LicensePlan:
     return plan
 
 
-async def _license_or_404(
-    session: AsyncSession, principal: Principal, license_id: str
-) -> TenantLicense:
+def _license_lookup(workspace_id: str, license_id: str, *, lock: bool = False) -> Select:
+    """The scoped licence query; ``lock`` takes the row ``FOR UPDATE``.
+
+    Everything that changes a licence's seats or status reads a number, decides,
+    and writes -- "9 of 10 assigned, so one more is fine". Under READ COMMITTED
+    two such transactions do not see each other's uncommitted rows, so both
+    decide the same thing and both write: a licence one seat over its ceiling, a
+    user holding two active seats, a purchase that vanished. Taking the licence
+    row first makes those transactions queue on it, and the loser then reads
+    what the winner committed. SQLite has no row locks and serialises writers
+    anyway, so the clause is simply not emitted there.
+    """
     stmt = select(TenantLicense).where(
         TenantLicense.id == license_id,
-        TenantLicense.tenant_workspace_id == principal.workspace_id,
+        TenantLicense.tenant_workspace_id == workspace_id,
     )
+    return stmt.with_for_update() if lock else stmt
+
+
+async def _license_or_404(
+    session: AsyncSession, principal: Principal, license_id: str, *, lock: bool = False
+) -> TenantLicense:
+    stmt = _license_lookup(principal.workspace_id, license_id, lock=lock)
     license_ = (await session.execute(stmt)).scalar_one_or_none()
     if license_ is None:
         # A licence owned by another workspace must be indistinguishable from
@@ -883,6 +918,18 @@ async def create_license(
         )
 
     now = _now()
+    # The schema can only compare the two dates when both are sent, and the
+    # console never sends ``starts_at``: picking today or an earlier day in the
+    # Expires field issued a licence whose term ended before it began. That row
+    # then refused every amendment and still blocked a replacement (409).
+    if payload.expires_at is not None and _as_utc(payload.expires_at) <= (
+        _as_utc(payload.starts_at) or now
+    ):
+        raise ValidationFailed(
+            "expires_at must be later than the start of the term"
+            + ("." if payload.starts_at is not None else ", which is now.")
+        )
+
     license_ = TenantLicense(
         tenant_workspace_id=principal.workspace_id,
         plan_id=plan.id,
@@ -959,10 +1006,25 @@ async def update_license(
                 details={"seats_assigned": assigned, "requested": data["seats_purchased"]},
             )
 
-    starts_at = data.get("starts_at", license_.starts_at)
-    expires_at = data.get("expires_at", license_.expires_at)
-    if starts_at is not None and expires_at is not None and expires_at <= starts_at:
-        raise ValidationFailed("expires_at must be later than starts_at.")
+    # A suspension is lifted by ``reactivate_license`` and nowhere else: it is
+    # what checks the term has not lapsed and clears ``suspended_at`` and the
+    # reason. ``status: Active`` through here skipped both, so a licence came
+    # back into service past its end date still labelled with why it was stopped.
+    if "status" in data and license_.status == LicenseStatus.SUSPENDED.value:
+        raise PreconditionFailed(
+            "This license is suspended. Reactivate it to return it to service; "
+            "its status cannot be set directly."
+        )
+
+    # The term is judged only when the request moves one of its dates. Judging
+    # the *stored* term on every PATCH meant a licence that already held a bad
+    # one refused a plan change or a seat change it had nothing to do with --
+    # and the way out, sending a later ``expires_at``, still passes through here.
+    if "starts_at" in data or "expires_at" in data:
+        starts_at = _as_utc(data.get("starts_at", license_.starts_at))
+        expires_at = _as_utc(data.get("expires_at", license_.expires_at))
+        if starts_at is not None and expires_at is not None and expires_at <= starts_at:
+            raise ValidationFailed("expires_at must be later than starts_at.")
 
     changed = _apply_updates(license_, data)
     now = _now()
@@ -1041,9 +1103,16 @@ async def suspend_license(
     payload: LicenseSuspendRequest,
     request: Request | None = None,
 ) -> ActionResult:
-    """Suspend a licence. New seat assignment is blocked from this moment on."""
+    """Suspend a licence. New seat assignment is blocked from this moment on.
+
+    So is everything :func:`enforce_entitlement` gates, and that includes agent
+    telemetry: every ingest batch for the workspace answers 402 until the
+    licence is reactivated, and the SDKs treat 402 as final and drop the batch.
+    That is what a suspension means, but it is not something to find out from a
+    silent Live Runs screen, so the result says it in as many words.
+    """
     principal.require(Role.OWNER)
-    license_ = await _license_or_404(session, principal, license_id)
+    license_ = await _license_or_404(session, principal, license_id, lock=True)
 
     if license_.status == LicenseStatus.SUSPENDED.value:
         raise Conflict("This license is already suspended.")
@@ -1087,11 +1156,96 @@ async def suspend_license(
         request=request,
     )
     return ActionResult(
-        message="License suspended. New seat assignment is blocked until it is reactivated.",
+        message=(
+            "License suspended. Until it is reactivated, new seat assignment is blocked "
+            "and agent telemetry for this workspace is refused (402), not queued."
+        ),
         entity_id=license_.id,
         data={
             "status": license_.status,
             "suspended_at": _iso(license_.suspended_at),
+            "seats_released": released,
+            "seats_assigned": license_.seats_assigned,
+            "ingest_refused": True,
+        },
+    )
+
+
+async def revoke_license(
+    session: AsyncSession,
+    principal: Principal,
+    license_id: str,
+    payload: LicenseRevokeRequest,
+    request: Request | None = None,
+) -> ActionResult:
+    """Revoke a licence for good and free the workspace to be licensed again.
+
+    ``Revoked`` was in the status list, the grid's filter and the KPI, and the
+    409 on a second licence told the owner to "revoke" the first -- but nothing
+    could write it. A licence issued by mistake, or suspended past the end of
+    its term, was a dead end: it could not be replaced, and deleting it stops
+    being possible the moment an invoice exists.
+
+    Revocation is terminal, unlike suspension: the row stays as history, can no
+    longer be amended, and stops being the workspace's current licence, so a new
+    one can be issued. Every seat still held is released -- a licence that serves
+    nobody holds no seats -- and the reason is kept on the audit event, which is
+    where the Audit Log tab reads it.
+    """
+    principal.require(Role.OWNER)
+    license_ = await _license_or_404(session, principal, license_id, lock=True)
+
+    if license_.status == LicenseStatus.REVOKED.value:
+        raise Conflict("This license is already revoked.")
+    if license_.status == LicenseStatus.EXPIRED.value:
+        raise PreconditionFailed("This license has expired; there is nothing left to revoke.")
+
+    now = _now()
+    previous_status = license_.status
+    result = await session.execute(
+        update(SeatAssignment)
+        .where(
+            SeatAssignment.license_id == license_.id,
+            SeatAssignment.released_at.is_(None),
+        )
+        .values(released_at=now)
+    )
+    released = int(result.rowcount or 0)
+
+    license_.status = LicenseStatus.REVOKED.value
+    license_.seats_assigned = 0
+    license_.updated_by = principal.actor
+    await _persist(session, license_)
+
+    reason = payload.reason or "no reason recorded"
+    await audit.record(
+        session,
+        principal=principal,
+        action="licensing.license.revoked",
+        entity_type="tenant_license",
+        entity_id=license_.id,
+        entity_label=license_.purchase_order_ref or license_.id,
+        source_screen=SOURCE_SCREEN,
+        detail=(
+            f"License revoked ({reason}); it was {previous_status}. "
+            f"{released} seat(s) released."
+        ),
+        metadata={
+            "reason": payload.reason,
+            "previous_status": previous_status,
+            "seats_released": released,
+        },
+        request=request,
+    )
+    return ActionResult(
+        message=(
+            "License revoked. Its seats were released and it can no longer be amended; "
+            "a new license can now be issued to this workspace."
+        ),
+        entity_id=license_.id,
+        data={
+            "status": license_.status,
+            "previous_status": previous_status,
             "seats_released": released,
             "seats_assigned": license_.seats_assigned,
         },
@@ -1156,14 +1310,21 @@ async def reactivate_license(
 
 
 def _included_allowance(plan: LicensePlan | None, metric: str) -> int | None:
+    """The plan's allowance for one meter, or ``None`` when it sets none.
+
+    Zero is how a plan says "not capped" -- it is the column default, and
+    :func:`_seed_entitlements` writes no ceiling for it -- so it must not read as
+    an allowance of nothing. It did, which was invisible while nothing metered
+    usage and would have flagged the first token on such a plan as overage.
+    """
     if plan is None:
         return None
     if metric == UsageMetric.TOKENS.value:
-        return plan.included_tokens
+        return plan.included_tokens or None
     if metric == UsageMetric.RUNS.value:
-        return plan.included_runs
+        return plan.included_runs or None
     if metric == UsageMetric.SEATS.value:
-        return plan.included_seats
+        return plan.included_seats or None
     return None
 
 
@@ -1196,10 +1357,7 @@ async def _usage_breakdown(
         if included is not None:
             remaining = Decimal(included) - used
             over_limit = used > Decimal(included)
-            if included > 0:
-                utilization = round(float(used) / included * 100, 1)
-            else:
-                utilization = 100.0 if used > 0 else 0.0
+            utilization = round(float(used) / included * 100, 1)
         rows.append(
             EntitlementUsageRead(
                 metric=metric,
@@ -1356,6 +1514,121 @@ async def enforce_entitlement(
         return limit
 
     return entitlement.string_value
+
+
+# --------------------------------------------------------------------------- #
+# Metering
+# --------------------------------------------------------------------------- #
+
+
+async def _meter(
+    session: AsyncSession,
+    license_id: str,
+    metric: str,
+    amount: int,
+    *,
+    day: dt.datetime,
+    now: dt.datetime,
+    source: str,
+) -> None:
+    """Add ``amount`` to one licence's bucket for one meter and one UTC day."""
+    bucket = (
+        await session.execute(
+            select(UsageRecord.id)
+            .where(
+                UsageRecord.license_id == license_id,
+                UsageRecord.metric == metric,
+                UsageRecord.period_start == day,
+                UsageRecord.source == source,
+            )
+            # Oldest first, so every writer settles on the same row even if the
+            # day's first two batches raced and each opened a bucket.
+            .order_by(UsageRecord.created_at.asc(), UsageRecord.id.asc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if bucket is None:
+        session.add(
+            UsageRecord(
+                license_id=license_id,
+                period_start=day,
+                period_end=day + dt.timedelta(days=1),
+                metric=metric,
+                quantity=Decimal(amount),
+                recorded_at=now,
+                source=source,
+            )
+        )
+        await session.flush()
+        return
+    # Incremented *in the database*, for the reason ``ingest._commit_quotas``
+    # gives: four workers reading a number and writing it back lose updates.
+    await session.execute(
+        update(UsageRecord)
+        .where(UsageRecord.id == bucket)
+        .values(quantity=UsageRecord.quantity + Decimal(amount), recorded_at=now)
+        .execution_options(synchronize_session=False)
+    )
+
+
+async def record_usage(
+    session: AsyncSession,
+    workspace_id: str,
+    *,
+    tokens: int = 0,
+    runs: int = 0,
+    source: str = USAGE_SOURCE_INGEST,
+) -> None:
+    """Meter what a workspace just consumed against the licence it holds.
+
+    Usage & Limits, the Overage Alerts KPI and the usage export all *read*
+    ``usage_records``, and nothing in the product ever wrote one: a tenant could
+    ingest for months and the tab still said nothing had been metered. This is
+    the write side. The ingest path calls it once per batch, after the telemetry
+    store has taken the batch, with the tokens and runs that were accepted.
+
+    One row per licence, meter and UTC day, grown by a SQL increment. Day
+    buckets keep the table small however busy a tenant is while still letting
+    the rolling window slide a day at a time. There is no unique key on the
+    bucket, so two workers can each open one for the day's first batch; every
+    reader sums, and later increments settle on the older row, so the totals
+    stay right either way.
+
+    A suspended licence is still metered -- what was consumed was consumed --
+    and a workspace holding no licence has nothing to meter against.
+
+    Strictly best effort, inside a savepoint: by now the batch is stored, and a
+    fault in metering must not become a 500 that the reporter answers by sending
+    the whole batch again.
+    """
+    amounts = {
+        UsageMetric.TOKENS.value: int(tokens or 0),
+        UsageMetric.RUNS.value: int(runs or 0),
+    }
+    if not any(amount > 0 for amount in amounts.values()):
+        return
+    try:
+        async with session.begin_nested():
+            license_ = await _current_license(session, workspace_id, include_suspended=True)
+            if license_ is None:
+                return
+            now = _now()
+            day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            # A fixed order, so two workers metering the same licence cannot
+            # take the two bucket rows in opposite orders and deadlock.
+            for metric in sorted(amounts):
+                if amounts[metric] > 0:
+                    await _meter(
+                        session,
+                        license_.id,
+                        metric,
+                        amounts[metric],
+                        day=day,
+                        now=now,
+                        source=source,
+                    )
+    except Exception:  # noqa: BLE001 - see above: never at the batch's expense
+        log.exception("usage could not be metered for workspace %s", workspace_id)
 
 
 # --------------------------------------------------------------------------- #
@@ -1665,7 +1938,12 @@ async def summary(session: AsyncSession, principal: Principal) -> LicensingSumma
             LicensePlan.included_runs,
             LicensePlan.included_seats,
         )
-        .having(func.coalesce(func.sum(UsageRecord.quantity), 0) > allowance)
+        # Zero is "not capped", exactly as in ``_included_allowance``: the KPI and
+        # the Usage & Limits tab must agree on what counts as over.
+        .having(
+            allowance > 0,
+            func.coalesce(func.sum(UsageRecord.quantity), 0) > allowance,
+        )
         .subquery()
     )
     overage_alerts = (

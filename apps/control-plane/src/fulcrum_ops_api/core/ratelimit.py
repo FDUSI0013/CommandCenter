@@ -8,11 +8,17 @@ keyed by the credential — API key id or user id — so one runaway agent canno
 starve its neighbours, and an unauthenticated flood is already refused earlier
 by authentication itself.
 
-In-process means per worker: with N uvicorn workers the effective ceiling is up
-to N x the configured figure. That is the documented trade of the redis-less
-deployment (``redis_url`` unset); the numbers are set with headroom, and the
-point of the limit is to stop a tight retry loop, not to meter revenue - quota
-does that, at ingest, transactionally.
+In-process means per worker, always: with N uvicorn workers the ceiling a caller
+actually meets lies between 1x the configured figure (one keep-alive connection,
+pinned to one worker) and N x it (requests spread over all of them). This used
+to be described as the trade of "the redis-less deployment (``redis_url``
+unset)", which implied that setting ``redis_url`` bought a shared limiter. It
+never did: nothing reads that setting and this service carries no Redis client,
+although the compose file has set it since the first release. The figures are
+set with headroom for exactly this reason, and the point of the limit is to
+stop a tight retry loop, not to meter revenue - quota does that, at ingest,
+transactionally. A limit that must hold across workers belongs in the proxy in
+front of them.
 """
 
 from __future__ import annotations

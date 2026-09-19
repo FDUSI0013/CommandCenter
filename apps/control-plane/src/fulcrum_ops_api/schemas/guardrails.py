@@ -11,7 +11,8 @@ here simulates a detection.
 from __future__ import annotations
 
 import datetime as dt
-from typing import Any, Final
+import re
+from typing import Any, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -45,6 +46,10 @@ GLOBAL_COVERAGE_LABEL: Final[str] = "All Agents"
 #: How much text of a triggering call is kept on the event row. The full
 #: payload stays in the engine; this is only enough to recognise the case.
 EVENT_SAMPLE_LIMIT: Final[int] = 280
+
+#: What an event row keeps instead of a sample when the guardrail that fired
+#: exists to keep data out of storage and could not say where that data is.
+SAMPLE_WITHHELD: Final[str] = "[content withheld]"
 
 #: Columns of the Guardrails CSV export, in display order.
 EXPORT_COLUMNS: Final[tuple[tuple[str, str], ...]] = (
@@ -99,8 +104,105 @@ def validation_name(guardrail_type: str, config: dict[str, Any] | None) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+#
+# ``config`` is what the checker is actually told to look for. The keys it
+# understands, per validation:
+#
+#   TOPIC  topics   list of topic names to watch for (required to run at all)
+#          mode     "restrict" (default: the topics are forbidden) or "allow"
+#   PII    entities list of entity labels to detect; omitted = the checker's own
+#          language two-letter language code; omitted = the checker's own
+#   any    validation  address a bespoke validator by name
+#          patterns    label -> regular expression, for the mirrored trace scan
+#
+# Anything else is passed through untouched.
+
+TOPIC_MODES: Final[tuple[str, ...]] = ("restrict", "allow")
+MAX_CONFIG_LIST_ITEMS: Final[int] = 50
+MAX_CONFIG_ITEM_LENGTH: Final[int] = 120
+
+
+def _names(value: Any, key: str) -> list[str]:
+    """A config list of names: trimmed, blanks dropped, duplicates folded."""
+    if not isinstance(value, (list, tuple)) or not all(isinstance(item, str) for item in value):
+        raise ValueError(f"config.{key} must be a list of names")
+    seen: dict[str, str] = {}
+    for item in value:
+        trimmed = item.strip()
+        if trimmed:
+            seen.setdefault(trimmed.lower(), trimmed)
+    names = list(seen.values())
+    if len(names) > MAX_CONFIG_LIST_ITEMS:
+        raise ValueError(f"config.{key} may hold at most {MAX_CONFIG_LIST_ITEMS} names")
+    if any(len(name) > MAX_CONFIG_ITEM_LENGTH for name in names):
+        raise ValueError(
+            f"each name in config.{key} may be at most {MAX_CONFIG_ITEM_LENGTH} characters"
+        )
+    return names
+
+
+def normalise_config(guardrail_type: str, config: dict[str, Any] | None) -> dict[str, Any]:
+    """The config as it is stored, or ``ValueError`` saying what is wrong with it.
+
+    Only the shape of the keys the checker understands is policed. A malformed
+    value is refused here because the checker refuses the *whole request* that
+    carries it -- discovered at ingest, by which time nobody is looking.
+    """
+    cleaned = dict(config or {})
+    name = validation_name(guardrail_type, cleaned).upper()
+
+    if "topics" in cleaned:
+        cleaned["topics"] = _names(cleaned["topics"], "topics")
+    if "entities" in cleaned:
+        cleaned["entities"] = _names(cleaned["entities"], "entities")
+    if name == "TOPIC" and "mode" in cleaned and cleaned["mode"] not in TOPIC_MODES:
+        raise ValueError("config.mode must be 'restrict' or 'allow'")
+    if "language" in cleaned and not (
+        isinstance(cleaned["language"], str) and cleaned["language"].strip()
+    ):
+        raise ValueError("config.language must be a language code such as 'en'")
+
+    patterns = cleaned.get("patterns")
+    if patterns is not None:
+        if not isinstance(patterns, dict):
+            raise ValueError("config.patterns must map a label to a regular expression")
+        for label, pattern in patterns.items():
+            try:
+                re.compile(str(pattern))
+            except re.error as exc:
+                raise ValueError(
+                    f"config.patterns[{label!r}] is not a valid regular expression: {exc}"
+                ) from exc
+    return cleaned
+
+
+def config_problem(guardrail_type: str, config: dict[str, Any] | None) -> str | None:
+    """Why the checker cannot run this guardrail as configured, if it cannot.
+
+    A guardrail like this is kept -- it is somebody's unfinished work -- but it is
+    never sent to the checker, and the read model says it is not enforced.
+    """
+    if validation_name(guardrail_type, config).upper() == "TOPIC":
+        topics = (config or {}).get("topics")
+        if not (isinstance(topics, list) and any(str(topic).strip() for topic in topics)):
+            return (
+                "No topics are configured, so the content checker has nothing to look "
+                "for. Add at least one topic (config.topics)."
+            )
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Reads
 # ---------------------------------------------------------------------------
+
+
+#: What actually happens to live content under a guardrail. See GuardrailRead.
+Enforcement = Literal[
+    "enforced", "shadow", "disabled", "unsupported", "misconfigured", "suspended"
+]
 
 
 class MatchedSpan(BaseModel):
@@ -146,6 +248,19 @@ class GuardrailRead(BaseModel):
         description="Whether this deployment's inline scanner implements the "
         "validation; a rule it does not implement is recorded but never "
         "enforced at ingest, and the screen must say so.",
+    )
+    enforcement: Enforcement = Field(
+        "enforced",
+        description="What actually happens to live content: 'enforced' (Active and "
+        "runnable), 'shadow' (Tuning: evaluated and recorded, never enforced), "
+        "'disabled', 'unsupported' (the scanner does not implement the validation), "
+        "'misconfigured' (the config cannot be run, e.g. a Topic guardrail with no "
+        "topics) or 'suspended' (the scanner recently failed this check and it is "
+        "not being asked for again yet).",
+    )
+    not_enforced_reason: str | None = Field(
+        None,
+        description="One sentence saying why, whenever enforcement is not 'enforced'.",
     )
 
     created_at: dt.datetime
@@ -193,6 +308,17 @@ class GuardrailsSummary(BaseModel):
         None, description="Mean added latency across active guardrails"
     )
     last_triggered_at: dt.datetime | None = None
+    not_enforced: int = Field(
+        0,
+        description="Active guardrails that are NOT being enforced right now: "
+        "unsupported by the scanner, misconfigured, or suspended.",
+    )
+    suspended_validations: list[str] = Field(
+        default_factory=list,
+        description="Validations the scanner recently proved unable to run, as seen "
+        "by the worker that answered. Guardrails of these types are not enforced "
+        "until the suspension lapses.",
+    )
 
 
 # ---------------------------------------------------------------------------

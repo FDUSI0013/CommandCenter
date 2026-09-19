@@ -17,6 +17,7 @@ from typing import Annotated, Any, Generic, TypeVar
 from fastapi import Query
 from pydantic import BaseModel, Field
 from sqlalchemy import Select, func, or_, select
+from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import InstrumentedAttribute
 
@@ -98,6 +99,18 @@ def apply_sort(
     default: InstrumentedAttribute,
     default_desc: bool = True,
 ) -> Select:
+    """Order the list -- totally, and the same way on every database.
+
+    Two things made a sorted table unreliable. NULLs: Postgres sorts them as
+    the largest value and SQLite as the smallest, so ``-last_run_at`` opened
+    with every never-run row in production and closed with them under test. A
+    value that was never recorded is not the newest or the oldest of anything;
+    it goes last whichever way the column is sorted. And ties: ordering by a
+    column whose values repeat (a status, a name, a timestamp shared by a bulk
+    write) leaves the order *within* a tie to the planner, which may choose
+    differently for OFFSET 0 and OFFSET 25 -- a row turns up on two pages and
+    another on none. The primary key breaks every tie the same way each time.
+    """
     if params.sort_key:
         column = sortable.get(params.sort_key)
         if column is None:
@@ -105,8 +118,34 @@ def apply_sort(
                 f"Cannot sort by '{params.sort_key}'.",
                 details={"sortable": sorted(sortable)},
             )
-        return stmt.order_by(column.desc() if params.descending else column.asc())
-    return stmt.order_by(default.desc() if default_desc else default.asc())
+        descending = params.descending
+    else:
+        column, descending = default, default_desc
+    ordering = column.desc() if descending else column.asc()
+    return stmt.order_by(ordering.nulls_last(), *_tiebreak(stmt, descending))
+
+
+def _tiebreak(stmt: Select, descending: bool) -> list[Any]:
+    """The listed entity's primary key, where the statement can be ordered by it.
+
+    An aggregate or DISTINCT statement cannot: Postgres refuses an ORDER BY
+    term that is neither grouped nor selected, and those lists are short enough
+    not to page. An aliased entity is left alone too -- its key would have to be
+    the alias's, not the table's.
+    """
+    if getattr(stmt, "_group_by_clauses", ()) or getattr(stmt, "_distinct", False):
+        return []
+    entity = next(
+        (d["entity"] for d in stmt.column_descriptions if d.get("entity") is not None),
+        None,
+    )
+    if not isinstance(entity, type):
+        return []
+    # Ids are time-ordered (UUIDv7), so following the sort's direction keeps
+    # "newest first" reading newest first inside a tie as well.
+    return [
+        key.desc() if descending else key.asc() for key in sa_inspect(entity).primary_key
+    ]
 
 
 def apply_filters(stmt: Select, filters: dict[InstrumentedAttribute, Any]) -> Select:

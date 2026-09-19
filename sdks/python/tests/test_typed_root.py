@@ -180,3 +180,36 @@ def test_the_module_level_decorator_uses_the_default_client(stub: StubServer) ->
         assert row["spans"][0]["usage"] == {"prompt_tokens": 5, "completion_tokens": 7}
     finally:
         fulcrum_ops.shutdown()
+
+
+def test_reporting_usage_never_breaks_an_agent_whose_telemetry_is_off() -> None:
+    """The documented one-liner, run on a laptop with no API key.
+
+    ``fulcrum_ops.current_span()`` answered ``None`` whenever there was no span
+    -- no key, a run not sampled in, a plain ``@trace`` root -- so the line the
+    docs tell a customer to add raised ``AttributeError`` inside their own
+    function exactly where the SDK was supposed to be doing nothing.
+    """
+
+    @trace(name="underwriting_insight", type="llm")
+    def insight() -> str:
+        step = fulcrum_ops.current_span()
+        step.set_model("gpt-5", "azure").set_usage(prompt_tokens=5, completion_tokens=7)
+        step.set_output({"decision": "refer"}).log("reported")
+        assert not step, "a span that records nothing must still read as absent"
+        return "refer"
+
+    try:
+        assert insight() == "refer"
+        # Outside anything traced, and as a context manager, it is just as inert.
+        with fulcrum_ops.current_span() as nothing:
+            nothing.set_cost(0.2)
+        assert isinstance(fulcrum_ops.current_span(), fulcrum_ops.NoopSpan)
+    finally:
+        fulcrum_ops.shutdown()
+
+
+def test_a_real_span_is_still_handed_out_when_there_is_one(client: FulcrumOps) -> None:
+    with client.span("classify", type="llm") as span:
+        assert fulcrum_ops.current_span() is span
+        assert fulcrum_ops.current_span()

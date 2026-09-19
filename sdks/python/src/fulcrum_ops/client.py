@@ -15,7 +15,10 @@ those are not telemetry and a silent failure there would be worse.
 from __future__ import annotations
 
 import atexit
+import dataclasses
+import json
 import logging
+import os
 import random
 import threading
 import time
@@ -32,6 +35,7 @@ from .limits import (
     MAX_EVENT_BODY_LENGTH,
     MAX_EVENT_SOURCE_LENGTH,
     MAX_GUARDRAIL_LENGTH,
+    MAX_ISSUE_TITLE_LENGTH,
     MAX_POLICY_LENGTH,
     MAX_RATING,
     MAX_REF_LENGTH,
@@ -58,12 +62,34 @@ __all__ = ["FulcrumOps", "configure", "get_client", "set_default_client", "shutd
 
 logger = logging.getLogger("fulcrum_ops")
 
+#: The feedback source an agent-raised issue is filed under. The control plane
+#: reads ``source`` through a closed list and files anything else as end-user
+#: feedback, which an agent judging its own answer is not; of the sources it
+#: knows, this is the one that says the verdict is about an agent response.
+ISSUE_SOURCE = "Agent Response Rating"
+
+#: How long the configuration document is trusted when it does not say. The
+#: control plane sends ``refresh_after_seconds``; the floor keeps a document that
+#: says ``0`` from turning every flush interval into a request.
+CONFIG_DEFAULT_REFRESH_SECONDS = 300.0
+CONFIG_MIN_REFRESH_SECONDS = 30.0
+#: How long to wait before asking again after a read that failed, by attempt.
+CONFIG_RETRY_DELAYS = (5.0, 30.0, 60.0, 120.0, 300.0)
+#: How long the first send waits for the start-up read, so that a run which ends
+#: in the process's first moments is not posted before the workspace's redaction
+#: rules have had a chance to arrive. Waited on the worker thread, never on the
+#: caller's, and bounded: a control plane that is down must not hold telemetry
+#: back for ever on the strength of rules nobody can fetch.
+BOOTSTRAP_GRACE_SECONDS = 5.0
+
 #: Every live client, so the atexit hook can flush all of them without keeping
 #: any of them alive past their last strong reference.
 _live_clients: "weakref.WeakSet[FulcrumOps]" = weakref.WeakSet()
 _default_client: Optional["FulcrumOps"] = None
 _default_lock = threading.Lock()
 _atexit_registered = False
+#: Whether this process has already been told that it has no API key.
+_warned_no_key = False
 
 
 class FulcrumOps:
@@ -112,6 +138,13 @@ class FulcrumOps:
         if self._options.debug:
             logging.getLogger("fulcrum_ops").setLevel(logging.DEBUG)
 
+        # What the constructor asked for, kept apart from what is in force. The
+        # configuration document narrows the live options, and it is read again
+        # every few minutes; narrowing from the already-narrowed values would
+        # make every limit a ratchet that an operator could tighten from the
+        # console and never loosen again without redeploying the fleet.
+        self._baseline: Options = dataclasses.replace(self._options)
+
         self._transport = Transport(self._options)
         self._flusher = Flusher(
             self._transport,
@@ -119,6 +152,8 @@ class FulcrumOps:
             on_error=self._handle_error,
             sleep=sleep if callable(sleep) else time.sleep,
             rng=rng,
+            on_tick=self._refresh_config_if_due,
+            prepare=self._prepare_row,
         )
         self._prompts = PromptCache(self._transport)
         self.datasets = Datasets(self._transport)
@@ -128,6 +163,15 @@ class FulcrumOps:
         self._config: Optional[Dict[str, Any]] = None
         self._config_etag: Optional[str] = None
         self._config_lock = threading.Lock()
+        # Bumped whenever the redaction rules change. A queued row remembers the
+        # revision it was built under, so one that was built before the rules in
+        # force arrived is put through them on its way out.
+        self._rules_revision = 0
+        self._rules_key = "[]"
+        self._config_due = 0.0  # monotonic; 0 means nothing is scheduled yet
+        self._config_failures = 0
+        self._bootstrapped = threading.Event()
+        self._grace_spent = False
         self._closed = False
         self._random = random.Random()
 
@@ -138,22 +182,55 @@ class FulcrumOps:
             set_default_client(self)
 
         if not self._options.enabled:
-            logger.debug(
-                "fulcrum-ops: reporting is disabled (no API key found in the argument, "
-                "FULCRUM_OPS_API_KEY, or FULCRUM_OPS_DISABLED is set)."
-            )
+            self._explain_disabled()
             return
+
+        if self._options.base_url_defaulted:
+            # Said once, here, because nothing later can say it: every request
+            # from now on fails as a plain connection error (or, worse, succeeds
+            # against some other service that happens to own the port), and
+            # neither outcome mentions that the address was never chosen.
+            logger.warning(
+                "fulcrum-ops: an API key is set but no control plane address is. Telemetry, "
+                "and the key with it, will be sent to the built-in default %s. Set "
+                "FULCRUM_OPS_BASE_URL (or pass base_url=) to your control plane, e.g. "
+                "https://controlplane.example.com.",
+                self._options.base_url,
+            )
 
         self._flusher.start()
         if self._options.bootstrap:
-            # Fire-and-forget: start-up must not block on the control plane, and
-            # a config document that arrives a moment late still applies,
-            # because payloads are not built until each span closes.
+            # Fire-and-forget: start-up must not block on the control plane. A
+            # document that arrives a moment late still applies — to payloads
+            # not built yet, and to rows already queued, which are put through
+            # the new rules before they are sent.
             threading.Thread(
                 target=self._bootstrap,
                 name="fulcrum-ops-bootstrap",
                 daemon=True,
             ).start()
+        else:
+            self._bootstrapped.set()
+
+    def _explain_disabled(self) -> None:
+        """Say why nothing will be reported — loudly, when it looks like a mistake.
+
+        Switched off on purpose is not news. No key at all usually is: the
+        variable is mistyped or was never exported, the agent runs perfectly,
+        ``flush()`` answers ``True``, and the first anybody hears of it is an
+        empty console a week later. Once per process, not per client, so a
+        codebase that builds clients freely does not repeat itself.
+        """
+        global _warned_no_key
+        if self._options.disabled_on_purpose or self._options.api_key or _warned_no_key:
+            logger.debug("fulcrum-ops: reporting is disabled for this client.")
+            return
+        _warned_no_key = True
+        logger.warning(
+            "fulcrum-ops: no API key found (api_key= or FULCRUM_OPS_API_KEY), so nothing will "
+            "be reported. The agent is unaffected. Set FULCRUM_OPS_DISABLED=1 to switch "
+            "reporting off on purpose and silence this message."
+        )
 
     # ------------------------------------------------------------ properties
 
@@ -232,6 +309,7 @@ class FulcrumOps:
         agent: Optional[str] = None,
         model: Optional[str] = None,
         provider: Optional[str] = None,
+        thread_id: Optional[str] = None,
     ) -> Span:
         """Open a span inside the current trace.
 
@@ -245,12 +323,25 @@ class FulcrumOps:
         Called with no trace open, it starts one named after the span and closes
         it at the same time, so a single instrumented function is still a
         complete run rather than an orphan.
+
+        That implicit trace is built here but not made current here: the span
+        takes it into the context when it is entered (``with client.span(...)``)
+        and out again when it exits. A span that is only ever ``end()``-ed —
+        which is how the provider wrappers use this — never touches the context
+        at all, so it cannot leave anything behind in it.
+
+        ``thread_id`` names the conversation for that implicit run, which has no
+        other place to be told; a run that is already open and has no thread
+        takes it too, and one that has a thread keeps its own.
         """
         trace = _context.current_trace()
         owns_trace = trace is None
         if trace is None:
-            trace = self.trace(name, agent=agent, metadata=metadata, tags=tags)
-            trace.__enter__()
+            trace = self.trace(
+                name, agent=agent, metadata=metadata, tags=tags, thread_id=thread_id
+            )
+        elif thread_id and not trace.thread_id:
+            trace.set_thread_id(thread_id)
 
         span = trace.span(
             name,
@@ -289,9 +380,10 @@ class FulcrumOps:
         if not self.enabled or not trace.sampled:
             return
         try:
+            revision = self._rules_revision  # read first: a change mid-build is redone
             payload = trace.to_payload()
             spans = len(payload.get("spans") or [])
-            self._flusher.submit("traces", payload, spans=spans)
+            self._flusher.submit("traces", payload, spans=spans, stamp=revision)
         except Exception as exc:  # noqa: BLE001 - a broken payload must not break the agent
             self._handle_error(to_fulcrum_error(exc, "Failed to serialise a trace."), "trace")
 
@@ -302,7 +394,10 @@ class FulcrumOps:
         if span.trace is not None and not span.trace.sampled:
             return
         try:
-            self._flusher.submit("spans", span.to_payload(include_trace_id=True), spans=1)
+            revision = self._rules_revision
+            self._flusher.submit(
+                "spans", span.to_payload(include_trace_id=True), spans=1, stamp=revision
+            )
         except Exception as exc:  # noqa: BLE001
             self._handle_error(to_fulcrum_error(exc, "Failed to serialise a span."), "span")
 
@@ -452,18 +547,41 @@ class FulcrumOps:
         Use this when the agent itself can tell something went wrong — a
         retrieval that returned nothing, a tool that answered nonsense — rather
         than waiting for a person to notice and complain.
+
+        It travels as negative feedback. The ingest contract is a closed set —
+        guardrail, policy and feedback events — and refuses the whole row for
+        any other kind or any field it does not know, so an ``issue.reported``
+        event with a ``title`` was queued, answered ``True`` here, and then
+        thrown away by the control plane at flush. An agent complaining about
+        its own answer *is* feedback, so that is the kind it goes out as, and
+        the Feedback inbox is where it lands. The title leads the body, because
+        the body is what that screen lists; the structured copy rides in
+        ``detail``, which the control plane stores verbatim, so nobody has to
+        parse the severity back out of prose.
         """
-        event: Dict[str, Any] = {"kind": "issue.reported"}
-        cleaned = clamp_text(title, MAX_EVENT_BODY_LENGTH)
+        cleaned = clamp_text(title, MAX_ISSUE_TITLE_LENGTH)
         if not cleaned:
             return False
-        event["title"] = cleaned
         allowed = ("Critical", "High", "Medium", "Low")
         chosen = str(severity or "Medium").strip().title()
-        event["severity"] = chosen if chosen in allowed else "Medium"
-        body = clamp_text(detail, MAX_EVENT_BODY_LENGTH)
-        if body:
-            event["body"] = body
+        chosen = chosen if chosen in allowed else "Medium"
+        explanation = clamp_text(detail, MAX_EVENT_BODY_LENGTH)
+        event: Dict[str, Any] = {
+            "kind": "feedback.submitted",
+            "sentiment": "negative",
+            "severity": chosen,
+            "source": ISSUE_SOURCE,
+            "body": clamp_text(
+                "{0}\n\n{1}".format(cleaned, explanation) if explanation else cleaned,
+                MAX_EVENT_BODY_LENGTH,
+            ),
+            "detail": {
+                "reported_as": "issue",
+                "reported_by": "agent",
+                "title": cleaned,
+                "severity": chosen,
+            },
+        }
         return self._submit_event(event, trace_id=trace_id, agent=agent, ref=ref)
 
     def log_guardrail_event(
@@ -480,6 +598,7 @@ class FulcrumOps:
         ref: Optional[str] = None,
     ) -> bool:
         """Report a guardrail the SDK enforced locally, in the customer's process."""
+        revision = self._rules_revision
         event: Dict[str, Any] = {"kind": "guardrail.triggered"}
         name = clamp_text(guardrail, MAX_GUARDRAIL_LENGTH)
         if not name:
@@ -502,7 +621,7 @@ class FulcrumOps:
             event["sample"] = self._redact(sample_text, "input")
         if span_id:
             event["span_id"] = clamp_text(span_id, MAX_TARGET_ID_LENGTH)
-        return self._submit_event(event, trace_id=trace_id, agent=agent, ref=ref)
+        return self._submit_event(event, trace_id=trace_id, agent=agent, ref=ref, stamp=revision)
 
     def log_policy_violation(
         self,
@@ -520,6 +639,7 @@ class FulcrumOps:
         name = clamp_text(policy, MAX_POLICY_LENGTH)
         if not name:
             return False
+        revision = self._rules_revision
         event: Dict[str, Any] = {"kind": "policy.violation", "policy": name}
         for key, value, cap in (
             ("severity", severity, MAX_SEVERITY_LENGTH),
@@ -532,7 +652,7 @@ class FulcrumOps:
             event["detail"] = self._redact(to_json_safe(detail), "metadata")
         if span_id:
             event["span_id"] = clamp_text(span_id, MAX_TARGET_ID_LENGTH)
-        return self._submit_event(event, trace_id=trace_id, agent=agent, ref=ref)
+        return self._submit_event(event, trace_id=trace_id, agent=agent, ref=ref, stamp=revision)
 
     def _submit_event(
         self,
@@ -541,6 +661,7 @@ class FulcrumOps:
         trace_id: Optional[str],
         agent: Optional[str],
         ref: Optional[str],
+        stamp: Optional[int] = None,
     ) -> bool:
         if not self.enabled:
             return False
@@ -555,7 +676,7 @@ class FulcrumOps:
         reference = clamp_text(ref, MAX_REF_LENGTH)
         if reference:
             event["ref"] = reference
-        return self._flusher.submit("events", event)
+        return self._flusher.submit("events", event, stamp=stamp)
 
     # --------------------------------------------------------------- prompts
 
@@ -626,6 +747,7 @@ class FulcrumOps:
             "GET", "ingest/config", headers=headers, timeout=timeout
         )
         if response.status == 304 and cached is not None:
+            self._schedule_config(cached)
             return cached
         if not response.ok:
             from .errors import error_from_response
@@ -646,13 +768,74 @@ class FulcrumOps:
         try:
             self.config()
         except Exception as exc:  # noqa: BLE001 - start-up must not fail on this
+            self._config_failed(exc)
+        finally:
+            self._bootstrapped.set()
+
+    def _refresh_config_if_due(self) -> None:
+        """Keep the configuration current. Runs on the flusher thread, each time it wakes.
+
+        The document used to be read exactly once, at start-up, with no second
+        try. A process that started while the control plane was restarting ran
+        for the rest of its life with no redaction rules at all, and a Mask
+        guardrail or a lower sampling rate set in the console reached no agent
+        until somebody redeployed it. The document says how long it is good for
+        (``refresh_after_seconds``); a read that fails is tried again after 5 s,
+        30 s, a minute, and so on. Revalidated with the ETag, a refresh that
+        finds nothing changed is one 304.
+        """
+        if not self._options.bootstrap or not self.enabled:
+            return
+        if not self._bootstrapped.is_set() and not self._grace_spent:
+            # Once. The grace is for the run that ends in the process's first
+            # moments; a start-up read that is still hanging after it -- a
+            # control plane that accepts the connection and then says nothing
+            # for thirty seconds -- must not cost every flush in that window
+            # another five.
+            self._grace_spent = True
+            self._bootstrapped.wait(timeout=BOOTSTRAP_GRACE_SECONDS)
+        due = self._config_due
+        if not due or time.monotonic() < due:
+            return
+        try:
+            self.config(refresh=True, timeout=min(self._options.timeout_seconds, 10.0))
+        except Exception as exc:  # noqa: BLE001 - housekeeping never raises into the worker
+            self._config_failed(exc)
+
+    def _schedule_config(self, document: Mapping[str, Any]) -> None:
+        try:
+            lifetime = float(document.get("refresh_after_seconds") or CONFIG_DEFAULT_REFRESH_SECONDS)
+        except (TypeError, ValueError):
+            lifetime = CONFIG_DEFAULT_REFRESH_SECONDS
+        if self._config_failures:
+            logger.info("fulcrum-ops: the SDK configuration was read after %d failed attempt(s)",
+                        self._config_failures)
+        self._config_failures = 0
+        self._config_due = time.monotonic() + max(CONFIG_MIN_REFRESH_SECONDS, lifetime)
+
+    def _config_failed(self, exc: BaseException) -> None:
+        delay = CONFIG_RETRY_DELAYS[min(self._config_failures, len(CONFIG_RETRY_DELAYS) - 1)]
+        self._config_failures += 1
+        self._config_due = time.monotonic() + delay
+        if self._config_failures == 1:
+            # Once per outage. The retries that follow are routine, and a
+            # warning every minute for as long as the control plane is away
+            # would teach people to filter this logger out.
             self._handle_error(
                 to_fulcrum_error(exc, "Could not read the SDK configuration."), "config"
             )
+        else:
+            logger.debug("fulcrum-ops: the SDK configuration is still unreadable", exc_info=exc)
 
     def _apply_config(self, document: Mapping[str, Any], etag: Optional[str]) -> None:
-        """Narrow the local options to whatever the deployment enforces."""
+        """Narrow the local options to whatever the deployment enforces.
+
+        Always from what the constructor asked for, never from the values
+        already in force, so that a limit the console relaxes is relaxed here
+        at the next refresh — up to the constructor's own value and no further.
+        """
         options = self._options
+        baseline = self._baseline
 
         def stricter_number(key: str, current: float, minimum: float = 0.0) -> float:
             raw = document.get(key)
@@ -666,41 +849,50 @@ class FulcrumOps:
                 return current
             return min(current, value)
 
-        options.sampling_rate = stricter_number("sampling_rate", options.sampling_rate)
+        options.sampling_rate = stricter_number("sampling_rate", baseline.sampling_rate)
         options.batch_max_spans = int(
-            stricter_number("batch_max_spans", options.batch_max_spans, 1)
+            stricter_number("batch_max_spans", baseline.batch_max_spans, 1)
         )
         options.batch_max_bytes = int(
-            stricter_number("batch_max_bytes", options.batch_max_bytes, 1_024)
+            stricter_number("batch_max_bytes", baseline.batch_max_bytes, 1_024)
         )
         options.flush_interval_seconds = stricter_number(
-            "flush_interval_seconds", options.flush_interval_seconds, 0.05
+            "flush_interval_seconds", baseline.flush_interval_seconds, 0.05
         )
-        options.max_queue_size = int(stricter_number("max_queue_size", options.max_queue_size, 1))
+        options.max_queue_size = int(stricter_number("max_queue_size", baseline.max_queue_size, 1))
         options.retry_max_attempts = int(
-            stricter_number("retry_max_attempts", options.retry_max_attempts, 0)
+            stricter_number("retry_max_attempts", baseline.retry_max_attempts, 0)
         )
         options.retry_backoff_seconds = max(
-            0.001, float(document.get("retry_backoff_seconds") or options.retry_backoff_seconds)
+            0.001, float(document.get("retry_backoff_seconds") or baseline.retry_backoff_seconds)
         )
 
-        # Capture is a conjunction: either side may switch content off, neither
-        # may switch it back on.
-        if document.get("capture_input") is False:
-            options.capture_input = False
-        if document.get("capture_output") is False:
-            options.capture_output = False
+        # Capture is a conjunction: either side may switch content off, and
+        # neither may switch on what the other has off.
+        options.capture_input = baseline.capture_input and document.get("capture_input") is not False
+        options.capture_output = (
+            baseline.capture_output and document.get("capture_output") is not False
+        )
 
-        if not options.agent and document.get("agent_name"):
+        if not baseline.agent and document.get("agent_name"):
             options.agent = str(document["agent_name"])
-        if not options.environment and document.get("environment"):
+        if not baseline.environment and document.get("environment"):
             options.environment = str(document["environment"])
 
-        rules = compile_rules(list(document.get("redaction") or []) + list(options.redaction))
+        served = list(document.get("redaction") or [])
+        rules = compile_rules(served + list(options.redaction))
+        try:
+            rules_key = json.dumps(served, sort_keys=True, default=str)
+        except (TypeError, ValueError):
+            rules_key = repr(served)
         with self._config_lock:
             self._rules = rules
             self._config = dict(document)
             self._config_etag = etag
+            if rules_key != self._rules_key:
+                self._rules_key = rules_key
+                self._rules_revision += 1
+        self._schedule_config(document)
 
         unsupported = sorted(
             {
@@ -733,6 +925,51 @@ class FulcrumOps:
         except Exception:  # noqa: BLE001 - redaction failing open would be worse than a lost span
             logger.warning("fulcrum-ops: redaction failed; dropping the field rather than sending it")
             return None
+
+    def _prepare_row(self, kind: str, item: Any) -> None:
+        """Put a queued row through the rules in force, if it was built under older ones.
+
+        Payloads are built, and redacted, on the caller's thread when a run
+        ends — which can be before the start-up read has answered, or while the
+        control plane was unreachable and the queue was holding rows for it.
+        Those rows went out carrying whatever the *server's* rules would have
+        removed. Called by the flusher for every row just before it is sent.
+        """
+        revision = self._rules_revision
+        if item.stamp is None or item.stamp == revision:
+            return
+        payload = item.payload
+        try:
+            if kind in ("traces", "spans"):
+                self._redact_row(payload)
+                for span in payload.get("spans") or []:
+                    self._redact_row(span)
+            elif kind == "events":
+                if payload.get("sample") is not None:
+                    payload["sample"] = self._redact(payload["sample"], "input")
+                if payload.get("kind") == "policy.violation" and payload.get("detail"):
+                    payload["detail"] = self._redact(payload["detail"], "metadata") or {}
+        except Exception:  # noqa: BLE001 - fail closed, as ``_redact`` does
+            logger.warning(
+                "fulcrum-ops: could not re-apply redaction to a queued row; "
+                "sending it without its content"
+            )
+            for row in [payload] + [r for r in payload.get("spans") or [] if isinstance(r, dict)]:
+                for field in ("input", "output", "metadata", "sample", "detail"):
+                    row.pop(field, None)
+        item.stamp = revision
+
+    def _redact_row(self, row: Dict[str, Any]) -> None:
+        for field in ("input", "output"):
+            if row.get(field) is not None:
+                row[field] = self._redact(row[field], field)
+        if row.get("metadata") is not None:
+            redacted = self._redact(row["metadata"], "metadata")
+            if redacted is None:
+                # Not nullable on the wire; see ``_payload_common``.
+                row.pop("metadata", None)
+            else:
+                row["metadata"] = redacted
 
     # -------------------------------------------------------------- lifetime
 
@@ -793,6 +1030,14 @@ class FulcrumOps:
             }
         )
         return snapshot
+
+    def _reset_after_fork(self) -> None:
+        """Make this client usable in a forked child. Called in the child only."""
+        self._config_lock = threading.Lock()
+        self._bootstrapped = threading.Event()
+        self._bootstrapped.set()
+        self._flusher._reset_after_fork()
+        self._transport._reset_after_fork()
 
     def _handle_error(self, error: FulcrumOpsError, operation: str) -> None:
         """Route an absorbed failure to the caller's handler, then to the log."""
@@ -878,6 +1123,28 @@ def shutdown(timeout: Optional[float] = 5.0) -> None:
             client.close(timeout=timeout if client.options.flush_on_exit else 0.0)
         except Exception:  # noqa: BLE001 - shutdown must not raise
             pass
+
+
+def _after_fork_in_child() -> None:
+    """Rebuild what ``fork()`` does not carry over.
+
+    A pre-forking server -- gunicorn with ``--preload``, Celery's prefork pool --
+    that calls ``configure()`` at import hands every worker a client whose
+    flusher thread exists only in the parent. Nothing the workers traced was
+    ever sent, nothing was logged, and each ``flush()`` stalled its request for
+    the full timeout waiting on a thread that was not there.
+    """
+    global _default_lock
+    _default_lock = threading.Lock()
+    for client in list(_live_clients):
+        try:
+            client._reset_after_fork()
+        except Exception:  # noqa: BLE001 - a fork hook must never raise into the child
+            pass
+
+
+if hasattr(os, "register_at_fork"):  # not on Windows, which cannot fork
+    os.register_at_fork(after_in_child=_after_fork_in_child)
 
 
 def _register_atexit() -> None:

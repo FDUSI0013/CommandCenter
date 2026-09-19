@@ -35,7 +35,8 @@ from typing import Any, Final
 
 from fastapi import Request
 from sqlalchemy import Select, func, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import update as sa_update
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -45,11 +46,12 @@ from ..core.errors import (
     AppError,
     Conflict,
     NotFound,
+    PermissionDenied,
     PreconditionFailed,
     ValidationFailed,
 )
 from ..db.session import get_sessionmaker
-from ..engine import EngineClient, EngineError, EngineNotFound, get_engine_client
+from ..engine import EngineClient, EngineError, get_engine_client
 from ..models.identity import Role, User
 from ..models.quality import (
     RunTrigger,
@@ -60,7 +62,6 @@ from ..models.quality import (
     TestSuite,
 )
 from ..models.registry import Agent
-from ..schemas.evaluations import average_score, metric_values
 from ..schemas.testing import (
     CASE_PASS_SCORE,
     FLAKY_WINDOW_RUNS,
@@ -84,6 +85,7 @@ from ..schemas.testing import (
     TestSuiteCreate,
     TestSuiteRead,
     TestSuiteUpdate,
+    case_score,
     describe_cron,
     next_fire,
     verdict_for,
@@ -96,8 +98,8 @@ from .evaluations import (
     PHASE_SCORING,
     POLL_SECONDS,
     REGISTER_PHASE_WEIGHT,
+    TRACE_LINK_WINDOW_DAYS,
     dataset_case_total,
-    experiment_scored_count,
     find_dataset_item_traces,
     item_experiment_result,
     namespaced,
@@ -118,8 +120,30 @@ RUN_ENTITY: Final[str] = "test_run"
 #: Window the KPI cards measure over.
 WINDOW_DAYS: Final[int] = 30
 
-#: A run may take this long before the supervisor stops waiting for verdicts.
-EXECUTION_DEADLINE_SECONDS: Final[float] = 1800.0
+#: A run may take this long, start to finish, before the supervisor concludes it
+#: with the verdicts it has. Counted from the moment the run starts — the same
+#: instant the scheduler's stale-run sweep counts from — so the sweep can never
+#: reap a run its own supervisor is still inside.
+EXECUTION_DEADLINE_SECONDS: Final[float] = 600.0
+
+#: Once the number of judged cases has stopped moving for this long, the run is
+#: concluded with the verdicts it has. A verdict is a score on the trace an SDK
+#: experiment left for the case; nothing in the platform judges a case after
+#: the run starts, so the only thing worth waiting for is a score still on its
+#: way into the store — a matter of seconds, not of the half hour this used to
+#: spend on every run with one unscored case.
+SETTLE_SECONDS: Final[float] = 60.0
+
+#: The scoring poll starts at the evaluation supervisor's cadence and backs off
+#: to this. Each poll re-reads every case a page at a time, so a fixed three
+#: seconds was hundreds of store reads for a run that was only waiting.
+POLL_MAX_SECONDS: Final[float] = 15.0
+POLL_BACKOFF: Final[float] = 1.6
+
+#: How long the runner keeps looking for a run row it was handed before it
+#: concludes the request that queued it was rolled back.
+RUN_ROW_WAIT_SECONDS: Final[float] = 5.0
+RUN_ROW_POLL_SECONDS: Final[float] = 0.25
 
 #: Cases read back per engine round trip, and the ceiling on one run's cases.
 CASE_PAGE_SIZE: Final[int] = 100
@@ -141,6 +165,10 @@ TERMINAL_STATUSES: Final[frozenset[str]] = frozenset(
         TestRunStatus.ERROR.value,
         TestRunStatus.CANCELLED.value,
     }
+)
+LIVE_STATUSES: Final[tuple[str, ...]] = (
+    TestRunStatus.QUEUED.value,
+    TestRunStatus.RUNNING.value,
 )
 
 SORTABLE: Final[dict[str, Any]] = {
@@ -396,6 +424,9 @@ class RunState:
     failed: int = 0
     phase: str = PHASE_PREPARING
     detail: str | None = None
+    #: Set to cut the scoring poll's sleep short, so a run cancelled on this
+    #: worker stops now rather than at its next poll.
+    wake: asyncio.Event = dataclasses.field(default_factory=asyncio.Event)
 
 
 class SuiteRunner:
@@ -418,9 +449,22 @@ class SuiteRunner:
     def state(self, run_id: str) -> RunState | None:
         return self._state.get(run_id)
 
+    def nudge(self, run_id: str) -> None:
+        """Have the run's supervisor, if it lives here, re-read its row now.
+
+        The row is the authority on whether a run has been cancelled; this only
+        saves the supervisor the rest of its sleep. A run another worker drives
+        notices at its own next poll.
+        """
+        state = self._state.get(run_id)
+        if state is not None:
+            state.wake.set()
+
     def _forget(self, run_id: str, task: asyncio.Task[None]) -> None:
         if self._tasks.get(run_id) is task:
             self._tasks.pop(run_id, None)
+            # The row is terminal by now and answers every later progress read.
+            self._state.pop(run_id, None)
         if task.cancelled():
             return
         error = task.exception()
@@ -448,8 +492,29 @@ class SuiteRunner:
         client = get_engine_client()
 
         async with get_sessionmaker()() as session:
-            run = await _load_run(session, workspace_id, run_id)
-            if run is None or run.status in TERMINAL_STATUSES:
+            # The runner is started by whoever queued the run, and that caller's
+            # transaction may not have landed yet. Returning quietly on a row
+            # that is merely not visible *yet* is what left runs Queued with
+            # nobody driving them, so look again for a few seconds first — each
+            # look in a fresh transaction, so it sees what has committed since.
+            # The row is held from the look to the Running write below, so a
+            # cancel lands wholly before it (and is seen) or wholly after it.
+            run = await _load_run(session, workspace_id, run_id, lock=True)
+            waited = 0.0
+            while run is None and waited < RUN_ROW_WAIT_SECONDS:
+                await session.rollback()
+                await asyncio.sleep(RUN_ROW_POLL_SECONDS)
+                waited += RUN_ROW_POLL_SECONDS
+                run = await _load_run(session, workspace_id, run_id, lock=True)
+            if run is None:
+                log.warning(
+                    "test run %s never became visible (waited %.1fs); its request "
+                    "was rolled back, so there is nothing to drive",
+                    run_id,
+                    waited,
+                )
+                return
+            if run.status in TERMINAL_STATUSES:
                 return
             suite = await session.get(TestSuite, run.suite_id)
             if suite is None:
@@ -463,6 +528,7 @@ class SuiteRunner:
             run.status = TestRunStatus.RUNNING.value
             run.started_at = _now()
             await session.commit()
+        deadline = asyncio.get_running_loop().time() + EXECUTION_DEADLINE_SECONDS
 
         dataset = await resolve_dataset(client, namespace, dataset_ref)
         dataset_id = str(dataset.get("id") or "")
@@ -501,14 +567,21 @@ class SuiteRunner:
         def _registered(done: int) -> None:
             state.processed = done
 
+        if await self._publish(run_id, workspace_id, state) not in LIVE_STATUSES:
+            return  # cancelled (or reaped) while it was being prepared
+
         # Same linking the evaluation supervisor does: cases an SDK experiment
-        # already ran carry their traces (and scores) into this run's diff.
+        # already ran carry their traces (and scores) into this run's diff. The
+        # dataset is named so the store is asked for that experiment's traces
+        # only: reading each project's newest few hundred traces of any kind
+        # lost the experiment as soon as the agent had real traffic, and every
+        # case of a suite that had been scored then registered bare.
         try:
             async with get_sessionmaker()() as session:
                 trace_links = await find_dataset_item_traces(
-                    client, session, workspace_id, agent_id=suite_agent_id
+                    client, session, workspace_id, agent_id=suite_agent_id, dataset=dataset_ref
                 )
-        except Exception:  # noqa: BLE001 - the lookup is an optimisation
+        except Exception:  # noqa: BLE001 - a run with nothing linked says so at the end
             log.exception("dataset-item trace lookup failed; registering bare")
             trace_links = {}
 
@@ -523,44 +596,132 @@ class SuiteRunner:
         state.processed = total
         state.phase = PHASE_SCORING
 
-        cases = await self._await_cases(client, experiment_id, dataset_id, total, state)
-        await self._finish(run_id, workspace_id, cases, total)
+        cases = await self._await_cases(
+            client,
+            run_id=run_id,
+            workspace_id=workspace_id,
+            experiment_id=experiment_id,
+            dataset_id=dataset_id,
+            total=total,
+            linked=frozenset(trace_links),
+            deadline=deadline,
+            state=state,
+        )
+        if cases is None:
+            return  # somebody else ended the run; its row is theirs
+        linked = sum(1 for case in cases if case.get("id") in trace_links)
+        await self._finish(run_id, workspace_id, cases, total, linked=linked)
 
     async def _await_cases(
         self,
         client: EngineClient,
+        *,
+        run_id: str,
+        workspace_id: str,
         experiment_id: str | None,
         dataset_id: str,
         total: int,
+        linked: frozenset[str],
+        deadline: float,
         state: RunState,
-    ) -> list[dict[str, Any]]:
-        """Poll until every case has a verdict, or the deadline passes."""
-        deadline = asyncio.get_running_loop().time() + EXECUTION_DEADLINE_SECONDS
-        cases: list[dict[str, Any]] = []
-        while True:
-            if experiment_id is not None:
-                with contextlib.suppress(EngineNotFound):
-                    payload = await client.get_experiment(experiment_id)
-                    state.scored = min(total, experiment_scored_count(payload))
+    ) -> list[dict[str, Any]] | None:
+        """Poll until every case that can have a verdict has one.
 
+        A case's verdict is the score on the trace an SDK experiment left for
+        it. A case registered without a trace has nothing that will ever judge
+        it, so waiting for *every* case meant a dataset with one unlinked case
+        always waited out the whole deadline — half an hour of three-second
+        polls, with the suite refusing Run and Delete the entire time. The wait
+        is for the linked cases only, it ends early once the count has stopped
+        moving (:data:`SETTLE_SECONDS`), and the poll backs off while it waits.
+
+        Each poll also writes what it measured onto the run row and reads the
+        row's status back: that is how a progress read served by another worker
+        shows real counts without an engine call, and how a cancel reaches a
+        supervisor that lives elsewhere. ``None`` means the run was ended by
+        someone else and must not be finished here.
+        """
+        loop = asyncio.get_running_loop()
+        interval = POLL_SECONDS
+        last_scored = -1
+        last_change = loop.time()
+        while True:
+            # Cleared before the row is read, not after: a cancel commits and
+            # then nudges, so a nudge that lands from here on is either already
+            # visible in the row below or cuts the sleep short.
+            state.wake.clear()
             cases = await _read_cases(client, dataset_id, experiment_id, total)
-            scored = sum(
-                1
-                for case in cases
-                if case.get("status") in (CaseStatus.PASSED.value, CaseStatus.FAILED.value)
-            )
-            state.scored = max(state.scored, scored)
             state.passed = sum(
                 1 for case in cases if case.get("status") == CaseStatus.PASSED.value
             )
             state.failed = sum(
                 1 for case in cases if case.get("status") == CaseStatus.FAILED.value
             )
-            if scored >= total:
+            state.scored = state.passed + state.failed
+            judgeable = sum(1 for case in cases if case.get("id") in linked)
+
+            now = loop.time()
+            if state.scored != last_scored:
+                last_scored, last_change = state.scored, now
+                interval = POLL_SECONDS  # verdicts are arriving: look again soon
+
+            if await self._publish(run_id, workspace_id, state) not in LIVE_STATUSES:
+                return None
+            if state.scored >= min(total, judgeable):
                 return cases
-            if asyncio.get_running_loop().time() >= deadline:
+            settled_at = last_change + SETTLE_SECONDS
+            if now >= settled_at or now >= deadline:
                 return cases
-            await asyncio.sleep(POLL_SECONDS)
+
+            pause = max(0.05, min(interval, settled_at - now, deadline - now))
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(state.wake.wait(), timeout=pause)
+            interval = min(POLL_MAX_SECONDS, interval * POLL_BACKOFF)
+
+    async def _publish(self, run_id: str, workspace_id: str, state: RunState) -> str | None:
+        """Write the live counters onto the run row; return the row's status.
+
+        The counters go into ``summary.progress`` rather than the ``passed`` and
+        ``failed`` columns: those are a finished run's result, and the KPI cards
+        add them up. The write is conditional on the run still being live, so a
+        cancel that lands between the read and the write is never overwritten.
+        This is bookkeeping: a database that is briefly out of connections costs
+        one progress write, not the run, and the next poll looks again.
+        """
+        try:
+            return await self._publish_counters(run_id, workspace_id, state)
+        except SQLAlchemyError:
+            log.warning("test run %s: progress was not written this poll", run_id, exc_info=True)
+            return TestRunStatus.RUNNING.value
+
+    async def _publish_counters(
+        self, run_id: str, workspace_id: str, state: RunState
+    ) -> str | None:
+        async with get_sessionmaker()() as session:
+            run = await _load_run(session, workspace_id, run_id)
+            if run is None:
+                return None
+            if run.status not in LIVE_STATUSES:
+                return run.status
+            summary = {
+                **(run.summary or {}),
+                "progress": {
+                    "phase": state.phase,
+                    "total": state.total,
+                    "processed": state.processed,
+                    "scored": state.scored,
+                    "passed": state.passed,
+                    "failed": state.failed,
+                },
+            }
+            await session.execute(
+                sa_update(TestRun)
+                .where(TestRun.id == run_id, TestRun.status.in_(LIVE_STATUSES))
+                .values(summary=summary)
+                .execution_options(synchronize_session=False)
+            )
+            await session.commit()
+            return run.status
 
     async def _finish(
         self,
@@ -568,10 +729,15 @@ class SuiteRunner:
         workspace_id: str,
         cases: Sequence[dict[str, Any]],
         total: int,
+        *,
+        linked: int = 0,
     ) -> None:
         async with get_sessionmaker()() as session:
-            run = await _load_run(session, workspace_id, run_id)
-            if run is None:
+            run = await _load_run(session, workspace_id, run_id, lock=True)
+            # A run that was cancelled, or that the stale-run sweep already
+            # reaped, has its terminal state; writing a verdict over it would
+            # bring a run the user stopped back as Passed.
+            if run is None or run.status in TERMINAL_STATUSES:
                 return
             suite = await session.get(TestSuite, run.suite_id)
 
@@ -605,10 +771,8 @@ class SuiteRunner:
             }
             if passed + failed == 0:
                 run.status = TestRunStatus.ERROR.value
-                detail = (
-                    "The telemetry store returned no verdicts within "
-                    f"{int(EXECUTION_DEADLINE_SECONDS)}s."
-                )
+                detail = _no_verdicts(suite.dataset_ref if suite else None, total, linked)
+                run.summary = {**run.summary, "error": detail}
             else:
                 run.status = (
                     TestRunStatus.PASSED.value if failed == 0 else TestRunStatus.FAILED.value
@@ -649,7 +813,9 @@ class SuiteRunner:
 
     async def _abandon(self, run_id: str, workspace_id: str, reason: str) -> None:
         async with get_sessionmaker()() as session:
-            run = await _load_run(session, workspace_id, run_id)
+            # Locked for the same reason _finish locks: a run the user has just
+            # cancelled stays Cancelled, whatever went wrong here meanwhile.
+            run = await _load_run(session, workspace_id, run_id, lock=True)
             if run is None or run.status in TERMINAL_STATUSES:
                 return
             run.status = TestRunStatus.ERROR.value
@@ -706,8 +872,7 @@ async def _read_cases(
                 continue
             data = row.get("data") if isinstance(row.get("data"), dict) else {}
             result = item_experiment_result(row, experiment_id) or {}
-            scores = metric_values(result.get("feedback_scores") or result.get("scores"))
-            score = average_score(dict(scores))
+            score = case_score(result.get("feedback_scores") or result.get("scores"))
             if score is None:
                 status = CaseStatus.UNSCORED.value
             elif score >= CASE_PASS_SCORE:
@@ -730,18 +895,34 @@ async def _read_cases(
     return cases
 
 
+def _no_verdicts(dataset: str | None, total: int, linked: int) -> str:
+    """Why a run ended with nothing graded, in terms the user can act on."""
+    name = f"'{dataset}'" if dataset else "the dataset"
+    if linked == 0:
+        return (
+            f"None of the {total} case(s) in {name} has an SDK experiment trace from the "
+            f"last {TRACE_LINK_WINDOW_DAYS} days, so there was nothing to grade. Run "
+            "client.evaluate(...) over the dataset with the SDK first: a suite run "
+            "grades the scores those traces carry."
+        )
+    return (
+        f"{linked} of {total} case(s) in {name} were linked to SDK experiment traces, "
+        "but none of those traces carries a score."
+    )
+
+
 async def _load_run(
-    session: AsyncSession, workspace_id: str, run_id: str | None
+    session: AsyncSession, workspace_id: str, run_id: str | None, *, lock: bool = False
 ) -> TestRun | None:
+    """One run. ``lock`` holds the row until the transaction ends, so the two
+    writers of a terminal state — the supervisor finishing and a user
+    cancelling — decide one after the other instead of over each other."""
     if not run_id:
         return None
-    return (
-        await session.execute(
-            select(TestRun).where(
-                TestRun.workspace_id == workspace_id, TestRun.id == run_id
-            )
-        )
-    ).scalar_one_or_none()
+    stmt = select(TestRun).where(TestRun.workspace_id == workspace_id, TestRun.id == run_id)
+    if lock:
+        stmt = stmt.with_for_update()
+    return (await session.execute(stmt)).scalar_one_or_none()
 
 
 async def execute_run(run_id: str, workspace_id: str) -> None:
@@ -880,6 +1061,7 @@ def _suite_read(
         pass_rate=(last_finished.pass_rate if last_finished else suite.pass_rate),
         last_run_at=suite.last_run_at,
         last_run_id=latest.id if latest else None,
+        last_finished_run_id=last_finished.id if last_finished else None,
         next_run_at=(
             next_fire(suite.schedule_cron, _now()) if suite.schedule_cron else None
         ),
@@ -1129,7 +1311,15 @@ async def get_run_detail(
 async def get_progress(
     session: AsyncSession, principal: Principal, suite_id: str, run_id: str
 ) -> TestRunProgress:
-    """Real progress: measured counts from the runner, or from the engine."""
+    """Real progress: measured counts from the runner, or from the run row.
+
+    The worker driving the run answers from its live counters. Any other worker
+    answers from the counters that supervisor writes onto the row at every poll.
+    It used to ask the engine instead, on every 1.4 s poll of the modal, and what
+    it read back was the number of cases *registered* — so the bar sat at 99%
+    with every case "scored" and Passed/Failed flickering to 0 whenever the poll
+    landed on a worker that did not own the run.
+    """
     await get_suite(session, principal, suite_id)
     run = await get_run(session, principal, run_id)
     if run.suite_id != suite_id:
@@ -1137,27 +1327,38 @@ async def get_progress(
 
     terminal = run.status in TERMINAL_STATUSES
     state = runner.state(run_id)
-    total = run.total_cases
-    processed = run.total_cases if terminal else 0
-    scored = run.passed + run.failed if terminal else 0
-    passed, failed = run.passed, run.failed
-    phase = PHASE_FINISHED if terminal else PHASE_PREPARING
-    detail = (run.summary or {}).get("error")
+    summary = run.summary or {}
+    measured = summary.get("progress") if isinstance(summary.get("progress"), dict) else {}
 
-    if state is not None and not terminal:
+    def _measured(key: str) -> int:
+        value = measured.get(key)
+        return int(value) if isinstance(value, (int, float)) else 0
+
+    total = run.total_cases
+    detail = summary.get("error")
+    if terminal and (run.status in FINISHED_STATUSES or not measured):
+        processed = run.total_cases
+        scored = run.passed + run.failed
+        passed, failed = run.passed, run.failed
+        phase = PHASE_FINISHED
+    elif state is not None and not terminal:
         total = state.total or total
         processed = state.processed
         scored = state.scored
         passed, failed = state.passed, state.failed
         phase = state.phase
         detail = state.detail or detail
-    elif not terminal and run.engine_experiment_id:
-        client = get_engine_client()
-        with contextlib.suppress(EngineError):
-            payload = await client.get_experiment(run.engine_experiment_id)
-            scored = min(total, experiment_scored_count(payload))
-            processed = total
-            phase = PHASE_SCORING
+    else:
+        # Driven by another worker, or stopped part-way (cancelled, errored):
+        # what had been measured the last time its supervisor looked.
+        total = _measured("total") or total
+        processed = _measured("processed")
+        scored = _measured("scored")
+        passed, failed = _measured("passed"), _measured("failed")
+        phase = PHASE_FINISHED if terminal else str(measured.get("phase") or PHASE_PREPARING)
+    if run.status == TestRunStatus.CANCELLED.value and not detail:
+        actor = summary.get("cancelled_by")
+        detail = f"Cancelled by {actor}." if isinstance(actor, str) and actor else "Cancelled."
 
     if terminal:
         percent = 100.0
@@ -1216,6 +1417,23 @@ async def _validate_agent(
         raise NotFound(f"Agent '{agent_id}' does not exist.")
 
 
+def _require_scheduler(principal: Principal) -> None:
+    """Setting, changing or clearing a cadence is an operator's call.
+
+    ``/testing/schedules`` has always said so. But a suite's cron is also a plain
+    field of the suite, and the suites endpoints ask only for the member role --
+    so a member could create a suite on ``*/5 * * * *``, re-point a Production
+    suite's cadence, or clear the schedule an operator had set, and was refused
+    only on the Schedules tab. The gate belongs to the field, whichever door it
+    is reached through.
+    """
+    if not principal.role.satisfies(Role.OPERATOR):
+        raise PermissionDenied(
+            "Scheduling a suite requires the operator role; "
+            f"you have {principal.role.value}. Leave the schedule out, or ask an operator."
+        )
+
+
 async def create_suite(
     session: AsyncSession,
     principal: Principal,
@@ -1225,6 +1443,8 @@ async def create_suite(
 ) -> TestSuite:
     """Create a suite once its dataset is known to exist in the engine."""
     principal.require(Role.MEMBER)
+    if payload.schedule_cron is not None:
+        _require_scheduler(principal)
     await _validate_agent(session, principal, payload.agent_id)
 
     clash = (
@@ -1271,7 +1491,11 @@ async def create_suite(
             f"{suite.suite_type} suite on {suite.environment} "
             f"over {suite.dataset_ref} ({case_count} case(s))"
         ),
-        metadata={"dataset": suite.dataset_ref, "cases": case_count},
+        metadata={
+            "dataset": suite.dataset_ref,
+            "cases": case_count,
+            **({"cron": suite.schedule_cron} if suite.schedule_cron else {}),
+        },
         request=request,
     )
     await session.flush()
@@ -1299,6 +1523,10 @@ async def update_suite(
     changes = payload.model_dump(exclude_unset=True, exclude={"expected_updated_at"})
     if not changes:
         return suite
+
+    previous_cron = suite.schedule_cron
+    if "schedule_cron" in changes and changes["schedule_cron"] != previous_cron:
+        _require_scheduler(principal)
 
     if "name" in changes and changes["name"] != suite.name:
         clash = (
@@ -1343,7 +1571,15 @@ async def update_suite(
         entity_label=suite.name,
         source_screen=SOURCE_SCREEN,
         detail="Updated " + ", ".join(sorted(changes)),
-        metadata={"fields": sorted(changes)},
+        metadata=(
+            {"fields": sorted(changes)}
+            if suite.schedule_cron == previous_cron
+            else {
+                "fields": sorted(changes),
+                "previous_cron": previous_cron,
+                "cron": suite.schedule_cron,
+            }
+        ),
         request=request,
     )
     await session.flush()
@@ -1473,6 +1709,54 @@ async def start_run(
     return run
 
 
+async def cancel_run(
+    session: AsyncSession,
+    principal: Principal,
+    suite_id: str,
+    run_id: str,
+    *,
+    request: Request | None = None,
+) -> TestRun:
+    """Stop a queued or running run.
+
+    The row is the authority: it is marked Cancelled here, and the supervisor —
+    on whichever worker it lives — reads that at its next poll and stops without
+    writing a verdict. Whatever had been measured stays on the row as progress;
+    a cancelled run has no pass rate and is never offered as a baseline. The
+    suite can be run again, or deleted, straight away.
+    """
+    principal.require(Role.MEMBER)
+    suite = await get_suite(session, principal, suite_id)
+    run = await _load_run(session, principal.workspace_id, run_id, lock=True)
+    if run is None or run.suite_id != suite.id:
+        raise NotFound(f"Test run '{run_id}' does not belong to suite '{suite_id}'.")
+    if run.status in TERMINAL_STATUSES:
+        raise Conflict(f"Run '{run.run_ref}' has already ended ({run.status}).")
+
+    # Like a run that errored part-way, it carries no duration: the KPI cards
+    # average that column, and a stopped run did not take "that long to run".
+    run.status = TestRunStatus.CANCELLED.value
+    run.finished_at = _now()
+    run.summary = {**(run.summary or {}), "cancelled_by": principal.actor}
+    await session.flush()
+
+    await audit.record(
+        session,
+        principal=principal,
+        action="test_run.cancelled",
+        entity_type=RUN_ENTITY,
+        entity_id=run.id,
+        entity_label=run.run_ref,
+        source_screen=SOURCE_SCREEN,
+        detail=f"Cancelled {suite.name} run {run.run_ref}",
+        metadata={"suite_id": suite.id},
+        request=request,
+    )
+    await session.flush()
+    await session.refresh(run)
+    return run
+
+
 async def promote_baseline(
     session: AsyncSession,
     principal: Principal,
@@ -1562,6 +1846,15 @@ async def compare_runs(
         raise ValidationFailed("Choose two different runs to compare.")
     baseline = await get_run(session, principal, baseline_id)
     candidate = await get_run(session, principal, candidate_id)
+    # Only a finished run holds verdicts. Diffing against one that is queued,
+    # running, errored or cancelled reported every baseline case as "Removed"
+    # under a verdict of "Unchanged" -- a comparison that is not one.
+    for run in (baseline, candidate):
+        if run.status not in FINISHED_STATUSES:
+            raise PreconditionFailed(
+                f"Run '{run.run_ref}' is {run.status}; only a finished run holds "
+                "verdicts to compare."
+            )
 
     deltas = _diff_cases(_cases_of(baseline), _cases_of(candidate))
     regressions = sum(1 for delta in deltas if delta.is_regression)
@@ -1600,7 +1893,13 @@ async def compare_runs(
 async def list_baselines(
     session: AsyncSession, principal: Principal, params: ListParams
 ) -> tuple[list[BaselineRead], int]:
-    """The Baselines tab: each suite's baseline against its newest finished run."""
+    """The Baselines tab: each suite's baseline against its newest finished run.
+
+    The candidate is the newest finished run *since the baseline*. Promoting the
+    latest run is the normal flow, and the tab then used to offer the run before
+    it as the candidate -- a delta computed older-minus-newer, and a Promote
+    Candidate button that walked the baseline backwards.
+    """
     rows, total = await paginate(session, _filtered_stmt(principal, params), params)
     if not rows:
         return [], total
@@ -1631,6 +1930,14 @@ async def list_baselines(
             for run in runs.get(suite.id, ())
             if run.status in FINISHED_STATUSES and run.id != suite.baseline_run_id
         ]
+        if baseline is not None:
+            # The baseline row is loaded by id, so this holds even once it has
+            # aged out of the recent-runs window: every run in it is then newer.
+            finished = [
+                run
+                for run in finished
+                if _as_utc(run.created_at) > _as_utc(baseline.created_at)
+            ]
         candidate = finished[0] if finished else None
         delta = (
             None

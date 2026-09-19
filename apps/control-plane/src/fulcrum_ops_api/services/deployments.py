@@ -45,7 +45,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..api.common import ListParams, apply_filters, apply_search, apply_sort, paginate
 from ..api.deps import Principal
-from ..core.errors import Conflict, NotFound, PreconditionFailed
+from ..core.errors import Conflict, NotFound, PermissionDenied, PreconditionFailed
 from ..db.session import get_sessionmaker
 from ..models.governance import (
     ApprovalRequest,
@@ -116,6 +116,16 @@ MAX_REFERENCE_PROBES = 200
 
 STREAM_POLL_SECONDS = 1.0
 STREAM_MAX_SECONDS = 900.0
+
+# How long a freshly started runner keeps looking for a deployment it cannot see
+# yet (its caller's commit has not landed) before it concludes there is none.
+ROW_VISIBLE_ATTEMPTS = 10
+ROW_VISIBLE_WAIT_SECONDS = 0.25
+
+# How long past its allowance a pipeline may sit still before it is taken to
+# have lost its runner. Stages run for seconds, so a minute is never a slow
+# runner; it is a worker that was restarted underneath one.
+ORPHAN_GRACE_SECONDS = 60.0
 
 
 # --------------------------------------------------------------------------- #
@@ -1097,6 +1107,136 @@ async def halt_deployment(
     return deployment
 
 
+def _assert_second_pair_of_eyes(
+    principal: Principal, deployment: Deployment, approval_request: ApprovalRequest | None
+) -> None:
+    """Opening the gate takes a person, and not the person who asked.
+
+    The gate exists to put a release in front of someone other than whoever
+    started it; Approvals & Audit refuses a requester deciding their own
+    request, and this verb decides the very same request. OPERATOR outranks
+    APPROVER, so without this every operator who could start a release could
+    also wave it through. A key has no user id, so every comparison below
+    would let it pass -- it is refused outright, as the queue refuses it.
+    Refusing the gate is not held to this: withdrawing your own release is a
+    halt, which its owner may always do.
+    """
+    if principal.kind != "user" or principal.user_id is None:
+        raise PermissionDenied("A release must be approved by a signed-in person.")
+    raised_by = {deployment.triggered_by_user_id}
+    if approval_request is not None:
+        raised_by.add(approval_request.requested_by_user_id)
+    if principal.user_id in raised_by:
+        raise PermissionDenied(
+            f"You started {deployment.deployment_ref}; a different reviewer has to approve it."
+        )
+
+
+async def _open_gate(
+    session: AsyncSession,
+    principal: Principal,
+    deployment: Deployment,
+    stage: DeploymentStage,
+    *,
+    note: str | None,
+    decided_at: dt.datetime,
+    request: Request | None,
+    via: ApprovalRequest | None = None,
+) -> None:
+    """Mark the Approval stage passed. The caller resumes the pipeline.
+
+    ``via`` is set when the decision was taken on the request itself, in
+    Approvals & Audit, and is only being carried through to the release.
+    """
+    stage.status = DeploymentStageStatus.APPROVED.value
+    stage.finished_at = decided_at
+    stage.log = note or (
+        f"Approved by {principal.actor} (request {via.request_ref})."
+        if via is not None
+        else f"Approved by {principal.actor}."
+    )
+    stage.detail = {
+        **(stage.detail or {}),
+        "approved_by": principal.actor,
+        "approved_at": decided_at.isoformat(),
+    }
+    deployment.updated_by = principal.actor
+    await session.flush()
+
+    await audit.record(
+        session,
+        principal=principal,
+        action="deployment.approve",
+        entity_type="Deployment",
+        entity_id=deployment.id,
+        entity_label=deployment.deployment_ref,
+        source_screen=SOURCE_SCREEN,
+        detail=(
+            f"Approved {deployment.version} for release via {via.request_ref}."
+            if via is not None
+            else f"Approved {deployment.version} for release."
+        ),
+        metadata={"approval_request_id": deployment.approval_request_id},
+        request=request,
+    )
+
+
+async def _shut_gate(
+    session: AsyncSession,
+    principal: Principal,
+    deployment: Deployment,
+    stage: DeploymentStage,
+    *,
+    note: str | None,
+    decided_at: dt.datetime,
+    request: Request | None,
+    via: ApprovalRequest | None = None,
+) -> None:
+    """The gate refused to open, which is a halt rather than a failure."""
+    # The runner is parked at the gate, so cancelling it is a formality.
+    runner.cancel(deployment.id)
+    reason = note or (
+        f"Rejected by {principal.actor} (request {via.request_ref})."
+        if via is not None
+        else f"Rejected by {principal.actor}."
+    )
+    stage.status = DeploymentStageStatus.FAILED.value
+    stage.finished_at = decided_at
+    stage.log = reason
+    stage.detail = {
+        **(stage.detail or {}),
+        "rejected_by": principal.actor,
+        "rejected_at": decided_at.isoformat(),
+    }
+    for pending in await _stages_for(session, deployment.id):
+        if pending.status == DeploymentStageStatus.PENDING.value:
+            pending.status = DeploymentStageStatus.SKIPPED.value
+            pending.finished_at = decided_at
+            pending.log = "Skipped: approval was not given."
+
+    deployment.status = DeploymentStatus.HALTED.value
+    deployment.finished_at = decided_at
+    deployment.duration_seconds = _elapsed_seconds(deployment.started_at, decided_at)
+    deployment.updated_by = principal.actor
+    await session.flush()
+
+    await audit.record(
+        session,
+        principal=principal,
+        action="deployment.reject",
+        entity_type="Deployment",
+        entity_id=deployment.id,
+        entity_label=deployment.deployment_ref,
+        source_screen=SOURCE_SCREEN,
+        detail=reason,
+        metadata={
+            "approval_request_id": deployment.approval_request_id,
+            **({"request_status": via.status} if via is not None else {}),
+        },
+        request=request,
+    )
+
+
 async def approve_deployment(
     session: AsyncSession,
     principal: Principal,
@@ -1105,20 +1245,33 @@ async def approve_deployment(
     *,
     request: Request | None = None,
 ) -> tuple[Deployment, bool]:
-    """Decide the approval gate.
+    """Decide the approval gate from the Deployments screen.
 
     Returns the deployment and whether the pipeline should resume — the route
-    schedules :func:`run_pipeline` when it should.
+    commits and then schedules :func:`run_pipeline` when it should.
+
+    The gate's ``ApprovalRequest`` is the record of the decision, and it can be
+    decided from two screens. Whichever gets there first wins: a request a
+    reviewer has already closed in Approvals & Audit is never rewritten from
+    here. Agreeing with it carries the decision through to a release that was
+    left parked; disagreeing with it is a conflict.
     """
     principal.require(Role.APPROVER)
     deployment = await _get_deployment(session, principal, deployment_id)
+
+    # Locked, as the queue locks it, so the two screens decide one at a time;
+    # then the release is re-read, because what the lock waited for may have
+    # been the other screen halting it.
+    approval_request = await _approval_request_for(session, deployment, for_update=True)
+    if approval_request is not None:
+        await session.refresh(deployment)
 
     if deployment.is_terminal:
         raise Conflict(
             f"{deployment.deployment_ref} already finished with status {deployment.status}."
         )
 
-    stage = await _stage_named(session, deployment.id, STAGE_APPROVAL)
+    stage = await _stage_named(session, deployment.id, STAGE_APPROVAL, fresh=True)
     if stage is None:
         raise PreconditionFailed(
             f"{deployment.deployment_ref} has no approval stage to decide."
@@ -1131,89 +1284,108 @@ async def approve_deployment(
         )
 
     decided_at = _now()
-    approval_request = await _approval_request_for(session, deployment)
-
-    if payload.approved:
-        stage.status = DeploymentStageStatus.APPROVED.value
-        stage.finished_at = decided_at
-        stage.log = payload.note or f"Approved by {principal.actor}."
-        stage.detail = {
-            **(stage.detail or {}),
-            "approved_by": principal.actor,
-            "approved_at": decided_at.isoformat(),
-        }
-        if approval_request is not None:
-            _decide_approval(
-                approval_request,
-                status=ApprovalStatus.APPROVED.value,
-                note=stage.log,
-                actor=principal.actor,
-                decided_by_user_id=principal.user_id,
-                decided_at=decided_at,
+    already_decided = approval_request is not None and not approval_request.is_open
+    if already_decided:
+        was_approved = approval_request.status == ApprovalStatus.APPROVED.value
+        if was_approved != payload.approved:
+            raise Conflict(
+                f"Request {approval_request.request_ref} was already "
+                f"{approval_request.status.lower()} in Approvals & Audit, and that "
+                "decision stands. "
+                + (
+                    f"Halt {deployment.deployment_ref} to stop the release."
+                    if was_approved
+                    else f"Reject or halt {deployment.deployment_ref}, then start a new "
+                    "deployment to try again."
+                )
             )
-        deployment.updated_by = principal.actor
-        await session.flush()
+    elif payload.approved:
+        _assert_second_pair_of_eyes(principal, deployment, approval_request)
 
-        await audit.record(
-            session,
-            principal=principal,
-            action="deployment.approve",
-            entity_type="Deployment",
-            entity_id=deployment.id,
-            entity_label=deployment.deployment_ref,
-            source_screen=SOURCE_SCREEN,
-            detail=f"Approved {deployment.version} for release.",
-            metadata={"approval_request_id": deployment.approval_request_id},
-            request=request,
-        )
-        return deployment, True
-
-    # Rejected: the gate refused to open, which is a halt rather than a failure.
-    runner.cancel(deployment.id)
-    note = payload.note or f"Rejected by {principal.actor}."
-    stage.status = DeploymentStageStatus.FAILED.value
-    stage.finished_at = decided_at
-    stage.log = note
-    stage.detail = {
-        **(stage.detail or {}),
-        "rejected_by": principal.actor,
-        "rejected_at": decided_at.isoformat(),
-    }
-    for pending in await _stages_for(session, deployment.id):
-        if pending.status == DeploymentStageStatus.PENDING.value:
-            pending.status = DeploymentStageStatus.SKIPPED.value
-            pending.finished_at = decided_at
-            pending.log = "Skipped: approval was rejected."
-
-    deployment.status = DeploymentStatus.HALTED.value
-    deployment.finished_at = decided_at
-    deployment.duration_seconds = _elapsed_seconds(deployment.started_at, decided_at)
-    deployment.updated_by = principal.actor
-
-    if approval_request is not None:
+    if approval_request is not None and not already_decided:
+        verdict = ApprovalStatus.APPROVED if payload.approved else ApprovalStatus.REJECTED
         _decide_approval(
             approval_request,
-            status=ApprovalStatus.REJECTED.value,
-            note=note,
+            status=verdict.value,
+            note=payload.note or f"{verdict.value} by {principal.actor}.",
             actor=principal.actor,
             decided_by_user_id=principal.user_id,
             decided_at=decided_at,
         )
-    await session.flush()
 
-    await audit.record(
+    gate = _open_gate if payload.approved else _shut_gate
+    await gate(
         session,
-        principal=principal,
-        action="deployment.reject",
-        entity_type="Deployment",
-        entity_id=deployment.id,
-        entity_label=deployment.deployment_ref,
-        source_screen=SOURCE_SCREEN,
-        detail=note,
-        metadata={"approval_request_id": deployment.approval_request_id},
+        principal,
+        deployment,
+        stage,
+        note=payload.note,
+        decided_at=decided_at,
         request=request,
+        via=approval_request if already_decided else None,
     )
-    return deployment, False
+    return deployment, payload.approved
+
+
+async def apply_gate_decision(
+    *,
+    session: AsyncSession,
+    principal: Principal,
+    approval_request: ApprovalRequest,
+    approved: bool,
+    note: str | None,
+    request: Request | None = None,
+) -> bool:
+    """Carry a decision taken in Approvals & Audit through to the release it gates.
+
+    The runner opens the gate's request and exits; nothing looks at a parked
+    stage again. So the queue -- where the request is actually decided, and
+    where the SLA sweeper expires it -- calls this in the same transaction,
+    after it has closed ``approval_request`` and enforced its own rules about
+    who may decide. The request row is the queue's and is not touched here.
+
+    ``approved=False`` covers a rejection and an expiry alike: the release is
+    halted and its environment freed. Returns True when the pipeline should
+    resume, which the caller does by scheduling :func:`run_pipeline` with the
+    deployment's id only AFTER it has committed. Returns False when there is
+    nothing to resume: not a gate, a release that already finished, or a gate
+    that is not open.
+
+    The release is found through its own pointer at the request, never through
+    the request's payload -- the payload is the requester's to write, and a
+    hand-raised request that merely names a deployment must not release it.
+    """
+    deployment = (
+        (
+            await session.execute(
+                select(Deployment).where(
+                    Deployment.workspace_id == approval_request.workspace_id,
+                    Deployment.approval_request_id == approval_request.id,
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if deployment is None or deployment.is_terminal:
+        return False
+
+    stage = await _stage_named(session, deployment.id, STAGE_APPROVAL)
+    if stage is None or stage.status != DeploymentStageStatus.RUNNING.value:
+        return False
+
+    gate = _open_gate if approved else _shut_gate
+    await gate(
+        session,
+        principal,
+        deployment,
+        stage,
+        note=note,
+        decided_at=_now(),
+        request=request,
+        via=approval_request,
+    )
+    return approved
 
 
 async def rollback_deployment(
@@ -1343,31 +1515,34 @@ async def _stages_for(session: AsyncSession, deployment_id: str) -> Sequence[Dep
 
 
 async def _stage_named(
-    session: AsyncSession, deployment_id: str, name: str
+    session: AsyncSession, deployment_id: str, name: str, *, fresh: bool = False
 ) -> DeploymentStage | None:
-    return (
-        await session.execute(
-            select(DeploymentStage).where(
-                DeploymentStage.deployment_id == deployment_id,
-                DeploymentStage.name == name,
-            )
-        )
-    ).scalar_one_or_none()
+    stmt = select(DeploymentStage).where(
+        DeploymentStage.deployment_id == deployment_id,
+        DeploymentStage.name == name,
+    )
+    if fresh:
+        # After waiting on a lock: the row as it is now, not as first loaded.
+        stmt = stmt.execution_options(populate_existing=True)
+    return (await session.execute(stmt)).scalar_one_or_none()
 
 
 async def _approval_request_for(
-    session: AsyncSession, deployment: Deployment
+    session: AsyncSession, deployment: Deployment, *, for_update: bool = False
 ) -> ApprovalRequest | None:
+    """The gate's request. ``for_update`` takes the same row lock the approvals
+    queue takes before it decides, so a decision here and a decision there are
+    made one after the other instead of over each other. SQLite has a single
+    writer and ignores the clause."""
     if not deployment.approval_request_id:
         return None
-    return (
-        await session.execute(
-            select(ApprovalRequest).where(
-                ApprovalRequest.id == deployment.approval_request_id,
-                ApprovalRequest.workspace_id == deployment.workspace_id,
-            )
-        )
-    ).scalar_one_or_none()
+    stmt = select(ApprovalRequest).where(
+        ApprovalRequest.id == deployment.approval_request_id,
+        ApprovalRequest.workspace_id == deployment.workspace_id,
+    )
+    if for_update:
+        stmt = stmt.with_for_update().execution_options(populate_existing=True)
+    return (await session.execute(stmt)).scalar_one_or_none()
 
 
 def _decide_approval(
@@ -1546,6 +1721,12 @@ class PipelineRunner:
         task.cancel()
         return True
 
+    def is_running(self, deployment_id: str) -> bool:
+        """True while THIS process is advancing the pipeline. Another worker's
+        runner is invisible from here, which is why recovery goes by the clock."""
+        task = self._tasks.get(deployment_id)
+        return task is not None and not task.done()
+
     def _forget(self, deployment_id: str, task: asyncio.Task[None]) -> None:
         if self._tasks.get(deployment_id) is task:
             self._tasks.pop(deployment_id, None)
@@ -1557,6 +1738,8 @@ class PipelineRunner:
 
     async def _run(self, deployment_id: str, workspace_id: str) -> None:
         try:
+            if not await self._wait_until_visible(deployment_id, workspace_id):
+                return
             while True:
                 started = await self._start_next_stage(deployment_id, workspace_id)
                 if started is None:
@@ -1572,6 +1755,25 @@ class PipelineRunner:
             # through: a halt has already written the terminal state itself.
             log.exception("deployment pipeline %s aborted", deployment_id)
             await self._abandon(deployment_id, workspace_id)
+
+    async def _wait_until_visible(self, deployment_id: str, workspace_id: str) -> bool:
+        """Look for the deployment a few times before concluding it is not there.
+
+        The routes commit before they start a pipeline, so the row is normally
+        there on the first look. This is the second guard: a caller that starts
+        the runner a moment before its own commit lands must not strand the
+        release Queued, which is what giving up on the first miss did.
+        """
+        for attempt in range(ROW_VISIBLE_ATTEMPTS):
+            if attempt:
+                await asyncio.sleep(ROW_VISIBLE_WAIT_SECONDS)
+            async with get_sessionmaker()() as session:
+                if await self._load(session, deployment_id, workspace_id) is not None:
+                    return True
+        log.warning(
+            "deployment pipeline %s never found its row; nothing was started", deployment_id
+        )
+        return False
 
     async def _start_next_stage(
         self, deployment_id: str, workspace_id: str
@@ -1880,10 +2082,103 @@ runner = PipelineRunner()
 async def run_pipeline(deployment_id: str, workspace_id: str) -> None:
     """Background entry point used by the routes.
 
-    Scheduled with ``BackgroundTasks`` so it fires after the request's
-    transaction has committed and the pipeline sees the rows it must advance.
+    ``BackgroundTasks`` does NOT wait for the request's transaction: it runs
+    before the request-scoped session commits. The runner works on its own
+    connection, so the caller must ``await session.commit()`` before scheduling
+    this -- otherwise the pipeline looks for rows nobody else can see yet.
     """
     runner.start(deployment_id, workspace_id)
+
+
+async def recover_orphaned_pipelines(*, grace_seconds: float = ORPHAN_GRACE_SECONDS) -> int:
+    """Pick up pipelines whose runner died with its worker. Returns how many.
+
+    The runner is an asyncio task in one worker's memory. A redeploy, an OOM
+    kill or a recycled worker during the few seconds a stage takes leaves the
+    deployment ``Running`` with nobody driving it, and nothing else ever looks:
+    the release never finishes and its environment refuses every deploy,
+    promote, rollback and restart until somebody notices and halts it by hand.
+    Test runs and evaluations have a sweeper for exactly this; this is the
+    deployments' one, meant to be called from the platform scheduler's tick
+    (which already runs in one worker at a time).
+
+    A runner in another worker cannot be seen from here, so an orphan is told
+    by the clock: a stage still Running well past the time the runner allows
+    it, or a next stage still Pending long after the last one finished (a
+    healthy runner starts it within milliseconds). A release parked at its
+    approval gate is waiting for a person, not for a runner, and is never
+    touched -- the approvals queue settles those.
+
+    The interrupted stage is put back to Pending and the pipeline is resumed
+    rather than failed: the stages are the control plane's own and repeatable,
+    and a restart of this service is not a reason to fail somebody's release.
+    """
+    now = _now()
+    adopted: list[tuple[str, str]] = []
+    async with get_sessionmaker()() as session:
+        in_flight = (
+            (
+                await session.execute(
+                    select(Deployment)
+                    .where(Deployment.status.in_(IN_FLIGHT_STATUSES))
+                    # A row somebody is halting or deciding this instant is
+                    # theirs; the next tick will find it if it is still stuck.
+                    .with_for_update(skip_locked=True)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for deployment in in_flight:
+            if runner.is_running(deployment.id):
+                continue
+            stages = await _stages_for(session, deployment.id)
+            stage = next((s for s in stages if s.status not in STAGE_DONE_STATUSES), None)
+
+            allowed = grace_seconds
+            last_moved = deployment.started_at or deployment.created_at
+            if stage is not None and stage.status == DeploymentStageStatus.RUNNING.value:
+                if stage.name == STAGE_APPROVAL:
+                    continue
+                allowed += STAGE_RUNTIME_SECONDS.get(stage.name, 0.0)
+                last_moved = stage.started_at or last_moved
+            elif stage is None or stage.status == DeploymentStageStatus.PENDING.value:
+                finished = [s.finished_at for s in stages if s.finished_at is not None]
+                last_moved = max([*finished, last_moved])
+            else:
+                # Failed: closed out together with its deployment, never alone.
+                continue
+            if (now - last_moved).total_seconds() < allowed:
+                continue
+
+            if stage is not None and stage.status == DeploymentStageStatus.RUNNING.value:
+                stage.status = DeploymentStageStatus.PENDING.value
+                stage.started_at = None
+                stage.log = "Interrupted by a service restart; started again."
+            await audit.record(
+                session,
+                principal=_system_principal(deployment.workspace_id),
+                action="deployment.recovered",
+                entity_type="Deployment",
+                entity_id=deployment.id,
+                entity_label=deployment.deployment_ref,
+                source_screen=SOURCE_SCREEN,
+                detail=(
+                    f"Pipeline for {deployment.version} had stopped"
+                    + (f" at '{stage.name}'" if stage is not None else " before it was closed out")
+                    + "; it was picked up again."
+                ),
+                metadata={"stage": stage.name if stage is not None else None},
+            )
+            adopted.append((deployment.id, deployment.workspace_id))
+        await session.commit()
+
+    # Only now: the runner works on its own connection and must see the reset.
+    for deployment_id, workspace_id in adopted:
+        runner.start(deployment_id, workspace_id)
+    if adopted:
+        log.warning("resumed %d orphaned deployment pipeline(s)", len(adopted))
+    return len(adopted)
 
 
 # --------------------------------------------------------------------------- #

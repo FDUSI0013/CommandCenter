@@ -673,6 +673,13 @@ class IngestItemResult(BaseModel):
     reason: str | None = None
     agent_id: str | None = None
     spans: int = Field(0, description="Spans this item carried; drives OTLP partial success.")
+    spans_rejected: int = Field(
+        0,
+        description=(
+            "Spans of an accepted trace the telemetry store would not take. The trace "
+            "itself was stored; reason says why these were not."
+        ),
+    )
     policy_id: str | None = Field(None, description="Policy that blocked or masked the item.")
     guardrail_id: str | None = Field(None, description="Guardrail that blocked or masked it.")
     masked: bool = Field(False, description="Content was removed before storage.")

@@ -199,3 +199,49 @@ def test_over_long_event_fields_are_trimmed_to_the_contract(
     assert len(event["guardrail"]) == 160
     assert len(event["action_taken"]) == 24
     assert len(event["sample"]) == 500
+
+
+def test_an_issue_raised_by_the_agent_is_a_row_the_control_plane_stores(
+    client: FulcrumOps, stub: StubServer
+) -> None:
+    """``report_issue`` answered True and the control plane then refused the row.
+
+    It went out as ``issue.reported`` with a ``title``; the ingest contract has
+    neither, and its row model is closed, so every agent-raised issue was queued,
+    rejected at flush and never seen. The stub refuses what the real endpoint
+    refuses, so ``accepted`` here is the assertion.
+    """
+    assert client.report_issue(
+        "Retrieval returned nothing",
+        severity="high",
+        detail="The index answered 0 chunks for a question it should cover.",
+        trace_id="trace-1",
+        ref="issue-1",
+    ) is True
+    assert client.flush(timeout=5) is True
+
+    stats = client.stats()
+    assert stats["rejected"] == 0, stats["last_error"]
+    assert stats["accepted"] == 1
+
+    (event,) = sent(stub, "events")
+    assert event["kind"] == "feedback.submitted"
+    assert event["sentiment"] == "negative"
+    assert event["severity"] == "High"
+    assert event["body"].startswith("Retrieval returned nothing")
+    assert "0 chunks" in event["body"]
+    assert event["detail"] == {
+        "reported_as": "issue",
+        "reported_by": "agent",
+        "title": "Retrieval returned nothing",
+        "severity": "High",
+    }
+    assert event["trace_id"] == "trace-1"
+    assert event["ref"] == "issue-1"
+    assert "rating" not in event, "the agent did not rate anything; no star count is invented"
+
+
+def test_an_issue_with_no_title_is_not_sent(client: FulcrumOps, stub: StubServer) -> None:
+    assert client.report_issue("   ") is False
+    client.flush(timeout=5)
+    assert sent(stub, "events") == []

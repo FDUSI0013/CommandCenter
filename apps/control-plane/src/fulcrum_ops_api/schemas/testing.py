@@ -25,6 +25,7 @@ from croniter import croniter
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ..models.quality import RunTrigger, SuiteStatus, SuiteType, TestRunStatus
+from .evaluations import average_score, metric_values
 
 #: Pass rate at or above which a finished run reads as Passed, and below which
 #: it degrades to Warning before it is called Failed. These two numbers are the
@@ -34,6 +35,47 @@ WARNING_THRESHOLD_PERCENT: Final[float] = 75.0
 
 #: A case scores 0-1 in the engine; at or above this it counts as a pass.
 CASE_PASS_SCORE: Final[float] = 0.5
+
+
+def _numeric_score(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return 1.0 if value else 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
+def case_score(raw: Any) -> float | None:
+    """One case's 0-1 grade from the feedback scores its trace carries.
+
+    The four published metrics are read first, through the same aliases (and the
+    same inversion of hallucination-style scores) the Evaluations screen uses, so
+    a case judged on them grades exactly as it does there. But a suite is graded
+    by whatever scorers the team wrote, and the SDK names each score after the
+    scorer function — ``contains_expected``, ``equals_metric`` — which is none of
+    those aliases. Dropping them read a fully scored case as Unscored, and a run
+    of nothing but such cases as "no verdicts". When none of the known metrics is
+    present the grade is therefore the mean of every numeric score on the case,
+    clamped to 0-1 (a boolean scorer counts as 0 or 1). ``None`` still means what
+    it always did: nobody scored this case.
+    """
+    known = average_score(dict(metric_values(raw)))
+    if known is not None:
+        return known
+
+    if isinstance(raw, dict):
+        offered = list(raw.values())
+    elif isinstance(raw, (list, tuple)):
+        offered = [row.get("value") for row in raw if isinstance(row, dict)]
+    else:
+        return None
+    values = [
+        max(0.0, min(1.0, value))
+        for value in (_numeric_score(item) for item in offered)
+        if value is not None
+    ]
+    return round(sum(values) / len(values), 4) if values else None
+
 
 #: How many finished runs the flaky-test detector looks back over.
 FLAKY_WINDOW_RUNS: Final[int] = 10
@@ -204,7 +246,17 @@ class TestSuiteRead(BaseModel):
     case_count: int = 0
     pass_rate: float | None = Field(None, description="Percentage, from the last finished run")
     last_run_at: dt.datetime | None = None
-    last_run_id: str | None = None
+    last_run_id: str | None = Field(
+        None, description="Newest run of any status, including one still in flight"
+    )
+    last_finished_run_id: str | None = Field(
+        None,
+        description=(
+            "Newest run that finished with verdicts (Passed or Failed): the one to "
+            "compare against the baseline. A queued, running, errored or cancelled "
+            "run has no verdicts to diff."
+        ),
+    )
     next_run_at: dt.datetime | None = Field(None, description="Computed from schedule_cron")
     schedule_cron: str | None = None
     baseline_run_id: str | None = None
@@ -336,7 +388,7 @@ class BaselineRead(BaseModel):
     pass_rate_delta: float | None = None
     regressions: int = 0
     promotable: bool = Field(
-        description="True when a finished run exists that is not already the baseline"
+        description="True when a finished run newer than the baseline exists"
     )
 
 

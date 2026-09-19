@@ -23,6 +23,7 @@ counters an operator is judged on.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import datetime as dt
 import logging
 import time
@@ -30,16 +31,24 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Final
 
 from fastapi import Request
-from sqlalchemy import Select, case, func, or_, select
+from sqlalchemy import Select, case, event, func, or_, select
 from sqlalchemy import update as sa_update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session
 
 from ..api.common import ListParams, apply_filters, apply_search, apply_sort, paginate
 from ..api.deps import Principal
 from ..core.config import settings
-from ..core.errors import Conflict, NotFound, PreconditionFailed
-from ..engine import EngineError, get_engine_client
+from ..core.errors import Conflict, NotFound, PreconditionFailed, ValidationFailed
+from ..engine import (
+    EngineBadRequest,
+    EngineError,
+    EngineNotFound,
+    EngineTimeout,
+    deadline,
+    get_engine_client,
+)
 from ..models.identity import Role
 from ..models.quality import (
     GuardrailAction,
@@ -52,6 +61,7 @@ from ..models.quality import (
 from ..models.registry import Agent
 from ..schemas.guardrails import (
     EVENT_SAMPLE_LIMIT,
+    SAMPLE_WITHHELD,
     ContentEvaluation,
     GuardrailCreate,
     GuardrailEventRead,
@@ -62,7 +72,9 @@ from ..schemas.guardrails import (
     GuardrailThresholdUpdate,
     GuardrailUpdate,
     MatchedSpan,
+    config_problem,
     coverage_label,
+    normalise_config,
     validation_name,
 )
 from . import audit
@@ -275,32 +287,93 @@ def _mask(text: str, spans: Sequence[MatchedSpan]) -> str:
     return masked
 
 
+#: Guardrail types whose whole purpose is keeping a kind of data out of storage.
+_DATA_PROTECTION_TYPES: Final[frozenset[str]] = frozenset(
+    {GuardrailType.PII.value, GuardrailType.SECRETS.value}
+)
+
+
+def _locatable(span: MatchedSpan) -> bool:
+    """Whether :func:`_mask` can actually remove this span from a text."""
+    if span.start is not None and span.end is not None and span.end > span.start:
+        return True
+    return span.start is None and bool(span.text)
+
+
+def _event_sample(
+    masked_text: str, guardrail: GuardrailConfig, matches: Sequence[MatchedSpan], limit: int
+) -> str:
+    """What an event row may keep of the content that fired it.
+
+    The sample is there so an operator can recognise the case. It used to be the
+    first few hundred *raw* characters, so a PII guardrail that masked an e-mail
+    address out of the telemetry store wrote the same address into our own
+    database, the detections feed and its CSV export -- readable by any viewer.
+    The guardrail leaked exactly what it was configured to protect.
+
+    ``masked_text`` is the content with everything *any* guardrail located in it
+    already masked (masked before the cut: offsets refer to the whole text). A
+    guardrail that exists to keep data out of storage, or whose action is Mask
+    -- shadow trial or not -- and which could not say where that data is, keeps
+    no sample at all: the same safe reading ingest applies to the payload.
+    """
+    protects = (
+        guardrail.guardrail_type in _DATA_PROTECTION_TYPES
+        or guardrail.action == GuardrailAction.MASK.value
+    )
+    if protects and not any(_locatable(span) for span in matches):
+        return SAMPLE_WITHHELD
+    return masked_text[:limit]
+
+
 def _pair_rows(
     guardrails: Sequence[GuardrailConfig], rows: Sequence[dict[str, Any]]
 ) -> dict[str, dict[str, Any]]:
     """Match each guardrail to the validation row that answers for it.
 
-    Names are matched first; a checker that answers positionally is honoured
-    only when the counts line up exactly, so a mismatched reply is reported as
-    "no verdict" rather than attributed to the wrong guardrail.
+    The scanner answers one row per requested validation, in request order, and
+    names a row only by its *type*. Two guardrails of one type -- a Global PII
+    mask and a stricter agent-scoped one, two topic lists -- are therefore told
+    apart by position and by nothing else. Matching on the name alone handed
+    both of them the first row of that type: the second guardrail never fired
+    on its own verdict, or fired (and blocked) on the first one's.
+
+    So position comes first, whenever the counts line up and no row names a
+    validation other than the one asked for in its place. Failing that, by name
+    -- each row answering for one guardrail only, and only where as many rows
+    carry a name as guardrails asked for it. Anything else is "no verdict"
+    rather than a verdict attributed to the wrong guardrail.
     """
-    by_name: dict[str, dict[str, Any]] = {}
-    for row in rows:
-        name = _row_name(row)
-        if name and name not in by_name:
-            by_name[name] = row
+    wanted = [validation_name(g.guardrail_type, g.config).upper() for g in guardrails]
+    names = [_row_name(row) for row in rows]
+    if len(rows) == len(guardrails) and all(
+        not name or name == want for name, want in zip(names, wanted, strict=True)
+    ):
+        return {
+            guardrail.id: row for guardrail, row in zip(guardrails, rows, strict=True)
+        }
+
+    by_name: dict[str, list[dict[str, Any]]] = {}
+    for row, name in zip(rows, names, strict=True):
+        if name:
+            by_name.setdefault(name, []).append(row)
+    asking: dict[str, list[GuardrailConfig]] = {}
+    for guardrail, want in zip(guardrails, wanted, strict=True):
+        asking.setdefault(want, []).append(guardrail)
 
     paired: dict[str, dict[str, Any]] = {}
-    unmatched: list[GuardrailConfig] = []
-    for guardrail in guardrails:
-        wanted = validation_name(guardrail.guardrail_type, guardrail.config).upper()
-        row = by_name.get(wanted)
-        if row is None:
-            unmatched.append(guardrail)
-            continue
-        paired[guardrail.id] = row
+    for want, group in asking.items():
+        answers = by_name.get(want, [])
+        if len(answers) == len(group):
+            for guardrail, row in zip(group, answers, strict=True):
+                paired[guardrail.id] = row
 
-    leftovers = [row for row in rows if _row_name(row) not in by_name or not _row_name(row)]
+    unmatched = [
+        guardrail
+        for guardrail, want in zip(guardrails, wanted, strict=True)
+        if want not in by_name
+    ]
+    leftovers = [row for row, name in zip(rows, names, strict=True) if not name]
     if unmatched and len(unmatched) == len(leftovers):
         for guardrail, row in zip(unmatched, leftovers, strict=True):
             paired[guardrail.id] = row
@@ -320,6 +393,19 @@ def checker_supported(guardrail: GuardrailConfig) -> bool:
     return (
         validation_name(guardrail.guardrail_type, guardrail.config).upper()
         in SUPPORTED_CHECKER_VALIDATIONS
+    )
+
+
+def checker_runnable(guardrail: GuardrailConfig) -> bool:
+    """Whether the scanner can be asked about this guardrail as it is configured.
+
+    A Topic guardrail with no topics is refused by the scanner, and the refusal
+    used to be read as "the scanner cannot run TOPIC": every correctly configured
+    Topic guardrail was suspended along with it. It is left out of the request
+    instead, exactly as an unsupported type is, and the read model says why.
+    """
+    return checker_supported(guardrail) and (
+        config_problem(guardrail.guardrail_type, guardrail.config) is None
     )
 
 
@@ -343,11 +429,37 @@ def _checker_request(guardrail: GuardrailConfig) -> dict[str, Any]:
 
 #: Validation name -> monotonic instant until which the scanner is not asked
 #: for it. Per process: the worst case is each worker discovering the same
-#: broken validation once.
+#: broken validation once. A key of the form ``guardrail:<id>`` suspends one
+#: guardrail rather than a whole validation (see :func:`_suspend_for`).
 _SUSPENDED: dict[str, float] = {}
+
+_GUARDRAIL_KEY: Final[str] = "guardrail:"
 
 #: Scanner calls in flight at once for one ingest batch.
 CHECK_CONCURRENCY: Final[int] = 8
+
+#: How what is left of a batch's budget is shared between the two rounds a check
+#: may need: the request carrying every validation, and -- if that fails -- the
+#: same question asked one validation at a time. Both rounds must finish, and
+#: what they learned be recorded, BEFORE the budget runs out (see _run_checker).
+FIRST_ROUND_SHARE: Final[float] = 0.6
+LAST_ROUND_SHARE: Final[float] = 0.8
+
+#: A check that starts with at least this much of the budget still ahead of it
+#: started on time. One that queued behind the others did not: it is still asked,
+#: with whatever is left, but its timing out says how long the queue was and
+#: nothing about the validation it asked for.
+ON_TIME: Final[float] = 0.9
+
+
+class ChecksOutOfTime(Exception):
+    """A batch's budget ran out on a check that never had a fair hearing.
+
+    Not an engine failure and not a verdict: the batch is stored unevaluated,
+    which is what running out of budget has always meant, and nothing is
+    suspended over it -- or one oversized batch could switch a healthy
+    validation off for every workspace this worker serves.
+    """
 
 
 def _validation(guardrail: GuardrailConfig) -> str:
@@ -357,7 +469,16 @@ def _validation(guardrail: GuardrailConfig) -> str:
 def suspended_validations() -> list[str]:
     """Validations the scanner recently proved unable to run, for diagnostics."""
     now = time.monotonic()
-    return sorted(name for name, until in _SUSPENDED.items() if until > now)
+    return sorted(
+        name
+        for name, until in _SUSPENDED.items()
+        if until > now and not name.startswith(_GUARDRAIL_KEY)
+    )
+
+
+def guardrail_suspended(guardrail: GuardrailConfig) -> bool:
+    """Whether this worker has stopped asking the scanner about this guardrail."""
+    return _is_suspended(_validation(guardrail)) or _is_suspended(_GUARDRAIL_KEY + guardrail.id)
 
 
 def _is_suspended(name: str) -> bool:
@@ -381,8 +502,36 @@ def _suspend(name: str, exc: Exception) -> None:
     )
 
 
+def _suspend_for(guardrail: GuardrailConfig, exc: EngineError) -> None:
+    """Suspend what the failure is actually about.
+
+    A refusal (4xx) is about what was *sent*: this guardrail's config. Suspending
+    the validation for it would switch off every other guardrail of the type, in
+    every workspace this worker serves, over one tenant's typo. Anything else --
+    a 5xx, a timeout -- is the scanner being unable to run the validation at all,
+    whoever asks.
+    """
+    if isinstance(exc, EngineBadRequest):
+        _SUSPENDED[_GUARDRAIL_KEY + guardrail.id] = (
+            time.monotonic() + settings.guardrail_suspend_seconds
+        )
+        log.error(
+            "the content scanner refused guardrail %s (%s): its configuration cannot be "
+            "run; it is NOT being enforced and will not be retried for %.0fs",
+            guardrail.id,
+            exc,
+            settings.guardrail_suspend_seconds,
+        )
+        return
+    _suspend(_validation(guardrail), exc)
+
+
 async def _run_checker(
-    text: str, guardrails: Sequence[GuardrailConfig], *, isolate: bool = False
+    text: str,
+    guardrails: Sequence[GuardrailConfig],
+    *,
+    isolate: bool = False,
+    give_up_at: float | None = None,
 ) -> tuple[dict[str, dict[str, Any]], int]:
     """Run the real checks for every supported guardrail, and time them.
 
@@ -395,38 +544,80 @@ async def _run_checker(
     so the healthy ones still answer, and whichever is broken is suspended
     rather than paid for on every batch. Without it the failure is raised,
     which is what the console's own "test this guardrail" wants to show.
+
+    ``give_up_at`` is the monotonic instant the caller's budget ends. Both
+    rounds used to run on the full per-call timeout, which together is longer
+    than a batch's budget: with two guardrails in scope and a scanner that had
+    stopped answering, the budget cancelled the second round before it could
+    suspend anything. Nothing was learned, so EVERY batch held its request --
+    and the database connection under it -- for the whole budget, and one slow
+    validation cost the healthy ones their verdicts for good. Each call is now
+    clipped to its share of what is left, so the second round ends first. A
+    check that only started after queueing behind the rest of its batch is
+    still asked, with what is left, but its silence suspends nothing (ON_TIME).
     """
     client = get_engine_client()
-    supported = [guardrail for guardrail in guardrails if checker_supported(guardrail)]
+    supported = [guardrail for guardrail in guardrails if checker_runnable(guardrail)]
     if isolate:
-        supported = [g for g in supported if not _is_suspended(_validation(g))]
+        supported = [g for g in supported if not guardrail_suspended(g)]
     if not supported:
         return {}, 0
     timeout = settings.guardrail_check_timeout_seconds
     started = time.perf_counter()
+    on_time = give_up_at is None or (
+        give_up_at - time.monotonic() >= ON_TIME * settings.guardrail_batch_budget_seconds
+    )
 
     def elapsed() -> int:
         return int(round((time.perf_counter() - started) * 1000))
 
+    def allowance(share: float) -> float:
+        if give_up_at is None:
+            return timeout
+        allowed = min(timeout, (give_up_at - time.monotonic()) * share)
+        if allowed <= 0:
+            raise ChecksOutOfTime("the batch's budget was spent before this check was asked")
+        return allowed
+
+    def unheard(exc: EngineError) -> None:
+        # A refusal or a 5xx is an answer, whenever it comes. Silence is only
+        # evidence from a check that had its proper time to be answered in.
+        if isinstance(exc, EngineTimeout) and not on_time:
+            raise ChecksOutOfTime(
+                "a check that queued behind the rest of its batch ran out of budget"
+            ) from exc
+
+    async def ask(asked: Sequence[GuardrailConfig], limit: float) -> Any:
+        # Bounded as a whole as well as per read: the HTTP timeout restarts with
+        # every byte, and a scanner that trickles an answer is as gone as one
+        # that sends none. The exchange itself is shielded by the client, so
+        # giving up on it here does not tear a pooled connection down half way.
+        async with deadline(limit, what="content check"):
+            return await client.evaluate_guardrails(
+                text, [_checker_request(guardrail) for guardrail in asked], timeout_seconds=limit
+            )
+
+    # Nothing is kept back for a second round that a single validation never has.
+    first_share = FIRST_ROUND_SHARE if isolate and len(supported) > 1 else LAST_ROUND_SHARE
     try:
-        payload = await client.evaluate_guardrails(
-            text, [_checker_request(guardrail) for guardrail in supported], timeout_seconds=timeout
-        )
+        payload = await ask(supported, allowance(first_share))
         return _pair_rows(supported, _check_rows(payload)), elapsed()
     except EngineError as exc:
         if not isolate:
             raise translate_engine_error(exc) from exc
+        unheard(exc)  # and no second round on the sliver a queued check has left
         if len(supported) == 1:
-            _suspend(_validation(supported[0]), exc)
+            _suspend_for(supported[0], exc)
             return {}, elapsed()
+
+    limit = allowance(LAST_ROUND_SHARE)
 
     async def alone(guardrail: GuardrailConfig) -> dict[str, dict[str, Any]]:
         try:
-            answer = await client.evaluate_guardrails(
-                text, [_checker_request(guardrail)], timeout_seconds=timeout
-            )
+            answer = await ask([guardrail], limit)
         except EngineError as exc:
-            _suspend(_validation(guardrail), exc)
+            unheard(exc)
+            _suspend_for(guardrail, exc)
             return {}
         return _pair_rows([guardrail], _check_rows(answer))
 
@@ -557,6 +748,37 @@ async def _coverage_names(
     return {agent_id: name for agent_id, name in found}
 
 
+def enforcement_of(guardrail: GuardrailConfig) -> tuple[str, str | None]:
+    """What actually happens to live content under this guardrail, and why.
+
+    "Active" on the screen used to be the whole story, and it was not true: a
+    rule the scanner does not implement, a Topic rule with no topics, a
+    validation the scanner has just failed -- each reads Active and enforces
+    nothing. The most permanent reason wins, so the sentence names the thing an
+    operator can actually fix.
+    """
+    if guardrail.status == GuardrailStatus.DISABLED.value:
+        return "disabled", "Disabled: content is not checked against this guardrail."
+    if not checker_supported(guardrail):
+        wanted = validation_name(guardrail.guardrail_type, guardrail.config)
+        return "unsupported", (
+            f"The content checker on this deployment does not implement '{wanted}', so "
+            "this rule is recorded but never enforced at ingest."
+        )
+    problem = config_problem(guardrail.guardrail_type, guardrail.config)
+    if problem is not None:
+        return "misconfigured", problem
+    if guardrail_suspended(guardrail):
+        return "suspended", (
+            "The content checker failed to run this check, so it has been suspended and "
+            f"is retried within {settings.guardrail_suspend_seconds / 60:.0f} minutes. "
+            "Until then content passes unchecked."
+        )
+    if guardrail.status == GuardrailStatus.TUNING.value:
+        return "shadow", "Tuning: content is checked and detections are recorded, never enforced."
+    return "enforced", None
+
+
 def _read(
     guardrail: GuardrailConfig,
     *,
@@ -565,6 +787,7 @@ def _read(
     owner: str | None = None,
 ) -> GuardrailRead:
     counted = rollup or _Rollup()
+    enforcement, not_enforced_reason = enforcement_of(guardrail)
     return GuardrailRead(
         id=guardrail.id,
         name=guardrail.name,
@@ -586,6 +809,8 @@ def _read(
         owner_user_id=guardrail.owner_user_id,
         owner_name=owner,
         checker_supported=checker_supported(guardrail),
+        enforcement=enforcement,
+        not_enforced_reason=not_enforced_reason,
         created_at=guardrail.created_at,
         updated_at=guardrail.updated_at,
         created_by=guardrail.created_by,
@@ -921,6 +1146,21 @@ async def summarise(
             return None
         return round((current - earlier) / earlier * 100, 1)
 
+    # "Active" is a setting; "enforced" is a fact. The card counts the first, so
+    # the summary also says how many of those are not the second.
+    active_rows = (
+        (
+            await session.execute(
+                select(GuardrailConfig).where(
+                    workspace, GuardrailConfig.status == GuardrailStatus.ACTIVE.value
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    not_enforced = sum(1 for row in active_rows if enforcement_of(row)[0] != "enforced")
+
     latency = totals[4]
     return GuardrailsSummary(
         window_days=window_days,
@@ -935,6 +1175,8 @@ async def summarise(
         pii_items_masked_delta_percent=_delta(masked_now, masked_before),
         avg_added_latency_ms=round(float(latency), 1) if latency is not None else None,
         last_triggered_at=last_triggered,
+        not_enforced=not_enforced,
+        suspended_validations=suspended_validations(),
     )
 
 
@@ -1057,55 +1299,102 @@ async def _scope_project_ids(
     return list((await session.execute(stmt)).scalars().all())
 
 
-async def _mirror_create(session: AsyncSession, guardrail: GuardrailConfig) -> None:
-    """Register the rule with the engine so enforcement matches the record."""
-    if not settings.engine_metric_library:
-        # The rule store executes metric code that imports the engine's own
-        # library, whose package name is deployment configuration (see
-        # Settings.engine_metric_library). Without it there is no runnable
-        # code to register; inline enforcement still applies at ingest.
+#: How long a console write waits on the engine's rule store before it carries
+#: on without it.
+MIRROR_BUDGET_SECONDS: Final[float] = 8.0
+
+#: Outcomes of :func:`_mirror`, recorded on the audit row of the write.
+MIRROR_SYNCED: Final[str] = "synced"
+MIRROR_NOT_MIRRORED: Final[str] = "not_mirrored"
+MIRROR_FAILED: Final[str] = "failed"
+
+
+async def _mirror(session: AsyncSession, guardrail: GuardrailConfig) -> str:
+    """Bring the engine's copy of the rule into line -- best effort, never fatal.
+
+    Enforcement is the inline checker at ingest, driven by OUR row. The rule in
+    the engine's store is a mirror of it, and a mirror that cannot be written
+    must not cost the write it mirrors. It used to: every engine error was
+    re-raised, the request rolled back, and so Disable -- the kill switch for a
+    guardrail that is blocking production telemetry -- answered 503 while the
+    engine restarted and 404 *for ever* once the engine had lost its copy of the
+    rule. Tune, Edit and Create failed the same way.
+
+    Now a failure is logged and reported to the caller for the audit row, and
+    the next edit tries again. A rule the engine no longer holds is registered
+    afresh. A guardrail whose scope covers no provisioned agent has its rule
+    removed rather than patched to an empty namespace list: the store attaches
+    an evaluator to at least one namespace, and one attached to none has
+    nothing to run on. The same goes for a deployment that has switched the
+    mirror off: the rule registered while it was on is removed, not abandoned.
+    """
+    # The rule store executes metric code that imports the engine's own library,
+    # whose package name is deployment configuration (see
+    # Settings.engine_metric_library). Without it there is no runnable code to
+    # register; inline enforcement still applies at ingest.
+    mirroring = bool(settings.engine_metric_library)
+    if not mirroring and not guardrail.engine_guardrail_id:
         log.info(
             "guardrail %s not mirrored: engine metric library not configured",
             guardrail.id,
         )
-        return
-    project_ids = await _scope_project_ids(session, guardrail)
-    if not project_ids:
-        # An evaluator has to be attached to at least one namespace. With no
-        # provisioned agents in scope there is nothing to attach to yet; the
-        # next update re-mirrors once agents exist.
-        log.info(
-            "guardrail %s not mirrored to the engine: no provisioned agents in scope",
-            guardrail.id,
-        )
-        return
+        return MIRROR_NOT_MIRRORED
+
+    # SQL before the clock starts: a statement cancelled half way costs the
+    # request its connection.
+    project_ids = await _scope_project_ids(session, guardrail) if mirroring else []
     client = get_engine_client()
     try:
-        guardrail.engine_guardrail_id = await client.create_guardrail(
-            _engine_definition(guardrail, project_ids)
-        )
-    except EngineError as exc:
-        raise translate_engine_error(exc) from exc
+        async with asyncio.timeout(MIRROR_BUDGET_SECONDS):
+            if not project_ids:
+                # Nothing to attach to -- or the mirror has been switched off,
+                # which has to UNLOAD what was mirrored while it was on: nothing
+                # reads these rules' scores, and one left behind is run by the
+                # metric runner against every sampled trace for good.
+                if guardrail.engine_guardrail_id:
+                    # Already gone from the store is what was wanted.
+                    with contextlib.suppress(EngineNotFound):
+                        await client.delete_guardrails([guardrail.engine_guardrail_id])
+                    guardrail.engine_guardrail_id = None
+                # With no provisioned agents in scope there is nothing to attach
+                # to yet; the next update re-mirrors once agents exist.
+                log.info(
+                    "guardrail %s not mirrored to the engine: %s",
+                    guardrail.id,
+                    "no provisioned agents in scope"
+                    if mirroring
+                    else "engine metric library not configured; its rule was removed",
+                )
+                return MIRROR_NOT_MIRRORED
 
-
-async def _mirror_update(session: AsyncSession, guardrail: GuardrailConfig) -> None:
-    if not guardrail.engine_guardrail_id:
-        await _mirror_create(session, guardrail)
-        return
-    if not settings.engine_metric_library:
-        log.info(
-            "guardrail %s mirror not updated: engine metric library not configured",
+            definition = _engine_definition(guardrail, project_ids)
+            if guardrail.engine_guardrail_id:
+                try:
+                    await client.update_guardrail(guardrail.engine_guardrail_id, definition)
+                    return MIRROR_SYNCED
+                except EngineNotFound:
+                    # The store lost its copy (it was reset, or the namespace
+                    # went away). Retrying the PATCH can never work; register
+                    # the rule again instead.
+                    guardrail.engine_guardrail_id = None
+            guardrail.engine_guardrail_id = await client.create_guardrail(definition)
+            return MIRROR_SYNCED
+    except (EngineError, TimeoutError) as exc:
+        log.warning(
+            "guardrail %s was saved but its engine rule could not be brought into line "
+            "(%s); inline enforcement is unaffected and the next edit retries",
             guardrail.id,
+            exc or type(exc).__name__,
         )
-        return
-    project_ids = await _scope_project_ids(session, guardrail)
-    client = get_engine_client()
+        return MIRROR_FAILED
+
+
+def _checked_config(guardrail_type: str, config: dict[str, Any] | None) -> dict[str, Any]:
+    """The config as it will be stored, or a 422 naming the key that is wrong."""
     try:
-        await client.update_guardrail(
-            guardrail.engine_guardrail_id, _engine_definition(guardrail, project_ids)
-        )
-    except EngineError as exc:
-        raise translate_engine_error(exc) from exc
+        return normalise_config(guardrail_type, config)
+    except ValueError as exc:
+        raise ValidationFailed(str(exc), details={"field": "config"}) from exc
 
 
 async def _validate_scope(
@@ -1138,6 +1427,7 @@ async def create_guardrail(
     """Register a guardrail and mirror it into the engine's rule store."""
     principal.require(Role.ADMIN)
     await _validate_scope(session, principal, payload.scope.value, payload.scope_ref)
+    config = _checked_config(payload.guardrail_type.value, payload.config)
 
     clash = (
         await session.execute(_scoped(principal).where(GuardrailConfig.name == payload.name))
@@ -1154,7 +1444,7 @@ async def create_guardrail(
         threshold=payload.threshold,
         scope=payload.scope.value,
         scope_ref=payload.scope_ref,
-        config=dict(payload.config),
+        config=config,
         owner_user_id=payload.owner_user_id,
         created_by=principal.actor,
         updated_by=principal.actor,
@@ -1166,7 +1456,7 @@ async def create_guardrail(
         await session.rollback()
         raise Conflict(f"A guardrail named '{payload.name}' already exists.") from exc
 
-    await _mirror_create(session, guardrail)
+    mirrored = await _mirror(session, guardrail)
     await audit.record(
         session,
         principal=principal,
@@ -1176,7 +1466,11 @@ async def create_guardrail(
         entity_label=guardrail.name,
         source_screen=SOURCE_SCREEN,
         detail=f"{guardrail.guardrail_type} guardrail, action {guardrail.action}",
-        metadata={"threshold": guardrail.threshold, "scope": guardrail.scope},
+        metadata={
+            "threshold": guardrail.threshold,
+            "scope": guardrail.scope,
+            "engine_mirror": mirrored,
+        },
         request=request,
     )
     await session.flush()
@@ -1229,13 +1523,25 @@ async def update_guardrail(
             changes.get("scope_ref", guardrail.scope_ref),
         )
 
+    if "config" in changes or "guardrail_type" in changes:
+        # ``config`` replaces the stored one whole: the console sends what the
+        # form holds. It is checked against the type it will live under, which
+        # may be changing in the same request.
+        kind = changes.get("guardrail_type", guardrail.guardrail_type)
+        checked = _checked_config(
+            kind.value if isinstance(kind, GuardrailType) else kind,
+            changes.get("config", guardrail.config),
+        )
+        if "config" in changes or checked != (guardrail.config or {}):
+            changes["config"] = checked
+
     vocabularies = (GuardrailType, GuardrailStatus, GuardrailAction, GuardrailScope)
     for field, value in changes.items():
         setattr(guardrail, field, value.value if isinstance(value, vocabularies) else value)
     guardrail.updated_by = principal.actor
     await session.flush()
 
-    await _mirror_update(session, guardrail)
+    mirrored = await _mirror(session, guardrail)
     await audit.record(
         session,
         principal=principal,
@@ -1245,7 +1551,7 @@ async def update_guardrail(
         entity_label=guardrail.name,
         source_screen=SOURCE_SCREEN,
         detail="Updated " + ", ".join(sorted(changes)),
-        metadata={"fields": sorted(changes)},
+        metadata={"fields": sorted(changes), "engine_mirror": mirrored},
         request=request,
     )
     await session.flush()
@@ -1268,6 +1574,8 @@ async def delete_guardrail(
         client = get_engine_client()
         try:
             await client.delete_guardrails([guardrail.engine_guardrail_id])
+        except EngineNotFound:
+            pass  # already gone from the store, which is what was asked for
         except EngineError as exc:
             raise translate_engine_error(exc) from exc
 
@@ -1286,6 +1594,13 @@ async def delete_guardrail(
     await session.flush()
 
 
+_STATUS_AUDIT_ACTIONS: Final[dict[GuardrailStatus, str]] = {
+    GuardrailStatus.ACTIVE: "guardrail.enabled",
+    GuardrailStatus.DISABLED: "guardrail.disabled",
+    GuardrailStatus.TUNING: "guardrail.shadowed",
+}
+
+
 async def set_status(
     session: AsyncSession,
     principal: Principal,
@@ -1294,7 +1609,7 @@ async def set_status(
     *,
     request: Request | None = None,
 ) -> GuardrailConfig:
-    """Enable or disable a guardrail, in the record and in the engine."""
+    """Enable, disable or shadow a guardrail, in the record and in the engine."""
     principal.require(Role.OPERATOR)
     guardrail = await get_guardrail(session, principal, guardrail_id)
     if guardrail.status == status.value:
@@ -1304,19 +1619,18 @@ async def set_status(
     guardrail.status = status.value
     guardrail.updated_by = principal.actor
     await session.flush()
-    await _mirror_update(session, guardrail)
+    mirrored = await _mirror(session, guardrail)
 
     await audit.record(
         session,
         principal=principal,
-        action=(
-            "guardrail.enabled" if status is GuardrailStatus.ACTIVE else "guardrail.disabled"
-        ),
+        action=_STATUS_AUDIT_ACTIONS[status],
         entity_type=ENTITY_TYPE,
         entity_id=guardrail.id,
         entity_label=guardrail.name,
         source_screen=SOURCE_SCREEN,
         detail=f"{previous} to {status.value}",
+        metadata={"engine_mirror": mirrored},
         request=request,
     )
     await session.flush()
@@ -1343,7 +1657,7 @@ async def set_threshold(
         guardrail.action = payload.action.value
     guardrail.updated_by = principal.actor
     await session.flush()
-    await _mirror_update(session, guardrail)
+    mirrored = await _mirror(session, guardrail)
 
     detail = f"Threshold {previous_threshold:.2f} to {payload.threshold:.2f}"
     if payload.action is not None and payload.action.value != previous_action:
@@ -1360,7 +1674,11 @@ async def set_threshold(
         entity_label=guardrail.name,
         source_screen=SOURCE_SCREEN,
         detail=detail,
-        metadata={"threshold": payload.threshold, "previous_threshold": previous_threshold},
+        metadata={
+            "threshold": payload.threshold,
+            "previous_threshold": previous_threshold,
+            "engine_mirror": mirrored,
+        },
         request=request,
     )
     await session.flush()
@@ -1381,6 +1699,86 @@ def _hit_from(
     score = _row_score(row)
     triggered = _row_triggered(row, score, guardrail.threshold)
     return triggered, score, _row_matches(row)
+
+
+#: ``session.info`` key a request's guardrail bookkeeping waits under.
+_BOOKKEEPING_KEY: Final[str] = "guardrail_bookkeeping"
+
+
+def _queue_bookkeeping(
+    session: AsyncSession,
+    guardrail_id: str,
+    *,
+    latency_ms: int | None = None,
+    triggers: int = 0,
+    blocked: int = 0,
+    masked: int = 0,
+    fired_at: dt.datetime | None = None,
+) -> None:
+    """Hold a guardrail's counters until the request commits.
+
+    The ingest hook runs BEFORE the batch is handed to the engine, and an UPDATE
+    keeps its row lock until the transaction ends. Written on the spot, a Global
+    guardrail's row -- shared by every agent in the workspace -- stayed locked
+    across up to four engine writes: concurrent batches queued behind one
+    another on it, and so did the console's Disable. Written from
+    ``before_commit`` the lock lives for the length of the commit. A request
+    that rolls back drops what it queued, which is right: its evidence rows were
+    never written either.
+    """
+    pending: dict[str, dict[str, Any]] | None = session.info.get(_BOOKKEEPING_KEY)
+    if pending is None:
+        pending = session.info[_BOOKKEEPING_KEY] = {}
+    sync = session.sync_session
+    if not event.contains(sync, "before_commit", _write_bookkeeping):
+        event.listen(sync, "before_commit", _write_bookkeeping)
+        event.listen(sync, "after_rollback", _drop_bookkeeping)
+
+    entry = pending.setdefault(
+        guardrail_id, {"latency_ms": None, "triggers": 0, "blocked": 0, "masked": 0, "at": None}
+    )
+    if latency_ms is not None:
+        entry["latency_ms"] = latency_ms
+    entry["triggers"] += triggers
+    entry["blocked"] += blocked
+    entry["masked"] += masked
+    if fired_at is not None:
+        entry["at"] = fired_at
+
+
+def _write_bookkeeping(sync_session: Session) -> None:
+    """Apply the queued counters as increments, in id order.
+
+    Increments, so two workers ingesting at once do not lose each other's
+    counts; id order, so two commits touching the same guardrails cannot
+    deadlock; and ``updated_at`` named and set to itself, because a guardrail
+    firing is not an edit to it (see :func:`db.base.stamp`).
+    """
+    pending: dict[str, dict[str, Any]] = sync_session.info.pop(_BOOKKEEPING_KEY, None) or {}
+    for guardrail_id in sorted(pending):
+        entry = pending[guardrail_id]
+        values: dict[str, Any] = {"updated_at": GuardrailConfig.updated_at}
+        if entry["latency_ms"] is not None:
+            values["added_latency_ms"] = entry["latency_ms"]
+        if entry["triggers"]:
+            values.update(
+                triggers_30d=GuardrailConfig.triggers_30d + entry["triggers"],
+                blocked_30d=GuardrailConfig.blocked_30d + entry["blocked"],
+                masked_30d=GuardrailConfig.masked_30d + entry["masked"],
+                last_triggered_at=entry["at"],
+            )
+        if len(values) == 1:
+            continue
+        sync_session.execute(
+            sa_update(GuardrailConfig)
+            .where(GuardrailConfig.id == guardrail_id)
+            .values(**values)
+            .execution_options(synchronize_session=False)
+        )
+
+
+def _drop_bookkeeping(sync_session: Session) -> None:
+    sync_session.info.pop(_BOOKKEEPING_KEY, None)
 
 
 async def test_guardrail(
@@ -1411,6 +1809,10 @@ async def test_guardrail(
             + ".",
             details={"validation": wanted},
         )
+
+    problem = config_problem(guardrail.guardrail_type, guardrail.config)
+    if problem is not None:
+        raise PreconditionFailed(problem, details={"field": "config"})
 
     paired, latency_ms = await _run_checker(text, [guardrail])
     triggered, score, matches = _hit_from(guardrail, paired.get(guardrail.id))
@@ -1536,16 +1938,33 @@ async def evaluate_content(
     masked_text = text
     blocked = False
 
+    judged = {
+        guardrail.id: _hit_from(guardrail, paired[guardrail.id])
+        for guardrail in guardrails
+        if guardrail.id in paired
+    }
+    # What the event rows may keep: the content with everything any guardrail
+    # located in it masked, whatever that guardrail's own action is.
+    sample_text = _mask(
+        text, [span for fired, _, found in judged.values() if fired for span in found]
+    )
+
     for guardrail in guardrails:
-        triggered, score, matches = _hit_from(guardrail, paired.get(guardrail.id))
+        if guardrail.id not in judged:
+            continue  # not asked, or the scanner could not answer: no verdict
+        triggered, score, matches = judged[guardrail.id]
         # The measured cost is charged to every guardrail that ran, whether or
         # not it fired: the latency tile is about the checking, not the finding.
-        guardrail.added_latency_ms = int(
+        # Queued, not assigned: assigning it would stamp updated_at, and a
+        # guardrail being checked is not a guardrail being edited.
+        smoothed = int(
             round(
                 guardrail.added_latency_ms * (1 - LATENCY_SMOOTHING)
                 + per_guardrail_latency * LATENCY_SMOOTHING
             )
         )
+        if smoothed != guardrail.added_latency_ms:
+            _queue_bookkeeping(session, guardrail.id, latency_ms=smoothed)
         if not triggered:
             continue
 
@@ -1572,12 +1991,14 @@ async def evaluate_content(
                 masked_text = _mask(masked_text, matches)
             applied.append((guardrail, matches))
 
-        guardrail.triggers_30d += 1
-        if action_taken is GuardrailAction.BLOCK:
-            guardrail.blocked_30d += 1
-        elif action_taken is GuardrailAction.MASK:
-            guardrail.masked_30d += len(matches) or 1
-        guardrail.last_triggered_at = now
+        _queue_bookkeeping(
+            session,
+            guardrail.id,
+            triggers=1,
+            blocked=1 if action_taken is GuardrailAction.BLOCK else 0,
+            masked=(len(matches) or 1) if action_taken is GuardrailAction.MASK else 0,
+            fired_at=now,
+        )
 
         session.add(
             GuardrailEvent(
@@ -1596,7 +2017,7 @@ async def evaluate_content(
                     ],
                     "enforced": enforced,
                 },
-                sample=text[:EVENT_SAMPLE_LIMIT],
+                sample=_event_sample(sample_text, guardrail, matches, EVENT_SAMPLE_LIMIT),
             )
         )
 
@@ -1689,50 +2110,84 @@ async def evaluate_ingest_batch(
     # whole batch: past it the batch is stored unevaluated, which ingest records
     # as exactly that, instead of the agent's request hanging on a slow scanner.
     gate = asyncio.Semaphore(CHECK_CONCURRENCY)
+    # The checks are told when the budget ends, so that a scanner which has
+    # stopped answering is found out -- and set aside -- inside it. The wait_for
+    # below is the backstop for a batch that simply has too much to ask.
+    give_up_at = time.monotonic() + settings.guardrail_batch_budget_seconds
 
     async def check(
         text: str, guardrails: Sequence[GuardrailConfig]
     ) -> tuple[dict[str, dict[str, Any]], int]:
         async with gate:
-            return await _run_checker(text, guardrails, isolate=True)
+            return await _run_checker(text, guardrails, isolate=True, give_up_at=give_up_at)
+
+    # The same content under the same guardrails is asked about once. A span
+    # batch repeats itself -- a model step and the chain step around it carry the
+    # same prompt and the same answer -- and every repeat was a scanner round
+    # trip. Each item still gets its own verdict and its own evidence row.
+    jobs: list[tuple[str, Sequence[GuardrailConfig]]] = []
+    job_of: dict[tuple[str, tuple[str, ...]], int] = {}
+    slots: list[int] = []
+    for _, text, guardrails in work:
+        key = (text, tuple(guardrail.id for guardrail in guardrails))
+        if key not in job_of:
+            job_of[key] = len(jobs)
+            jobs.append((text, guardrails))
+        slots.append(job_of[key])
 
     checked = await asyncio.wait_for(
-        asyncio.gather(*(check(text, guardrails) for _, text, guardrails in work)),
+        asyncio.gather(*(check(text, guardrails) for text, guardrails in jobs)),
         timeout=settings.guardrail_batch_budget_seconds,
     )
 
-    #: guardrail id -> [triggers, blocked, masked]. Counted here and written once
-    #: as increments, so two workers ingesting at once do not lose each other's
-    #: counts, and so a guardrail that is busy firing can still be edited.
-    counts: dict[str, list[int]] = {}
+    # The measured cost is charged once per check that ran, to every guardrail
+    # that was answered for -- whether or not it fired.
     latency: dict[str, int] = {}
-    rows: dict[str, GuardrailConfig] = {}
-
-    for (candidate, text, guardrails), (paired, latency_ms) in zip(work, checked, strict=True):
-        per_guardrail_latency = max(1, latency_ms // max(1, len(guardrails)))
-
-        for guardrail in guardrails:
-            if guardrail.id not in paired:
-                continue  # not asked, or the scanner could not answer: no verdict
-            rows[guardrail.id] = guardrail
-            triggered, score, matches = _hit_from(guardrail, paired.get(guardrail.id))
+    measured_before: dict[str, int] = {}
+    for (_, guardrails), (paired, latency_ms) in zip(jobs, checked, strict=True):
+        answered = [guardrail for guardrail in guardrails if guardrail.id in paired]
+        per_guardrail_latency = max(1, latency_ms // max(1, len(answered)))
+        for guardrail in answered:
+            measured_before.setdefault(guardrail.id, guardrail.added_latency_ms)
             latency[guardrail.id] = int(
                 round(
                     latency.get(guardrail.id, guardrail.added_latency_ms) * (1 - LATENCY_SMOOTHING)
                     + per_guardrail_latency * LATENCY_SMOOTHING
                 )
             )
-            if not triggered:
-                continue
+    for guardrail_id, smoothed in latency.items():
+        if smoothed != measured_before[guardrail_id]:  # no row lock for no news
+            _queue_bookkeeping(session, guardrail_id, latency_ms=smoothed)
 
+    for (candidate, text, guardrails), slot in zip(work, slots, strict=True):
+        paired, _ = checked[slot]
+
+        fired: list[tuple[GuardrailConfig, float | None, list[MatchedSpan]]] = []
+        for guardrail in guardrails:
+            if guardrail.id not in paired:
+                continue  # not asked, or the scanner could not answer: no verdict
+            triggered, score, matches = _hit_from(guardrail, paired.get(guardrail.id))
+            if triggered:
+                fired.append((guardrail, score, matches))
+        if not fired:
+            continue
+        # One guardrail's sample must not carry what another one located: a
+        # Topic warning firing beside a PII mask would otherwise keep the address.
+        masked_text = _mask(text, [span for _, _, matches in fired for span in matches])
+
+        for guardrail, score, matches in fired:
             enforced = guardrail.status == GuardrailStatus.ACTIVE.value
             action_taken = GuardrailAction(guardrail.action) if enforced else GuardrailAction.LOG
-            tally = counts.setdefault(guardrail.id, [0, 0, 0])
-            tally[0] += 1
-            if action_taken is GuardrailAction.BLOCK:
-                tally[1] += 1
-            elif action_taken is GuardrailAction.MASK:
-                tally[2] += len(matches) or 1
+            # Counted here and written at commit as increments: see
+            # _queue_bookkeeping for why neither happens on the spot.
+            _queue_bookkeeping(
+                session,
+                guardrail.id,
+                triggers=1,
+                blocked=1 if action_taken is GuardrailAction.BLOCK else 0,
+                masked=(len(matches) or 1) if action_taken is GuardrailAction.MASK else 0,
+                fired_at=now,
+            )
 
             verdicts.append(
                 GuardrailVerdict(
@@ -1749,7 +2204,7 @@ async def evaluate_ingest_batch(
                         ],
                         "enforced": enforced,
                     },
-                    sample=text[:MAX_SAMPLE_LENGTH],
+                    sample=_event_sample(masked_text, guardrail, matches, MAX_SAMPLE_LENGTH),
                     # The literal text found, so a mask removes that and only
                     # that. Never serialised: see the schema.
                     redactions=[
@@ -1761,28 +2216,4 @@ async def evaluate_ingest_batch(
                     ],
                 )
             )
-
-    for guardrail_id, guardrail in rows.items():
-        tally = counts.get(guardrail_id)
-        smoothed = latency.get(guardrail_id, guardrail.added_latency_ms)
-        if tally is None and smoothed == guardrail.added_latency_ms:
-            continue  # nothing to record: do not take a row lock for nothing
-        values: dict[str, Any] = {
-            "added_latency_ms": smoothed,
-            # Named, and set to itself: a guardrail firing is not an edit to it.
-            "updated_at": GuardrailConfig.updated_at,
-        }
-        if tally is not None:
-            values.update(
-                triggers_30d=GuardrailConfig.triggers_30d + tally[0],
-                blocked_30d=GuardrailConfig.blocked_30d + tally[1],
-                masked_30d=GuardrailConfig.masked_30d + tally[2],
-                last_triggered_at=now,
-            )
-        await session.execute(
-            sa_update(GuardrailConfig)
-            .where(GuardrailConfig.id == guardrail_id)
-            .values(**values)
-            .execution_options(synchronize_session=False)
-        )
     return verdicts

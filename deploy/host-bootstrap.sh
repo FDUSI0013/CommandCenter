@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Fulcrum Ops — prepare a fresh Ubuntu host to run the stack.
 #
-# Installs Docker and the edge proxy, sets the kernel limits the analytics store
-# needs, and leaves the host ready for `docker compose up -d`. It does not start
+# Installs Docker, the edge proxy and the AWS CLI, sets the kernel limits the
+# analytics store needs, installs the host's cron jobs and log rotation, and
+# leaves the host ready for `docker compose up -d`. It does not start
 # anything: configuration comes next, and a half-configured public service is
 # worse than one that is not running.
 #
@@ -89,6 +90,41 @@ install -d -o caddy -g caddy /var/log/caddy
 install -d /srv/fulcrum-ops
 
 echo
+echo "== aws cli =="
+# The nightly backup mirrors the governance database to S3 with it, and refuses
+# to call a night a success without it. Ubuntu 24.04 has no awscli package; this
+# is AWS's own v2 installer, which lands in /usr/local/bin — a directory cron's
+# default PATH does not include, which is why deploy/cron.d/fulcrum-ops sets one.
+if command -v aws >/dev/null 2>&1; then
+  echo "already installed: $(aws --version 2>&1)"
+else
+  awstmp="$(mktemp -d)"
+  curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o "$awstmp/awscliv2.zip"
+  unzip -q "$awstmp/awscliv2.zip" -d "$awstmp"
+  "$awstmp/aws/install" --update >/dev/null
+  rm -rf "$awstmp"
+  echo "installed: $(aws --version 2>&1)"
+fi
+
+echo
+echo "== host jobs =="
+# autoheal (every minute), the nightly backup, the weekly build-cache prune, and
+# rotation for their logs. The jobs call scripts under /opt/fulcrum/deploy, so
+# they are only installed once the repository is actually there — a cron line
+# pointing at nothing would write an error a minute until it was.
+HOST_JOBS_INSTALLED=0
+if [ -f /opt/fulcrum/deploy/autoheal.sh ] && [ -f /opt/fulcrum/deploy/backup.sh ]; then
+  install -m 0644 -o root -g root /opt/fulcrum/deploy/cron.d/fulcrum-ops /etc/cron.d/fulcrum-ops
+  install -m 0644 -o root -g root /opt/fulcrum/deploy/logrotate.d/fulcrum-ops /etc/logrotate.d/fulcrum-ops
+  # The earlier, backup-only cron file: left in place it would run the dump twice.
+  rm -f /etc/cron.d/fulcrum-backup
+  HOST_JOBS_INSTALLED=1
+  echo "installed /etc/cron.d/fulcrum-ops and /etc/logrotate.d/fulcrum-ops"
+else
+  echo "skipped: /opt/fulcrum/deploy is not in place yet (re-run this script once it is)"
+fi
+
+echo
 echo "== swap =="
 # A small swap file is insurance, not capacity: it turns a brief allocation
 # spike during a compaction into slowness instead of an OOM kill.
@@ -114,3 +150,7 @@ echo "  1. copy the repository and deploy/.env to this host"
 echo "  2. engine/fetch-vendor.sh <archive> && engine/build.sh"
 echo "  3. cd deploy && docker compose up -d"
 echo "  4. install deploy/Caddyfile to /etc/caddy/Caddyfile and reload caddy"
+if [ "$HOST_JOBS_INSTALLED" -eq 0 ]; then
+  echo "  5. re-run this script with the repository at /opt/fulcrum, to install the"
+  echo "     host jobs (autoheal, nightly backup, log rotation) — see deploy/README.md"
+fi

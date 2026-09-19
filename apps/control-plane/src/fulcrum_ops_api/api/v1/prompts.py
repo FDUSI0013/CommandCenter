@@ -356,13 +356,16 @@ async def test_prompt(
     payload: PromptTestRequest,
     request: Request,
 ) -> PromptTestResult:
-    """Render the template over sample variable sets and score the run.
+    """Render the template over sample variable sets and record the run.
 
     The response reports, per case, what rendered and which variables were
     missing or left unresolved. With `score` set the rendered cases are stored
-    as a dataset and an experiment is opened against the tested commit so the
-    engine's evaluation path scores them; no model is executed here because the
-    telemetry adapter exposes no completion endpoint. Requires the member role.
+    as a dataset — listed under Evaluations, where it can be scored — and an
+    experiment is opened against the tested commit; `recorded` says that
+    happened. No model is executed here because the telemetry adapter exposes
+    no completion endpoint, and no evaluator is attached, so `scored` is false
+    until an evaluation is run against the dataset. A failure part-way removes
+    the dataset it had just created. Requires the member role.
     """
     return await service.test_prompt(session, principal, prompt_id, payload, request=request)
 

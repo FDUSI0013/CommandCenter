@@ -30,6 +30,7 @@ export type {
   PolicyViolationOptions,
   SpanBody,
   TracedBody,
+  TracedOptions,
 } from './client.js';
 
 export { Span, Trace } from './trace.js';

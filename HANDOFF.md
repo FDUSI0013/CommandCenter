@@ -7,6 +7,15 @@ as a real user would, find what breaks, and fix it.
 
 Work from evidence. Do not trust this document over what you observe.
 
+> **Corrected 2026-09-18.** This brief was written on 2026-08-24, before the
+> repository existed, and three of its statements had since become false: that
+> the code is not under version control, that a restore has never been tested,
+> and that the encryption key exists only on the host. They are corrected in
+> place below, each with where the evidence is. The rest of "What is not done"
+> is as it was written — `git log` is the record of what has been closed since,
+> and the 2026-09-18 audit (branch `fix/audit-2026-09-18`) is the current list
+> of what is open.
+
 ## The product
 
 Fulcrum Ops governs AI agents. Teams register agents, connect them with an SDK
@@ -27,7 +36,7 @@ itself instead.
 
 | Thing | Location |
 |---|---|
-| Source | `C:\Users\FDUSI0013\fulcrum-ops\` — **not a git repo** |
+| Source | `C:\Users\FDUSI0013\fulcrum-ops\` — a git repository; `origin` is AWS CodeCommit `fulcrum-ops` (us-east-1). History starts 2026-08-24 |
 | Control plane | `apps/control-plane` (FastAPI, Python 3.12, venv at `.venv`) |
 | Console | `apps/web` (vanilla JS, no build step) |
 | SDKs | `sdks/python`, `sdks/typescript` |
@@ -59,11 +68,17 @@ tar the changed dirs -> aws s3 cp to s3://fulcrum-ops-demo-deploy-155954279114/p
 Gates that must pass before any deploy:
 
 ```
-apps/control-plane/.venv/Scripts/python.exe -m pytest          # 615 pass today
+apps/control-plane/.venv/Scripts/python.exe -m pytest          # 615 when this was written; it has grown, and takes ~30 min
 apps/control-plane/.venv/Scripts/python.exe -m ruff check src
 apps/control-plane/scripts/check_contract.py                   # console<->API
 scripts/check-branding.sh                                      # no vendor strings
+scripts/check-config.sh                                        # deploy XML, compose, Caddyfile, shell
 ```
+
+A host deployed before 2026-09-18 needs two one-time steps **before** its next
+`docker compose up -d` — the keeper's transaction log has to be moved onto a
+named volume first, or the analytics store comes back read-only. They are in
+`deploy/README.md` under "Upgrades".
 
 ## Environment traps, already paid for
 
@@ -137,12 +152,28 @@ documentation bug — fix it, regenerate both formats, and republish.
 
 ### 4. Close the three Red risks
 
-- **The code exists only on this laptop.** No git repo, no remote, no history.
-  This is the cheapest catastrophic risk to close.
-- **No CI.** Nothing gates a deploy but discipline.
-- **Single host, no HA, untested restore** — and the Postgres backup is unreadable
-  without `APP_ENCRYPTION_KEY`, which lives on the same host. Verify a restore
-  actually works and get the key escrowed elsewhere.
+- ~~**The code exists only on this laptop.**~~ **Closed.** The source is a git
+  repository with its remote on AWS CodeCommit (`git remote -v`; `git log` goes
+  back to the initial import on 2026-08-24). What is still true: nothing pushes
+  for you, so an unpushed branch is still only on this laptop.
+- **No CI.** Nothing gates a deploy but discipline. Still open.
+- **Single host, no HA.** Still open. The other two halves of this risk are
+  closed:
+  - ~~untested restore~~ — a restore of the nightly dump into a fresh database
+    was proven on 2026-08-24; the command is in the header of `deploy/backup.sh`
+    and in `deploy/README.md`. Prove it again after any change to the backup.
+  - ~~the encryption key lives only on the host~~ — `APP_ENCRYPTION_KEY` is
+    escrowed off the host in SSM Parameter Store,
+    `/fulcrum-ops/prod/APP_ENCRYPTION_KEY` (us-east-1), and the dumps are
+    mirrored to S3. A dump plus that parameter is a full recovery; either alone
+    is not.
+
+  What the 2026-09-18 audit found underneath that: the nightly backup exited 0
+  when the host had no `aws` CLI on cron's `PATH`, so "mirrored to S3" was never
+  checked by anything. `backup.sh` now fails loudly (non-zero, and a
+  `BACKUP_FAILED` marker beside the dumps) and verifies each upload — **confirm
+  on the host that last night's dump is actually in the bucket** before relying
+  on it.
 
 ### 5. Harden it
 

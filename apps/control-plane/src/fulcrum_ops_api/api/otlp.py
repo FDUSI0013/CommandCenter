@@ -37,6 +37,7 @@ from __future__ import annotations
 import base64
 import binascii
 import datetime as dt
+import hashlib
 import json
 import struct
 import uuid
@@ -695,20 +696,48 @@ def _hex_bytes(value: str, size: int) -> bytes:
         return b"\x00" * size
 
 
-def _trace_uuid(trace_id_hex: str) -> str:
-    """An OTLP trace id is 16 bytes, which is exactly a UUID."""
-    return str(uuid.UUID(bytes=_hex_bytes(trace_id_hex, 16)))
+def _uuid7(start_ns: int, *seed: bytes) -> str:
+    """A version 7 UUID that is a pure function of an instant and an OTel id.
 
+    The telemetry store refuses any trace or span id that is not genuinely
+    version 7 -- and refuses the *whole batch* with it. An OTel id is sixteen
+    (or eight) random bytes, so reading it as a UUID produced a version 7 value
+    about one time in a hundred and an export the store would take about never.
 
-def _span_uuid(span_id_hex: str, trace_id_hex: str) -> str:
-    """Widen an 8-byte span id into a UUID, deterministically.
-
-    The store addresses spans by UUID and OTLP span ids are half that width, so
-    the trace's first eight bytes are appended. The derivation is pure, so a
-    parent reference resolves to the same id its span was stored under, and a
-    replayed export produces the same ids rather than duplicate spans.
+    The layout is the one ``db.base.new_id`` writes: 48 bits of Unix
+    milliseconds, then the version and variant nibbles. What would be randomness
+    is a digest of the OTel id instead, so nothing is minted: the same span
+    always lands under the same id, a replayed export overwrites rather than
+    duplicates, and a parent reference resolves to the id its span was stored
+    under. The original ids stay on the item as ``otel.trace_id`` and
+    ``otel.span_id``.
     """
-    return str(uuid.UUID(bytes=_hex_bytes(span_id_hex, 8) + _hex_bytes(trace_id_hex, 16)[:8]))
+    millis = max(start_ns, 0) // 1_000_000
+    raw = bytearray(
+        (millis & ((1 << 48) - 1)).to_bytes(6, "big")
+        + hashlib.sha256(b"\x00".join(seed)).digest()[:10]
+    )
+    raw[6] = (raw[6] & 0x0F) | 0x70  # version 7
+    raw[8] = (raw[8] & 0x3F) | 0x80  # RFC 4122 variant
+    return str(uuid.UUID(bytes=bytes(raw)))
+
+
+def _trace_uuid(trace_id_hex: str, start_ns: int) -> str:
+    """The store's id for an OTel trace first seen starting at ``start_ns``.
+
+    The instant is the earliest span start *in this export*, because that is all
+    a stateless receiver knows. A trace whose spans arrive in one export -- or
+    are exported again -- keeps one id. A long trace flushed in several exports
+    does not: each later export starts from a later span and lands as its own
+    run. Keeping those together needs the first id remembered between requests,
+    which this module has nowhere to put.
+    """
+    return _uuid7(start_ns, _hex_bytes(trace_id_hex, 16))
+
+
+def _span_uuid(span_id_hex: str, trace_id_hex: str, start_ns: int) -> str:
+    """The store's id for an OTel span; its own start time never changes."""
+    return _uuid7(start_ns, _hex_bytes(trace_id_hex, 16), _hex_bytes(span_id_hex, 8))
 
 
 def _span_type(attributes: dict[str, Any]) -> SpanType:
@@ -807,6 +836,7 @@ def translate(resources: list[_ResourceSpans]) -> tuple[list[TraceIn], int, list
             members = members[:MAX_SPANS_PER_TRACE]
 
         ids = {span.span_id for _, span in members}
+        starts = {span.span_id: span.start_ns for _, span in members}
         root = next(
             (
                 span
@@ -821,14 +851,14 @@ def translate(resources: list[_ResourceSpans]) -> tuple[list[TraceIn], int, list
         for _res, span in members:
             attributes = span.attributes
             parent = (
-                _span_uuid(span.parent_span_id, trace_id_hex)
+                _span_uuid(span.parent_span_id, trace_id_hex, starts[span.parent_span_id])
                 if span.parent_span_id and span.parent_span_id in ids
                 else None
             )
             try:
                 spans.append(
                     SpanIn(
-                        id=_span_uuid(span.span_id, trace_id_hex),
+                        id=_span_uuid(span.span_id, trace_id_hex, span.start_ns),
                         parent_span_id=parent,
                         name=span.name or "span",
                         type=_span_type(attributes),
@@ -856,13 +886,14 @@ def translate(resources: list[_ResourceSpans]) -> tuple[list[TraceIn], int, list
                 problems.append(f"a span could not be translated: {exc.error_count()} problem(s)")
 
         root_attributes = root.attributes
+        earliest = min(span.start_ns for _, span in members)
         latest = max((span.end_ns for _, span in members), default=0)
         try:
             traces.append(
                 TraceIn(
-                    id=_trace_uuid(trace_id_hex),
+                    id=_trace_uuid(trace_id_hex, earliest),
                     name=root.name or "trace",
-                    start_time=_instant(min(span.start_ns for _, span in members)),
+                    start_time=_instant(earliest),
                     end_time=_instant(latest) if latest else None,
                     input=_attr(root_attributes, _INPUT_KEYS),
                     output=_attr(root_attributes, _OUTPUT_KEYS),
@@ -974,6 +1005,12 @@ async def export_traces(
         )
         for row in outcome.results:
             if row.outcome is ItemOutcome.ACCEPTED:
+                # The trace landed; spans of it that the store would not take
+                # are still spans the exporter has to be told it lost.
+                if row.spans_rejected:
+                    rejected_spans += row.spans_rejected
+                    if row.reason:
+                        reasons.append(row.reason)
                 continue
             # A refused trace takes its spans with it; a trace that carried none
             # still counts as one rejected span so the exporter sees the loss.

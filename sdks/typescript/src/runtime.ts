@@ -12,6 +12,9 @@
 export interface ProcessLike {
   env?: Record<string, string | undefined>;
   versions?: { node?: string };
+  pid?: number;
+  kill?: (pid: number, signal?: string | number) => unknown;
+  listenerCount?: (event: string) => number;
   /** Node >= 20.16/22.3: synchronous access to a built-in module. */
   getBuiltinModule?: (name: string) => unknown;
   on?: (event: string, listener: (...args: unknown[]) => void) => unknown;
@@ -135,13 +138,109 @@ export function onPageHide(listener: () => void): () => void {
 export function onProcessExit(listener: () => void): () => void {
   const proc = getProcess();
   if (!proc || typeof proc.on !== 'function') return () => undefined;
-  // `beforeExit` only — a SIGINT/SIGTERM handler would stop the default
-  // "terminate now" behaviour a host expects, which is not the SDK's to change.
+  // `beforeExit` covers a process that runs out of work. One that is *told* to
+  // stop never reaches it; that is `onTerminationSignal`'s half.
   proc.on('beforeExit', listener);
   return () => {
     const remove = proc.off ?? proc.removeListener;
     if (typeof remove === 'function') remove.call(proc, 'beforeExit', listener);
   };
+}
+
+/** The signals a supervisor stops a process with: a deploy, a scale-in, Ctrl+C. */
+const TERMINATION_SIGNALS = ['SIGTERM', 'SIGINT'] as const;
+
+/** The longest a last flush may delay a process that was told to stop. */
+export const SIGNAL_FLUSH_GRACE_MS = 2_000;
+
+const signalFlushers = new Set<() => Promise<unknown>>();
+let removeSignalListeners: (() => void) | undefined;
+
+/**
+ * Flush when the process is told to terminate; returns the undo function.
+ *
+ * SIGTERM is how Docker, ECS and Kubernetes stop a container, and it skips
+ * `beforeExit` — so without this every rolling deploy loses whatever was
+ * queued since the last timed flush. The catch is that listening for a signal
+ * at all switches off Node's default "terminate now", and how an application
+ * answers a kill signal is not a telemetry library's to change. So the
+ * listener gives that behaviour back, exactly:
+ *
+ * * If the application has its own handler for the signal, the shutdown is
+ *   theirs. The flush is started and nothing else is done — they decide when
+ *   the process ends, and `close()` in their handler still waits for it.
+ * * If it has none, the default would have ended the process on the spot. The
+ *   flush gets `SIGNAL_FLUSH_GRACE_MS` at most, and then the same signal is
+ *   raised again with this listener gone, so the process dies the way it would
+ *   have, with the exit status a supervisor expects.
+ *
+ * Every client shares one listener per signal, and the last one to unregister
+ * takes it away: a listener left behind with nothing to flush would swallow
+ * Ctrl+C.
+ */
+export function onTerminationSignal(flush: () => Promise<unknown>): () => void {
+  const proc = getProcess();
+  if (
+    !proc ||
+    !isNode() ||
+    typeof proc.on !== 'function' ||
+    typeof proc.kill !== 'function' ||
+    typeof proc.listenerCount !== 'function' ||
+    typeof proc.pid !== 'number'
+  ) {
+    return () => undefined;
+  }
+  signalFlushers.add(flush);
+  removeSignalListeners ??= installSignalListeners(proc);
+  return () => {
+    signalFlushers.delete(flush);
+    if (signalFlushers.size > 0) return;
+    removeSignalListeners?.();
+    removeSignalListeners = undefined;
+  };
+}
+
+function installSignalListeners(proc: ProcessLike): () => void {
+  const installed = new Map<string, () => void>();
+  const removeAll = () => {
+    const remove = proc.off ?? proc.removeListener;
+    for (const [signal, listener] of installed) {
+      if (typeof remove === 'function') remove.call(proc, signal, listener);
+    }
+    installed.clear();
+  };
+
+  for (const signal of TERMINATION_SIGNALS) {
+    const listener = () => {
+      // Off first, whatever happens next: a second signal must get the default.
+      removeAll();
+      removeSignalListeners = undefined;
+
+      const flushed = Promise.all(
+        Array.from(signalFlushers).map(async (flush) => {
+          try {
+            await flush();
+          } catch {
+            /* a failed last flush is not a reason to outlive the signal */
+          }
+        }),
+      );
+      if ((proc.listenerCount?.(signal) ?? 0) > 0) return;
+
+      let raised = false;
+      const raise = () => {
+        if (raised) return;
+        raised = true;
+        clearTimeout(timer);
+        proc.kill?.(proc.pid as number, signal);
+      };
+      const timer = setTimeout(raise, SIGNAL_FLUSH_GRACE_MS);
+      void flushed.then(raise);
+    };
+    installed.set(signal, listener);
+    proc.on?.(signal, listener);
+  }
+  return removeAll;
 }
 
 /** A `setTimeout` handle that never keeps a Node process alive on its own. */

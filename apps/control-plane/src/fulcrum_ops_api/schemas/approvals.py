@@ -21,7 +21,14 @@ import datetime as dt
 import enum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    computed_field,
+    field_validator,
+    model_validator,
+)
 
 from ..models.governance import ApprovalStatus, PolicyScope, PolicyStatus, RiskLevel
 
@@ -132,6 +139,13 @@ class ApprovalRequestRead(BaseModel):
 
     policy_id: str | None = None
     policy_name: str | None = None
+    approvers: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Approver groups named by the approval rule this request was filed under; "
+            "empty when no rule applied"
+        ),
+    )
 
     requested_by_user_id: str | None = None
     requested_by_name: str | None = None
@@ -198,7 +212,12 @@ class ApprovalRequestCreate(BaseModel):
     )
     source: str | None = Field(None, max_length=64, description="Screen or system that raised it")
     requested_by_user_id: str | None = Field(
-        None, max_length=36, description="Defaults to the calling user"
+        None,
+        max_length=36,
+        description=(
+            "API keys only: the workspace member the request is raised for. A signed-in "
+            "caller always raises in their own name, and naming anyone else is refused."
+        ),
     )
     request_ref: str | None = Field(
         None,
@@ -211,7 +230,11 @@ class ApprovalRequestCreate(BaseModel):
         None, ge=5, le=20160, description="Overrides the risk-derived SLA window"
     )
     payload: dict[str, Any] = Field(
-        default_factory=dict, description="Replayable action returned on approval"
+        default_factory=dict,
+        description=(
+            "Replayable action returned on approval. Its `amount` (a number) and `trigger` "
+            "(an approval rule's trigger label) are also what an approval rule is matched on"
+        ),
     )
     impact: ApprovalImpact = Field(default_factory=ApprovalImpact)
 
@@ -290,9 +313,10 @@ class ApprovalCommentCreate(BaseModel):
 # ---------------------------------------------------------------------------
 # Approval rules
 #
-# A rule is a policy in the "Approval & Escalation" category: it is what turns
-# an agent action into a request in the queue. It is stored in ``policies`` so
-# the Policy Center, the enforcement path and this screen all read one table.
+# A rule is a policy in the "Approval & Escalation" category, stored in
+# ``policies`` so the Policy Center lists it with every other control. It does
+# not raise requests; a request raised while the rule is in force, and falling
+# under its trigger, is filed under it, runs on its SLA and names its approvers.
 # ---------------------------------------------------------------------------
 
 
@@ -437,6 +461,22 @@ class AuditEventRead(BaseModel):
     event_metadata: dict[str, Any] = Field(default_factory=dict)
     checksum: str | None = Field(None, description="SHA-256 linking this row to the previous one")
 
+    @model_validator(mode="after")
+    def _states_from_metadata(self) -> AuditEventRead:
+        """Show a before/after for rows written before the columns were.
+
+        The trail is append-only, so those rows cannot be backfilled; many of
+        them recorded their transition as ``{"from", "to"}`` in the metadata,
+        and reading it from there fills the drawer and the CSV without touching
+        a stored row or its checksum. Plain values only -- a dict is a diff.
+        """
+        for column, key in (("prev_value", "from"), ("new_value", "to")):
+            recorded = self.event_metadata.get(key)
+            if getattr(self, column) is None and isinstance(recorded, str | int | float):
+                shown = str(recorded).lower() if isinstance(recorded, bool) else str(recorded)
+                setattr(self, column, shown)
+        return self
+
 
 class AuditChainStatus(BaseModel):
     """Result of replaying the hash chain over a workspace's audit rows."""
@@ -445,3 +485,11 @@ class AuditChainStatus(BaseModel):
     checked: int = Field(..., description="Rows verified before the answer was returned")
     broken_at_event_id: str | None = None
     broken_at: dt.datetime | None = None
+    forks: int | None = Field(
+        None,
+        description=(
+            "Rows that reconcile but chain from a row other than the one immediately "
+            "before them: two writers read the same tail before writers were "
+            "serialised. Not tampering, and not hidden. Present only when there are any."
+        ),
+    )

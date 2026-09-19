@@ -295,6 +295,13 @@ async def test_connector(
     The probe is unauthenticated, so an endpoint that answers 401 or 403 counts
     as reachable. A blocked connector is reported as blocked without being
     called, and one with no endpoint registered cannot be tested at all.
+
+    The answer is always a result, never an error, once the connector is found:
+    a malformed endpoint is ``Unreachable`` with a message saying so, and an
+    endpoint on a private, loopback or link-local address - or one that
+    redirects to such an address - is ``Warning`` with ``ok: false`` and no
+    ``http_status`` or ``latency_ms``, because the control plane does not call
+    into its own network on a connector's behalf and so measured nothing.
     """
     return await connectors_service.test_connector(
         session, principal, connector_id, request=request

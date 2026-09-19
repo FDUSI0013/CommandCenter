@@ -25,8 +25,8 @@ from __future__ import annotations
 
 import datetime as dt
 import enum
+import re
 from typing import Any, Final
-from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -44,13 +44,17 @@ SYNC_STATE_KEY: Final[str] = "sync"
 #: Feedback score names this domain understands, mapped onto the four bars the
 #: inspector's Grounding & Quality panel renders. Matching is case-insensitive
 #: and ignores separators, so "Context Relevance" and "context_relevance" are
-#: the same score.
+#: the same score. Every dimension reads high-is-good. "hallucination" is the
+#: one alias a judge emits the other way round (1.0 = hallucinated); the
+#: service turns it over before averaging, using the same list of inverted
+#: judges the evaluations domain keeps. "grounded" is the name this product's
+#: own user guide tells people to score with.
 GROUNDING_DIMENSIONS: Final[dict[str, tuple[str, ...]]] = {
     "context_relevance": ("contextrelevance", "contextprecision", "retrievalrelevance"),
     "answer_relevance": ("answerrelevance", "responserelevance"),
     "citation_quality": ("citationquality", "citationaccuracy", "attribution"),
-    "completeness": ("completeness", "answercompleteness", "coverage"),
-    "grounding": ("grounding", "groundedness", "faithfulness", "hallucination"),
+    "completeness": ("completeness", "answercompleteness", "coverage", "contextrecall"),
+    "grounding": ("grounding", "grounded", "groundedness", "faithfulness", "hallucination"),
 }
 
 #: Stages a sync walks, with the progress percentage each one ends at. The
@@ -92,16 +96,32 @@ class SyncStage(enum.StrEnum):
     FAILED = "Failed"
 
 
+#: Schemes a browser would run rather than fetch. The location is only ever
+#: displayed, but the console may render it as a link.
+_SCRIPT_SCHEMES: Final[frozenset[str]] = frozenset({"javascript", "data", "vbscript"})
+_SCHEME: Final[re.Pattern[str]] = re.compile(r"^([a-z][a-z0-9+.\-]*):", re.IGNORECASE)
+#: A browser drops tabs and line breaks from a URL before reading its scheme.
+_IGNORED_IN_SCHEME: Final[re.Pattern[str]] = re.compile(r"[\t\r\n]+")
+
+
 def _absolute_or_scheme_free(value: str) -> str:
-    """Accept a URL or a plain path; reject a string that is neither."""
+    """Accept any URL or path; refuse only what a browser would execute.
+
+    This used to allow a short list of URL schemes, and a URL parser calls
+    whatever precedes the first colon a scheme. So it refused ``Z:\\Policies``
+    (a File Share), ``wasbs://`` and ``gs://`` (Blob Storage),
+    ``sharepoint://``, ``jdbc:`` and ``postgresql://`` (Database) and
+    ``localhost:9200/idx`` (Vector Index) -- every source type the dialog
+    offers beside the web -- with a message that ended "or a plain path".
+    Stored blocks are validated again on every read, so this rule must never
+    be made stricter than it is.
+    """
     trimmed = value.strip()
     if not trimmed:
         raise ValueError("must not be blank")
-    parsed = urlparse(trimmed)
-    if parsed.scheme and parsed.scheme not in ("http", "https", "abfss", "s3", "file"):
-        raise ValueError(
-            "location must be an http(s), abfss, s3 or file URL, or a plain path"
-        )
+    scheme = _SCHEME.match(_IGNORED_IN_SCHEME.sub("", trimmed))
+    if scheme and scheme.group(1).lower() in _SCRIPT_SCHEMES:
+        raise ValueError("location must be a URL or a path, not a script")
     return trimmed
 
 

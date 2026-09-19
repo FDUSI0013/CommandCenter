@@ -126,6 +126,11 @@ async def get_summary(principal: CurrentPrincipal, session: Db) -> SecretsSummar
     rotations, the compliance score and the 30-day privileged-access count are
     all SQL aggregates, so the panel costs the same on a vault of ten
     credentials as on one of ten thousand.
+
+    Expiring, overdue and the compliance figures are taken over the credentials
+    in service (`in_service`): a disabled or revoked one cannot be rotated, so
+    it is not scored. `privileged_access_30d` counts successful reveals and
+    rotations of privileged credentials, not metadata edits or refusals.
     """
     return await service.summarise(session, principal)
 
@@ -223,6 +228,14 @@ async def update_secret(
     The material cannot be changed here — rotate it instead. Send
     `expected_updated_at` to make the write conditional: if the row moved since
     you read it the request is refused with 409. Requires the admin role.
+
+    `status` is held to the same state machine as the verbs. Setting `Revoked`
+    revokes the credential and is recorded as such; moving a revoked credential
+    anywhere else is refused with 412, exactly as `/enable` refuses it; and
+    `Disabled` is entered and left through `/disable` and `/enable` only (422
+    here), because those record the reason. `owner_user_id` must name a member
+    of this workspace, and a field that cannot be empty — name, type, vault,
+    status, risk, privileged — answers 422 to an explicit null.
     """
     return await service.update_secret(
         session, principal, secret_id, payload, request=request
@@ -293,6 +306,11 @@ async def rotate_secret(
     fresh one is generated — a generated value is returned exactly once, in
     this response, while a supplied one is never echoed back. `next_rotation_at`
     is recomputed from the rotation period. Requires the admin role.
+
+    A credential the control plane only points at (`has_material` false) is
+    never minted into: omit `value` there and the call records a rotation you
+    performed in its own vault — `recorded_upstream` is true, no value comes
+    back, and the row stays a reference.
     """
     return await service.rotate_secret(
         session, principal, secret_id, payload or SecretRotateRequest(), request=request

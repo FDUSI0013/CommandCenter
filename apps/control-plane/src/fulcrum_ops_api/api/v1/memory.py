@@ -1,9 +1,9 @@
 """Memory & State Management routes.
 
-Seventeen endpoints back one screen: the store table with its four filters and
+Eighteen endpoints back one screen: the store table with its four filters and
 its export, the KPI row above it, the six tabs beside it (stores, sessions,
-agent state, conversation state, retention policies, backups) and the five row
-actions (view records, update retention, purge, back up, restore).
+agent state, conversation state, retention policies, backups) and the six row
+actions (view records, update retention, purge, back up, restore, delete).
 
 Handlers here only parse, delegate and shape. Workspace scoping, role checks,
 audit writes and every call into the telemetry adapter live in
@@ -298,6 +298,23 @@ async def update_store(
     return await service.update_store(session, principal, store_id, payload, request=request)
 
 
+@router.delete(
+    "/{store_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete a memory store",
+)
+async def delete_store(
+    principal: CurrentPrincipal, session: Db, store_id: str, request: Request
+) -> None:
+    """Remove a store from the registry.
+
+    Only the registry row goes; no record is deleted anywhere, and the store's
+    backups stay on the ledger. Refused with 412 while any agent still names the
+    store as its memory policy. Requires the admin role.
+    """
+    await service.delete_store(session, principal, store_id, request=request)
+
+
 @router.get(
     "/{store_id}/records",
     response_model=Page[MemoryRecordRead],
@@ -312,9 +329,10 @@ async def list_records(
 ) -> Page[MemoryRecordRead]:
     """One page of the store's records, read live from the telemetry store.
 
-    Records are conversation threads, so this is answered for conversation and
-    session stores; any other type is refused with 412 naming the backend that
-    does hold them.
+    Records are the conversation threads of the agents whose memory policy names
+    the store — the same scope a purge sweeps — so this is answered for
+    conversation and session stores; any other type is refused with 412 naming
+    the backend that does hold them. A store no agent names holds no records.
     """
     rows, total = await service.list_records(
         session, principal, store_id, params, agent_id=agent_id
@@ -357,12 +375,22 @@ async def purge_store(
     payload: MemoryPurgeRequest,
     request: Request,
 ) -> MemoryPurgeResult:
-    """Delete everything past the store's retention window.
+    """Delete the conversation records past the store's retention window.
 
-    This is a real deletion against the telemetry store, batched, with the
-    registry's record count and usage reduced by exactly what went. Send
-    `dry_run` to walk the same window and count without deleting. Refused with
-    412 when the store has no policy or is paused. Requires the operator role.
+    This is a real, permanent deletion against the telemetry store, so it is
+    narrow on purpose: only the agents whose memory policy names this store are
+    swept, only whole conversation threads whose last activity is past the
+    window are removed, and runs that belong to no thread are never touched.
+
+    Send `dry_run` first: it needs no confirmation and answers with how many
+    records would go and which agents hold them. The real call must carry
+    `confirm` set to the store's exact name, or it is refused with 422.
+
+    Refused with 412 when the store has no policy, is paused, or is named by no
+    agent; with 409 while another purge of the same store is running. A run the
+    telemetry store interrupts answers 200 with `partial` set — what it reports
+    was deleted and audited — and `capped` means there is more: run it again.
+    Requires the operator role.
     """
     return await service.purge_store(session, principal, store_id, payload, request=request)
 
@@ -380,11 +408,14 @@ async def backup_store(
     payload: MemoryBackupRequest,
     request: Request,
 ) -> MemoryBackupResult:
-    """Snapshot the store: export its threads and record the manifest.
+    """Snapshot the store's governed state and record the manifest.
 
-    A store that has been backed up before is exported incrementally from the
-    last snapshot unless `full` is set. The response carries the backup id used
-    by restore. Requires the operator role.
+    The manifest holds the retention policy and status — what a restore can put
+    back — and a count of the conversation threads the store's agents held at
+    that moment. The threads themselves are **not** copied: `threads_captured`
+    is always false, `payload_bytes` is always null, and `notice` says so in a
+    sentence. A backup is therefore no protection against a purge. The response
+    carries the backup id used by restore. Requires the operator role.
     """
     return await service.backup_store(session, principal, store_id, payload, request=request)
 
@@ -414,10 +445,12 @@ async def restore_store(
     payload: MemoryRestoreRequest,
     request: Request,
 ) -> MemoryRestoreResult:
-    """Put the store back into the state one backup captured.
+    """Put the store's governed state back to what one backup captured.
 
-    The manifest holds the governed state — record count, usage, retention and
-    status — and `fields_restored` reports exactly which of them moved. Requires
-    the admin role.
+    That is the retention policy and the status, and `fields_restored` reports
+    exactly which of them moved. Conversation threads are never restored — no
+    backup holds any — so `threads_restored` is always false, `record_count` is
+    what the store holds *now*, and `notice` says so in a sentence. Requires the
+    admin role.
     """
     return await service.restore_store(session, principal, store_id, payload, request=request)

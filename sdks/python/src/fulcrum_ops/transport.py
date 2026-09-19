@@ -13,6 +13,7 @@ import logging
 import random
 import threading
 from typing import Any, Dict, Mapping, Optional, Tuple
+from urllib.parse import urljoin, urlsplit
 
 from ._version import SDK_NAME, SDK_VERSION, USER_AGENT
 from .errors import ApiError, FulcrumOpsError, to_fulcrum_error
@@ -22,6 +23,10 @@ from .options import Options
 __all__ = ["Transport", "Response", "backoff_delay"]
 
 logger = logging.getLogger("fulcrum_ops")
+
+#: The redirects that mean "the same request, over there". 303 is left out: it
+#: means "now GET this", which is not what re-posting a batch would be.
+_REDIRECTS = (301, 302, 307, 308)
 
 
 class Response:
@@ -75,6 +80,7 @@ class Transport:
         self._closed = False
         self._owns_client = options.http_client is None
         self._client: Optional[Any] = options.http_client
+        self._redirect_reported = False
 
     # ------------------------------------------------------------------ setup
 
@@ -153,19 +159,69 @@ class Transport:
             if isinstance(content, str):
                 content = content.encode("utf-8")
 
+        url = self._url(path)
         try:
             raw = client.request(
                 method.upper(),
-                self._url(path),
+                url,
                 content=content,
                 params=dict(params) if params else None,
                 headers=merged,
                 timeout=timeout if timeout is not None else self._options.timeout_seconds,
             )
+            target = self._redirect_target(url, raw)
+            if target is not None:
+                raw = client.request(
+                    method.upper(),
+                    target,
+                    content=content,
+                    params=dict(params) if params else None,
+                    headers=merged,
+                    timeout=timeout if timeout is not None else self._options.timeout_seconds,
+                )
         except Exception as exc:
             raise to_fulcrum_error(exc, "The request to the control plane failed.") from exc
 
         return Response(raw.status_code, _decode(raw), raw.headers)
+
+    def _redirect_target(self, url: str, raw: Any) -> Optional[str]:
+        """Where to re-send a redirected request, when the HTTP client will not.
+
+        The client this SDK builds follows redirects. One the caller injects —
+        for a proxy, or a custom trust store — usually does not, because httpx
+        does not by default; and an ``http://`` base URL in front of a proxy
+        that upgrades to ``https://`` then answers every batch with a 308, which
+        is not retryable, so every batch was dropped as ``The API returned HTTP
+        308``. Followed once, and only to the same host: the request carries the
+        API key, and a redirect is not allowed to send that somewhere else.
+        """
+        if self._owns_client or getattr(raw, "status_code", None) not in _REDIRECTS:
+            return None
+        try:
+            location = raw.headers.get("location")
+        except Exception:  # noqa: BLE001
+            location = None
+        if not location:
+            return None
+        target = urljoin(url, str(location))
+        if (urlsplit(target).hostname or "").lower() != (urlsplit(url).hostname or "").lower():
+            logger.warning(
+                "fulcrum-ops: the control plane at %s redirects to another host (%s); not "
+                "following it with the API key. Set base_url to the address it should use.",
+                url,
+                target,
+            )
+            return None
+        if not self._redirect_reported:
+            self._redirect_reported = True
+            logger.warning(
+                "fulcrum-ops: %s redirects to %s. Following it, at the cost of a second request "
+                "every time; set base_url (FULCRUM_OPS_BASE_URL) to the final address, or build "
+                "your http_client with follow_redirects=True.",
+                url,
+                target,
+            )
+        return target
 
     def request_json(
         self,
@@ -243,6 +299,19 @@ class Transport:
         return None, last_error, attempts
 
     # ---------------------------------------------------------------- cleanup
+
+    def _reset_after_fork(self) -> None:
+        """Stop sharing the parent's connections. Called in a forked child only.
+
+        The pooled sockets are the parent's too, and two processes writing
+        requests down one connection corrupts both. The client is let go of
+        rather than closed — closing would say goodbye on sockets the parent is
+        still using — and the next request builds a fresh one. A client the
+        caller injected is theirs to make fork-safe.
+        """
+        self._lock = threading.Lock()
+        if self._owns_client:
+            self._client = None
 
     def close(self) -> None:
         """Release the underlying connection pool, if this transport owns it."""

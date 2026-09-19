@@ -100,6 +100,9 @@ async def list_audit_events(
 @router.get(
     "/verify",
     response_model=AuditChainStatus,
+    # ``forks`` is reported only when the replay found any, so a trail without
+    # them answers exactly as it always has.
+    response_model_exclude_unset=True,
     summary="Verify the audit hash chain",
 )
 async def verify_chain(principal: CurrentPrincipal, session: Db) -> AuditChainStatus:
@@ -107,7 +110,9 @@ async def verify_chain(principal: CurrentPrincipal, session: Db) -> AuditChainSt
 
     Returns how many rows reconciled; when the chain is broken it also names the
     event where the recomputed checksum stopped matching, which is where an
-    investigation starts.
+    investigation starts. `forks` counts rows that reconcile but chain from a row
+    other than their immediate predecessor — the mark two concurrent writers left
+    before writers were serialised; it is history, not tampering.
     """
     return await service.verify_audit_chain(session, principal)
 

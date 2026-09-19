@@ -1,6 +1,6 @@
 {
   "name": "@fulcrum-ops/sdk",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Fulcrum Ops SDK — report agent traces, spans, feedback scores and governance events to the Fulcrum Ops control plane.",
   "license": "UNLICENSED",
   "private": false,

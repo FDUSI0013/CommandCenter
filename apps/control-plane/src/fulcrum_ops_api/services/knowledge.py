@@ -38,6 +38,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..api.common import ListParams, apply_filters, apply_search, apply_sort, paginate
 from ..api.deps import Principal
+from ..core.config import settings as app_settings
 from ..core.errors import (
     Conflict,
     NotFound,
@@ -45,12 +46,14 @@ from ..core.errors import (
     TelemetryBackendUnavailable,
     ValidationFailed,
 )
+from ..core.ttlcache import SingleFlightCache
 from ..db.session import get_sessionmaker
 from ..engine import (
     EngineBadRequest,
     EngineClient,
     EngineNotFound,
     EngineUnavailable,
+    deadline,
     get_engine_client,
 )
 from ..models.identity import Role, User
@@ -60,6 +63,7 @@ from ..models.registry import (
     KnowledgeSourceStatus,
     Sensitivity,
 )
+from ..schemas.evaluations import INVERTED_METRIC_SOURCES
 from ..schemas.knowledge import (
     DEFAULT_WINDOW_DAYS,
     GROUNDING_DIMENSIONS,
@@ -90,10 +94,32 @@ T = TypeVar("T")
 SOURCE_SCREEN: Final[str] = "RAG & Knowledge Governance"
 ENTITY_TYPE: Final[str] = "knowledge_source"
 
-#: One search call per project; these bound what a scan will pull back so a
-#: busy workspace cannot turn one console click into an unbounded read.
+#: These bound what a scan will pull back so a busy workspace cannot turn one
+#: console click into an unbounded read.
 MAX_SCAN_PROJECTS: Final[int] = 10
-MAX_SPANS_PER_PROJECT: Final[int] = 500
+#: Rows asked for per call, and the most one project contributes to a scan. The
+#: store streams a project's spans newest first and knows nothing about
+#: retrieval, so a single page of a busy agent was mostly model calls and the
+#: "30-day window" the screen prints was really its last few dozen runs. The
+#: scan follows the cursor back through the window until it reaches this cap.
+SPAN_PAGE_SIZE: Final[int] = 500
+MAX_SPANS_PER_PROJECT: Final[int] = 2000
+#: Projects read side by side. Every page is an untruncated stream the adapter
+#: parses in this process, and ten at once starved the requests beside it.
+SCAN_CONCURRENCY: Final[int] = 5
+
+#: Wall-clock ceiling on one sync, enforced by the job's own supervisor. A
+#: healthy sync is a handful of store reads and takes seconds.
+EXECUTION_DEADLINE_SECONDS: Final[float] = 120.0
+#: A row still Syncing this long after its job's last committed progress, and
+#: past the ceiling above, has no job: the task lives in one worker's memory,
+#: and a restart, a deploy or an OOM kill takes it without a word. Counting from
+#: the ceiling is what makes closing such a row out race-free -- a job that is
+#: still within its lifetime is never touched.
+STRANDED_GRACE_SECONDS: Final[float] = 120.0
+INTERRUPTED: Final[str] = "Interrupted before it finished (restart or timeout)."
+#: Times the job looks for its own row before concluding it is not there.
+VERIFY_ATTEMPTS: Final[int] = 3
 
 #: Sensitivity levels that may not have ACL trimming switched off.
 ACL_MANDATORY: Final[frozenset[str]] = frozenset(
@@ -570,16 +596,75 @@ class SpanScan:
     projects_total: int = 0
 
 
+@dataclasses.dataclass(frozen=True)
+class _Entry:
+    """One retrieved-document record, reduced to what the screen shows."""
+
+    document_id: str
+    title: str | None
+    chunk: str | None
+    score: float | None
+
+
+@dataclasses.dataclass(frozen=True)
+class _RetrievalSpan:
+    """What this domain reads off one span: what it says it read from, the
+    documents it got back and how it was scored. Never the payload itself --
+    a scan is remembered between requests and prompts are not ours to keep."""
+
+    agent: str
+    names: frozenset[str]
+    entries: tuple[_Entry, ...]
+    scores: tuple[tuple[str, float], ...]
+    seen_at: dt.datetime | None
+
+
+@dataclasses.dataclass
+class _WorkspaceScan:
+    """One workspace's retrieval telemetry for one window, for every source."""
+
+    spans: list[_RetrievalSpan] = dataclasses.field(default_factory=list)
+    projects_scanned: int = 0
+    projects_total: int = 0
+
+
+#: key: (workspace id, window in days). What the store is asked does not depend
+#: on the source -- only the match made afterwards does -- so one scan answers
+#: the grounding panel and the documents modal of every source in the
+#: workspace, and every page of that modal. Single flight: the inspector and
+#: the Citations & Grounding tab ask at the same moment and share one read.
+_workspace_scans: SingleFlightCache[_WorkspaceScan] = SingleFlightCache(
+    ttl=lambda: app_settings.knowledge_scan_cache_seconds, max_entries=64
+)
+
+
+def forget_scans(workspace_id: str | None = None) -> None:
+    """Forget the remembered retrieval scans of one workspace, or of all."""
+    if workspace_id is None:
+        _workspace_scans.invalidate()
+        return
+    _workspace_scans.invalidate(
+        lambda key: isinstance(key, tuple) and bool(key) and key[0] == workspace_id
+    )
+
+
 async def _agent_projects(
     session: AsyncSession, principal: Principal
 ) -> list[tuple[str, str]]:
-    """``(agent name, engine project name)`` for every agent that reports telemetry."""
+    """``(agent name, engine project name)`` for every agent that reports telemetry.
+
+    Most recently reporting first: the scan reads a bounded number of projects,
+    and which ones must not be left to the order the database happens to
+    return rows in. A quiet agent is the right one to leave out.
+    """
     rows = (
         await session.execute(
-            select(Agent.name, Agent.engine_project_name).where(
+            select(Agent.name, Agent.engine_project_name)
+            .where(
                 Agent.workspace_id == principal.workspace_id,
                 Agent.engine_project_name.isnot(None),
             )
+            .order_by(Agent.last_used_at.desc().nulls_last(), Agent.name)
         )
     ).all()
     return [(name, project) for name, project in rows if project]
@@ -594,18 +679,19 @@ def _identifiers(source: KnowledgeSource) -> set[str]:
     }
 
 
-def _references(span: Mapping[str, Any], identifiers: set[str]) -> bool:
-    """True when the span says it read from this source."""
+def _named_sources(span: Mapping[str, Any]) -> frozenset[str]:
+    """Every string this span uses to say what it read from."""
+    names: set[str] = set()
     metadata = span.get("metadata")
     if isinstance(metadata, dict):
         for key in _SOURCE_KEYS:
             value = metadata.get(key)
-            if isinstance(value, str) and value in identifiers:
-                return True
+            if isinstance(value, str) and value:
+                names.add(value)
     tags = span.get("tags")
-    return isinstance(tags, list) and any(
-        isinstance(tag, str) and tag in identifiers for tag in tags
-    )
+    if isinstance(tags, list):
+        names.update(tag for tag in tags if isinstance(tag, str) and tag)
+    return frozenset(names)
 
 
 def _document_entries(span: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -640,66 +726,157 @@ def _span_scores(span: Mapping[str, Any]) -> list[tuple[str, float]]:
         needle = _normalise(name)
         for dimension, aliases in GROUNDING_DIMENSIONS.items():
             if needle in aliases:
-                found.append((dimension, float(value)))
+                score = float(value)
+                # Every bar reads high-is-good. A hallucination judge scores the
+                # other way round, so averaged as it came a source that never
+                # hallucinates showed a red 0.00 and one that always does a
+                # green 1.00. Clamped, because a score outside 0-1 would leave
+                # the scale once turned over.
+                if needle in INVERTED_METRIC_SOURCES:
+                    score = 1.0 - score
+                found.append((dimension, max(0.0, min(1.0, score))))
                 break
     return found
 
 
-def _absorb(scan: SpanScan, span: Mapping[str, Any], agent: str) -> None:
-    """Fold one matching span into the accumulating scan."""
-    scan.spans += 1
-    seen_at = _instant(_first(span, ("end_time", "start_time", "created_at")))
+def _reduce(span: Mapping[str, Any], agent: str) -> _RetrievalSpan | None:
+    """Keep what the screen reads off a span; ``None`` if it names no source."""
+    names = _named_sources(span)
+    if not names:
+        return None
 
+    entries: list[_Entry] = []
     for entry in _document_entries(span):
         raw_id = _first(entry, _DOCUMENT_ID_KEYS)
         title = _first(entry, _TITLE_KEYS)
         document_id = str(raw_id) if raw_id is not None else (str(title) if title else None)
         if not document_id:
             continue
-        document = scan.documents.setdefault(document_id, _Document(document_id=document_id))
-        if title and not document.title:
-            document.title = str(title)
         chunk = _first(entry, _CHUNK_KEYS)
-        if chunk is not None:
-            key = f"{document_id}:{chunk}"
+        score = _first(entry, _SCORE_KEYS)
+        entries.append(
+            _Entry(
+                document_id=document_id,
+                title=str(title) if title else None,
+                chunk=str(chunk) if chunk is not None else None,
+                score=(
+                    float(score)
+                    if isinstance(score, (int, float)) and not isinstance(score, bool)
+                    else None
+                ),
+            )
+        )
+
+    return _RetrievalSpan(
+        agent=agent,
+        names=names,
+        entries=tuple(entries),
+        scores=tuple(_span_scores(span)),
+        seen_at=_instant(_first(span, ("end_time", "start_time", "created_at"))),
+    )
+
+
+def _absorb(scan: SpanScan, span: _RetrievalSpan) -> None:
+    """Fold one matching span into the accumulating scan."""
+    scan.spans += 1
+
+    for entry in span.entries:
+        document = scan.documents.setdefault(
+            entry.document_id, _Document(document_id=entry.document_id)
+        )
+        if entry.title and not document.title:
+            document.title = entry.title
+        if entry.chunk is not None:
+            key = f"{entry.document_id}:{entry.chunk}"
             document.chunks.add(key)
             scan.chunk_ids.add(key)
-        score = _first(entry, _SCORE_KEYS)
-        if isinstance(score, (int, float)) and not isinstance(score, bool):
-            document.scores.append(float(score))
-        if seen_at and (document.last_seen is None or seen_at > document.last_seen):
-            document.last_seen = seen_at
-        document.agents.add(agent)
+        if entry.score is not None:
+            document.scores.append(entry.score)
+        if span.seen_at and (document.last_seen is None or span.seen_at > document.last_seen):
+            document.last_seen = span.seen_at
+        document.agents.add(span.agent)
 
-    for dimension, value in _span_scores(span):
+    for dimension, value in span.scores:
         scan.dimensions.setdefault(dimension, []).append(value)
 
 
-async def scan_retrieval_spans(
-    session: AsyncSession,
-    principal: Principal,
-    source: KnowledgeSource,
-    *,
-    window_days: int = DEFAULT_WINDOW_DAYS,
-    client: EngineClient | None = None,
-) -> SpanScan:
-    """Read the retrieval spans that name this source, across our agents only.
+def _is_error_envelope(row: Any) -> bool:
+    """True for a stream row that reports a failure rather than a span.
 
-    Spans are fetched per engine project, and the only projects addressed are
-    those of agents in this workspace — a source can never be described using
-    another tenant's telemetry. Both the number of projects and the number of
-    spans per project are capped; the scan reports what it covered so a caller
-    can say the sample was limited rather than imply it was exhaustive.
+    The store answers a search 200 and then streams; a query that dies half
+    way is reported as a row in that stream. Such a row has no ``id`` and says
+    what went wrong. Read as "not a span" it used to be skipped, and a store
+    failure then looked like a source nothing had ever retrieved from.
     """
-    engine = client or get_engine_client()
-    pairs = await _agent_projects(session, principal)
-    scan = SpanScan(projects_total=len({project for _agent, project in pairs}))
-    if not pairs:
-        return scan
+    return (
+        isinstance(row, dict)
+        and not row.get("id")
+        and any(key in row for key in ("code", "errors", "message"))
+    )
 
-    now = _now()
-    since = now - dt.timedelta(days=window_days)
-    identifiers = _identifiers(source)
+
+async def _project_spans(
+    engine: EngineClient,
+    agent: str,
+    project: str,
+    *,
+    since: dt.datetime,
+    until: dt.datetime,
+    timeout_seconds: float | None,
+) -> list[_RetrievalSpan]:
+    """One project's retrieval spans in the window, cursored back to the cap."""
+    found: list[_RetrievalSpan] = []
+    fetched = 0
+    cursor: str | None = None
+    while fetched < MAX_SPANS_PER_PROJECT:
+        wanted = min(SPAN_PAGE_SIZE, MAX_SPANS_PER_PROJECT - fetched)
+        batch = await _call(
+            engine.search_spans(
+                project_name=project,
+                from_time=since,
+                to_time=until,
+                limit=wanted,
+                last_retrieved_id=cursor,
+                # Documents are parsed from ``output``; a truncated one is not JSON.
+                truncate=False,
+                timeout_seconds=timeout_seconds,
+            ),
+            action="reading retrieval spans",
+        )
+        rows = batch or []
+        if any(_is_error_envelope(row) for row in rows):
+            raise TelemetryBackendUnavailable(
+                "The telemetry store failed part way through reading retrieval spans."
+            )
+        usable = [row for row in rows if isinstance(row, dict) and row.get("id")]
+        fetched += len(usable)
+
+        left_window = False
+        for row in usable:
+            started = _instant(_first(row, ("start_time", "created_at")))
+            if started is not None and started < since:
+                # Newest first: everything after this row is older still.
+                left_window = True
+                continue
+            reduced = _reduce(row, agent)
+            if reduced is not None:
+                found.append(reduced)
+
+        if len(rows) < wanted or not usable or left_window:
+            break
+        cursor = str(usable[-1]["id"])
+    return found
+
+
+async def _read_workspace(
+    engine: EngineClient,
+    pairs: Sequence[tuple[str, str]],
+    *,
+    window_days: int,
+    timeout_seconds: float | None,
+) -> _WorkspaceScan:
+    """Ask the store, once, for everything any source in the workspace needs."""
+    scan = _WorkspaceScan(projects_total=len({project for _agent, project in pairs}))
 
     selected: list[tuple[str, str]] = []
     seen_projects: set[str] = set()
@@ -710,29 +887,114 @@ async def scan_retrieval_spans(
         selected.append((agent, project))
         if len(selected) >= MAX_SCAN_PROJECTS:
             break
+    if not selected:
+        return scan
 
-    payloads = await asyncio.gather(
-        *(
-            _call(
-                engine.search_spans(
-                    project_name=project,
-                    from_time=since,
-                    to_time=now,
-                    limit=MAX_SPANS_PER_PROJECT,
-                    truncate=False,
-                ),
-                action="reading retrieval spans",
+    until = _now()
+    since = until - dt.timedelta(days=window_days)
+    gate = asyncio.Semaphore(SCAN_CONCURRENCY)
+
+    async def read(agent: str, project: str) -> list[_RetrievalSpan]:
+        async with gate:
+            return await _project_spans(
+                engine,
+                agent,
+                project,
+                since=since,
+                until=until,
+                timeout_seconds=timeout_seconds,
             )
-            for _agent, project in selected
-        )
-    )
 
+    per_project = await asyncio.gather(*(read(agent, project) for agent, project in selected))
     scan.projects_scanned = len(selected)
-    for (agent, _project), spans in zip(selected, payloads, strict=True):
-        for span in spans or []:
-            if isinstance(span, dict) and _references(span, identifiers):
-                _absorb(scan, span, agent)
+    for spans in per_project:
+        scan.spans.extend(spans)
     return scan
+
+
+async def _source_scan(
+    workspace_id: str,
+    pairs: Sequence[tuple[str, str]],
+    identifiers: set[str],
+    *,
+    window_days: int,
+    client: EngineClient | None = None,
+    fresh: bool = False,
+) -> SpanScan:
+    """One source's view of the workspace scan. Touches no database.
+
+    A screen read is served from the remembered scan when there is one, and
+    waits under the fan-out deadline so this API answers before the console
+    stops listening; a shared read it gave up on finishes on its own and is
+    there for the retry. ``fresh`` is the sync job: it always reads the store,
+    takes the time it needs, and leaves what it read for the screen's next look.
+    """
+    engine = client or get_engine_client()
+    key = (workspace_id, window_days)
+
+    async def compute() -> _WorkspaceScan:
+        return await _read_workspace(
+            engine,
+            pairs,
+            window_days=window_days,
+            timeout_seconds=None if fresh else app_settings.engine_read_timeout_seconds,
+        )
+
+    if fresh:
+        forget_scans(workspace_id)
+        workspace_scan = await _workspace_scans.get(key, compute)
+    else:
+        try:
+            async with deadline(what="reading retrieval spans"):
+                workspace_scan = await _workspace_scans.get(key, compute)
+        except EngineUnavailable as exc:
+            raise TelemetryBackendUnavailable(
+                "The telemetry store could not be reached while reading retrieval spans."
+            ) from exc
+
+    scan = SpanScan(
+        projects_scanned=workspace_scan.projects_scanned,
+        projects_total=workspace_scan.projects_total,
+    )
+    for span in workspace_scan.spans:
+        if span.names & identifiers:
+            _absorb(scan, span)
+    return scan
+
+
+async def scan_retrieval_spans(
+    session: AsyncSession,
+    principal: Principal,
+    source: KnowledgeSource,
+    *,
+    window_days: int = DEFAULT_WINDOW_DAYS,
+    client: EngineClient | None = None,
+    fresh: bool = False,
+) -> SpanScan:
+    """Read the retrieval spans that name this source, across our agents only.
+
+    Spans are fetched per engine project, and the only projects addressed are
+    those of agents in this workspace — a source can never be described using
+    another tenant's telemetry. Both the number of projects and the number of
+    spans per project are capped; the scan reports what it covered so a caller
+    can say the sample was limited rather than imply it was exhaustive.
+
+    The session's transaction is ended before the store is asked anything. The
+    scan can take as long as the store does, and a request that holds a pooled
+    database connection for that long is how a slow store empties the pool for
+    requests that never touch it. Rows already loaded stay readable.
+    """
+    pairs = await _agent_projects(session, principal)
+    identifiers = _identifiers(source)
+    await session.commit()
+    return await _source_scan(
+        principal.workspace_id,
+        pairs,
+        identifiers,
+        window_days=window_days,
+        client=client,
+        fresh=fresh,
+    )
 
 
 def _grounding(scan: SpanScan) -> tuple[float | None, list[GroundingDimension]]:
@@ -787,7 +1049,9 @@ async def grounding_breakdown(
         projects_scanned=scan.projects_scanned,
         projects_total=scan.projects_total,
         window_days=window_days,
-        measured=any(dimension.sample_size for dimension in dimensions) or bool(overall),
+        # ``overall`` is None exactly when no recognised score was seen. Its
+        # truthiness is not the test: 0.0 is a measurement, and the worst one.
+        measured=overall is not None,
     )
 
 
@@ -892,16 +1156,18 @@ async def create_source(
     if clash is not None:
         raise Conflict(f"A knowledge source named '{payload.name}' already exists.")
 
+    # The row is always born at rest, whatever ``start_sync`` says. Queuing the
+    # first sync is start_sync()'s job and nobody else's: it is the one place
+    # that flips a row to Syncing, and its first guard refuses a row that
+    # already is. A row inserted as Syncing met that guard on the very next
+    # line of the route, so the default "start the first sync now" answered
+    # 409 "already syncing" and rolled the creation back with it.
     source = KnowledgeSource(
         workspace_id=principal.workspace_id,
         name=payload.name,
         source_type=payload.source_type.value,
         environment=payload.environment.value,
-        status=(
-            KnowledgeSourceStatus.SYNCING.value
-            if payload.start_sync
-            else KnowledgeSourceStatus.PAUSED.value
-        ),
+        status=KnowledgeSourceStatus.PAUSED.value,
         document_count=payload.document_count,
         chunk_count=payload.chunk_count,
         grounding_score=None,
@@ -909,7 +1175,7 @@ async def create_source(
         has_acl=payload.has_acl,
         acl_summary=payload.acl_summary,
         last_sync_at=None,
-        sync_progress=0 if payload.start_sync else 100,
+        sync_progress=100,
         owner_user_id=payload.owner_user_id or principal.user_id,
         index_name=payload.index_name,
         embedding_model=payload.embedding_model,
@@ -923,7 +1189,7 @@ async def create_source(
         source,
         policy=payload.retrieval_policy,
         settings=payload.settings,
-        sync=SyncState(state=SyncStage.QUEUED if payload.start_sync else None),
+        sync=SyncState(),
     )
     session.add(source)
 
@@ -1074,6 +1340,8 @@ async def delete_source(
     principal.require(Role.ADMIN)
     source = await get_source(session, principal, source_id)
 
+    if _stranded(source):
+        await _close_out_stranded(session, source)
     if source.status == KnowledgeSourceStatus.SYNCING.value:
         raise PreconditionFailed(
             f"'{source.name}' is syncing. Wait for the job to finish before deleting it."
@@ -1147,12 +1415,118 @@ def sync_status_of(source: KnowledgeSource) -> KnowledgeSyncStatus:
     )
 
 
+def _stranded(source: KnowledgeSource) -> bool:
+    """True when the row says Syncing and no job can still be behind it.
+
+    Measured from the job's last committed progress -- every stage commits, and
+    each commit moves ``updated_at`` -- so a job that is alive in another worker
+    is never mistaken for a dead one: it would have had to sit silent for longer
+    than its own supervisor lets it live.
+    """
+    if source.status != KnowledgeSourceStatus.SYNCING.value or runner.is_running(source.id):
+        return False
+    marks = [
+        _as_utc(mark)
+        for mark in (_sync_state(source).started_at, source.updated_at)
+        if mark is not None
+    ]
+    if not marks:
+        return True
+    cutoff = _now() - dt.timedelta(
+        seconds=EXECUTION_DEADLINE_SECONDS + STRANDED_GRACE_SECONDS
+    )
+    return max(marks) < cutoff
+
+
+async def _close_out_stranded(session: AsyncSession, source: KnowledgeSource) -> None:
+    """Fail a Syncing row whose job is gone, which gives the row its exits back.
+
+    While a row is Syncing, Sync Now answers 409 and Delete answers 412, and
+    only the job ever moves it on. With the job gone that was for ever, short
+    of an UPDATE by hand.
+    """
+    state = _sync_state(source)
+    current = _settings(source)
+    _write_blocks(
+        source,
+        settings=current.model_copy(
+            update={"indexing_errors": current.indexing_errors + 1}
+        ),
+        sync=state.model_copy(
+            update={"state": SyncStage.FAILED, "finished_at": _now(), "error": INTERRUPTED}
+        ),
+    )
+    source.status = KnowledgeSourceStatus.FAILED.value
+    await audit.record(
+        session,
+        principal=_system_principal(source.workspace_id),
+        action="knowledge_source.sync_failed",
+        entity_type=ENTITY_TYPE,
+        entity_id=source.id,
+        entity_label=source.name,
+        source_screen=SOURCE_SCREEN,
+        detail=f"Sync failed: {INTERRUPTED}",
+        metadata={"job_id": state.job_id, "stranded": True},
+    )
+    await session.flush()
+
+
+async def fail_stranded_syncs() -> int:
+    """Close out every stranded sync, in every workspace. The scheduler's sweep.
+
+    The screen heals a stranded row the moment anyone looks at it (the progress
+    poll below); this is for the rows nobody is looking at, whose Syncing count
+    sits on the KPI card all the same.
+    """
+    closed = 0
+    async with get_sessionmaker()() as session:
+        rows = (
+            (
+                await session.execute(
+                    select(KnowledgeSource).where(
+                        KnowledgeSource.status == KnowledgeSourceStatus.SYNCING.value
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for source in rows:
+            if _stranded(source):
+                await _close_out_stranded(session, source)
+                closed += 1
+        await session.commit()
+    return closed
+
+
 async def sync_status(
     session: AsyncSession, principal: Principal, source_id: str
 ) -> KnowledgeSyncStatus:
-    """What the console's percentage bar polls."""
+    """What the console's percentage bar polls.
+
+    The console polls this for every row it shows as Syncing, which makes it
+    the one call certain to arrive for a stranded row. It is closed out here
+    rather than reported as "Syncing... 40%" every two seconds for ever.
+    """
     source = await get_source(session, principal, source_id)
+    if _stranded(source):
+        await _close_out_stranded(session, source)
     return sync_status_of(source)
+
+
+class _Superseded(Exception):
+    """The row is no longer this job's to write: it stands down without a word."""
+
+
+def _still_owned(source: KnowledgeSource, job_id: str) -> bool:
+    """True while the row is Syncing under this job's id.
+
+    A job that outlives its welcome -- closed out as stranded, then restarted
+    by an operator -- must not write its progress over its successor's.
+    """
+    return source.status == KnowledgeSourceStatus.SYNCING.value and _sync_state(
+        source
+    ).job_id in (None, job_id)
 
 
 class SyncRunner:
@@ -1207,6 +1581,16 @@ class SyncRunner:
             await self._stage_publish(
                 source_id, workspace_id, job_id, scan, overall, principal, source_name
             )
+        except _Superseded:
+            log.info("knowledge sync %s (job %s) was superseded", source_id, job_id)
+        except TimeoutError:
+            await self._fail(
+                source_id,
+                workspace_id,
+                job_id,
+                "The telemetry store did not answer within "
+                f"{EXECUTION_DEADLINE_SECONDS:g} s.",
+            )
         except asyncio.CancelledError:  # pragma: no cover - shutdown path
             await self._fail(source_id, workspace_id, job_id, "Sync was cancelled.")
             raise
@@ -1243,6 +1627,8 @@ class SyncRunner:
                 source = await self._load(session, source_id, workspace_id)
                 if source is None:
                     return
+                if not _still_owned(source, job_id):
+                    raise _Superseded
                 state = _sync_state(source)
                 updated = state.model_copy(
                     update={
@@ -1264,22 +1650,33 @@ class SyncRunner:
         self, source_id: str, workspace_id: str, job_id: str
     ) -> tuple[str, bool]:
         """Refuse to sync a source that has nothing to identify its index by."""
-        async with get_sessionmaker()() as session:
-            source = await self._load(session, source_id, workspace_id)
-            if source is None:
-                return "", False
-            name = source.name
-            settings = _settings(source)
-            if not source.index_name and not settings.location:
-                await session.rollback()
-                await self._fail(
-                    source_id,
-                    workspace_id,
-                    job_id,
-                    "No vector index or location is configured, so there is nothing "
-                    "to synchronise.",
-                )
-                return name, False
+        # The routes commit before they schedule the job, so the row is there.
+        # Should it not be -- a replica a moment behind, a route that forgot --
+        # look again before giving up: a job that walks away from a row it
+        # could not see yet leaves that row Syncing with nothing working on it.
+        source: KnowledgeSource | None = None
+        for attempt in range(VERIFY_ATTEMPTS):
+            async with get_sessionmaker()() as session:
+                source = await self._load(session, source_id, workspace_id)
+            if source is not None:
+                break
+            await asyncio.sleep(0.25 * (attempt + 1))
+        if source is None:
+            log.warning("knowledge sync %s: the source row never appeared", source_id)
+            return "", False
+        if not _still_owned(source, job_id):
+            raise _Superseded
+
+        name = source.name
+        if not source.index_name and not _settings(source).location:
+            await self._fail(
+                source_id,
+                workspace_id,
+                job_id,
+                "No vector index or location is configured, so there is nothing "
+                "to synchronise.",
+            )
+            return name, False
         await self._mark(source_id, workspace_id, job_id, 0)
         return name, True
 
@@ -1288,8 +1685,20 @@ class SyncRunner:
             source = await self._load(session, source_id, workspace_id)
             if source is None:
                 return SpanScan()
-            principal = _system_principal(workspace_id)
-            scan = await scan_retrieval_spans(session, principal, source)
+            identifiers = _identifiers(source)
+            pairs = await _agent_projects(session, _system_principal(workspace_id))
+        # The store is read with no session open, and always afresh: a sync that
+        # republished the scan the screen made a minute ago would measure nothing.
+        # It is the one stage that waits on somebody else, so it is the one the
+        # job's ceiling is applied to; no SQL runs inside the block.
+        async with asyncio.timeout(EXECUTION_DEADLINE_SECONDS):
+            scan = await _source_scan(
+                workspace_id,
+                pairs,
+                identifiers,
+                window_days=DEFAULT_WINDOW_DAYS,
+                fresh=True,
+            )
         await self._mark(
             source_id,
             workspace_id,
@@ -1331,6 +1740,8 @@ class SyncRunner:
                 source = await self._load(session, source_id, workspace_id)
                 if source is None:
                     return
+                if not _still_owned(source, job_id):
+                    raise _Superseded
                 settings = _settings(source).model_copy(
                     update={
                         "observed_documents": len(scan.documents),
@@ -1396,7 +1807,7 @@ class SyncRunner:
         try:
             async with get_sessionmaker()() as session:
                 source = await self._load(session, source_id, workspace_id)
-                if source is None:
+                if source is None or not _still_owned(source, job_id):
                     return
                 settings = _settings(source).model_copy(
                     update={"indexing_errors": _settings(source).indexing_errors + 1}
@@ -1434,8 +1845,9 @@ runner = SyncRunner()
 async def run_sync(source_id: str, workspace_id: str, job_id: str) -> None:
     """Background entry point used by the routes.
 
-    Scheduled with ``BackgroundTasks`` so it fires after the request's
-    transaction has committed and the job's own session sees the Syncing row.
+    Scheduled with ``BackgroundTasks``, which run BEFORE the session dependency
+    commits. The routes therefore commit the request's transaction themselves
+    before scheduling this, so the job's own session sees the Syncing row.
     """
     runner.start(source_id, workspace_id, job_id=job_id)
 
@@ -1455,6 +1867,9 @@ async def start_sync(
     principal.require(Role.OPERATOR)
     source = await get_source(session, principal, source_id)
 
+    # Sync Now is the operator's way out of a sync that died with its worker.
+    if _stranded(source):
+        await _close_out_stranded(session, source)
     if source.status == KnowledgeSourceStatus.SYNCING.value or runner.is_running(source.id):
         raise Conflict(f"'{source.name}' is already syncing.")
 
@@ -1505,12 +1920,15 @@ async def start_sync(
 
 __all__ = [
     "DEFAULT_WINDOW_DAYS",
+    "EXECUTION_DEADLINE_SECONDS",
     "EXPORT_COLUMNS",
     "SpanScan",
     "SyncRunner",
     "create_source",
     "delete_source",
     "export_sources",
+    "fail_stranded_syncs",
+    "forget_scans",
     "get_source",
     "grounding_breakdown",
     "hydrate",

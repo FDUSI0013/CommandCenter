@@ -36,13 +36,32 @@ from ...schemas.evaluations import (
 )
 from ...services import evaluations as service
 from ..common import ActionResult, ListParams, Page, list_params, to_csv
-from ..deps import CurrentPrincipal, Db
+from ..deps import CurrentPrincipal, Db, Principal
 
 router = APIRouter(prefix="/evaluations", tags=["Evaluations"])
 
 
 def _stamp() -> str:
     return dt.datetime.now(dt.UTC).strftime("%Y%m%d")
+
+
+async def _start(
+    session: Db, principal: Principal, run: Any, background: BackgroundTasks
+) -> EvaluationRead:
+    """Make a queued run durable, then hand it to the supervisor.
+
+    The supervisor reads the row on a connection of its own, and background
+    tasks run *before* the request-scoped session commits. Scheduled first, the
+    supervisor's opening SELECT races the COMMIT; when it wins it finds no row,
+    gives up without a word, and the run sits Queued behind a frozen progress
+    bar until the reaper fails it a quarter of an hour later. Committing here
+    closes that window — the same order the export queue uses — and means a
+    caller holding a 202 is holding a promise the database has already accepted.
+    """
+    await session.commit()
+    background.add_task(service.execute_evaluation, run.id, principal.workspace_id)
+    records = await service.read_many(session, principal, [run])
+    return records[0]
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +126,21 @@ async def list_datasets(
     """
     items, total = await service.list_datasets(principal, params)
     return Page.build(items, total, params.page, params.page_size)
+
+
+@router.get(
+    "/datasets/in-use",
+    response_model=list[str],
+    summary="Datasets this workspace has evaluated",
+)
+async def list_datasets_in_use(principal: CurrentPrincipal, session: Db) -> list[str]:
+    """The distinct datasets on the workspace's evaluations — the table's Dataset filter.
+
+    Read from the evaluations themselves rather than from the engine's dataset
+    listing: the filter has to offer every dataset a row in the table names,
+    including one that has since been deleted, and none that no row does.
+    """
+    return await service.datasets_in_use(session, principal)
 
 
 @router.post(
@@ -287,9 +321,7 @@ async def create_evaluation(
     seconds later in a task nobody is watching. Requires the member role.
     """
     run = await service.create_evaluation(session, principal, payload, request=request)
-    background.add_task(service.execute_evaluation, run.id, principal.workspace_id)
-    records = await service.read_many(session, principal, [run])
-    return records[0]
+    return await _start(session, principal, run, background)
 
 
 # ---------------------------------------------------------------------------
@@ -357,6 +389,4 @@ async def rerun_evaluation(
     run = await service.rerun_evaluation(
         session, principal, evaluation_id, payload, request=request
     )
-    background.add_task(service.execute_evaluation, run.id, principal.workspace_id)
-    records = await service.read_many(session, principal, [run])
-    return records[0]
+    return await _start(session, principal, run, background)

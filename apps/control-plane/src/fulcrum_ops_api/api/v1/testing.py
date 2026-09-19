@@ -1,6 +1,6 @@
 """Testing & Regression routes.
 
-Twenty endpoints back one screen and its seven tabs: the six KPI cards, the
+Twenty-one endpoints back one screen and its seven tabs: the six KPI cards, the
 suite table with its four filters and CSV export, the Create Test Suite modal,
 Run Suite with live progress, Promote Baseline, the baseline comparison, the
 Test Runs, Baselines, Schedules and Environments tabs. The Datasets and
@@ -487,8 +487,18 @@ async def run_suite(
     member role.
     """
     run = await service.start_run(session, principal, suite_id, payload, request=request)
-    background.add_task(service.execute_run, run.id, principal.workspace_id)
+    # The runner opens its own session, so the row has to be durable before the
+    # task may look for it. The request-scoped session commits only after the
+    # response has been sent — and sending the response *includes* running the
+    # background tasks — so without this the runner's SELECT raced the COMMIT,
+    # and a run that lost sat Queued with nobody driving it: every later Run
+    # answered 409 and Delete 412 until the stale sweep reaped it half an hour
+    # on. Same order the exports route uses, for the same reason. The response
+    # is built first: what is committed stays committed, so nothing that can
+    # still fail may come between the commit and handing the run to its runner.
     records = await service.read_runs(session, principal, [run])
+    await session.commit()
+    background.add_task(service.execute_run, run.id, principal.workspace_id)
     return records[0]
 
 
@@ -529,10 +539,38 @@ async def get_run_progress(
     """Measured progress of a run.
 
     Counts come from the runner driving it, or — when the run belongs to
-    another worker — from the experiment itself. The percentage is derived from
-    cases registered and cases judged; nothing here is a timer.
+    another worker — from what that runner last wrote onto the run. The
+    percentage is derived from cases registered and cases judged; nothing here
+    is a timer.
     """
     return await service.get_progress(session, principal, suite_id, run_id)
+
+
+@router.post(
+    "/suites/{suite_id}/runs/{run_id}/cancel",
+    response_model=TestRunRead,
+    summary="Cancel a test run",
+)
+async def cancel_run(
+    principal: CurrentPrincipal,
+    session: Db,
+    suite_id: str,
+    run_id: str,
+    request: Request,
+) -> TestRunRead:
+    """Stop a queued or running run.
+
+    The run ends as Cancelled with no verdict, and the suite can be run again
+    or deleted at once. A run that has already ended answers 409. Requires the
+    member role.
+    """
+    run = await service.cancel_run(session, principal, suite_id, run_id, request=request)
+    # Durable first, then wake the supervisor: it re-reads the row to learn why
+    # it was woken, and must find the cancellation there.
+    await session.commit()
+    service.runner.nudge(run.id)
+    records = await service.read_runs(session, principal, [run])
+    return records[0]
 
 
 @router.post(

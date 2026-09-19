@@ -1,0 +1,26 @@
+# Fulcrum Ops — rotate the host jobs' logs. Install as root:
+#
+#   install -m 0644 -o root -g root /opt/fulcrum/deploy/logrotate.d/fulcrum-ops /etc/logrotate.d/fulcrum-ops
+#   logrotate --debug /etc/logrotate.d/fulcrum-ops        # dry run: prints what it would do
+#
+# The cron jobs append with >> and nothing ever trimmed the result. The backup
+# log is the only record of whether last night's dump left the host, so it is
+# kept for two months rather than thrown away.
+#
+# `su root root`: Ubuntu's /var/log is group-writable (root:syslog), and logrotate
+# refuses to rotate inside such a directory unless told which user to act as.
+# The jobs reopen their log on every run, so no copytruncate and no signal.
+
+/var/log/fulcrum-backup.log
+/var/log/fulcrum-autoheal.log
+/var/log/fulcrum-housekeeping.log
+{
+    su root root
+    weekly
+    rotate 8
+    maxsize 20M
+    missingok
+    notifempty
+    compress
+    delaycompress
+}

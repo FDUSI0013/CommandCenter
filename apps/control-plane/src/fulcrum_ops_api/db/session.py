@@ -7,7 +7,8 @@ lives here.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import (
@@ -19,6 +20,9 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.pool import NullPool
 
 from ..core.config import settings
+
+if TYPE_CHECKING:
+    from starlette.background import BackgroundTasks
 
 _engine: AsyncEngine | None = None
 _sessionmaker: async_sessionmaker[AsyncSession] | None = None
@@ -79,7 +83,12 @@ def get_sessionmaker() -> async_sessionmaker[AsyncSession]:
 
 
 async def get_session() -> AsyncIterator[AsyncSession]:
-    """FastAPI dependency: one session per request, committed on clean exit."""
+    """FastAPI dependency: one session per request, committed on clean exit.
+
+    "On exit" is later than it reads: after the response has been sent and after
+    the route's ``BackgroundTasks`` have run. A route that hands a row it just
+    wrote to a background job must use :func:`commit_then`.
+    """
     async with get_sessionmaker()() as session:
         try:
             yield session
@@ -87,6 +96,39 @@ async def get_session() -> AsyncIterator[AsyncSession]:
         except Exception:
             await session.rollback()
             raise
+
+
+async def commit_then(
+    session: AsyncSession,
+    background: BackgroundTasks,
+    job: Callable[..., Any],
+    *args: Any,
+    **kwargs: Any,
+) -> None:
+    """Make the request's writes durable, THEN schedule the job that reads them.
+
+    ``get_session`` commits when the dependency exits, and under the FastAPI
+    this service runs on a request-scoped ``yield`` dependency exits after the
+    response has been sent -- which is after ``BackgroundTasks`` have run. So::
+
+        run = await service.start_run(session, ...)     # row is only flushed
+        background.add_task(service.execute_run, run.id, ...)
+
+    starts a job that opens its own session, looks for a row no other
+    connection can see yet, finds nothing and gives up: the run sits Queued
+    until the stale-run sweep fails it. A route that hands a row to a
+    background job calls this instead of ``background.add_task``::
+
+        await commit_then(session, background, service.execute_run, run.id, ...)
+
+    Call it last, after everything else in the route that can still fail: what
+    is committed here stays committed, and a client holding the 202 is then
+    holding a promise the database has already accepted. The dependency's own
+    commit afterwards is a no-op, and the session stays usable for building the
+    response (``expire_on_commit`` is off).
+    """
+    await session.commit()
+    background.add_task(job, *args, **kwargs)
 
 
 async def ping() -> bool:

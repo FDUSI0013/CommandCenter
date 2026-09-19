@@ -126,7 +126,9 @@ class ExportJobCreate(BaseModel):
     filters: dict[str, Any] = Field(
         default_factory=dict,
         description="Column filters replayed against the dataset, plus an optional "
-        "'days' window, e.g. {'status': 'Open', 'days': 30}.",
+        "'days' window, e.g. {'status': 'Open', 'days': 30}. The window applies "
+        "only to datasets that report windowed=true; an inventory dataset exports "
+        "every record and drops 'days' from the filters it records.",
     )
 
     @field_validator("filters")
@@ -153,6 +155,17 @@ class ExportDatasetRead(BaseModel):
     source_screen: str
     columns: list[str]
     filterable: list[str]
+    windowed: bool = Field(
+        True,
+        description="Whether the 'days' window applies. False for an inventory "
+        "(agents, secrets, budgets, quotas, alert rules), which always exports "
+        "every record: the picker should hide its time range for these.",
+    )
+    time_label: str | None = Field(
+        None,
+        description="The column the 'days' window measures, e.g. 'Raised At'. "
+        "Null when the dataset is not windowed.",
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -191,7 +204,12 @@ class ExportScheduleCreate(BaseModel):
     cron: CronExpr
     export_format: ExportFormat = ExportFormat.CSV
     filters: dict[str, Any] = Field(default_factory=dict)
-    recipients: list[Recipient] = Field(default_factory=list, max_length=50)
+    recipients: list[Recipient] = Field(
+        default_factory=list,
+        max_length=50,
+        description="Delivery targets. Refused with 422 unless the summary reports "
+        "delivery_available, because nothing would be sent to them.",
+    )
     enabled: bool = True
 
     @field_validator("cron")
@@ -261,4 +279,11 @@ class ExportsSummary(BaseModel):
     datasets: list[ExportDatasetRead] = Field(
         default_factory=list,
         description="Every exportable dataset, so one summary call can seed the picker.",
+    )
+    delivery_available: bool = Field(
+        False,
+        description="Whether a schedule's recipients are actually sent anything. "
+        "False on this build: there is no mail or notification transport, a "
+        "non-empty 'recipients' is refused with 422, and the console should not "
+        "offer the input.",
     )

@@ -12,6 +12,15 @@ domain raises its alerts through that function.
 first human response is what MTTA measures. Resolving freezes ``mttr_seconds``
 from ``raised_at`` so the KPI never re-derives from timestamps that later move.
 
+**Rules.** The screens decide *when* something is wrong; a rule decides what the
+workspace wants done about it. :func:`raise_alert` is the one place a rule is
+read: an enabled rule for the alert's source and severity is recorded on the
+alert it governs, and a rule an admin has switched off silences that source at
+that severity — the condition is still written down, as a Muted alert, because a
+row that was never written cannot be found again when the rule comes back. No
+notification is delivered from here: a rule's channels are labels with no
+address behind them, and the alert says nothing about having told anybody.
+
 Nothing here imports FastAPI beyond the ``Request`` that the audit trail records
 the caller's address from; HTTP concerns live in ``api.v1.alerts``.
 """
@@ -72,6 +81,17 @@ PATCHABLE_STATUSES: tuple[str, ...] = (
     AlertStatus.OPEN.value,
     AlertStatus.INVESTIGATING.value,
 )
+
+#: Payload key that marks an alert a switched-off rule silenced. It is what tells
+#: such a mute from an operator's, which carries a ``muted_until`` deadline.
+RULE_MUTE_KEY = "silenced_by_rule_id"
+
+#: Everything a rule's mute writes onto the payload, taken off again when it lifts.
+_RULE_MUTE_KEYS: tuple[str, ...] = (RULE_MUTE_KEY, "muted_by", "mute_reason")
+
+#: How many times a raise reads the next reference again after another raise
+#: took it between the read and the insert, before settling for an opaque one.
+REF_ALLOCATION_ATTEMPTS = 5
 
 #: Hard ceiling on a CSV export so one click cannot pull an unbounded table.
 MAX_EXPORT_ROWS = 10_000
@@ -167,8 +187,12 @@ async def _next_alert_ref(session: AsyncSession, workspace_id: str) -> str:
     """Allocate the next ``al-N`` reference for a workspace.
 
     Counting then probing keeps references dense and human-quotable. The probe
-    loop covers the race where two raises land at once; after a stubborn run it
-    falls back to an opaque suffix rather than blocking the raise.
+    walks past references that outlived a deleted alert; it does nothing for two
+    raises that land at once, which read the same table and choose the same
+    reference — :func:`raise_alert` inserts under a savepoint and asks again for
+    that. After a stubborn run it falls back to an opaque suffix rather than
+    blocking the raise. The suffix is the *tail* of the id: the head of a
+    time-ordered id is its clock, and stays the same for a minute at a time.
     """
     used = (
         await session.execute(
@@ -188,7 +212,55 @@ async def _next_alert_ref(session: AsyncSession, workspace_id: str) -> str:
         if clash is None:
             return ref
         candidate += 1
-    return f"al-{new_id()[:8]}"
+    return _opaque_alert_ref()
+
+
+def _opaque_alert_ref() -> str:
+    return f"al-{new_id()[-8:]}"
+
+
+async def _live_alert(session: AsyncSession, workspace_id: str, dedupe_key: str) -> Alert | None:
+    """The alert a recurrence of ``dedupe_key`` lands on, if one is still live."""
+    return (
+        await session.execute(
+            select(Alert)
+            .where(
+                Alert.workspace_id == workspace_id,
+                Alert.dedupe_key == dedupe_key,
+                Alert.status.in_(LIVE_STATUSES),
+            )
+            .order_by(Alert.raised_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+
+async def _absorb(
+    session: AsyncSession, existing: Alert, occurred: dt.datetime, payload: dict[str, Any]
+) -> Alert:
+    """Fold one more occurrence onto the alert that is already live.
+
+    The count is incremented by the database rather than read and written back:
+    a flood is concurrent by nature, and two recurrences that both read 3 would
+    both write 4. The instance is then brought into line with what was written,
+    since the caller goes on to serialise it.
+    """
+    await session.execute(
+        update(Alert)
+        .where(Alert.id == existing.id)
+        .values(
+            occurrence_count=func.coalesce(Alert.occurrence_count, 1) + 1,
+            last_occurred_at=occurred,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    await session.refresh(
+        existing, attribute_names=["occurrence_count", "last_occurred_at", "updated_at"]
+    )
+    if payload:
+        _merge_metadata(existing, payload)
+    await session.flush()
+    return existing
 
 
 async def _get_alert(session: AsyncSession, principal: Principal, alert_id: str) -> Alert:
@@ -232,6 +304,86 @@ def _merge_metadata(alert: Alert, extra: dict[str, Any]) -> None:
     alert.event_metadata = {**(alert.event_metadata or {}), **extra}
 
 
+async def _rule_covering(
+    session: AsyncSession, workspace_id: str, source: str, severity: str
+) -> AlertRule | None:
+    """The rule that speaks for alerts from ``source`` at ``severity``, if any.
+
+    A rule and a raise are joined on the two things both of them state: the
+    source screen and the severity. ``condition`` cannot be the join — it is an
+    opaque document each screen words for itself — and the source alone is too
+    coarse: a "Quota exceeded / Critical" rule would claim the Medium
+    "approaching limit" warning as well, and switching it off would silence the
+    whole screen. The label is compared without case because the rule editor
+    takes it as free text.
+
+    An enabled rule wins over a disabled one, then the name decides, so the
+    answer is the same on every raise. ``None`` means nobody has written a rule
+    for this pair and the screen's built-in raise stands on its own.
+    """
+    return (
+        await session.execute(
+            select(AlertRule)
+            .where(
+                AlertRule.workspace_id == workspace_id,
+                func.lower(AlertRule.source) == source.strip().lower(),
+                AlertRule.severity == severity,
+            )
+            .order_by(AlertRule.enabled.desc(), AlertRule.name.asc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+
+async def _lift_rule_mutes(session: AsyncSession, workspace_id: str) -> int:
+    """Reopen the alerts a switched-off rule silenced, once nothing silences them.
+
+    Run after every rule write. A rule's mute has no deadline for the mute sweep
+    to lapse, and the condition behind it may never be raised again — a quota
+    alerts on the *change* to Exceeded, not on staying there — so an admin who
+    switched a rule back on would otherwise be left with a queue that says
+    nothing is wrong. Re-asking :func:`_rule_covering` rather than matching on
+    the rule that was edited covers every way a pair stops being silenced:
+    enabled, deleted, moved to another source, or outranked by a new rule.
+
+    An operator's own mute carries ``muted_until`` and is left to run its course.
+    """
+    muted = (
+        (
+            await session.execute(
+                select(Alert).where(
+                    Alert.workspace_id == workspace_id,
+                    Alert.status == AlertStatus.MUTED.value,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    now = _now().isoformat()
+    still_silenced: dict[tuple[str, str], bool] = {}
+    lifted = 0
+    for alert in muted:
+        payload = alert.event_metadata or {}
+        if not payload.get(RULE_MUTE_KEY) or payload.get("muted_until"):
+            continue
+        pair = (alert.source.strip().lower(), alert.severity)
+        if pair not in still_silenced:
+            rule = await _rule_covering(session, workspace_id, alert.source, alert.severity)
+            still_silenced[pair] = rule is not None and not rule.enabled
+        if still_silenced[pair]:
+            continue
+        alert.status = AlertStatus.OPEN.value
+        alert.event_metadata = {
+            **{key: value for key, value in payload.items() if key not in _RULE_MUTE_KEYS},
+            "rule_mute_lifted_at": now,
+        }
+        lifted += 1
+    if lifted:
+        await session.flush()
+    return lifted
+
+
 # --------------------------------------------------------------------------- #
 # Raising
 # --------------------------------------------------------------------------- #
@@ -257,61 +409,103 @@ async def raise_alert(
 ) -> tuple[Alert, bool]:
     """Raise an alert, collapsing recurrences onto the row that is already live.
 
-    This is the entry point every other domain calls — the quota evaluator, the
-    secret rotation sweep, the deployment gate. It takes ``workspace_id`` rather
-    than a principal because most callers are background work with no user
-    attached; pass ``principal`` when a person raised the alert and the action
-    should appear in the audit trail. A machine-raised alert needs no audit row:
-    the alert *is* the record.
+    This is the entry point every other domain raises through. It takes
+    ``workspace_id`` rather than a principal because most callers are background
+    work with no user attached; pass ``principal`` when a person raised the
+    alert and the action should appear in the audit trail. A machine-raised
+    alert needs no audit row: the alert *is* the record.
 
-    Returns the alert and whether it was newly created; ``False`` means an
-    existing alert absorbed this occurrence.
+    A new alert is put to the workspace's rules (:func:`_rule_covering`). An
+    enabled rule is named on the alert it governs, which is how a triager — and
+    whatever eventually delivers notifications — knows whose channels it falls
+    under. A rule that is switched off silences what a *screen* raises: the
+    alert is born Muted, out of the open count, and comes back when the rule
+    does. What a person or an external monitor posts by hand is never silenced;
+    a rule speaks for the screen it watches, not for them. A recurrence lands on
+    the live row as it is, so a flood costs no rule lookups.
+
+    Always returns an alert, and whether it was newly created; ``False`` means
+    an existing alert absorbed this occurrence.
     """
     severity_value = severity.value if isinstance(severity, AlertSeverity) else str(severity)
     occurred = raised_at or _now()
     payload = metadata or {}
 
     if dedupe_key:
-        existing = (
-            await session.execute(
-                select(Alert)
-                .where(
-                    Alert.workspace_id == workspace_id,
-                    Alert.dedupe_key == dedupe_key,
-                    Alert.status.in_(LIVE_STATUSES),
-                )
-                .order_by(Alert.raised_at.desc())
-                .limit(1)
-            )
-        ).scalar_one_or_none()
+        existing = await _live_alert(session, workspace_id, dedupe_key)
         if existing is not None:
-            existing.occurrence_count = (existing.occurrence_count or 1) + 1
-            existing.last_occurred_at = occurred
-            if payload:
-                _merge_metadata(existing, payload)
-            await session.flush()
-            return existing, False
+            return await _absorb(session, existing, occurred, payload), False
 
-    alert = Alert(
-        workspace_id=workspace_id,
-        alert_ref=await _next_alert_ref(session, workspace_id),
-        severity=severity_value,
-        title=title,
-        description=description,
-        source=source,
-        source_entity_type=source_entity_type,
-        source_entity_id=source_entity_id,
-        status=AlertStatus.OPEN.value,
-        raised_at=occurred,
-        assigned_to_user_id=assigned_to_user_id,
-        dedupe_key=dedupe_key,
-        occurrence_count=1,
-        last_occurred_at=occurred,
-        engine_alert_id=engine_alert_id,
-        event_metadata=payload,
-    )
-    session.add(alert)
-    await session.flush()
+    status = AlertStatus.OPEN.value
+    rule = await _rule_covering(session, workspace_id, source, severity_value)
+    if rule is not None and rule.enabled:
+        payload = {**payload, "alert_rule": rule.name, "alert_rule_id": rule.id}
+    elif rule is not None and principal is None:
+        status = AlertStatus.MUTED.value
+        payload = {
+            **payload,
+            "alert_rule": rule.name,
+            RULE_MUTE_KEY: rule.id,
+            "muted_by": f"Alert rule '{rule.name}'",
+            "mute_reason": (
+                f"The alert rule '{rule.name}' is switched off for {severity_value} "
+                f"alerts from {source}."
+            ),
+        }
+
+    def _candidate(alert_ref: str) -> Alert:
+        return Alert(
+            workspace_id=workspace_id,
+            alert_ref=alert_ref,
+            severity=severity_value,
+            title=title,
+            description=description,
+            source=source,
+            source_entity_type=source_entity_type,
+            source_entity_id=source_entity_id,
+            status=status,
+            raised_at=occurred,
+            assigned_to_user_id=assigned_to_user_id,
+            dedupe_key=dedupe_key,
+            occurrence_count=1,
+            last_occurred_at=occurred,
+            engine_alert_id=engine_alert_id,
+            event_metadata=payload,
+        )
+
+    # The reference is read without a lock, so raises that land together — the
+    # burst an incident is made of — choose the same one and the unique
+    # constraint refuses all but the first. That used to surface as a 500, and
+    # from a screen's evaluator it took the caller's whole transaction with it.
+    # The insert runs in a savepoint, so losing the race costs a re-read: of the
+    # reference, and of the dedupe key too, because the raise that won may have
+    # been this very condition, and then this one is its second occurrence.
+    #
+    # Two raises of one key that read *different* tables (a third alert was
+    # committed between them) choose different references and both insert; only
+    # a unique index on the live key can refuse that, and the lookup above
+    # tolerates it by landing on the newest.
+    alert: Alert | None = None
+    for _attempt in range(REF_ALLOCATION_ATTEMPTS):
+        candidate = _candidate(await _next_alert_ref(session, workspace_id))
+        try:
+            async with session.begin_nested():
+                session.add(candidate)
+                await session.flush()
+        except IntegrityError:
+            if dedupe_key:
+                existing = await _live_alert(session, workspace_id, dedupe_key)
+                if existing is not None:
+                    return await _absorb(session, existing, occurred, payload), False
+            continue
+        alert = candidate
+        break
+    if alert is None:
+        # Outrun every time: an opaque reference rather than a lost alert. Not
+        # caught — if this fails too, the reference was never the problem.
+        alert = _candidate(_opaque_alert_ref())
+        session.add(alert)
+        await session.flush()
 
     if principal is not None:
         await audit.record(
@@ -963,6 +1157,8 @@ async def create_rule(
             f"An alert rule named '{payload.name}' already exists in this workspace."
         ) from exc
 
+    # A new enabled rule can outrank the disabled one that was silencing its pair.
+    reopened = await _lift_rule_mutes(session, principal.workspace_id)
     await audit.record(
         session,
         principal=principal,
@@ -972,6 +1168,7 @@ async def create_rule(
         entity_label=rule.name,
         source_screen=SCREEN,
         detail=f"{rule.severity} rule watching {rule.source}.",
+        metadata={"alerts_reopened": reopened} if reopened else None,
         request=request,
     )
     return rule
@@ -1012,6 +1209,9 @@ async def update_rule(
         await session.rollback()
         raise Conflict("Another alert rule in this workspace already uses that name.") from exc
 
+    # Switching a rule back on, or moving it off the pair it was silencing,
+    # brings back what it silenced while it was off.
+    reopened = await _lift_rule_mutes(session, principal.workspace_id)
     await audit.record(
         session,
         principal=principal,
@@ -1021,6 +1221,7 @@ async def update_rule(
         entity_label=rule.name,
         source_screen=SCREEN,
         detail=f"Updated {', '.join(sorted(changes))}.",
+        metadata={"alerts_reopened": reopened} if reopened else None,
         request=request,
     )
     return rule
@@ -1039,6 +1240,8 @@ async def delete_rule(
     label = rule.name
     await session.delete(rule)
     await session.flush()
+    # A deleted rule silences nothing: its pair is back on the built-in raise.
+    reopened = await _lift_rule_mutes(session, principal.workspace_id)
     await audit.record(
         session,
         principal=principal,
@@ -1048,5 +1251,6 @@ async def delete_rule(
         entity_label=label,
         source_screen=SCREEN,
         detail=f"Deleted alert rule '{label}'.",
+        metadata={"alerts_reopened": reopened} if reopened else None,
         request=request,
     )

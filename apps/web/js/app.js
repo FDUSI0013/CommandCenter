@@ -93,6 +93,12 @@
     });
   }
 
+  /** End whatever the screen on display left running: timers, open streams, menus. */
+  function teardownScreen(){
+    if(APP._cleanup){ try{ APP._cleanup(); }catch(e){} APP._cleanup = null; }
+    C.closeMenu();
+  }
+
   function navigate(){
     const raw = location.hash.replace(/^#\/?/, '') || 'live-runs';
     // "#/replay?run=<id>" — the query rides on APP.query so outside links
@@ -105,9 +111,7 @@
     }
     const [route, param] = hash.split('/');
     const screen = SCREENS[route] || SCREENS['live-runs'];
-    // cleanup previous screen (timers, open streams)
-    if(APP._cleanup){ try{ APP._cleanup(); }catch(e){} APP._cleanup = null; }
-    C.closeMenu();
+    teardownScreen();
     APP.route = SCREENS[route] ? route : 'live-runs';
     APP.param = param || null;
     APP.currentTitle = screen.title;
@@ -119,6 +123,7 @@
     screen.render(main, APP.param);
     if(screen.cleanup) APP._cleanup = screen.cleanup;
     main.scrollTop = 0;
+    refreshBadgesIfStale();
   }
 
   // global cross-link handler
@@ -200,6 +205,14 @@
 
   /** Show the sign-in gate and, once through it, start the app. */
   function gate(reason){
+    // The session is over, so everything the screen left running ends with it.
+    // Hiding #app is not enough: a live stream opened under the old session kept
+    // delivering run data behind the sign-in form until the server aged it out,
+    // and then retried against a dead cookie for as long as the tab stayed open.
+    // The next sign-in renders the same route afresh, so nothing here is lost.
+    teardownScreen();
+    C.closeAllModals();
+    document.getElementById('main').innerHTML = '';
     document.getElementById('app').style.display = 'none';
     AUTH.show({
       reason,
@@ -214,7 +227,20 @@
   async function bootSession(){
     await Store.session.refresh();
     renderUserCard();
-    await Store.refreshBadges();
+    // Not awaited: the counts are decoration, and the first screen must not
+    // wait on two summary calls (or on their timeout) before it may render.
+    Store.refreshBadges();
+  }
+
+  /* The two sidebar counts are the console's only passive signal that something
+     needs a person: an alert raised by a monitor, an approval opened by an
+     agent. Nothing this tab does causes those, so they are re-read on a timer,
+     on navigation and when the tab comes back into view — never while the tab
+     is hidden or signed out, and never more often than the throttle allows. */
+  const BADGE_POLL_MS = 60000, BADGE_MAX_AGE_MS = 30000;
+  function refreshBadgesIfStale(){
+    if(document.hidden || !Store.session.isAuthenticated) return;
+    Store.refreshBadges({ maxAge: BADGE_MAX_AGE_MS });
   }
 
   let started = false;
@@ -225,6 +251,8 @@
       Store.on('badges', paintBadges);
       // Any mutation anywhere can change the two sidebar counts.
       Store.on('mutation', ()=>Store.refreshBadges());
+      setInterval(refreshBadgesIfStale, BADGE_POLL_MS);
+      document.addEventListener('visibilitychange', refreshBadgesIfStale);
     }
     if(!location.hash) location.hash = '#/live-runs';
     navigate();

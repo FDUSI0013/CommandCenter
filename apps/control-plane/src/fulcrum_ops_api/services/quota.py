@@ -26,22 +26,37 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import datetime as dt
+import logging
 import math
+import os
+import shutil
 import statistics
+import time
 from collections.abc import Sequence
 from typing import Any, Final
 
 from fastapi import Request
-from sqlalchemy import Select, or_, select
+from sqlalchemy import Select, func, or_, select
+from sqlalchemy import delete as sa_delete
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..api.common import ListParams, apply_filters, apply_search, apply_sort, paginate
 from ..api.deps import Principal
-from ..core.errors import Conflict, NotFound, QuotaExceeded, ValidationFailed
-from ..engine import get_engine_client
+from ..core.config import settings
+from ..core.errors import (
+    Conflict,
+    NotFound,
+    QuotaExceeded,
+    TelemetryBackendUnavailable,
+    ValidationFailed,
+)
+from ..db.base import stamp
+from ..db.session import get_sessionmaker
+from ..engine import EngineError, get_engine_client
+from ..engine import deadline as engine_deadline
 from ..models.governance import AuditEvent
-from ..models.identity import Role
+from ..models.identity import Role, Workspace
 from ..models.operations import (
     Alert,
     AlertSeverity,
@@ -70,8 +85,10 @@ from ..schemas.quota import (
     BudgetCreate,
     BudgetUpdate,
     CapacityHealth,
+    CapacityReport,
     ForecastPoint,
     InsightSeverity,
+    LimitHealth,
     QuotaCheck,
     QuotaCreate,
     QuotaForecast,
@@ -85,9 +102,20 @@ from ..schemas.quota import (
 from . import alerts, approvals, audit
 from . import metrics as telemetry
 
+log = logging.getLogger(__name__)
+
 SOURCE_SCREEN: Final[str] = "Quota, Cost & Capacity"
 ENTITY_QUOTA: Final[str] = "quota"
 ENTITY_BUDGET: Final[str] = "budget"
+
+#: The approvals queue knows an increase by this action. ``request_increase``
+#: files under it and ``apply_approved_increase`` answers to it.
+INCREASE_ACTION: Final[str] = "Quota Increase"
+INCREASE_REQUESTED: Final[str] = "quota.increase_requested"
+#: How many of a quota's past increase requests are searched for the one being
+#: decided. They are read newest first, and a quota does not collect fifty open
+#: requests.
+MAX_INCREASE_LOOKBACK: Final[int] = 50
 
 #: A quota with no explicit reset instant is rolled onto the calendar period it
 #: declares, so "Monthly" means the calendar month everywhere on the screen.
@@ -880,9 +908,11 @@ async def request_increase(
 ) -> dict[str, Any]:
     """Route a bigger ceiling into the approvals queue.
 
-    The quota is not touched: an increase is a decision, and the decision is
-    recorded where every other governed decision lives. The approval payload
-    carries everything an approver needs to apply it afterwards.
+    The quota is not touched here: an increase is a decision, and the decision
+    is recorded where every other governed decision lives. When it is approved,
+    ``apply_approved_increase`` raises the ceiling in the same transaction --
+    to the number filed here, which is why it is written to the audit row below
+    as well as to the payload an approver reads.
     """
     principal.require(Role.MEMBER)
     quota = await get_quota(session, principal, quota_id)
@@ -906,7 +936,7 @@ async def request_increase(
         session,
         principal,
         ApprovalRequestCreate(
-            action="Quota Increase",
+            action=INCREASE_ACTION,
             action_detail=(
                 f"{quota.name}: {telemetry.compact(current)} → "
                 f"{telemetry.compact(payload.requested_limit)} {quota.unit}"
@@ -932,7 +962,7 @@ async def request_increase(
     await audit.record(
         session,
         principal=principal,
-        action="quota.increase_requested",
+        action=INCREASE_REQUESTED,
         entity_type=ENTITY_QUOTA,
         entity_id=quota.id,
         entity_label=quota.name,
@@ -959,6 +989,133 @@ async def request_increase(
         "requested_limit": payload.requested_limit,
         "unit": quota.unit,
     }
+
+
+async def apply_approved_increase(
+    *,
+    session: AsyncSession,
+    principal: Principal,
+    approval_request: Any,
+    request: Request | None = None,
+) -> str | None:
+    """Carry an approved Quota Increase through to the quota it asked about.
+
+    Approving one used to change the request and nothing else: the queue said
+    Approved, the quota kept its old ceiling, and a ``Block`` quota went on
+    refusing traffic until an admin found it and typed the new number in by
+    hand. ``services.approvals`` calls this in the transaction that records the
+    approval, so the decision and its effect land together or not at all.
+
+    Returns the sentence to add to the decision's message, or ``None`` when the
+    request is not a quota increase. It never raises over the state of the
+    quota: a quota deleted while its request waited, or already raised past the
+    ask, leaves the approval standing and says so.
+
+    **What is applied is what was filed, not what the payload says now.** A
+    request's payload can be edited by any member while it is open, and anybody
+    can raise a request by hand with this action and a payload of their
+    choosing. The risk rung, the SLA and the line the approver read were all
+    derived from the number ``request_increase`` was given, and that number is
+    in the audit trail, which no API can edit, under the request's reference. A
+    request with no such row was not filed from this screen, and one whose
+    payload has drifted from it is not the request that was reviewed; neither
+    moves a ceiling.
+    """
+    row = approval_request
+    if row.action != INCREASE_ACTION:
+        return None
+    payload = row.payload if isinstance(row.payload, dict) else {}
+    quota_id = payload.get("quota_id")
+    asked = payload.get("requested_limit")
+    if (
+        not isinstance(quota_id, str)
+        or isinstance(asked, bool)
+        or not isinstance(asked, (int, float))
+    ):
+        return "It names no quota and limit, so no ceiling was changed."
+
+    filed_rows = (
+        (
+            await session.execute(
+                select(AuditEvent.event_metadata)
+                .where(
+                    AuditEvent.workspace_id == row.workspace_id,
+                    AuditEvent.action == INCREASE_REQUESTED,
+                    AuditEvent.entity_type == ENTITY_QUOTA,
+                    AuditEvent.entity_id == quota_id,
+                )
+                .order_by(AuditEvent.occurred_at.desc())
+                .limit(MAX_INCREASE_LOOKBACK)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    filed = next(
+        (
+            metadata
+            for metadata in filed_rows
+            if isinstance(metadata, dict) and metadata.get("request_ref") == row.request_ref
+        ),
+        None,
+    )
+    if filed is None:
+        return f"It was not filed from {SOURCE_SCREEN}, so no ceiling was changed."
+    requested = float(asked)
+    if float(filed.get("requested_limit") or 0.0) != requested:
+        return (
+            "Its payload no longer matches the increase that was filed, so no ceiling "
+            "was changed. Ask for the increase again."
+        )
+
+    quota = (
+        await session.execute(
+            select(Quota)
+            .where(Quota.id == quota_id, Quota.workspace_id == row.workspace_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if quota is None:
+        return "The quota no longer exists, so there was nothing to raise."
+
+    current = float(quota.limit_value or 0.0)
+    if requested <= current:
+        return (
+            f"'{quota.name}' already allows {telemetry.compact(current)} {quota.unit}; "
+            "nothing was changed."
+        )
+
+    quota.limit_value = requested
+    quota.updated_by = principal.actor
+    # A raised ceiling can clear a Warning or a breach; a switched-off quota
+    # stays switched off at its new limit.
+    if quota.status not in INERT_STATUSES:
+        await _evaluate_quota(session, quota, request=request)
+    await session.flush()
+    await audit.record(
+        session,
+        principal=principal,
+        action="quota.increase_applied",
+        entity_type=ENTITY_QUOTA,
+        entity_id=quota.id,
+        entity_label=quota.name,
+        source_screen=SOURCE_SCREEN,
+        detail=(
+            f"Raised from {telemetry.compact(current)} to {telemetry.compact(requested)} "
+            f"{quota.unit} under {row.request_ref}"
+        ),
+        metadata={
+            "request_ref": row.request_ref,
+            "from": current,
+            "to": requested,
+            "status": quota.status,
+        },
+        request=request,
+    )
+    return (
+        f"'{quota.name}' now allows {telemetry.compact(requested)} {quota.unit}; "
+        "the new ceiling is in force."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1014,7 +1171,11 @@ def budget_payload(budget: Budget, *, at: dt.datetime | None = None) -> dict[str
         "period_start": budget.period_start,
         "period_end": budget.period_end,
         "resets_in_days": days,
-        "resets_label": _resets_label(days),
+        # A period that is over does not "reset today", however many days ago
+        # it ended; its successor is a row of its own.
+        "resets_label": (
+            "Period ended" if moment >= _as_utc(budget.period_end) else _resets_label(days)
+        ),
         "status": budget.status,
         "health": health,
         "health_color": health.color,
@@ -1079,6 +1240,20 @@ async def get_budget(session: AsyncSession, principal: Principal, budget_id: str
     return budget
 
 
+def _budget_status(budget: Budget, spent: float, at: dt.datetime) -> LimitStatus:
+    """The state a budget is in at ``spent`` dollars. Decides; writes nothing."""
+    if budget.status == LimitStatus.DISABLED.value:
+        return LimitStatus.DISABLED
+    utilization = _utilisation(spent, float(budget.amount_usd or 0.0))
+    if at >= _as_utc(budget.period_end):
+        return LimitStatus.EXPIRED
+    if utilization >= budget.hard_threshold_percent:
+        return LimitStatus.EXCEEDED
+    if utilization >= budget.warn_threshold_percent:
+        return LimitStatus.WARNING
+    return LimitStatus.ACTIVE
+
+
 async def _evaluate_budget(
     session: AsyncSession, budget: Budget, *, request: Request | None = None
 ) -> LimitStatus:
@@ -1087,22 +1262,31 @@ async def _evaluate_budget(
     if previous == LimitStatus.DISABLED.value:
         return LimitStatus.DISABLED
 
+    status = _budget_status(budget, float(budget.spent_usd or 0.0), _now())
+    budget.status = status.value
+    if status.value != previous:
+        await _alert_budget(session, budget, status, request=request)
+    return status
+
+
+async def _alert_budget(
+    session: AsyncSession,
+    budget: Budget,
+    status: LimitStatus,
+    *,
+    request: Request | None = None,
+) -> None:
+    """Raise the alert for a budget that has just *entered* ``status``.
+
+    Only an escalation is news: dropping back to Active, or reaching the end of
+    the period, moves the chip and nothing else. Deduplicated on the budget and
+    the state it entered, so a threshold that stays crossed is one alert.
+    """
+    if status not in (LimitStatus.WARNING, LimitStatus.EXCEEDED):
+        return
     amount = float(budget.amount_usd or 0.0)
     spent = float(budget.spent_usd or 0.0)
     utilization = _utilisation(spent, amount)
-    if _now() >= _as_utc(budget.period_end):
-        status = LimitStatus.EXPIRED
-    elif utilization >= budget.hard_threshold_percent:
-        status = LimitStatus.EXCEEDED
-    elif utilization >= budget.warn_threshold_percent:
-        status = LimitStatus.WARNING
-    else:
-        status = LimitStatus.ACTIVE
-    budget.status = status.value
-
-    if status.value == previous or status not in (LimitStatus.WARNING, LimitStatus.EXCEEDED):
-        return status
-
     breached = status is LimitStatus.EXCEEDED
     threshold = (
         budget.hard_threshold_percent if breached else budget.warn_threshold_percent
@@ -1134,7 +1318,6 @@ async def _evaluate_budget(
         },
         request=request,
     )
-    return status
 
 
 async def create_budget(
@@ -1144,7 +1327,16 @@ async def create_budget(
     *,
     request: Request | None = None,
 ) -> dict[str, Any]:
-    """Open a budget for a period. Spend starts at zero until it is rolled up."""
+    """Open a budget for a period and measure what has already been spent in it.
+
+    A budget opened on the twentieth is twenty days into its period. It used to
+    start at $0 and stay there until somebody pressed Re-measure Spend -- "0.0%
+    utilized" on the KPI row and "under-consumed" in the insights, over spend
+    that might already be past the ceiling. It is measured here, so its first
+    reading is true and a threshold it is already over raises its alert at
+    once. A store that cannot answer does not stop the budget being created: it
+    opens at zero and the scheduled roll-up fills it in.
+    """
     principal.require(Role.ADMIN)
     at = _now()
     default_start, default_end = period_bounds(payload.period, at)
@@ -1210,6 +1402,13 @@ async def create_budget(
         },
         request=request,
     )
+    try:
+        await _roll_up_spend(session, principal, [budget], at=at, request=request)
+    except (TelemetryBackendUnavailable, EngineError) as exc:
+        # An unanswered read is not a reason to refuse the budget, and it is
+        # not evidence of zero spend either: the row keeps its opening zero and
+        # the next roll-up measures it.
+        log.warning("budget %s opened unmeasured: %s", budget.id, exc)
     await session.flush()
     await session.refresh(budget)
     return budget_payload(budget)
@@ -1324,69 +1523,343 @@ def _in_scope(budget: Budget, project: telemetry.AgentProject) -> bool:
     return project.environment == budget.scope_ref
 
 
-async def refresh_budgets(
+async def _roll_up_spend(
     session: AsyncSession,
     principal: Principal,
+    budgets: Sequence[Budget],
     *,
-    budget_id: str | None = None,
+    at: dt.datetime,
+    bookkeeping: bool = False,
     request: Request | None = None,
-) -> list[dict[str, Any]]:
-    """Roll measured cost into budgets and evaluate their thresholds.
+) -> None:
+    """Measure what each budget's scope has cost over its period, and evaluate it.
 
-    Budgets store spend rather than joining it live, so this is the job that
-    keeps the bars true — invoked from the screen and from the scheduled sweep.
-    Budgets sharing a period are measured with one engine call, and a budget the
-    engine reported no cost for keeps the spend it already had: an unanswered
-    read is not evidence that spending stopped.
+    Budgets sharing a period share one measurement. The measurement is always a
+    fresh one: this number is stored and compared against a threshold, so it is
+    never the one a dashboard remembered a minute ago. A budget the engine
+    reported no cost for keeps the spend it already had: an unanswered read is
+    not evidence that spending stopped.
+
+    ``bookkeeping`` is how the clock writes. A person pressing Re-measure Spend
+    edits the row and is named on it. The scheduled roll-up is an observation
+    about the row, not a change to it, so it must not move ``updated_at`` -- the
+    optimistic-concurrency token -- under whoever has the budget open, and it
+    writes nothing at all when the spend and the status are what they were.
     """
-    principal.require(Role.OPERATOR)
-    client = get_engine_client()
-    budgets = (
-        [await get_budget(session, principal, budget_id)]
-        if budget_id
-        else await current_budgets(session, principal)
-    )
     if not budgets:
-        return []
-
+        return
+    client = get_engine_client()
     projects = await telemetry.workspace_projects(session, principal)
-    at = _now()
     periods: dict[tuple[dt.datetime, dt.datetime], list[Budget]] = {}
     for budget in budgets:
         start = _as_utc(budget.period_start)
         end = min(_as_utc(budget.period_end), at)
-        periods.setdefault((start, end), []).append(budget)
+        if end > start:  # a budget for a period that has not opened has no spend
+            periods.setdefault((start, end), []).append(budget)
 
     for (start, end), group in periods.items():
-        rollups = await telemetry.project_rollups(client, projects, start, end)
+        try:
+            async with engine_deadline(what="the budget roll-up"):
+                rollups = await telemetry.project_rollups(
+                    client, projects, start, end, fresh=True
+                )
+        except EngineError as exc:
+            raise telemetry.telemetry_unavailable(exc) from exc
         for budget in group:
             matched = [rollup for rollup in rollups if _in_scope(budget, rollup.project)]
             spend = telemetry.sum_optional(rollup.cost_usd for rollup in matched)
+            if bookkeeping:
+                await _book_spend(session, budget, spend, at, request=request)
+                continue
             if spend is not None:
                 budget.spent_usd = round(spend, 2)
             budget.updated_by = principal.actor
             await _evaluate_budget(session, budget, request=request)
 
-    await audit.record(
-        session,
-        principal=principal,
-        action="budget.refreshed",
-        entity_type=ENTITY_BUDGET,
-        entity_label=f"{len(budgets)} budget(s)",
-        source_screen=SOURCE_SCREEN,
-        detail=(
-            f"Rolled measured cost into {len(budgets)} budget(s); "
-            + ", ".join(f"{b.name} {_utilisation(b.spent_usd, b.amount_usd):.1f}%" for b in budgets)
-        ),
-        metadata={"budget_ids": [budget.id for budget in budgets]},
-        request=request,
+
+async def _book_spend(
+    session: AsyncSession,
+    budget: Budget,
+    spend: float | None,
+    at: dt.datetime,
+    *,
+    request: Request | None = None,
+) -> None:
+    """The scheduled roll-up's write: spend and status, without it being an edit."""
+    previous = budget.status
+    spent = float(budget.spent_usd or 0.0) if spend is None else round(spend, 2)
+    status = _budget_status(budget, spent, at)
+    changes: dict[str, Any] = {}
+    if spent != float(budget.spent_usd or 0.0):
+        changes["spent_usd"] = spent
+    if status.value != previous:
+        changes["status"] = status.value
+    if not changes:
+        return
+    await stamp(session, [budget], **changes)
+    if status.value != previous:
+        await _alert_budget(session, budget, status, request=request)
+
+
+async def _lapsed_budgets(
+    session: AsyncSession, principal: Principal, at: dt.datetime
+) -> list[Budget]:
+    """Budgets whose period has ended and whose books have not been closed.
+
+    Nothing used to look at these: the roll-up read only the live period, so a
+    budget past its end stayed "Active", "Resets today", for ever. Measuring one
+    a last time records the period's final spend and moves it to Expired.
+    """
+    stmt = (
+        _scoped_budgets(principal)
+        .where(Budget.period_end <= at, Budget.status.not_in(INERT_STATUSES))
+        .order_by(Budget.period_end.asc())
     )
+    return list((await session.execute(stmt)).scalars().all())
+
+
+async def _open_next_periods(
+    session: AsyncSession,
+    principal: Principal,
+    at: dt.datetime,
+    *,
+    request: Request | None = None,
+) -> list[Budget]:
+    """Carry every recurring budget whose period has ended into the current one.
+
+    A budget is a row per period, and nothing opened the next row: on the first
+    of the month "Production monthly" dropped out of the live set, the KPI card
+    fell back to "No budget set" and the forecast lost its ceiling. The newest
+    row of each name is the budget as its owner last left it, so when that row
+    has lapsed its amount, thresholds, scope and owner are carried into the
+    period that contains now.
+
+    Two kinds of budget are left alone. One that was switched off stays off --
+    Disabled is how an admin ends a recurring budget. And one created with
+    hand-picked dates was never "Monthly" in the calendar sense, so there is no
+    next period to infer for it.
+    """
+    covered = set(
+        (
+            await session.execute(
+                select(Budget.name).where(
+                    Budget.workspace_id == principal.workspace_id, Budget.period_end > at
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    lapsed = (
+        (
+            await session.execute(
+                _scoped_budgets(principal)
+                .where(Budget.period_end <= at)
+                .order_by(Budget.period_start.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    opened: list[Budget] = []
+    for budget in lapsed:
+        if budget.name in covered:
+            continue
+        covered.add(budget.name)  # only the newest row of a name speaks for it
+        if budget.status == LimitStatus.DISABLED.value:
+            continue
+        period = LimitPeriod(budget.period)
+        span = (_as_utc(budget.period_start), _as_utc(budget.period_end))
+        if period_bounds(period, span[0]) != span:
+            continue
+        period_start, period_end = period_bounds(period, at)
+        successor = Budget(
+            workspace_id=budget.workspace_id,
+            name=budget.name,
+            scope=budget.scope,
+            scope_ref=budget.scope_ref,
+            period=budget.period,
+            amount_usd=budget.amount_usd,
+            spent_usd=0.0,
+            currency=budget.currency,
+            warn_threshold_percent=budget.warn_threshold_percent,
+            hard_threshold_percent=budget.hard_threshold_percent,
+            period_start=period_start,
+            period_end=period_end,
+            owner_user_id=budget.owner_user_id,
+            status=LimitStatus.ACTIVE.value,
+            created_by=principal.actor,
+            updated_by=principal.actor,
+        )
+        try:
+            async with session.begin_nested():
+                session.add(successor)
+                await session.flush()
+        except IntegrityError:
+            continue  # another worker opened it between the read and the insert
+        await audit.record(
+            session,
+            principal=principal,
+            action="budget.rolled_over",
+            entity_type=ENTITY_BUDGET,
+            entity_id=successor.id,
+            entity_label=successor.name,
+            source_screen=SOURCE_SCREEN,
+            detail=(
+                f"Opened the {budget.period.lower()} period starting "
+                f"{period_start.date().isoformat()} at "
+                f"{telemetry.money(float(budget.amount_usd or 0.0))}, carried forward from "
+                f"the period that ended {span[1].date().isoformat()}"
+            ),
+            metadata={
+                "previous_budget_id": budget.id,
+                "amount_usd": float(budget.amount_usd or 0.0),
+                "period_start": period_start.isoformat(),
+            },
+            request=request,
+        )
+        opened.append(successor)
+    return opened
+
+
+async def refresh_budgets(
+    session: AsyncSession,
+    principal: Principal,
+    *,
+    budget_id: str | None = None,
+    scheduled: bool = False,
+    request: Request | None = None,
+) -> list[dict[str, Any]]:
+    """Roll measured cost into budgets and evaluate their thresholds.
+
+    Budgets store spend rather than joining it live, so this is the job that
+    keeps the bars true -- invoked from the screen, and by ``run_budget_sweep``
+    on the platform clock. Without a ``budget_id`` it is the whole pass: it
+    closes the books on every budget whose period has ended, opens the current
+    period for the recurring ones, and measures everything that is live.
+
+    ``scheduled`` is the clock's pass. It writes as bookkeeping (see
+    ``_roll_up_spend``) and leaves no ``budget.refreshed`` audit row -- at one
+    pass every ten minutes that would *be* the workspace's audit trail. What
+    the clock changes is still on the record: a threshold crossed raises its
+    alert, and a period opened writes ``budget.rolled_over``.
+    """
+    principal.require(Role.OPERATOR)
+    at = _now()
+    if budget_id:
+        budgets = [await get_budget(session, principal, budget_id)]
+    else:
+        await _open_next_periods(session, principal, at, request=request)
+        budgets = [
+            *await _lapsed_budgets(session, principal, at),
+            *await current_budgets(session, principal),
+        ]
+    if not budgets:
+        return []
+
+    await _roll_up_spend(
+        session, principal, budgets, at=at, bookkeeping=scheduled, request=request
+    )
+
+    if not scheduled:
+        await audit.record(
+            session,
+            principal=principal,
+            action="budget.refreshed",
+            entity_type=ENTITY_BUDGET,
+            entity_label=f"{len(budgets)} budget(s)",
+            source_screen=SOURCE_SCREEN,
+            detail=(
+                f"Rolled measured cost into {len(budgets)} budget(s); "
+                + ", ".join(
+                    f"{b.name} {_utilisation(b.spent_usd, b.amount_usd):.1f}%" for b in budgets
+                )
+            ),
+            metadata={"budget_ids": [budget.id for budget in budgets]},
+            request=request,
+        )
     await session.flush()
     for budget in budgets:
         # ``updated_at`` is a server-side onupdate: the UPDATE expired it rather
         # than refetching it, so read it back before the caller serialises the row.
         await session.refresh(budget)
     return [budget_payload(budget, at=at) for budget in budgets]
+
+
+#: When this process last ran the budget pass, on the monotonic clock.
+_last_budget_sweep: float | None = None
+
+
+def _sweep_principal(workspace_id: str) -> Principal:
+    """How the clock signs what it does, as the scheduler's other sweeps do."""
+    return Principal(
+        workspace_id=workspace_id,
+        workspace_slug="",
+        engine_workspace="",
+        role=Role.OPERATOR,
+        kind="api_key",
+        api_key_id="platform-scheduler",
+        display_name="Platform Scheduler",
+    )
+
+
+async def run_budget_sweep(*, force: bool = False) -> dict[str, int]:
+    """The scheduled pass over every workspace's budgets. Never raises.
+
+    This is the sweep ``refresh_budgets`` always said it had and the model's
+    "rolled up from usage on a schedule" always assumed. Without it a budget's
+    spend moved only when an operator pressed a button: the 80% and 100% alerts
+    never fired on their own, and nothing closed or reopened a period.
+
+    Called from the platform scheduler on every tick, it runs at most once per
+    ``budget_sweep_interval_seconds`` in this process; it measures, so it has no
+    business running every thirty seconds. The gate is per process on purpose:
+    with several workers taking turns at the scheduler's lock the worst case is
+    one pass per worker per interval, which costs a few store reads, and every
+    write here is idempotent. It waits on the telemetry store, so the scheduler
+    runs it *after* giving its lock back, never under it.
+
+    Each workspace is measured on its own session and committed on its own: a
+    store that cannot answer for one, or one bad row, costs that workspace this
+    pass and nobody else anything.
+    """
+    global _last_budget_sweep
+    moment = time.monotonic()
+    if (
+        not force
+        and _last_budget_sweep is not None
+        and moment - _last_budget_sweep < settings.budget_sweep_interval_seconds
+    ):
+        return {}
+    _last_budget_sweep = moment
+
+    async with get_sessionmaker()() as session:
+        workspace_ids = (
+            (
+                await session.execute(
+                    select(Budget.workspace_id)
+                    .where(Budget.status != LimitStatus.DISABLED.value)
+                    .distinct()
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    counts = {"budgets_measured": 0, "budget_sweeps_failed": 0}
+    for workspace_id in workspace_ids:
+        try:
+            async with get_sessionmaker()() as session:
+                rows = await refresh_budgets(
+                    session, _sweep_principal(workspace_id), scheduled=True
+                )
+                await session.commit()
+            counts["budgets_measured"] += len(rows)
+        except Exception:  # noqa: BLE001 - one workspace must not stop the others
+            counts["budget_sweeps_failed"] += 1
+            log.exception("budget sweep failed for workspace %s", workspace_id)
+    return counts
 
 
 # ---------------------------------------------------------------------------
@@ -1404,19 +1877,52 @@ def _capacity_icon(resource_type: str) -> str:
 
 async def _capacity_readings(
     session: AsyncSession, principal: Principal, *, since: dt.datetime
-) -> dict[str, list[CapacityRecord]]:
-    """Every reading in the window, grouped by resource, oldest first."""
-    stmt = (
-        select(CapacityRecord)
+) -> dict[str, list[Any]]:
+    """The newest readings of every pool in the window, newest first per pool.
+
+    The table needs one row per pool -- its latest reading -- and a sparkline
+    of at most ``MAX_TREND_POINTS``. This used to load every reading of the
+    last thirty days as ORM objects (up to 20,000 of them) to find those few,
+    three times per Overview page; and because it read oldest-first under a row
+    cap, a workspace past the cap was shown readings that were weeks old as
+    "latest". The database now ranks the readings and hands back only the ones
+    the table draws, with the count of readings behind each pool beside them.
+    """
+    position = (
+        func.row_number()
+        .over(
+            partition_by=CapacityRecord.name,
+            order_by=(CapacityRecord.measured_at.desc(), CapacityRecord.id.desc()),
+        )
+        .label("position")
+    )
+    ranked = (
+        select(
+            CapacityRecord.name,
+            CapacityRecord.resource_type,
+            CapacityRecord.region,
+            CapacityRecord.provisioned,
+            CapacityRecord.used,
+            CapacityRecord.unit,
+            CapacityRecord.utilization_percent,
+            CapacityRecord.status,
+            CapacityRecord.measured_at,
+            position,
+            func.count().over(partition_by=CapacityRecord.name).label("reading_count"),
+        )
         .where(
             CapacityRecord.workspace_id == principal.workspace_id,
             CapacityRecord.measured_at >= since,
         )
-        .order_by(CapacityRecord.measured_at.asc())
-        .limit(MAX_CAPACITY_READINGS)
+        .subquery()
     )
-    grouped: dict[str, list[CapacityRecord]] = {}
-    for record in (await session.execute(stmt)).scalars():
+    stmt = (
+        select(ranked)
+        .where(ranked.c.position <= MAX_TREND_POINTS)
+        .order_by(ranked.c.name.asc(), ranked.c.position.asc())
+    )
+    grouped: dict[str, list[Any]] = {}
+    for record in (await session.execute(stmt)).all():
         grouped.setdefault(record.name, []).append(record)
     return grouped
 
@@ -1437,12 +1943,12 @@ async def capacity_rows(
 
     rows: list[dict[str, Any]] = []
     for name, readings in grouped.items():
-        latest = readings[-1]
+        latest = readings[0]
         trend = [
             round(float(record.utilization_percent or 0.0), 1)
-            for record in readings
+            for record in reversed(readings)  # the sparkline reads oldest first
             if _as_utc(record.measured_at) >= trend_floor
-        ][-MAX_TREND_POINTS:]
+        ]
         utilization = round(float(latest.utilization_percent or 0.0), 1)
         health = health_for(utilization)
         provisioned = float(latest.provisioned or 0.0)
@@ -1463,7 +1969,7 @@ async def capacity_rows(
                 "health": health,
                 "health_color": health.color,
                 "measured_at": latest.measured_at,
-                "reading_count": len(readings),
+                "reading_count": int(latest.reading_count),
                 "trend": trend,
             }
         )
@@ -1556,6 +2062,301 @@ async def capacity_series(
 
 
 # ---------------------------------------------------------------------------
+# Capacity — writes
+#
+# The table above had no writer. Nothing in the product, its deployment or its
+# tests ever inserted a capacity reading, so the Capacity tab, the Overview
+# card and the sixth KPI were empty on every installation. There are two
+# writers now: a reporter outside the platform posts what it measured, and the
+# platform records what it can see of itself on its own clock.
+# ---------------------------------------------------------------------------
+
+#: How far ahead of our clock a reporter's may run before a reading is refused.
+CAPACITY_CLOCK_SKEW: Final[dt.timedelta] = dt.timedelta(minutes=5)
+
+
+def _capacity_status(utilization: float) -> CapacityStatus:
+    """The stored verdict, from the same thresholds the chip is drawn with."""
+    health = health_for(utilization)
+    if health is LimitHealth.CRITICAL:
+        return CapacityStatus.CRITICAL
+    if health is LimitHealth.WATCH:
+        return CapacityStatus.WARNING
+    return CapacityStatus.HEALTHY
+
+
+def _capacity_record(
+    workspace_id: str,
+    *,
+    name: str,
+    resource_type: str,
+    region: str | None,
+    provisioned: float,
+    used: float,
+    unit: str,
+    measured_at: dt.datetime,
+) -> CapacityRecord:
+    utilization = round(used / provisioned * 100, 1)
+    return CapacityRecord(
+        workspace_id=workspace_id,
+        name=name,
+        resource_type=resource_type,
+        region=region,
+        provisioned=provisioned,
+        used=used,
+        unit=unit,
+        utilization_percent=utilization,
+        status=_capacity_status(utilization).value,
+        measured_at=measured_at,
+    )
+
+
+async def record_capacity(
+    session: AsyncSession, principal: Principal, payload: CapacityReport
+) -> int:
+    """Store a reporter's readings. Returns how many were recorded.
+
+    Readings are measurements, not governed changes: like ingested telemetry
+    they are not audited one by one, or a reporter on a five-minute cadence
+    would be the workspace's audit trail.
+    """
+    principal.require(Role.OPERATOR)
+    at = _now()
+    oldest = at - dt.timedelta(days=CAPACITY_HISTORY_DAYS)
+    records: list[CapacityRecord] = []
+    for position, reading in enumerate(payload.readings):
+        measured_at = _as_utc(reading.measured_at) if reading.measured_at else at
+        if measured_at > at + CAPACITY_CLOCK_SKEW:
+            raise ValidationFailed(
+                f"Reading {position + 1} ('{reading.name}') is dated in the future.",
+                details={"field": f"readings[{position}].measured_at"},
+            )
+        if measured_at < oldest:
+            raise ValidationFailed(
+                f"Reading {position + 1} ('{reading.name}') is older than the "
+                f"{CAPACITY_HISTORY_DAYS} days of history the screen shows.",
+                details={"field": f"readings[{position}].measured_at"},
+            )
+        records.append(
+            _capacity_record(
+                principal.workspace_id,
+                name=reading.name,
+                resource_type=reading.resource_type,
+                region=reading.region,
+                provisioned=reading.provisioned,
+                used=reading.used,
+                unit=reading.unit,
+                measured_at=measured_at,
+            )
+        )
+    session.add_all(records)
+    await session.flush()
+    return len(records)
+
+
+@dataclasses.dataclass(frozen=True)
+class PlatformReading:
+    """One thing the control plane measured about the machine it runs on."""
+
+    name: str
+    resource_type: str
+    provisioned: float
+    used: float
+    unit: str
+
+
+#: The pools the platform reports about itself. The names are fixed: they are
+#: how the sweep recognises its own readings when it asks whether one is due.
+PLATFORM_MEMORY: Final[str] = "Control Plane Memory"
+PLATFORM_HOST_MEMORY: Final[str] = "Host Memory"
+PLATFORM_DISK: Final[str] = "Platform Disk"
+PLATFORM_CPU: Final[str] = "Host CPU"
+PLATFORM_POOLS: Final[tuple[str, ...]] = (
+    PLATFORM_MEMORY,
+    PLATFORM_HOST_MEMORY,
+    PLATFORM_DISK,
+    PLATFORM_CPU,
+)
+
+_GIB: Final[float] = float(1024**3)
+#: A cgroup with no memory limit reports a number this large, or the word "max".
+_NO_LIMIT_BYTES: Final[int] = 1 << 60
+
+#: ``(busy, total)`` jiffies at this process's previous CPU sample.
+_cpu_sample: tuple[float, float] | None = None
+
+
+def _read_number(path: str) -> int | None:
+    try:
+        with open(path, encoding="ascii") as handle:
+            text = handle.read().strip()
+    except OSError:
+        return None
+    return int(text) if text.isdigit() else None
+
+
+def _memory_reading() -> PlatformReading | None:
+    """This container's memory against its limit, else the host's.
+
+    Inside a limited container ``/proc/meminfo`` still describes the host, so
+    the cgroup files are asked first (v2, then v1): the limit the container will
+    be killed at is the capacity that matters to it.
+    """
+    for limit_path, used_path in (
+        ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current"),
+        (
+            "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+            "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+        ),
+    ):
+        limit, used = _read_number(limit_path), _read_number(used_path)
+        if limit and used is not None and limit < _NO_LIMIT_BYTES:
+            return PlatformReading(
+                PLATFORM_MEMORY, "Memory", round(limit / _GIB, 3), round(used / _GIB, 3), "GiB"
+            )
+    try:
+        with open("/proc/meminfo", encoding="ascii") as handle:
+            fields = {
+                line.split(":", 1)[0]: line.split(":", 1)[1].split()[0]
+                for line in handle
+                if ":" in line
+            }
+        total = int(fields["MemTotal"]) * 1024
+        available = int(fields["MemAvailable"]) * 1024
+    except (OSError, KeyError, ValueError, IndexError):
+        return None
+    if total <= 0:
+        return None
+    return PlatformReading(
+        PLATFORM_HOST_MEMORY,
+        "Memory",
+        round(total / _GIB, 3),
+        round((total - available) / _GIB, 3),
+        "GiB",
+    )
+
+
+def _disk_reading() -> PlatformReading | None:
+    """The filesystem this process writes to."""
+    try:
+        usage = shutil.disk_usage(os.path.abspath(os.sep))
+    except OSError:
+        return None
+    if usage.total <= 0:
+        return None
+    return PlatformReading(
+        PLATFORM_DISK, "Disk", round(usage.total / _GIB, 2), round(usage.used / _GIB, 2), "GiB"
+    )
+
+
+def _cpu_reading() -> PlatformReading | None:
+    """Cores busy, averaged over the time since this process last looked.
+
+    ``/proc/stat`` counts jiffies since boot, so utilisation is a difference
+    between two samples. The first look has nothing to subtract from and
+    reports nothing, rather than reporting the average since boot as "now".
+    """
+    global _cpu_sample
+    try:
+        with open("/proc/stat", encoding="ascii") as handle:
+            fields = handle.readline().split()
+    except OSError:
+        return None
+    if len(fields) < 5 or fields[0] != "cpu":
+        return None
+    try:
+        jiffies = [float(value) for value in fields[1:]]
+    except ValueError:
+        return None
+    idle = jiffies[3] + (jiffies[4] if len(jiffies) > 4 else 0.0)  # idle + iowait
+    sample = (sum(jiffies) - idle, sum(jiffies))
+    previous, _cpu_sample = _cpu_sample, sample
+    if previous is None or sample[1] <= previous[1]:
+        return None
+    busy = max(0.0, sample[0] - previous[0]) / (sample[1] - previous[1])
+    cores = float(os.cpu_count() or 1)
+    return PlatformReading(PLATFORM_CPU, "CPU", cores, round(busy * cores, 3), "cores")
+
+
+def platform_readings() -> list[PlatformReading]:
+    """What this process can honestly say about the machine under it.
+
+    Only what is measured: a reading the operating system will not give --
+    no ``/proc`` on this platform, no cgroup limit, a first CPU sample -- is
+    left out, never estimated.
+    """
+    found = (_memory_reading(), _disk_reading(), _cpu_reading())
+    return [reading for reading in found if reading is not None]
+
+
+async def run_capacity_sweep(*, force: bool = False) -> dict[str, int]:
+    """Record the platform's own capacity readings and drop the expired ones.
+
+    Called from the platform scheduler, *under* its lock: it is short SQL and a
+    few local file reads, and the lock is what makes one worker the writer.
+    Whether a pass is due is decided from the table rather than from a timer in
+    this process -- the newest platform reading says when the last pass ran,
+    whichever worker ran it -- so four workers record one reading per interval,
+    not four. At the default fifteen minutes a month of readings is a few
+    thousand rows per workspace.
+
+    Capacity rows are workspace-scoped and the machine is shared, so the same
+    reading is written once for every active workspace.
+    """
+    # Looked at on every call, due or not: CPU is a difference between two looks,
+    # and the closer together they are the more "now" the reading is.
+    readings = [reading for reading in platform_readings() if reading.provisioned > 0]
+    at = _now()
+    counts = {"capacity_recorded": 0, "capacity_expired": 0}
+    async with get_sessionmaker()() as session:
+        if not force:
+            due_after = at - dt.timedelta(seconds=settings.capacity_sweep_interval_seconds)
+            recent = await session.execute(
+                select(CapacityRecord.id)
+                .where(
+                    CapacityRecord.name.in_(PLATFORM_POOLS),
+                    CapacityRecord.measured_at > due_after,
+                )
+                .limit(1)
+            )
+            if recent.first() is not None:
+                return {}
+
+        workspace_ids = (
+            (await session.execute(select(Workspace.id).where(Workspace.status == "active")))
+            .scalars()
+            .all()
+        )
+        records = [
+            _capacity_record(
+                workspace_id,
+                name=reading.name,
+                resource_type=reading.resource_type,
+                region=None,
+                provisioned=reading.provisioned,
+                used=reading.used,
+                unit=reading.unit,
+                measured_at=at,
+            )
+            for workspace_id in workspace_ids
+            for reading in readings
+        ]
+        session.add_all(records)
+        counts["capacity_recorded"] = len(records)
+
+        # Readings past the history window are never shown again; whoever
+        # reported them, keeping them only makes every read of the table slower.
+        expired = await session.execute(
+            sa_delete(CapacityRecord).where(
+                CapacityRecord.measured_at < at - dt.timedelta(days=CAPACITY_HISTORY_DAYS)
+            )
+        )
+        counts["capacity_expired"] = expired.rowcount or 0
+        await session.commit()
+    return counts
+
+
+# ---------------------------------------------------------------------------
 # Cost attribution
 # ---------------------------------------------------------------------------
 
@@ -1571,21 +2372,47 @@ class CostContext:
     previous: list[telemetry.ProjectRollup]
     spend_usd: float | None
     previous_spend_usd: float | None
+    #: Daily spend over ``span`` as ``(bucket starts, values)``, when the caller
+    #: asked for it to be measured alongside everything else; ``None`` when it
+    #: did not, and the forecast then reads it for itself.
+    daily_spend: tuple[list[dt.datetime], list[float | None]] | None = None
 
 
 async def cost_context(
-    session: AsyncSession, principal: Principal, period: QuotaPeriod
+    session: AsyncSession,
+    principal: Principal,
+    period: QuotaPeriod,
+    *,
+    with_daily_spend: bool = False,
 ) -> CostContext:
-    """Measure the period and the one before it, in parallel."""
+    """Measure the period and the one before it, in parallel.
+
+    ``with_daily_spend`` adds the daily cost series to the same gather. The KPI
+    row needs it for its forecast, and used to await it only *after* everything
+    else had answered -- one more store round trip added end to end to the
+    slowest card on the screen.
+
+    The whole fan-out answers inside the one-request engine deadline: a slow
+    store costs the page a typed 503 it can retry, not a worker and a database
+    connection held for as long as every queued read takes to time out.
+    """
     client = get_engine_client()
     span = resolve_period(period)
     projects = await telemetry.workspace_projects(session, principal)
-    current, previous, spend, previous_spend = await asyncio.gather(
+    reads: list[Any] = [
         telemetry.project_rollups(client, projects, span.start, span.end),
         telemetry.project_rollups(client, projects, span.previous_start, span.previous_end),
         telemetry.cost_total(client, projects, span.start, span.end),
         telemetry.cost_total(client, projects, span.previous_start, span.previous_end),
-    )
+    ]
+    if with_daily_spend:
+        reads.append(telemetry.cost_points(client, projects, span.start, span.end))
+    try:
+        async with engine_deadline(what="the cost and usage measurement"):
+            measured = await asyncio.gather(*reads)
+    except EngineError as exc:
+        raise telemetry.telemetry_unavailable(exc) from exc
+    current, previous, spend, previous_spend = measured[:4]
     return CostContext(
         period=period,
         span=span,
@@ -1594,7 +2421,16 @@ async def cost_context(
         previous=previous,
         spend_usd=spend,
         previous_spend_usd=previous_spend,
+        daily_spend=_daily_spend(span, measured[4]) if with_daily_spend else None,
     )
+
+
+def _daily_spend(
+    span: telemetry.Range, points: Sequence[tuple[dt.datetime, float]]
+) -> tuple[list[dt.datetime], list[float | None]]:
+    """Cost points folded onto the daily grid the spend chart and forecast share."""
+    starts = telemetry.bucket_starts(span.start, span.end, MetricInterval.DAILY)
+    return starts, telemetry.fold_sum(points, starts, MetricInterval.DAILY)
 
 
 def _unit_cost(cost: float | None, tokens: float | None) -> float | None:
@@ -1764,8 +2600,11 @@ async def attach_team_trends(
     if not rows:
         return
     client = get_engine_client()
-    end = _now()
-    start = end - dt.timedelta(days=days)
+    # The shared window, not ``_now()``: an end stamped to the microsecond is a
+    # question nobody else has ever asked, so every page view paid for every
+    # team's series again however recently it had been measured.
+    window = telemetry.resolve_window_days(days)
+    start, end = window.start, window.end
     starts = telemetry.bucket_starts(start, end, MetricInterval.DAILY)
 
     by_team: dict[str, list[telemetry.AgentProject]] = {}
@@ -1840,9 +2679,7 @@ async def spend_points(
         if projects is not None
         else await telemetry.workspace_projects(session, principal)
     )
-    starts = telemetry.bucket_starts(span.start, span.end, MetricInterval.DAILY)
-    points = await telemetry.cost_points(client, resolved, span.start, span.end)
-    return starts, telemetry.fold_sum(points, starts, MetricInterval.DAILY)
+    return _daily_spend(span, await telemetry.cost_points(client, resolved, span.start, span.end))
 
 
 def _least_squares(values: Sequence[float]) -> tuple[float, float]:
@@ -1864,6 +2701,7 @@ async def forecast(
     *,
     period: QuotaPeriod = QuotaPeriod.MTD,
     context: CostContext | None = None,
+    budgets: Sequence[Budget] | None = None,
 ) -> QuotaForecast:
     """Project period-end spend from the daily spend already measured.
 
@@ -1873,18 +2711,26 @@ async def forecast(
     deviations off the fitted line. With fewer than four measured days nothing
     is projected: a line through two points is not a forecast.
 
-    ``context`` lets a caller that has already measured the period — the KPI
-    summary does — hand its measurements over instead of paying for them twice.
+    ``context`` and ``budgets`` let a caller that has already measured the
+    period and read the live budgets — the KPI summary does both — hand them
+    over instead of paying for them twice.
     """
-    measured = context if context is not None else await cost_context(session, principal, period)
+    measured = (
+        context
+        if context is not None
+        else await cost_context(session, principal, period, with_daily_spend=True)
+    )
     span = measured.span
     at = _now()
     period_end = (
         period_bounds(LimitPeriod.MONTHLY, at)[1] if period is QuotaPeriod.MTD else span.end
     )
-    starts, values = await spend_points(
-        session, principal, span, projects=measured.projects
-    )
+    if measured.daily_spend is not None:
+        starts, values = measured.daily_spend
+    else:
+        starts, values = await spend_points(
+            session, principal, span, projects=measured.projects
+        )
     observed = [(index, value) for index, value in enumerate(values) if value is not None]
 
     labels = [telemetry.bucket_label(start, MetricInterval.DAILY) for start in starts]
@@ -1894,7 +2740,8 @@ async def forecast(
     ]
     days_elapsed = len(starts)
     days_remaining = max(0, math.ceil((period_end - at).total_seconds() / DAY.total_seconds()))
-    budgets = await current_budgets(session, principal)
+    if budgets is None:
+        budgets = await current_budgets(session, principal)
     budget_total = (
         round(sum(float(budget.amount_usd or 0.0) for budget in budgets), 2) if budgets else None
     )
@@ -2015,19 +2862,32 @@ _SEVERITY_RANK: Final[dict[InsightSeverity, int]] = {
 
 
 async def insights(
-    session: AsyncSession, principal: Principal, *, period: QuotaPeriod = QuotaPeriod.MTD
+    session: AsyncSession,
+    principal: Principal,
+    *,
+    period: QuotaPeriod = QuotaPeriod.MTD,
+    context: CostContext | None = None,
+    budgets: Sequence[Budget] | None = None,
+    capacity: Sequence[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Observations computed from what was measured, in this request.
 
     Nothing here is stored or authored: each observation is a rule over budgets,
     quotas, capacity readings and per-model unit cost, and its body quotes the
     numbers that triggered it so an operator can check the reasoning.
+
+    ``context``, ``budgets`` and ``capacity`` are for a caller that already
+    holds them (``overview`` does): the panel is then a view of the measurement
+    the rest of the page was drawn from, not a second one.
     """
     at = _now()
-    context = await cost_context(session, principal, period)
-    budgets = await current_budgets(session, principal)
+    if context is None:
+        context = await cost_context(session, principal, period)
+    if budgets is None:
+        budgets = await current_budgets(session, principal)
     quotas = await all_quota_rows(session, principal)
-    capacity = await capacity_rows(session, principal)
+    if capacity is None:
+        capacity = await capacity_rows(session, principal)
 
     found: list[dict[str, Any]] = []
 
@@ -2306,25 +3166,41 @@ async def events(
 
 
 async def summarise(
-    session: AsyncSession, principal: Principal, *, period: QuotaPeriod = QuotaPeriod.MTD
+    session: AsyncSession,
+    principal: Principal,
+    *,
+    period: QuotaPeriod = QuotaPeriod.MTD,
+    context: CostContext | None = None,
+    budgets: Sequence[Budget] | None = None,
+    capacity_readings: Sequence[dict[str, Any]] | None = None,
 ) -> QuotaSummary:
     """The six KPI cards, each against the equivalent span of the prior period.
 
     Spend, tokens and calls are measured; budget is the sum of the ceilings we
     hold for the live period; unit cost is derived from the first two; capacity
     health is scored from the latest reading of every pool.
+
+    Everything the cards need from the store is measured in one gather -- the
+    forecast's daily series included -- and the budgets are read once and handed
+    to the forecast rather than read again inside it.
     """
-    context = await cost_context(session, principal, period)
+    if context is None:
+        context = await cost_context(session, principal, period, with_daily_spend=True)
     head = telemetry.aggregate(context.current)
     tail = telemetry.aggregate(context.previous)
 
-    budgets = await current_budgets(session, principal)
+    if budgets is None:
+        budgets = await current_budgets(session, principal)
     budget_total = round(sum(float(budget.amount_usd or 0.0) for budget in budgets), 2)
     budget_spent = round(sum(float(budget.spent_usd or 0.0) for budget in budgets), 2)
     budget_utilization = _utilisation(budget_spent, budget_total) if budget_total else None
 
-    capacity = capacity_health(await capacity_rows(session, principal))
-    projection = await forecast(session, principal, period=period, context=context)
+    if capacity_readings is None:
+        capacity_readings = await capacity_rows(session, principal)
+    capacity = capacity_health(capacity_readings)
+    projection = await forecast(
+        session, principal, period=period, context=context, budgets=budgets
+    )
 
     unit_cost = _unit_cost(context.spend_usd, head.tokens)
     previous_unit_cost = _unit_cost(context.previous_spend_usd, tail.tokens)
@@ -2448,3 +3324,57 @@ def kpi_cards(summary: QuotaSummary) -> list[MetricKpi]:
         summary.cost_per_1k_tokens,
         summary.capacity,
     ]
+
+
+# ---------------------------------------------------------------------------
+# Overview
+# ---------------------------------------------------------------------------
+
+#: Teams whose sparkline the overview fetches: the page the Overview card shows.
+OVERVIEW_TEAM_TRENDS: Final[int] = 10
+
+
+async def overview(
+    session: AsyncSession, principal: Principal, *, period: QuotaPeriod = QuotaPeriod.MTD
+) -> dict[str, Any]:
+    """The KPI row and every cost panel of the screen, from one measurement.
+
+    The cards, the per-model table, the service donut, the driver bars, the team
+    table and the insights are all views of one thing: the period's per-agent
+    rollup and the one before it. Served apart, the Overview tab measured that
+    four times over and the Costs tab three more -- each a walk of the store's
+    project statistics plus a token aggregation per busy agent, twice. The
+    telemetry layer's shared memory only helps when those requests happen to
+    reach the same worker; served together it is measured once by construction.
+
+    The breakdowns arrive whole, heaviest first. They are a handful of rows, so
+    the console sorts, searches and pages them without asking again.
+    """
+    context = await cost_context(session, principal, period, with_daily_spend=True)
+    budgets = await current_budgets(session, principal)
+    capacity = await capacity_rows(session, principal)
+
+    teams = team_rows(context)
+    await attach_team_trends(context, teams[:OVERVIEW_TEAM_TRENDS])
+    return {
+        "summary": await summarise(
+            session,
+            principal,
+            period=period,
+            context=context,
+            budgets=budgets,
+            capacity_readings=capacity,
+        ),
+        "models": model_cost_rows(context),
+        "services": service_cost_rows(context),
+        "drivers": driver_rows(context),
+        "teams": teams,
+        "insights": await insights(
+            session,
+            principal,
+            period=period,
+            context=context,
+            budgets=budgets,
+            capacity=capacity,
+        ),
+    }

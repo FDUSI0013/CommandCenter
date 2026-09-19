@@ -17,6 +17,7 @@ import datetime as dt
 from collections.abc import Sequence
 from typing import Annotated, Literal
 
+import httpx
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, computed_field, field_validator
 from sqlalchemy import inspect as sa_inspect
 
@@ -131,11 +132,26 @@ class _ConnectorWrite(BaseModel):
     @field_validator("endpoint_url", check_fields=False)
     @classmethod
     def _http_endpoint(cls, value: str | None) -> str | None:
-        """Only http(s) endpoints can be probed, so only those may be registered."""
+        """Only http(s) endpoints can be probed, so only those may be registered.
+
+        The prefix alone is not enough: ``https://erp.internal:port/`` has it,
+        and so does the form's own ``https://…`` placeholder pasted back in.
+        Those registered cleanly and then could never be tested. The value is
+        parsed by the same library that will later open it, so what is accepted
+        here is exactly what the probe can address.
+        """
         if value is None:
             return None
         if not value.lower().startswith(("http://", "https://")):
             raise ValueError("must be an http:// or https:// URL")
+        try:
+            url = httpx.URL(value)
+        except httpx.InvalidURL as exc:
+            raise ValueError(f"must be a valid http(s) URL ({exc})") from None
+        if not url.host:
+            raise ValueError("must be a valid http(s) URL with a host name")
+        if url.port is not None and not 0 < url.port < 65536:
+            raise ValueError("must be a valid http(s) URL (the port is out of range)")
         return value
 
     @field_validator("scopes", check_fields=False)

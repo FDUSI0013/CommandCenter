@@ -1,0 +1,28 @@
+# Fulcrum Ops control plane — pinned dependency versions for the image build.
+#
+# Every dependency in apps/control-plane/pyproject.toml is a lower bound
+# (fastapi>=0.115, uvicorn>=0.32, ...), so an image rebuilt next month is not the
+# image that was tested: pip takes whatever is newest that day. That has already
+# mattered here — whether a request's database session is released before or
+# after a streaming response finishes depends on the FastAPI release, and that
+# was the difference between an open Live Runs tab pinning a Postgres connection
+# for half an hour and not.
+#
+# apps/control-plane/Dockerfile installs with `pip install -c` this file. A
+# constraints file never adds a package; it only fixes the version of one that
+# is going to be installed anyway, so extra lines are harmless and a missing
+# line simply floats as before.
+#
+# THIS FILE SHIPS WITHOUT PINS ON PURPOSE. The only honest source for them is
+# the image production is actually running and has been verified on — not a
+# developer's virtualenv on another operating system. Record them on the host
+# after a deploy you are satisfied with, commit the result, and every rebuild
+# from then on reproduces that set:
+#
+#   cd /opt/fulcrum/deploy
+#   { grep '^#' constraints.txt
+#     docker compose exec -T control-plane pip freeze --exclude fulcrum-ops-api
+#   } > constraints.new && mv constraints.new constraints.txt
+#
+# To take an upgrade deliberately: delete the line (or raise it), rebuild, run
+# the suite against the result, and freeze again.

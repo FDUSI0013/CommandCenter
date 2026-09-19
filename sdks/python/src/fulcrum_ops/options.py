@@ -129,6 +129,13 @@ class Options:
 
     api_key: Optional[str] = None
     base_url: str = DEFAULT_BASE_URL
+    #: True when nobody named a control plane and ``base_url`` is the fallback.
+    #: The client says so out loud: a key with nowhere to go is a mistake, and
+    #: the fallback sends that key to whatever is listening on this machine.
+    base_url_defaulted: bool = False
+    #: True when reporting was switched off on purpose — ``enabled=False`` or
+    #: ``FULCRUM_OPS_DISABLED`` — rather than by the absence of a key.
+    disabled_on_purpose: bool = False
     workspace: Optional[str] = None
     environment: Optional[str] = None
     agent: Optional[str] = None
@@ -206,15 +213,14 @@ def resolve_options(  # noqa: PLR0913 - this is the public surface; each name ma
 ) -> Options:
     """Apply argument → environment → default precedence, and validate the result."""
     key = (api_key or "").strip() or _env(ENV_API_KEY)
-    resolved_base = normalise_base_url(
-        (base_url or "").strip() or _env(ENV_BASE_URL) or DEFAULT_BASE_URL
-    )
+    named_base = (base_url or "").strip() or _env(ENV_BASE_URL)
+    resolved_base = normalise_base_url(named_base or DEFAULT_BASE_URL)
 
     # A client with no key is not an error: it is a developer running the app on
     # their laptop without credentials. Reporting turns itself off and every
     # other line of their code keeps working.
+    disabled_by_env = _env_bool(ENV_DISABLED)
     if enabled is None:
-        disabled_by_env = _env_bool(ENV_DISABLED)
         resolved_enabled = bool(key) and not bool(disabled_by_env)
     else:
         resolved_enabled = bool(enabled)
@@ -222,6 +228,8 @@ def resolve_options(  # noqa: PLR0913 - this is the public surface; each name ma
     options = Options(
         api_key=key,
         base_url=resolved_base,
+        base_url_defaulted=named_base is None,
+        disabled_on_purpose=enabled is False or (enabled is None and bool(disabled_by_env)),
         workspace=(workspace or "").strip() or _env(ENV_WORKSPACE),
         environment=(environment or "").strip() or _env(ENV_ENVIRONMENT),
         agent=(agent or "").strip() or _env(ENV_AGENT),

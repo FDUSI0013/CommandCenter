@@ -45,7 +45,7 @@ from ..api.common import (
     to_csv,
 )
 from ..api.deps import Principal
-from ..core.errors import Conflict, NotFound, PreconditionFailed
+from ..core.errors import Conflict, NotFound, PreconditionFailed, ValidationFailed
 from ..core.security import decrypt_secret, encrypt_secret, mask_secret
 from ..models.governance import (
     Secret,
@@ -53,9 +53,10 @@ from ..models.governance import (
     SecretAccessLog,
     SecretStatus,
 )
-from ..models.identity import Role, User
+from ..models.identity import Membership, Role, User
 from ..schemas.secrets import (
     EXPIRING_WINDOW_DAYS,
+    INERT_STATUSES,
     PRIVILEGED_ACCESS_WINDOW_DAYS,
     AccessLogFilters,
     RotationState,
@@ -88,11 +89,29 @@ EXPORT_MAX_ROWS: Final[int] = 5000
 #: round ``updated_at`` on the way out, and a rounding artefact is not a clash.
 CONFLICT_TOLERANCE_SECONDS: Final[float] = 1.0
 
-#: States in which a credential is inert: it may not be revealed or rotated.
-INERT_STATUSES: Final[tuple[str, ...]] = (
-    SecretStatus.DISABLED.value,
-    SecretStatus.REVOKED.value,
+#: ``INERT_STATUSES`` (disabled, revoked) is defined beside the row flags in
+#: ``schemas.secrets`` so the chips and these aggregates cannot drift apart.
+#: This is its SQL form. Rotation and expiry are obligations of a credential
+#: that is in service: rotate refuses an inert one, so counting it as overdue
+#: would park it in that KPI, and drag the compliance score, with no way out
+#: short of deleting it. ``status`` is NOT NULL, so the test stays two-valued.
+IN_SERVICE: Final[Any] = Secret.status.notin_(INERT_STATUSES)
+
+#: What "Privileged Access (30d)" counts: the material being read or replaced.
+#: A metadata edit is not an access, and neither is a reveal that was refused;
+#: those stay in the credential's own access log, where the inspector's
+#: failed-attempts counter reads them.
+PRIVILEGED_ACCESS_ACTIONS: Final[tuple[str, ...]] = (
+    SecretAccessAction.REVEAL.value,
+    SecretAccessAction.ROTATE.value,
 )
+
+#: The access-log action written when PATCH moves a credential to Revoked.
+#: ``SecretAccessAction`` has no member for it yet; the column is a plain
+#: string and the read model types it as ``str``, so the row reads back as
+#: written. Until the enum gains the member, ``?action=revoke`` is not a
+#: filter the access-log endpoint accepts.
+REVOKE_ACTION: Final[str] = "revoke"
 
 SEARCH_COLUMNS: Final[tuple[Any, ...]] = (
     Secret.name,
@@ -205,9 +224,14 @@ def _listing_query(
     """The vault table's query: workspace scope, dropdowns, search, sort.
 
     The owner join is always present because the table both searches and sorts
-    on the owner's display name, which lives on ``users``.
+    on the owner's display name, which lives on ``users``. It goes through the
+    workspace's memberships: ``users`` is shared by every tenant, so a bare
+    join would let an owner id from another workspace be searched and sorted
+    by that person's name.
     """
-    stmt = _scoped(principal).outerjoin(User, User.id == Secret.owner_user_id)
+    stmt = _scoped(principal).outerjoin(
+        User, and_(User.id == Secret.owner_user_id, User.id.in_(_member_ids(principal)))
+    )
     stmt = apply_filters(
         stmt,
         {
@@ -222,8 +246,13 @@ def _listing_query(
     )
     stmt = _apply_rotation_state(stmt, filters.rotation_state)
     if filters.expiring_within_days is not None:
+        # No lower bound on purpose: a credential that lapsed yesterday is the
+        # most urgent row this filter can return. One that is out of service is
+        # not on the list at all.
         horizon = _now() + dt.timedelta(days=filters.expiring_within_days)
-        stmt = stmt.where(Secret.expires_at.is_not(None), Secret.expires_at <= horizon)
+        stmt = stmt.where(
+            IN_SERVICE, Secret.expires_at.is_not(None), Secret.expires_at <= horizon
+        )
     stmt = apply_search(stmt, params, SEARCH_COLUMNS)
     stmt = apply_sort(stmt, params, SORTABLE, Secret.created_at)
     # Deterministic tie-break: without it, two rows sharing a sort value can
@@ -235,10 +264,16 @@ def _apply_rotation_state(stmt: Select, state: RotationState | None) -> Select:
     if state is None:
         return stmt
     now = _now()
+    # Overdue and due-soon are calls to action, and the action (rotate) is
+    # refused for a disabled or revoked credential. Those rows read "N/A" in
+    # the Rotation column, so they must not answer these two slices either.
     if state is RotationState.OVERDUE:
-        return stmt.where(Secret.next_rotation_at.is_not(None), Secret.next_rotation_at < now)
+        return stmt.where(
+            IN_SERVICE, Secret.next_rotation_at.is_not(None), Secret.next_rotation_at < now
+        )
     if state is RotationState.DUE_SOON:
         return stmt.where(
+            IN_SERVICE,
             Secret.next_rotation_at.is_not(None),
             Secret.next_rotation_at >= now,
             Secret.next_rotation_at <= now + dt.timedelta(days=EXPIRING_WINDOW_DAYS),
@@ -251,22 +286,59 @@ def _apply_rotation_state(stmt: Select, state: RotationState | None) -> Select:
     return stmt.where(Secret.next_rotation_at.is_(None))
 
 
+def _member_ids(principal: Principal) -> Select:
+    """The user ids that belong to the caller's workspace, as a subquery."""
+    return select(Membership.user_id).where(
+        Membership.workspace_id == principal.workspace_id
+    )
+
+
 async def _owner_map(
-    session: AsyncSession, user_ids: set[str]
+    session: AsyncSession, principal: Principal, user_ids: set[str]
 ) -> dict[str, tuple[str | None, str | None]]:
-    """One extra statement per page resolves every owner; never one per row."""
+    """One extra statement per page resolves every owner; never one per row.
+
+    Only members of the caller's workspace resolve. ``users`` spans tenants, so
+    an owner id pointing at somebody else's user must come back nameless, never
+    as that person's name and email.
+    """
     if not user_ids:
         return {}
     rows = (
         await session.execute(
-            select(User.id, User.full_name, User.email).where(User.id.in_(user_ids))
+            select(User.id, User.full_name, User.email).where(
+                User.id.in_(user_ids), User.id.in_(_member_ids(principal))
+            )
         )
     ).all()
     return {row.id: (row.full_name, row.email) for row in rows}
 
 
-async def _reads(session: AsyncSession, rows: Sequence[Secret]) -> list[SecretRead]:
-    owners = await _owner_map(session, {r.owner_user_id for r in rows if r.owner_user_id})
+async def _assert_owner_is_member(
+    session: AsyncSession, principal: Principal, user_id: str
+) -> None:
+    """Refuse an owner who does not belong to this workspace."""
+    member = (
+        await session.execute(
+            select(Membership.user_id).where(
+                Membership.user_id == user_id,
+                Membership.workspace_id == principal.workspace_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if member is None:
+        raise ValidationFailed(
+            "That user is not a member of this workspace.",
+            details={"field": "owner_user_id"},
+        )
+
+
+async def _reads(
+    session: AsyncSession, principal: Principal, rows: Sequence[Secret]
+) -> list[SecretRead]:
+    owners = await _owner_map(
+        session, principal, {r.owner_user_id for r in rows if r.owner_user_id}
+    )
     reads: list[SecretRead] = []
     for row in rows:
         owner_name, owner_email = owners.get(row.owner_user_id or "", (None, None))
@@ -276,8 +348,8 @@ async def _reads(session: AsyncSession, rows: Sequence[Secret]) -> list[SecretRe
     return reads
 
 
-async def _read(session: AsyncSession, secret: Secret) -> SecretRead:
-    return (await _reads(session, [secret]))[0]
+async def _read(session: AsyncSession, principal: Principal, secret: Secret) -> SecretRead:
+    return (await _reads(session, principal, [secret]))[0]
 
 
 async def _get(session: AsyncSession, principal: Principal, secret_id: str) -> Secret:
@@ -307,7 +379,7 @@ async def _assert_name_free(
 def _access_row(
     secret: Secret,
     principal: Principal,
-    action: SecretAccessAction,
+    action: SecretAccessAction | str,
     *,
     request: Request | None = None,
     justification: str | None = None,
@@ -318,7 +390,7 @@ def _access_row(
         secret_id=secret.id,
         actor=principal.actor,
         actor_user_id=principal.user_id,
-        action=action.value,
+        action=_value(action),
         occurred_at=_now(),
         ip_address=_client_ip(request),
         justification=justification,
@@ -366,6 +438,37 @@ async def _record_refusal(
     await session.commit()
 
 
+def _assert_status_move(secret: Secret, target: str) -> None:
+    """Hold PATCH to the state machine the verbs enforce.
+
+    ``status`` is writable because the health chips (Active, Expiring Soon, ...)
+    are accepted on write, and because there is no revoke verb: PATCH is how a
+    credential is revoked. It is not a way round the verbs. Leaving Revoked is
+    refused exactly as :func:`enable_secret` refuses it, and the moves into and
+    out of Disabled belong to the verbs, which record the reason and write the
+    ``disable`` / ``enable`` access row rather than an anonymous ``update``.
+    """
+    if secret.status == SecretStatus.REVOKED.value:
+        raise PreconditionFailed(
+            f"'{secret.name}' has been revoked and cannot be returned to service. "
+            "Store a replacement credential instead."
+        )
+    if target == SecretStatus.DISABLED.value:
+        raise ValidationFailed(
+            "Take a credential out of service with POST /secrets/{id}/disable, "
+            "which records the reason.",
+            details={"field": "status"},
+        )
+    if (
+        secret.status == SecretStatus.DISABLED.value
+        and target != SecretStatus.REVOKED.value
+    ):
+        raise ValidationFailed(
+            "Return a disabled credential to service with POST /secrets/{id}/enable.",
+            details={"field": "status"},
+        )
+
+
 def _next_rotation(anchor: dt.datetime, period_days: int | None) -> dt.datetime | None:
     return anchor + dt.timedelta(days=period_days) if period_days else None
 
@@ -397,7 +500,7 @@ async def list_secrets(
     """One page of the vault, newest first unless ``sort`` says otherwise."""
     stmt = _listing_query(principal, params, filters)
     rows, total = await paginate(session, stmt, params)
-    return await _reads(session, rows), total
+    return await _reads(session, principal, rows), total
 
 
 async def get_secret(
@@ -405,7 +508,7 @@ async def get_secret(
 ) -> SecretRead:
     """One credential's metadata. Never its material."""
     secret = await _get(session, principal, secret_id)
-    return await _read(session, secret)
+    return await _read(session, principal, secret)
 
 
 async def list_access_log(
@@ -449,17 +552,23 @@ async def summarise(session: AsyncSession, principal: Principal) -> SecretsSumma
     costs the same as one with ten.
     """
     now = _now()
-    expiring = and_(
+    lapsing = and_(
         Secret.expires_at.is_not(None),
         Secret.expires_at <= now + dt.timedelta(days=EXPIRING_WINDOW_DAYS),
     )
-    overdue = and_(
+    past_due = and_(
         Secret.next_rotation_at.is_not(None),
         Secret.next_rotation_at < now,
     )
-    # Compliant means neither of the above. The NULL guards above keep this a
-    # two-valued test, so rows with no expiry and no cadence count as compliant.
-    compliant = and_(not_(expiring), not_(overdue))
+    # Every figure is taken over the credentials in service. A disabled or
+    # revoked one is neither overdue nor compliant: it is out of the score.
+    expiring = and_(IN_SERVICE, lapsing)
+    overdue = and_(IN_SERVICE, past_due)
+    # Compliant means in service and neither of the above. It is built from the
+    # date tests, not from not_(expiring): that would be true of every inert
+    # row. The NULL guards keep this a two-valued test, so rows with no expiry
+    # and no cadence count as compliant.
+    compliant = and_(IN_SERVICE, not_(lapsing), not_(past_due))
 
     totals = (
         await session.execute(
@@ -469,10 +578,11 @@ async def summarise(session: AsyncSession, principal: Principal) -> SecretsSumma
                 func.coalesce(func.sum(case((expiring, 1), else_=0)), 0),
                 func.coalesce(func.sum(case((overdue, 1), else_=0)), 0),
                 func.coalesce(func.sum(case((compliant, 1), else_=0)), 0),
+                func.coalesce(func.sum(case((IN_SERVICE, 1), else_=0)), 0),
             ).where(Secret.workspace_id == principal.workspace_id)
         )
     ).one()
-    total, active_vaults, expiring_soon, rotation_overdue, compliant_count = totals
+    total, active_vaults, expiring_soon, rotation_overdue, compliant_count, in_service = totals
 
     privileged_access = (
         await session.execute(
@@ -482,6 +592,8 @@ async def summarise(session: AsyncSession, principal: Principal) -> SecretsSumma
                 SecretAccessLog.workspace_id == principal.workspace_id,
                 SecretAccessLog.occurred_at
                 >= now - dt.timedelta(days=PRIVILEGED_ACCESS_WINDOW_DAYS),
+                SecretAccessLog.action.in_(PRIVILEGED_ACCESS_ACTIONS),
+                SecretAccessLog.success.is_(True),
                 Secret.privileged.is_(True),
             )
         )
@@ -492,6 +604,7 @@ async def summarise(session: AsyncSession, principal: Principal) -> SecretsSumma
             select(
                 Secret.secret_type,
                 func.count(Secret.id),
+                func.coalesce(func.sum(case((IN_SERVICE, 1), else_=0)), 0),
                 func.coalesce(func.sum(case((compliant, 1), else_=0)), 0),
             )
             .where(Secret.workspace_id == principal.workspace_id)
@@ -502,20 +615,27 @@ async def summarise(session: AsyncSession, principal: Principal) -> SecretsSumma
 
     return SecretsSummary(
         total=int(total),
+        in_service=int(in_service),
         active_vaults=int(active_vaults),
         expiring_soon=int(expiring_soon),
         rotation_overdue=int(rotation_overdue),
-        # An empty vault is fully compliant; there is nothing out of policy in it.
-        compliance_score=round(100 * int(compliant_count) / int(total)) if total else 100,
+        # A vault with nothing in service is fully compliant; there is nothing
+        # out of policy in it.
+        compliance_score=(
+            round(100 * int(compliant_count) / int(in_service)) if in_service else 100
+        ),
         privileged_access_30d=int(privileged_access),
         by_type=[
             SecretTypeBreakdown(
                 secret_type=secret_type,
                 count=int(count),
+                in_service=int(live),
                 compliant=int(compliant_rows),
-                compliance_pct=round(100 * int(compliant_rows) / int(count)) if count else 100,
+                # A type with nothing in service has no score, rather than a
+                # flattering 100 or an alarming 0.
+                compliance_pct=round(100 * int(compliant_rows) / int(live)) if live else None,
             )
-            for secret_type, count, compliant_rows in by_type_rows
+            for secret_type, count, live, compliant_rows in by_type_rows
         ],
     )
 
@@ -536,7 +656,7 @@ async def export_csv(
     """
     stmt = _listing_query(principal, params, filters)
     rows = (await session.execute(stmt.limit(EXPORT_MAX_ROWS))).scalars().all()
-    reads = await _reads(session, rows)
+    reads = await _reads(session, principal, rows)
 
     await audit.record(
         session,
@@ -565,6 +685,10 @@ async def create_secret(
     """Store a credential. Any supplied value is encrypted before it is attached."""
     principal.require(Role.ADMIN)
     await _assert_name_free(session, principal, payload.name)
+    # Only an owner the caller named is checked. The fallback is the caller,
+    # who is either a member already or an API key with no user behind it.
+    if payload.owner_user_id:
+        await _assert_owner_is_member(session, principal, payload.owner_user_id)
 
     now = _now()
     has_material = bool(payload.value)
@@ -613,7 +737,7 @@ async def create_secret(
         detail=f"Stored {secret.secret_type} in {secret.vault} as {stored}",
         request=request,
     )
-    return await _read(session, secret)
+    return await _read(session, principal, secret)
 
 
 async def update_secret(
@@ -636,37 +760,91 @@ async def update_secret(
         raise Conflict(
             "This secret changed after you loaded it. Reload the row and reapply your edit."
         )
+
+    # A status that only echoes the current one is not a change, and must not
+    # be reported as one. A real move has to be one the verbs would allow.
+    revoked = False
+    if "status" in changes:
+        target = _value(changes["status"])
+        if target == secret.status:
+            del changes["status"]
+        else:
+            _assert_status_move(secret, target)
+            revoked = target == SecretStatus.REVOKED.value
     if not changes:
-        return await _read(session, secret)
+        return await _read(session, principal, secret)
 
     new_name = changes.get("name")
     if new_name is not None and new_name.lower() != secret.name.lower():
         await _assert_name_free(session, principal, new_name, exclude_id=secret.id)
 
+    # Checked only when the owner really changes: the access form sends the
+    # field on every save, and an owner who has since left the workspace must
+    # not make every other edit to the row impossible.
+    new_owner = changes.get("owner_user_id")
+    if new_owner and new_owner != secret.owner_user_id:
+        await _assert_owner_is_member(session, principal, new_owner)
+
+    old_period = secret.rotation_period_days
     for field, value in changes.items():
         setattr(secret, field, _value(value))
 
-    if "rotation_period_days" in changes:
+    if "rotation_period_days" in changes and changes["rotation_period_days"] != old_period:
         # Re-anchor the schedule on the last real rotation so shortening a
         # cadence can legitimately make a credential overdue straight away.
-        anchor = secret.last_rotated_at or _now()
+        # Only when the cadence really changed: the console's access form sends
+        # the field on every save, and a save that merely echoes it back must
+        # not move the deadline. A credential with no rotation on record dates
+        # from its creation, never from "now" — anchoring on now let an edit to
+        # an unrelated field clear a vault-held credential out of Rotation
+        # Overdue without anything having been rotated.
+        anchor = secret.last_rotated_at or secret.created_at
         secret.next_rotation_at = _next_rotation(anchor, secret.rotation_period_days)
 
     secret.updated_by = principal.actor
-    session.add(_access_row(secret, principal, SecretAccessAction.UPDATE, request=request))
-    await audit.record(
-        session,
-        principal=principal,
-        action="secret.updated",
-        entity_type=ENTITY_TYPE,
-        entity_id=secret.id,
-        entity_label=secret.name,
-        source_screen=SOURCE_SCREEN,
-        detail="Updated " + ", ".join(sorted(changes)),
-        request=request,
-    )
+    label = secret.name
+    try:
+        # Before the evidence is written, as on create: the audit writer
+        # flushes too, and a clash raised in there would surface as a 500.
+        await session.flush()
+    except IntegrityError as exc:  # a rename claimed the name between check and flush
+        await session.rollback()
+        raise Conflict(
+            f"A secret named '{label}' already exists in this workspace."
+        ) from exc
+
+    if revoked:
+        # Revocation is a lifecycle event, not a metadata edit, so it gets its
+        # own access row and its own audit action, the same standing the
+        # disable and enable verbs give theirs.
+        session.add(_access_row(secret, principal, REVOKE_ACTION, request=request))
+        await audit.record(
+            session,
+            principal=principal,
+            action="secret.revoked",
+            entity_type=ENTITY_TYPE,
+            entity_id=secret.id,
+            entity_label=secret.name,
+            source_screen=SOURCE_SCREEN,
+            detail="Revoked. Revocation is final; the credential cannot be re-enabled",
+            request=request,
+        )
+    edited = sorted(field for field in changes if not (revoked and field == "status"))
+    if edited:
+        session.add(_access_row(secret, principal, SecretAccessAction.UPDATE, request=request))
+        await audit.record(
+            session,
+            principal=principal,
+            action="secret.updated",
+            entity_type=ENTITY_TYPE,
+            entity_id=secret.id,
+            entity_label=secret.name,
+            source_screen=SOURCE_SCREEN,
+            detail="Updated " + ", ".join(edited),
+            request=request,
+        )
     await session.flush()
-    return await _read(session, secret)
+    return await _read(session, principal, secret)
 
 
 async def delete_secret(
@@ -826,6 +1004,13 @@ async def rotate_secret(
     A value may be supplied — when the credential was reissued upstream — or
     minted here. A minted value is returned exactly once, in this response; a
     supplied one is never echoed back.
+
+    A credential the control plane only points at is the exception to minting.
+    There is no material here to replace and nothing is pushed to the external
+    vault, so a value generated locally would exist nowhere upstream while the
+    row claimed "rotated", "compliant" and "material stored". With no value
+    supplied, the call records the rotation the operator performed in that
+    vault — the clock restarts, the row stays a pointer — and mints nothing.
     """
     principal.require(Role.ADMIN)
     secret = await _get(session, principal, secret_id)
@@ -836,18 +1021,21 @@ async def rotate_secret(
             "Enable it first."
         )
 
-    generated = payload.value is None
-    plaintext = payload.value or token_urlsafe(GENERATED_VALUE_BYTES)
+    recorded_upstream = secret.ciphertext is None and payload.value is None
+    generated = payload.value is None and not recorded_upstream
     now = _now()
 
     if payload.rotation_period_days is not None:
         secret.rotation_period_days = payload.rotation_period_days
 
-    secret.ciphertext = encrypt_secret(plaintext)
-    secret.display_hint = mask_secret(plaintext)
+    plaintext: str | None = None
+    if not recorded_upstream:
+        plaintext = payload.value or token_urlsafe(GENERATED_VALUE_BYTES)
+        secret.ciphertext = encrypt_secret(plaintext)
+        secret.display_hint = mask_secret(plaintext)
+        secret.last_accessed_at = now
     secret.last_rotated_at = now
     secret.next_rotation_at = _next_rotation(now, secret.rotation_period_days)
-    secret.last_accessed_at = now
     # Inert states were refused above, so whatever warning the row carried —
     # expiring, overdue, expired — is answered by the new material.
     secret.status = SecretStatus.ACTIVE.value
@@ -862,8 +1050,11 @@ async def rotate_secret(
             justification=payload.reason,
         )
     )
-    origin = "generated by the control plane" if generated else "supplied by the operator"
-    detail = f"Rotated with a new value {origin}"
+    if recorded_upstream:
+        detail = f"Rotation recorded; material is held upstream in {secret.vault}"
+    else:
+        origin = "generated by the control plane" if generated else "supplied by the operator"
+        detail = f"Rotated with a new value {origin}"
     if payload.reason:
         detail = f"{detail}. Reason: {payload.reason}"
     await audit.record(
@@ -880,8 +1071,9 @@ async def rotate_secret(
     await session.flush()
 
     return SecretRotateResult(
-        secret=await _read(session, secret),
+        secret=await _read(session, principal, secret),
         generated=generated,
+        recorded_upstream=recorded_upstream,
         value=plaintext if generated else None,
         rotated_at=now,
         next_rotation_at=secret.next_rotation_at,
@@ -930,7 +1122,7 @@ async def disable_secret(
         request=request,
     )
     await session.flush()
-    return await _read(session, secret)
+    return await _read(session, principal, secret)
 
 
 async def enable_secret(
@@ -972,4 +1164,4 @@ async def enable_secret(
         request=request,
     )
     await session.flush()
-    return await _read(session, secret)
+    return await _read(session, principal, secret)

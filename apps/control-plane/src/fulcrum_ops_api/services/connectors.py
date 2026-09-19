@@ -15,8 +15,11 @@ rather than a scan of loaded rows.
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import enum
+import ipaddress
+import socket
 import time
 from collections.abc import Sequence
 from typing import Any
@@ -28,6 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..api.common import ListParams, apply_filters, apply_search, apply_sort, paginate
 from ..api.deps import Principal
+from ..core.config import settings
 from ..core.errors import Conflict, NotFound, PreconditionFailed, ValidationFailed
 from ..models.identity import Role
 from ..models.registry import (
@@ -63,6 +67,14 @@ MAX_EXPORT_ROWS = 5000
 
 #: A reachability probe is a UI action behind a spinner - it fails fast.
 PROBE_TIMEOUT_SECONDS = 5.0
+#: ...and that is a timeout per phase (connect, then the status line), started
+#: again on every redirect. The probe as a whole gets one deadline as well, so a
+#: slow chain of hops cannot outlive the console's request while the handler
+#: sits on a database connection.
+PROBE_DEADLINE_SECONDS = 10.0
+#: Redirects are followed by hand so that each hop is vetted like the first; a
+#: real endpoint is an http->https bounce and perhaps a trailing slash away.
+PROBE_MAX_REDIRECTS = 3
 PROBE_USER_AGENT = "Fulcrum-Ops-Control-Plane/1.0 (connector reachability probe)"
 
 #: Two clocks are never perfectly aligned and clients round timestamps when they
@@ -864,7 +876,10 @@ async def test_connector(
     The probe carries no credentials - this service holds none for the connector
     - so it answers reachability only: a 401 proves the endpoint is up and
     guarding itself, which is a healthy answer to this question. A blocked
-    connector is not probed at all; blocked means blocked.
+    connector is not probed at all; blocked means blocked. Neither is one whose
+    endpoint is on a private network (see :func:`probe_addresses`): that is
+    reported as a warning that says so, never as unreachable, because nothing
+    was measured. Every outcome, including those, is audited.
     """
     principal.require(Role.MEMBER)
     connector = await _load(session, principal, connector_id)
@@ -907,36 +922,180 @@ async def test_connector(
     return result
 
 
+class ProbeStopped(Exception):
+    """The probe ended without an answer from the endpoint, and this is why.
+
+    Carries the verdict to report, because the two reasons are different
+    answers: a host that does not resolve is unreachable, while an address this
+    process refuses to call has not been found to be anything at all.
+    """
+
+    def __init__(self, status: TestStatus, message: str) -> None:
+        super().__init__(message)
+        self.status: TestStatus = status
+
+
+def is_public_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """True when ``address`` is on the public internet and nowhere else.
+
+    Everything else is somewhere a URL typed into a form must not be able to
+    send this process: loopback, the RFC 1918 and unique-local ranges the
+    container network hands out, carrier-grade NAT space, and link-local, which
+    is where the instance metadata endpoint (169.254.169.254) lives.
+    """
+    # An IPv4 address carried inside an IPv6 one is routed as the IPv4 address,
+    # so it is judged as one: ::ffff:10.0.0.5 is 10.0.0.5 by another spelling.
+    if isinstance(address, ipaddress.IPv6Address):
+        for carried in (address.ipv4_mapped, address.sixtofour):
+            if carried is not None:
+                return is_public_address(carried)
+    return address.is_global and not (
+        address.is_private
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_reserved
+        or address.is_multicast
+        or address.is_unspecified
+    )
+
+
+async def probe_addresses(url: httpx.URL, *, redirected: bool = False) -> list[str]:
+    """The literal addresses a probe of ``url`` may connect to.
+
+    The probe is a request this process makes on a member's say-so to a URL an
+    operator typed, and the control plane sits on the same network as the
+    telemetry engine, the analytics store and the blob store - none of them
+    published, some of them unauthenticated *because* they are unpublished. So
+    the host is resolved here, once, and refused if **any** answer is not a
+    public address (:class:`ProbeStopped`). The caller then connects to the
+    addresses returned rather than to the name: handing the name back to the
+    HTTP library would resolve it a second time, and a DNS server that answers
+    "public" the first time and "10.0.0.5" the second walks straight through a
+    check made on the first answer.
+
+    Registering a private endpoint stays legal - an internal MCP server is a
+    legitimate thing to govern - it is only the call from here that is withheld,
+    unless ``connector_probe_allow_private`` says this deployment wants it.
+    """
+    if url.scheme not in ("http", "https"):
+        raise httpx.UnsupportedProtocol(f"'{url.scheme}://' cannot be probed")
+    # The ASCII form: what DNS is asked, and what goes in Host and SNI later.
+    host = url.raw_host.decode("ascii")
+    if not host:
+        raise httpx.InvalidURL("the URL has no host")
+
+    try:
+        addresses = [ipaddress.ip_address(host)]
+    except ValueError:
+        port = url.port or (443 if url.scheme == "https" else 80)
+        try:
+            found = await asyncio.get_running_loop().getaddrinfo(
+                host, port, type=socket.SOCK_STREAM
+            )
+        except (OSError, UnicodeError):
+            raise ProbeStopped("Unreachable", f"The host name '{host}' does not resolve.") from None
+        # sockaddr[0] may carry a zone ("fe80::1%eth0"); the address is the part before it.
+        addresses = list(
+            dict.fromkeys(ipaddress.ip_address(str(info[4][0]).partition("%")[0]) for info in found)
+        )
+
+    if not settings.connector_probe_allow_private and not all(map(is_public_address, addresses)):
+        where = f"The endpoint redirects to '{host}', which" if redirected else f"'{host}'"
+        raise ProbeStopped(
+            "Warning",
+            f"{where} is a private or internal address, so it was not probed: the control "
+            "plane does not call into its own network on a connector's behalf.",
+        )
+    return [str(address) for address in addresses]
+
+
+async def _status_line(
+    client: httpx.AsyncClient, url: httpx.URL, addresses: Sequence[str]
+) -> tuple[int, str | None]:
+    """One GET to the vetted addresses; the status, and where it redirects if it does.
+
+    The connection goes to the address, while the Host header and the TLS server
+    name stay the registered name - so virtual hosting works and the certificate
+    is still checked against the name, not the number.
+    """
+    headers = {"User-Agent": PROBE_USER_AGENT, "Host": url.netloc.decode("ascii")}
+    extensions = {"sni_hostname": url.raw_host.decode("ascii")}
+    failure: httpx.TransportError | None = None
+    # A name with an address this host has no route to (AAAA from a v4-only
+    # network) must not read as down while another of its addresses answers.
+    for address in addresses:
+        try:
+            async with client.stream(
+                "GET", url.copy_with(host=address), headers=headers, extensions=extensions
+            ) as response:
+                location = response.headers.get("location")
+                return response.status_code, location if response.has_redirect_location else None
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            failure = exc
+    raise failure or httpx.ConnectError("the host has no address")
+
+
+async def _final_status(client: httpx.AsyncClient, endpoint: str) -> int:
+    """Follow the endpoint to its answer, vetting every hop like the first.
+
+    Redirects are followed by hand. Left to the HTTP library, a public URL that
+    answers ``302 Location: http://169.254.169.254/...`` would be followed into
+    exactly the place :func:`probe_addresses` exists to keep the probe out of.
+    """
+    url = httpx.URL(endpoint)
+    for hop in range(PROBE_MAX_REDIRECTS + 1):
+        addresses = await probe_addresses(url, redirected=hop > 0)
+        http_status, location = await _status_line(client, url, addresses)
+        if location is None:
+            return http_status
+        try:
+            url = url.join(location)
+        except httpx.InvalidURL:
+            raise ProbeStopped(
+                "Unreachable", f"The endpoint answered {http_status} with a redirect to nowhere."
+            ) from None
+    raise ProbeStopped("Unreachable", f"Redirected more than {PROBE_MAX_REDIRECTS} times.")
+
+
 async def _probe(connector: Connector, checked_at: dt.datetime) -> ConnectorTestResult:
     """Open the endpoint, read the status line, close it without reading a body."""
     endpoint = connector.endpoint_url or ""
-    started = time.perf_counter()
+
+    def no_answer(message: str, status: TestStatus = "Unreachable") -> ConnectorTestResult:
+        return ConnectorTestResult(
+            connector_id=connector.id,
+            name=connector.name,
+            ok=False,
+            status=status,
+            message=message,
+            endpoint_url=endpoint,
+            checked_at=checked_at,
+        )
+
     try:
-        async with (
-            httpx.AsyncClient(timeout=PROBE_TIMEOUT_SECONDS, follow_redirects=True) as client,
-            client.stream("GET", endpoint, headers={"User-Agent": PROBE_USER_AGENT}) as response,
-        ):
-            http_status = response.status_code
+        async with httpx.AsyncClient(
+            timeout=PROBE_TIMEOUT_SECONDS, follow_redirects=False
+        ) as client:
+            # The clock starts once there is a client: building one loads the
+            # trust store, which is neither the endpoint's latency nor its fault.
+            started = time.perf_counter()
+            async with asyncio.timeout(PROBE_DEADLINE_SECONDS):
+                http_status = await _final_status(client, endpoint)
+    except ProbeStopped as stopped:
+        return no_answer(str(stopped), stopped.status)
+    except httpx.InvalidURL:
+        # Not an httpx.HTTPError, so the arm below never saw it and a malformed
+        # endpoint was an opaque 500 on every test, with no audit row. Rows
+        # registered before the schema started parsing the URL are still in the
+        # table, so this has to be an answer rather than an error.
+        return no_answer("The registered endpoint is not a valid URL.")
     except httpx.TimeoutException:
-        return ConnectorTestResult(
-            connector_id=connector.id,
-            name=connector.name,
-            ok=False,
-            status="Unreachable",
-            message=f"No response within {PROBE_TIMEOUT_SECONDS:.0f}s.",
-            endpoint_url=endpoint,
-            checked_at=checked_at,
-        )
+        return no_answer(f"No response within {PROBE_TIMEOUT_SECONDS:.0f}s.")
+    except TimeoutError:
+        # The overall deadline, which is the builtin and not an httpx exception.
+        return no_answer(f"No answer within {PROBE_DEADLINE_SECONDS:.0f}s.")
     except httpx.HTTPError as exc:
-        return ConnectorTestResult(
-            connector_id=connector.id,
-            name=connector.name,
-            ok=False,
-            status="Unreachable",
-            message=f"The endpoint could not be reached ({type(exc).__name__}).",
-            endpoint_url=endpoint,
-            checked_at=checked_at,
-        )
+        return no_answer(f"The endpoint could not be reached ({type(exc).__name__}).")
 
     latency_ms = int((time.perf_counter() - started) * 1000)
     if http_status >= 500:

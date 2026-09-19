@@ -181,8 +181,11 @@ export function normaliseTags(tags: readonly string[] | undefined): string[] | u
  * Token counters, coerced to the whole non-negative numbers the API accepts.
  *
  * Provider SDKs disagree on shape — `prompt_tokens`/`completion_tokens` from
- * OpenAI, `input_tokens`/`output_tokens` from Anthropic — so both are carried
- * through unchanged and `total_tokens` is filled in when it can be derived.
+ * OpenAI, `input_tokens`/`output_tokens` from Anthropic — so what a caller
+ * hands `setUsage()` is carried through under the names they used, and
+ * `total_tokens` is filled in when it can be derived from either pair. (The
+ * provider integrations settle on the first pair before they get here; see
+ * `canonicalUsage`.)
  */
 export function normaliseUsage(usage: unknown): Record<string, number> | undefined {
   if (!usage || typeof usage !== 'object') return undefined;
@@ -205,20 +208,38 @@ export function normaliseUsage(usage: unknown): Record<string, number> | undefin
   return out;
 }
 
-/** A thrown value rendered as the contract's `error_info`. */
+/**
+ * A thrown value rendered as the contract's `error_info`.
+ *
+ * `traceback` is never left empty. The telemetry store requires one, and an
+ * `error_info` without it is refused along with everything else in the request
+ * — so `throw 'timeout'` or `Promise.reject({ code })`, which JavaScript allows
+ * and which carry no stack, would cost the runs reported beside them. Where
+ * there is no stack, the traceback is the line a stack would have opened with
+ * (`Error: timeout`): true, and no frames are invented.
+ */
 export function toErrorInfo(thrown: unknown): ErrorInfoIn {
-  if (thrown instanceof Error) {
-    return {
-      exception_type: clampText(thrown.name, MAX_EXCEPTION_TYPE_LENGTH) ?? 'Error',
-      message: clampText(thrown.message, MAX_EXCEPTION_MESSAGE_LENGTH) ?? null,
-      traceback: clampText(thrown.stack, MAX_TRACEBACK_LENGTH) ?? null,
-    };
-  }
+  const isError = thrown instanceof Error;
+  const exceptionType = (isError ? clampText(thrown.name, MAX_EXCEPTION_TYPE_LENGTH) : undefined) ?? 'Error';
+  const message = clampText(isError ? thrown.message : describeThrown(thrown), MAX_EXCEPTION_MESSAGE_LENGTH);
+  const stack = isError && typeof thrown.stack === 'string' ? thrown.stack : undefined;
   return {
-    exception_type: 'Error',
-    message: clampText(String(thrown), MAX_EXCEPTION_MESSAGE_LENGTH) ?? null,
-    traceback: null,
+    exception_type: exceptionType,
+    message: message ?? null,
+    traceback:
+      clampText(stack, MAX_TRACEBACK_LENGTH) ??
+      clampText(message ? `${exceptionType}: ${message}` : exceptionType, MAX_TRACEBACK_LENGTH) ??
+      exceptionType,
   };
+}
+
+function describeThrown(thrown: unknown): string {
+  try {
+    return String(thrown);
+  } catch {
+    // An object with a null prototype, or a `toString` that throws.
+    return Object.prototype.toString.call(thrown);
+  }
 }
 
 /**

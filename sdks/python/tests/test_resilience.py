@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import socket
 import threading
+import time
 
 import pytest
 
@@ -50,10 +51,15 @@ def test_a_dead_control_plane_does_not_stop_the_agent(shared_http_client) -> Non
                 span.set_output({"chunks": 3})
             run.set_output({"answer": "still computed"})
 
-        assert client.flush(timeout=10) is True, "flush must settle rather than hang"
+        began = time.monotonic()
+        assert client.flush(timeout=30) is False, "nothing was delivered, and flush must say so"
+        assert time.monotonic() - began < 25, "flush must settle, not wait out its timeout"
 
         stats = client.stats()
-        assert stats["dropped_failed"] == 1
+        # An unreachable control plane is waited out, not thrown away: the run
+        # is still queued for the next attempt.
+        assert stats["dropped_failed"] == 0
+        assert stats["requeued"] == 1 and stats["pending"] == 1
         assert stats["accepted"] == 0
         assert errors, "the failure must reach on_error rather than vanishing"
         assert errors[-1][1] == "ingest.traces"
@@ -209,8 +215,9 @@ def test_a_control_plane_that_dies_mid_run_does_not_take_the_agent_with_it(
                 results.append(index)
         assert results == [0, 1, 2], "the agent kept working"
 
-        client.flush(timeout=10)
-        assert client.stats()["dropped_failed"] == 3
+        assert client.flush(timeout=10) is False
+        assert client.stats()["dropped_failed"] == 0
+        assert client.stats()["pending"] == 3, "the runs wait for the control plane to come back"
         assert client.stats()["accepted"] == 1
     finally:
         client.close(timeout=2)

@@ -49,11 +49,21 @@ export function newId(): string {
   return out;
 }
 
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const UUID_V7_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-/** Whether a caller-supplied id is one the API will accept. */
+/**
+ * Whether a caller-supplied trace or span id is one the telemetry store will take.
+ *
+ * "Is a UUID" is not the test. The store checks the version nibble and accepts
+ * version 7 only, and its refusal is not confined to the item that earned it:
+ * one `crypto.randomUUID()` (version 4) on a trace costs every trace sent in
+ * the same request, and on a span it costs that request's spans while the
+ * traces are still reported as accepted. The control plane's own check stops at
+ * the UUID shape, so this is the last place the difference can be caught while
+ * it still belongs to one item. An id that fails is replaced by `newId()`.
+ */
 export function isValidId(value: string): boolean {
-  return UUID_PATTERN.test(value);
+  return typeof value === 'string' && UUID_V7_PATTERN.test(value);
 }
 
 /** An RFC 3339 timestamp in UTC, which is the only format the API reads. */

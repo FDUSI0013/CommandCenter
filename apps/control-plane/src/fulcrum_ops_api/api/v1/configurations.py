@@ -1,9 +1,9 @@
 """Configuration Center routes.
 
-Nineteen operations back one screen: the KPI cards, the filtered table and its
+Twenty operations back one screen: the KPI cards, the filtered table and its
 CSV download, the type tabs, the New/Edit/Clone dialogs, the Import and Export
-buttons, and the inspector's four tabs — Overview, Versions (with diff and
-Rollback to Previous), Usage and Audit Trail.
+buttons, and the inspector's four tabs — Overview, Versions (with diff, Activate
+for a drafted revision and Rollback to Previous), Usage and Audit Trail.
 
 Handlers here only parse, delegate and shape. Workspace scoping, role checks,
 the lifecycle state machine, body validation and the audit trail all live in
@@ -21,6 +21,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, Query, Request, status
 from fastapi.responses import StreamingResponse
 
+from ...core.errors import NotFound
 from ...models.registry import (
     ConfigurationStatus,
     ConfigurationType,
@@ -123,6 +124,19 @@ def _action(
     return ConfigurationActionResponse(
         configuration=configuration, message=message, version=version, validation=validation
     )
+
+
+def _label(version: str) -> str:
+    """A version label off the path, normalised -- or the 404 it amounts to.
+
+    ``normalise_version`` raises ``ValueError``, which a request model turns
+    into a 422 but a path parameter handed straight to it turned into a 500. A
+    label that cannot exist names a revision that does not exist.
+    """
+    try:
+        return normalise_version(version)
+    except ValueError as exc:
+        raise NotFound(f"Version '{version}' does not exist for this configuration.") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -342,6 +356,12 @@ async def update_configuration(
 
     Bodies never move through here: cut a version instead. Send
     `expected_updated_at` to make the write conditional. Requires the operator role.
+
+    A change of type or environment on a configuration that is not a Draft is
+    refused with 422 (listing the findings) when the live body would not pass
+    validation under the new rules. A rename is refused with 409, naming the
+    dependents in `details.dependents`, while another configuration's live body
+    links to the current name.
     """
     configuration = await service.update_configuration(
         session, principal, configuration_id, payload, request=request
@@ -430,8 +450,8 @@ async def diff_versions(
         session,
         principal,
         configuration_id,
-        from_version=normalise_version(from_version),
-        to_version=normalise_version(to_version),
+        from_version=_label(from_version),
+        to_version=_label(to_version),
     )
 
 
@@ -444,8 +464,40 @@ async def get_version(
     principal: CurrentPrincipal, session: Db, configuration_id: str, version: str
 ) -> ConfigurationVersionDetail:
     """One revision, body included."""
-    return await service.get_version(
-        session, principal, configuration_id, normalise_version(version)
+    return await service.get_version(session, principal, configuration_id, _label(version))
+
+
+@router.post(
+    "/{configuration_id}/versions/{version}/activate",
+    response_model=ConfigurationActionResponse,
+    summary="Activate a drafted version",
+)
+async def activate_version(
+    principal: CurrentPrincipal,
+    session: Db,
+    configuration_id: str,
+    version: str,
+    request: Request,
+) -> ConfigurationActionResponse:
+    """Publish a revision that was drafted earlier — the Versions tab's Activate.
+
+    This is how a revision cut with `activate=false`, or left behind by an
+    import, goes live. The body is validated first and the request is refused
+    with 422 listing every finding if it fails; the previous current revision is
+    demoted rather than deleted. Only a Draft can be activated: a revision that
+    has been live before comes back through `/rollback`, and the one that is
+    already current answers 412. Requires the operator role.
+    """
+    row, report = await service.activate_version(
+        session, principal, configuration_id, _label(version), request=request
+    )
+    configuration = await service.read_configuration(session, principal, configuration_id)
+    return _action(
+        configuration,
+        f"{configuration.name} {row.version} activated"
+        + (f" with {report.warning_count} warning(s)." if report.warning_count else "."),
+        version=ConfigurationVersionRead.model_validate(row),
+        validation=report,
     )
 
 
@@ -600,8 +652,9 @@ async def get_usage(
 
     Bound agents come from the registry; run counts and success rate come from
     the telemetry engine for those agents' projects. When no agent is bound the
-    counts are null rather than zero, and if the engine is unreachable the call
-    fails rather than reporting an outage as no traffic.
+    counts are null rather than zero, and if the engine cannot answer the call
+    fails with 503 `telemetry_unavailable` (or `telemetry_rejected`) rather than
+    reporting an outage as no traffic.
     """
     return await service.usage(
         session, principal, configuration_id, window_days=window_days

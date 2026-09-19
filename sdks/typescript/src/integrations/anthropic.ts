@@ -7,14 +7,24 @@
  *
  * The differences that matter are in the payload. Anthropic reports
  * `input_tokens` / `output_tokens` where OpenAI reports `prompt_tokens` /
- * `completion_tokens`; both are carried through under their own names and
- * `total_tokens` is derived, so the console's per-model breakdown adds up
+ * `completion_tokens`; they are the same two numbers, so they are recorded
+ * under the second pair of names (see `canonicalUsage`) and `total_tokens` is
+ * derived, which is what makes the console's per-model breakdown add up
  * across providers. Usage also arrives split across two stream events
  * (`message_start` carries the input count, `message_delta` the output count),
  * so it is accumulated rather than taken from the last chunk.
  */
 
-import { isAsyncIterable, loadOptionalPackage, pick, proxyMethod } from './shared.js';
+import {
+  canonicalUsage,
+  isAsyncIterable,
+  isThenable,
+  loadOptionalPackage,
+  observeIteration,
+  observePromise,
+  pick,
+  proxyMethod,
+} from './shared.js';
 import type { FulcrumOps } from '../client.js';
 import type { Span } from '../trace.js';
 
@@ -40,10 +50,9 @@ interface CallShape {
 }
 
 function mergeUsage(into: Record<string, number>, source: unknown): void {
-  const usage = pick<Record<string, unknown>>(source, 'usage');
+  const usage = canonicalUsage(pick(source, 'usage'));
   if (!usage) return;
   for (const [key, value] of Object.entries(usage)) {
-    if (typeof value !== 'number') continue;
     // Output tokens are reported cumulatively on `message_delta`, so the later
     // value replaces the earlier one rather than adding to it.
     into[key] = Math.max(into[key] ?? 0, value);
@@ -61,60 +70,94 @@ function collectContentText(response: unknown): string | undefined {
   return text.length > 0 ? text : undefined;
 }
 
-function wrapStream(stream: AsyncIterable<unknown>, span: Span, captureOutput: boolean): AsyncIterable<unknown> {
-  return new Proxy(stream as object, {
-    get(target, property, receiver) {
-      if (property !== Symbol.asyncIterator) return Reflect.get(target, property, receiver);
-      return function iterate(): AsyncIterator<unknown> {
-        const inner = (target as AsyncIterable<unknown>)[Symbol.asyncIterator]();
-        const usage: Record<string, number> = {};
-        let text = '';
-        let events = 0;
-        let closed = false;
+/** The slice of Anthropic's `MessageStream` the wrapper listens through. */
+interface MessageStreamLike {
+  on(event: string, listener: (...args: unknown[]) => void): unknown;
+  finalMessage(): unknown;
+  errored?: boolean;
+  aborted?: boolean;
+}
 
-        const finish = (error?: unknown) => {
-          if (closed) return;
-          closed = true;
-          if (Object.keys(usage).length > 0) span.setUsage(usage);
-          span.end({ output: captureOutput ? { events, text } : undefined, error });
-        };
+function isMessageStream(value: unknown): value is MessageStreamLike {
+  const candidate = value as MessageStreamLike | null;
+  return (
+    candidate !== null &&
+    typeof candidate === 'object' &&
+    typeof candidate.on === 'function' &&
+    typeof candidate.finalMessage === 'function'
+  );
+}
 
-        return {
-          async next(...args: [] | [undefined]) {
-            try {
-              const result = await inner.next(...args);
-              if (result.done) {
-                finish();
-                return result;
-              }
-              events += 1;
-              const event = result.value;
-              mergeUsage(usage, event);
-              mergeUsage(usage, pick(event, 'message'));
-              const delta = pick<Record<string, unknown>>(event, 'delta');
-              if (delta && typeof delta.text === 'string') text += delta.text;
-              return result;
-            } catch (error) {
-              finish(error);
-              throw error;
-            }
-          },
-          async return(value?: unknown) {
-            finish();
-            return inner.return ? inner.return(value) : { done: true, value };
-          },
-          async throw(error?: unknown) {
-            finish(error);
-            if (inner.throw) return inner.throw(error);
-            throw error;
-          },
-          [Symbol.asyncIterator]() {
-            return this;
-          },
-        } as AsyncIterator<unknown>;
-      };
-    },
-  }) as AsyncIterable<unknown>;
+/**
+ * Watch the returned stream so the span closes when the generation is over.
+ *
+ * The caller gets Anthropic's own object back, never a stand-in: the helper
+ * keeps its listeners and its snapshot in `#private` fields, and
+ * `stream.on('text', ...)` through a proxy throws inside the caller's code.
+ *
+ * `messages.stream()` returns a `MessageStream`, which runs on its own whether
+ * or not anybody iterates it — the documented use is `.on('text')` and
+ * `await stream.finalMessage()`, with no `for await` at all. So that one is
+ * followed through its own events. Only `end` is listened to for the outcome,
+ * deliberately not `error` or `abort`: the helper raises an unhandled rejection
+ * when a stream fails and nobody registered for those, and a telemetry listener
+ * must not be what silences it.
+ *
+ * `messages.create({ stream: true })` returns a bare `Stream` with no events,
+ * which is followed through its reads instead.
+ *
+ * Either way the span is deferred first: the usual caller returns the stream
+ * from the function that asked for it, so the trace around the call closes
+ * before the first token, and would otherwise take this span down with it.
+ */
+function watchStream<T extends AsyncIterable<unknown>>(stream: T, span: Span, captureOutput: boolean): T {
+  span.defer();
+  const usage: Record<string, number> = {};
+  let text = '';
+  let events = 0;
+  let closed = false;
+
+  const onEvent = (event: unknown) => {
+    if (closed) return;
+    events += 1;
+    mergeUsage(usage, event);
+    mergeUsage(usage, pick(event, 'message'));
+    const delta = pick<Record<string, unknown>>(event, 'delta');
+    if (delta && typeof delta.text === 'string') text += delta.text;
+  };
+
+  const finish = (error?: unknown) => {
+    if (closed) return;
+    closed = true;
+    if (Object.keys(usage).length > 0) span.setUsage(usage);
+    span.end({ output: captureOutput ? { events, text } : undefined, error });
+  };
+
+  if (isMessageStream(stream)) {
+    try {
+      let completed = false;
+      stream.on('streamEvent', onEvent);
+      stream.on('finalMessage', (message) => {
+        completed = true;
+        mergeUsage(usage, message);
+        const model = pick<string>(message, 'model');
+        if (model) span.setModel(model);
+      });
+      stream.on('end', () => {
+        if (completed) return finish();
+        // The helper says that it failed but not, without an `error` listener,
+        // why. The reason is on the trace: `finalMessage()` rejected with it.
+        if (stream.aborted) return finish(new Error('The stream was aborted before the message was complete.'));
+        if (stream.errored) return finish(new Error('The stream failed before the message was complete.'));
+        return finish();
+      });
+      return stream;
+    } catch {
+      /* not the emitter it looked like; follow the reads instead */
+    }
+  }
+
+  return observeIteration(stream, { onItem: onEvent, onEnd: finish });
 }
 
 /** Instrument an existing Anthropic client. */
@@ -148,18 +191,27 @@ export function wrapAnthropic<T extends AnthropicLike>(
         // `messages.stream()` returns a stream object directly rather than a
         // promise of one.
         if (alwaysStreams && isAsyncIterable(result)) {
-          return wrapStream(result, span, options.captureOutput !== false);
+          return watchStream(result, span, options.captureOutput !== false);
         }
 
-        if (!(result instanceof Promise)) {
+        if (!isThenable(result)) {
           span.end({ output: options.captureOutput === false ? undefined : result });
           return result;
         }
 
-        return result.then(
-          (value) => {
+        // What goes back is Anthropic's own `APIPromise`, so `.withResponse()`
+        // and `.asResponse()` are still there. The caller may read it more than
+        // once (`await` it, then `.finally()` it), so the first look decides.
+        let seen = false;
+        let handedBack: unknown;
+        return observePromise(result, {
+          onValue(value) {
+            if (seen) return handedBack;
+            seen = true;
+            handedBack = value;
             if ((body.stream === true || alwaysStreams) && isAsyncIterable(value)) {
-              return wrapStream(value, span, options.captureOutput !== false);
+              handedBack = watchStream(value, span, options.captureOutput !== false);
+              return handedBack;
             }
             const usage: Record<string, number> = {};
             mergeUsage(usage, value);
@@ -174,11 +226,15 @@ export function wrapAnthropic<T extends AnthropicLike>(
             }
             return value;
           },
-          (error: unknown) => {
+          onError(error) {
             span.end({ error });
-            throw error;
           },
-        );
+          onRawResponse() {
+            // The body is the caller's to read, so there is no output or usage
+            // to record — only that the call came back, and when.
+            span.end({});
+          },
+        });
       };
 
   let wrapped = anthropic as AnthropicLike;

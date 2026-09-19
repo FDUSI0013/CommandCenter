@@ -137,7 +137,13 @@ class PromptVersionRead(BaseModel):
         None, description="State recorded when the commit was cut."
     )
     change_note: str | None = None
-    author: str | None = None
+    author: str | None = Field(
+        None,
+        description=(
+            "Who cut the commit, as the audit trail names them. The registry's own "
+            "author is used only for a commit this service has no record of making."
+        ),
+    )
     created_at: dt.datetime | None = None
     estimated_tokens: int = 0
     is_head: bool = False
@@ -237,9 +243,10 @@ class PromptLifecycleRequest(BaseModel):
 class PromptTestRequest(BaseModel):
     """Run the prompt's template over sample variable sets.
 
-    Each case is one mapping of variable name to value. The rendered results are
-    stored as a dataset and an experiment is opened against them, so the engine
-    scores the prompt through the evaluation path.
+    Each case is one mapping of variable name to value. With ``score`` set the
+    rendered results are stored as a dataset in this workspace's evaluation
+    namespace and an experiment is opened against them; running an evaluation
+    against that dataset is what scores them.
     """
 
     cases: list[dict[str, Any]] = Field(
@@ -250,13 +257,17 @@ class PromptTestRequest(BaseModel):
     commit: str | None = Field(
         None, description="Commit to test; defaults to the head version."
     )
-    dataset_name: str | None = Field(None, max_length=160)
-    experiment_name: str | None = Field(None, max_length=160)
+    dataset_name: str | None = Field(
+        None, max_length=160, description="Bare name; the API adds the workspace namespace."
+    )
+    experiment_name: str | None = Field(
+        None, max_length=160, description="Bare name; the API adds the workspace namespace."
+    )
     score: bool = Field(
         True,
         description=(
-            "Persist the rendered cases as a dataset and open an experiment so the "
-            "engine scores them. Set false to render only."
+            "Persist the rendered cases as a dataset and open an experiment against "
+            "them, ready to be evaluated. Set false to render only."
         ),
     )
 
@@ -335,13 +346,33 @@ class PromptTestResult(BaseModel):
     passed: int
     failed: int
 
+    recorded: bool = Field(
+        False,
+        description=(
+            "True when the rendered cases were stored as a dataset with an experiment "
+            "opened against the tested commit."
+        ),
+    )
     scored: bool = Field(
-        description="True when the run was handed to the engine's evaluation path."
+        False,
+        description=(
+            "True only when something has actually scored the run. Recording a test "
+            "attaches no evaluator, so this is false until an evaluation is run "
+            "against the dataset."
+        ),
     )
     dataset_id: str | None = None
-    dataset_name: str | None = None
+    dataset_name: str | None = Field(
+        None,
+        description=(
+            "The dataset's name as the Evaluations screen lists it; the workspace "
+            "namespace is stripped."
+        ),
+    )
     experiment_id: str | None = None
-    experiment_name: str | None = None
+    experiment_name: str | None = Field(
+        None, description="Bare name; the workspace namespace is stripped."
+    )
     detail: str = Field(
         description="How the run was executed, including why it was not model-executed."
     )

@@ -27,10 +27,12 @@ domain's keys are disturbed.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import datetime as dt
 import re
 import secrets
+import uuid
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any, Final
@@ -43,6 +45,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..api.common import ListParams, apply_filters, apply_search, apply_sort, paginate
 from ..api.deps import Principal
 from ..core.errors import Conflict, NotFound, PreconditionFailed, ValidationFailed
+from ..db.base import stamp
 from ..engine import EngineError, get_engine_client
 from ..models.identity import Role, User, Workspace
 from ..models.quality import (
@@ -92,6 +95,7 @@ from ..schemas.feedback import (
     ThemeRead,
     sentiment_for,
 )
+from ..schemas.ingest import REDACTION_MARKER
 from . import audit
 
 SOURCE_SCREEN: Final[str] = "Feedback & Quality Loop"
@@ -106,6 +110,11 @@ ENTITY_SETTINGS: Final[str] = "feedback_settings"
 #: what we keep on the row.
 TELEMETRY_SCORE_NAME: Final[str] = "user_feedback"
 
+#: How long the mirror may hold a submission. The capture is ours and durable;
+#: the mirror is a courtesy to the telemetry store and must not keep the
+#: request, or its transaction, waiting on a store that is not answering.
+MIRROR_SECONDS: Final[float] = 5.0
+
 #: An export is a report, not a bulk data channel.
 MAX_EXPORT_ROWS: Final[int] = 5000
 
@@ -118,6 +127,12 @@ MAX_AGENT_BARS: Final[int] = 20
 
 #: Themes the insights tab lists.
 MAX_THEMES: Final[int] = 25
+
+#: Persisted themes one clustering pass lets new feedback join, largest first.
+#: Every one is a leader each new comment may be compared with, so the number is
+#: bounded; a comment that would have joined a theme too small to make the cut
+#: waits for a second report, exactly as it did before themes were leaders.
+MAX_SEED_THEMES: Final[int] = 500
 
 #: Words that carry no signal about *what* went wrong.
 STOPWORDS: Final[frozenset[str]] = frozenset(
@@ -411,6 +426,69 @@ async def save_collection_settings(
     return payload
 
 
+#: The identifiers the PII switch removes from a comment: the ones recognisable
+#: without a model, which is what lets the scrub run inline on every submission.
+#: Order matters — an address is taken before the digits inside it can look like
+#: anything else, and a card before its groups can look like a phone number.
+#: Every repeat is bounded (a mailbox name is at most 64 characters), so a long
+#: comment with no address in it costs a scan and not a scan per character.
+_PII_PATTERNS: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
+    ("email", re.compile(r"[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+")),
+    ("ssn", re.compile(r"(?<!\d)\d{3}[- ]\d{2}[- ]\d{4}(?!\d)")),
+    ("card", re.compile(r"(?<!\d)\d(?:[ -]?\d){12,18}(?!\d)")),
+    (
+        "phone",
+        re.compile(
+            r"(?<![\w.])(?:"
+            r"\+\d{1,3}(?:[ .-]?\(?\d{1,4}\)?){2,5}"
+            r"|(?:\(\d{3}\)[ .-]?|\d{3}[ .-]?)\d{3}[ .-]?\d{4}"
+            r")(?!\w)"
+        ),
+    ),
+)
+
+
+def _luhn_valid(digits: str) -> bool:
+    """The card check digit. Thirteen-plus digits that fail it are an order number."""
+    total = 0
+    for offset, char in enumerate(reversed(digits)):
+        value = int(char)
+        if offset % 2:
+            value = value * 2 - 9 if value > 4 else value * 2
+        total += value
+    return total % 10 == 0
+
+
+def scrub_pii(text: str | None) -> tuple[str | None, list[str]]:
+    """Replace the personal identifiers in a comment; say which kinds were found.
+
+    Returns the scrubbed text and the kinds removed — never the values, so the
+    row can record *that* it was scrubbed without keeping what was. Public
+    because feedback is captured in two places: ``submit`` here and the SDK
+    event path in ``services.ingest``, which must not keep its own copy of this.
+    """
+    if not text:
+        return text, []
+    found: list[str] = []
+
+    for kind, pattern in _PII_PATTERNS:
+
+        def replace(match: re.Match[str], kind: str = kind) -> str:
+            if kind == "card" and not _luhn_valid(re.sub(r"\D", "", match.group(0))):
+                return match.group(0)
+            if kind not in found:
+                found.append(kind)
+            return REDACTION_MARKER
+
+        text = pattern.sub(replace, text)
+    return text, found
+
+
+async def pii_scrubbing_enabled(session: AsyncSession, principal: Principal) -> bool:
+    """Whether this workspace's Collection Settings ask for comments to be scrubbed."""
+    return (await get_collection_settings(session, principal)).pii_scrubbing
+
+
 def add_business_hours(
     start: dt.datetime, hours: int, rules: SlaRules
 ) -> dt.datetime:
@@ -515,6 +593,7 @@ def _feedback_read(
 ) -> FeedbackRead:
     metadata = _metadata(item)
     tags = metadata.get("tags")
+    scrubbed = metadata.get("pii_scrubbed")
     return FeedbackRead(
         id=item.id,
         feedback_ref=item.feedback_ref,
@@ -535,6 +614,7 @@ def _feedback_read(
         environment=metadata.get("environment"),
         tags=[str(tag) for tag in tags] if isinstance(tags, list) else [],
         scored_in_telemetry=bool(item.engine_feedback_score_id),
+        pii_scrubbed=[str(kind) for kind in scrubbed] if isinstance(scrubbed, list) else [],
         created_at=item.created_at,
     )
 
@@ -697,48 +777,107 @@ async def export_feedback_rows(
 # ---------------------------------------------------------------------------
 
 
+def _is_trace_id(value: str) -> bool:
+    """Whether this could name a run at all: the telemetry store keys runs by UUID.
+
+    ``trace_id`` arrives as free text and the ownership check below reads the run
+    by id, which puts that text in a request path. Anything that is not a UUID is
+    a run the store cannot hold, so it is answered here rather than sent.
+    """
+    try:
+        uuid.UUID(value)
+    except ValueError:
+        return False
+    return True
+
+
+async def _trace_agent(
+    session: AsyncSession, principal: Principal, trace: Mapping[str, Any]
+) -> Agent | None:
+    """The agent in the caller's workspace whose project holds this trace, or None.
+
+    The telemetry store addresses a score by project as well as by trace id, and
+    the project travels as a *name*. A score sent under the wrong name is at best
+    refused; at worst it is accepted, filed under whatever project that name
+    resolves to, and never shown on the run. The only name worth sending is
+    therefore the one the trace itself reports, and only when that project
+    belongs to an agent of this workspace — which is also what stops one tenant
+    scoring another's run by quoting its id. The workspace's own name is never a
+    project name.
+    """
+    project_id = trace.get("project_id") if isinstance(trace, Mapping) else None
+    if not project_id:
+        return None
+    agent = (
+        await session.execute(
+            select(Agent).where(
+                Agent.workspace_id == principal.workspace_id,
+                Agent.engine_project_id == str(project_id),
+            )
+        )
+    ).scalars().first()
+    if agent is None:
+        return None
+    # A key bound to one agent may not annotate a neighbour's run.
+    bound = principal.api_key_agent_id
+    if bound and agent.id != bound:
+        return None
+    return agent
+
+
 async def mirror_score(
     session: AsyncSession, principal: Principal, item: FeedbackItem
 ) -> str | None:
     """Write the rating onto the trace as a telemetry feedback score.
 
-    Returns the reference the score is addressable by, or None when there was
-    nothing to mirror (no trace, or no rating). A telemetry outage degrades the
-    mirror, not the capture: the durable record is ours, so the submission still
-    succeeds and ``scored_in_telemetry`` reports what actually happened.
+    Returns the reference the score is addressable by, or None when nothing was
+    mirrored: no trace, no rating, a trace the store does not have, or one that
+    belongs to no agent of this workspace. The project the score is filed under
+    is read off the trace rather than taken from the agent the submitter picked
+    (or did not pick), because ``scored_in_telemetry`` must mean the score is on
+    the run, not merely that the store accepted a write. When the submitter named
+    no agent, the run's own agent is recorded on the row.
+
+    A telemetry outage degrades the mirror, not the capture: the durable record
+    is ours, so the submission still succeeds, within ``MIRROR_SECONDS``.
     """
-    if not item.trace_id or item.rating is None:
+    if not item.trace_id or item.rating is None or not _is_trace_id(item.trace_id):
         return None
 
-    project_name = principal.engine_workspace
-    if item.agent_id:
-        agent_project = (
-            await session.execute(
-                select(Agent.engine_project_name).where(
-                    Agent.workspace_id == principal.workspace_id,
-                    Agent.id == item.agent_id,
-                )
-            )
-        ).scalar_one_or_none()
-        if agent_project:
-            project_name = agent_project
+    # One deadline over both exchanges with the store. The lookup between them
+    # is ours and stays outside it on purpose: a database call cancelled midway
+    # takes its connection, and with it the transaction holding the capture.
+    client = get_engine_client()
+    deadline = asyncio.get_running_loop().time() + MIRROR_SECONDS
+    try:
+        async with asyncio.timeout_at(deadline):
+            trace = await client.get_trace(item.trace_id, strip_attachments=True)
+    except (EngineError, TimeoutError):
+        return None
+
+    agent = await _trace_agent(session, principal, trace)
+    if agent is None or not agent.engine_project_name:
+        return None
 
     try:
-        await get_engine_client().score_traces_batch(
-            [
-                {
-                    "id": item.trace_id,
-                    "project_name": project_name,
-                    "name": TELEMETRY_SCORE_NAME,
-                    "value": float(item.rating),
-                    "category_name": item.sentiment,
-                    "source": "sdk" if principal.kind == "api_key" else "ui",
-                    "reason": (item.body or "")[:500] or None,
-                }
-            ]
-        )
-    except EngineError:
+        async with asyncio.timeout_at(deadline):
+            await client.score_traces_batch(
+                [
+                    {
+                        "id": item.trace_id,
+                        "project_name": agent.engine_project_name,
+                        "name": TELEMETRY_SCORE_NAME,
+                        "value": float(item.rating),
+                        "category_name": item.sentiment,
+                        "source": "sdk" if principal.kind == "api_key" else "ui",
+                        "reason": (item.body or "")[:500] or None,
+                    }
+                ]
+            )
+    except (EngineError, TimeoutError):
         return None
+    if item.agent_id is None:
+        item.agent_id = agent.id
     return f"{item.trace_id}/{TELEMETRY_SCORE_NAME}"
 
 
@@ -791,6 +930,15 @@ async def submit(
         metadata["tags"] = list(payload.tags)
     metadata["captured_via"] = principal.kind
 
+    # Scrubbed before the comment is anywhere: the row, the export and the score
+    # reason the mirror copies into the telemetry store all read this value.
+    body = payload.body
+    metadata.pop("pii_scrubbed", None)  # ours to state, never the caller's
+    if body and await pii_scrubbing_enabled(session, principal):
+        body, scrubbed = scrub_pii(body)
+        if scrubbed:
+            metadata["pii_scrubbed"] = scrubbed
+
     sentiment = payload.sentiment or sentiment_for(payload.rating)
     item = FeedbackItem(
         workspace_id=principal.workspace_id,
@@ -799,7 +947,7 @@ async def submit(
         trace_id=payload.trace_id,
         rating=payload.rating,
         sentiment=sentiment.value,
-        body=payload.body,
+        body=body,
         source=payload.source.value,
         submitted_by=payload.submitted_by or principal.email or principal.display_name,
         submitted_at=submitted_at,
@@ -920,6 +1068,11 @@ def _tokenise(text: str | None) -> set[str]:
 
 
 def _jaccard(left: set[str], right: set[str]) -> float:
+    """Overlap of two token sets, 0-1: the definition the clustering scores by.
+
+    ``_cluster_comments`` arrives at the same number from its word index rather
+    than by calling this for every pair; this is what that shortcut is held to.
+    """
     if not left or not right:
         return 0.0
     union = len(left | right)
@@ -928,24 +1081,125 @@ def _jaccard(left: set[str], right: set[str]) -> float:
 
 @dataclasses.dataclass
 class _Cluster:
-    """One group under construction: its leader's tokens and its members."""
+    """One group under construction: its leader's tokens and its members.
+
+    Members are positions in the list of comments being clustered, not rows, so
+    the grouping itself touches nothing that belongs to a database session. A
+    cluster seeded from a theme an earlier pass persisted carries that theme's
+    label and how many rows already wear it; its members are only the new ones.
+    """
 
     leader: set[str]
-    members: list[FeedbackItem] = dataclasses.field(default_factory=list)
+    theme: str | None = None
+    existing: int = 0
+    members: list[int] = dataclasses.field(default_factory=list)
+    scores: list[float] = dataclasses.field(default_factory=list)
     counts: Counter = dataclasses.field(default_factory=Counter)
 
-    def add(self, item: FeedbackItem, tokens: set[str]) -> None:
-        self.members.append(item)
+    def add(self, position: int, tokens: set[str], score: float) -> None:
+        self.members.append(position)
+        self.scores.append(score)
         self.counts.update(tokens)
 
+    def absorb(self, other: _Cluster) -> None:
+        """Fold in a cluster that arrived at the same label: one label, one theme."""
+        self.members.extend(other.members)
+        self.scores.extend(other.scores)
+        self.counts.update(other.counts)
+        self.existing = max(self.existing, other.existing)
+
     def label(self) -> str:
-        top = [word for word, _ in self.counts.most_common(3)]
+        if self.theme:
+            return self.theme
+        top = self.keywords(3)
         if not top:
             return "Unlabelled feedback"
-        return " ".join(word.capitalize() for word in sorted(top, key=self._rank))
+        return " ".join(word.capitalize() for word in top)
+
+    def keywords(self, limit: int) -> list[str]:
+        # Ranked by count and then by the word itself. ``Counter.most_common``
+        # breaks a tie by insertion order, which for words that came out of a
+        # set is the process's hash seed — and a label that differs between two
+        # workers is two themes for one problem.
+        return sorted(self.counts, key=self._rank)[:limit]
+
+    def representatives(self, limit: int) -> list[int]:
+        """The members closest to the leader, earliest first among equals."""
+        ranked = sorted(zip(self.scores, self.members, strict=True), key=self._closest)
+        return [position for _, position in ranked[:limit]]
+
+    @staticmethod
+    def _closest(scored: tuple[float, int]) -> tuple[float, int]:
+        return (-scored[0], scored[1])
 
     def _rank(self, word: str) -> tuple[int, str]:
         return (-self.counts[word], word)
+
+
+def _cluster_comments(
+    comments: Sequence[str | None],
+    seeds: Sequence[tuple[str, str | None, int]],
+    similarity: float,
+) -> tuple[list[_Cluster], int]:
+    """Greedy leader clustering over plain strings.
+
+    Returns every cluster, seeded ones included, and how many comments had no
+    words to compare. ``seeds`` are ``(theme, earliest member's comment, rows
+    already wearing it)`` for the themes earlier passes persisted; they are
+    opened first, so a new report of a known problem joins that theme instead of
+    waiting for a second stranger to arrive and found a rival one.
+
+    Pure on purpose: strings in, positions out, no row and no session, so the
+    pass can run it on a worker thread. Comparing every comment with every leader
+    is two thousand comments against up to two thousand leaders in the worst
+    case — the case the workload drifts towards, because a comment nothing
+    resembles is never themed and is re-examined by every pass — and that was
+    seconds of arithmetic during which the worker served nobody else.
+
+    It is also mostly arithmetic that cannot matter: a comment only overlaps a
+    leader it shares a word with. Leaders are therefore indexed by word, and the
+    index is what counts the words a comment shares with each of them — one
+    increment per shared word, where intersecting and uniting the two sets again
+    for every pair was the cost. Jaccard overlap follows from that count and the
+    two sizes, so the score is the same number ``_jaccard`` gives, and the winner
+    is unchanged: the highest overlap, and among equals the cluster opened first,
+    exactly as when every leader was tried in order.
+    """
+    clusters: list[_Cluster] = []
+    by_word: dict[str, list[int]] = {}
+
+    def open_cluster(cluster: _Cluster) -> None:
+        for word in cluster.leader:
+            by_word.setdefault(word, []).append(len(clusters))
+        clusters.append(cluster)
+
+    for theme, comment, existing in seeds:
+        leader = _tokenise(comment)
+        if leader:
+            open_cluster(_Cluster(leader=leader, theme=theme, existing=existing))
+
+    blank = 0
+    for position, comment in enumerate(comments):
+        tokens = _tokenise(comment)
+        if not tokens:
+            blank += 1
+            continue
+        shared: dict[int, int] = {}
+        for word in tokens:
+            for index in by_word.get(word, ()):
+                shared[index] = shared.get(index, 0) + 1
+        best_index, best_score = -1, 0.0
+        for index, overlap in shared.items():
+            score = overlap / (len(tokens) + len(clusters[index].leader) - overlap)
+            if score > best_score or (score == best_score and index < best_index):
+                best_index, best_score = index, score
+        if best_index >= 0 and best_score >= similarity:
+            clusters[best_index].add(position, tokens, best_score)
+        else:
+            fresh = _Cluster(leader=tokens)
+            fresh.add(position, tokens, 1.0)
+            open_cluster(fresh)
+    return clusters, blank
 
 
 def _severity_for(size: int, negative_share: float, threshold: int) -> IssueSeverity:
@@ -957,6 +1211,174 @@ def _severity_for(size: int, negative_share: float, threshold: int) -> IssueSeve
     if size >= threshold:
         return IssueSeverity.MEDIUM
     return IssueSeverity.LOW
+
+
+@dataclasses.dataclass(frozen=True)
+class _ThemeStats:
+    """One theme as the window's rows describe it, counted rather than inferred."""
+
+    size: int
+    negatives: int
+    #: Negative reports no issue has accounted for yet — what the auto-issue
+    #: threshold counts, so reports a resolved issue already answered cannot
+    #: reopen the theme on their own.
+    unlinked_negatives: int
+    avg_rating: float | None
+    first_seen_at: dt.datetime | None
+    last_seen_at: dt.datetime | None
+
+
+async def _theme_seeds(
+    session: AsyncSession, principal: Principal, start: dt.datetime
+) -> list[tuple[str, str | None, int]]:
+    """The themes earlier passes persisted, each with a comment to stand for it.
+
+    ``(theme, comment, rows wearing it)`` for the window's largest themes. The
+    comment is the theme's earliest one in the window, because the pass visits
+    oldest first and so that is the report that led the cluster when it formed.
+    """
+    commented = case((FeedbackItem.body.is_not(None), FeedbackItem.submitted_at), else_=None)
+    sized = (
+        select(
+            FeedbackItem.theme.label("theme"),
+            func.count(FeedbackItem.id).label("size"),
+            func.min(commented).label("first_commented"),
+        )
+        .where(
+            FeedbackItem.workspace_id == principal.workspace_id,
+            FeedbackItem.theme.is_not(None),
+            FeedbackItem.submitted_at >= start,
+        )
+        .group_by(FeedbackItem.theme)
+        .order_by(func.count(FeedbackItem.id).desc(), FeedbackItem.theme.asc())
+        .limit(MAX_SEED_THEMES)
+        .subquery()
+    )
+    rows = (
+        await session.execute(
+            select(sized.c.theme, sized.c.size, FeedbackItem.body)
+            .join(
+                FeedbackItem,
+                (FeedbackItem.theme == sized.c.theme)
+                & (FeedbackItem.submitted_at == sized.c.first_commented),
+            )
+            .where(
+                FeedbackItem.workspace_id == principal.workspace_id,
+                FeedbackItem.body.is_not(None),
+            )
+            .order_by(sized.c.size.desc(), sized.c.theme.asc(), FeedbackItem.id.asc())
+        )
+    ).all()
+    seeds: dict[str, tuple[str, str | None, int]] = {}
+    for theme, size, comment in rows:
+        seeds.setdefault(str(theme), (str(theme), comment, int(size)))
+    return list(seeds.values())
+
+
+async def _theme_stats(
+    session: AsyncSession, principal: Principal, themes: Sequence[str], start: dt.datetime
+) -> dict[str, _ThemeStats]:
+    """Size, sentiment and span of each theme over the window, from its rows."""
+    if not themes:
+        return {}
+    is_negative = FeedbackItem.sentiment == Sentiment.NEGATIVE.value
+    negative = case((is_negative, 1), else_=0)
+    unlinked = case((is_negative & FeedbackItem.issue_id.is_(None), 1), else_=0)
+    rows = (
+        await session.execute(
+            select(
+                FeedbackItem.theme,
+                func.count(FeedbackItem.id),
+                func.coalesce(func.sum(negative), 0),
+                func.coalesce(func.sum(unlinked), 0),
+                func.avg(FeedbackItem.rating),
+                func.min(FeedbackItem.submitted_at),
+                func.max(FeedbackItem.submitted_at),
+            )
+            .where(
+                FeedbackItem.workspace_id == principal.workspace_id,
+                FeedbackItem.theme.in_(themes),
+                FeedbackItem.submitted_at >= start,
+            )
+            .group_by(FeedbackItem.theme)
+        )
+    ).all()
+    return {
+        str(theme): _ThemeStats(
+            size=int(size),
+            negatives=int(negatives),
+            unlinked_negatives=int(unlinked_negatives),
+            avg_rating=round(float(avg_rating), 2) if avg_rating is not None else None,
+            first_seen_at=first_seen,
+            last_seen_at=last_seen,
+        )
+        for theme, size, negatives, unlinked_negatives, avg_rating, first_seen, last_seen in rows
+    }
+
+
+async def _open_issues_by_theme(
+    session: AsyncSession, principal: Principal
+) -> dict[str, FeedbackIssue]:
+    """The issue still open for each theme; the oldest, should there be two.
+
+    Every open issue that names a theme, not only the themes one pass touched:
+    the pass is also what catches an issue up on reports that were themed while
+    nothing linked them, and those need no new report to arrive first. Open
+    issues are a working set of dozens, so this is one small read.
+    """
+    rows = (
+        await session.execute(
+            select(FeedbackIssue)
+            .where(
+                FeedbackIssue.workspace_id == principal.workspace_id,
+                FeedbackIssue.theme.is_not(None),
+                FeedbackIssue.status.in_(
+                    [IssueStatus.OPEN.value, IssueStatus.IN_PROGRESS.value]
+                ),
+            )
+            .order_by(FeedbackIssue.opened_at.asc(), FeedbackIssue.id.asc())
+        )
+    ).scalars().all()
+    issues: dict[str, FeedbackIssue] = {}
+    for issue in rows:
+        issues.setdefault(str(issue.theme), issue)
+    return issues
+
+
+async def _link_to_open_issues(
+    session: AsyncSession,
+    principal: Principal,
+    issues: Mapping[str, FeedbackIssue],
+    start: dt.datetime,
+) -> int:
+    """Attach the window's unlinked reports of a theme to the issue open for it.
+
+    An issue links the feedback that exists when it is opened. Without this the
+    reports that keep arriving afterwards never reach it: its Reports (30d)
+    decays to zero as the originals age out while the problem is at its worst,
+    and the backlog's Votes stay frozen at the day the issue was opened.
+    """
+    if not issues:
+        return 0
+    rows = (
+        await session.execute(
+            _scoped(principal).where(
+                FeedbackItem.theme.in_(list(issues)),
+                FeedbackItem.issue_id.is_(None),
+                FeedbackItem.submitted_at >= start,
+            )
+        )
+    ).scalars().all()
+    touched: set[str] = set()
+    for row in rows:
+        issue = issues[str(row.theme)]
+        row.issue_id = issue.id
+        touched.add(issue.id)
+    if touched:
+        await session.flush()
+        for issue_id in sorted(touched):
+            await _recount_issue(session, principal, issue_id)
+    return len(rows)
 
 
 async def analyze(
@@ -973,6 +1395,11 @@ async def analyze(
     matters because the result is written to rows and counted by the funnel.
     Items are visited oldest first, so the earliest report of a problem becomes
     the cluster's leader and re-running the pass reproduces the same grouping.
+
+    The themes earlier passes persisted are leaders too, so a new report of a
+    known problem joins that theme — and, when an issue is open for the theme,
+    that issue. A pass asked to ``recluster`` is rebuilding the grouping from the
+    rows themselves and so starts from none.
     """
     principal.require(Role.MEMBER)
     rules = await get_sla_rules(session, principal)
@@ -990,81 +1417,114 @@ async def analyze(
     )
     items = (await session.execute(stmt)).scalars().all()
 
-    clusters: list[_Cluster] = []
-    unclustered = 0
-    for item in items:
-        tokens = _tokenise(item.body)
-        if not tokens:
-            unclustered += 1
-            continue
-        best: _Cluster | None = None
-        best_score = 0.0
-        for cluster in clusters:
-            score = _jaccard(tokens, cluster.leader)
-            if score > best_score:
-                best, best_score = cluster, score
-        if best is not None and best_score >= payload.similarity:
-            best.add(item, tokens)
-        else:
-            fresh = _Cluster(leader=tokens)
-            fresh.add(item, tokens)
-            clusters.append(fresh)
-
-    kept = [cluster for cluster in clusters if len(cluster.members) >= payload.min_cluster_size]
-    unclustered += sum(
-        len(cluster.members)
-        for cluster in clusters
-        if len(cluster.members) < payload.min_cluster_size
+    seeds = [] if payload.recluster else await _theme_seeds(session, principal, start)
+    # Off the event loop: the grouping is CPU-bound Python, and on the loop it
+    # stalls every other request this worker holds — SDK ingest, the live-runs
+    # streams, other people's page loads — for as long as it takes. It is handed
+    # plain strings and hands back positions; the rows stay on this side.
+    clusters, unclustered = await asyncio.to_thread(
+        _cluster_comments, [item.body for item in items], seeds, payload.similarity
     )
 
+    # A theme already on rows counts towards the minimum: one new report of a
+    # fifty-report problem is not "unclustered". Two clusters that arrive at the
+    # same label are one theme, because the label is all a row keeps.
+    themes: dict[str, _Cluster] = {}
+    for cluster in clusters:
+        if not cluster.members:
+            continue
+        if cluster.existing + len(cluster.members) < payload.min_cluster_size:
+            unclustered += len(cluster.members)
+            continue
+        label = cluster.label()[:120]
+        if label in themes:
+            themes[label].absorb(cluster)
+        else:
+            themes[label] = cluster
+
+    clustered = 0
+    for label, cluster in themes.items():
+        for position in cluster.members:
+            items[position].theme = label
+            clustered += 1
+    # Flushed before anything is counted: this session does not autoflush, and
+    # the numbers below are read back from the rows.
+    await session.flush()
+
+    labels = list(themes)
+    open_issues = await _open_issues_by_theme(session, principal)
+    linked = await _link_to_open_issues(session, principal, open_issues, start)
+    stats = await _theme_stats(session, principal, labels, start)
+
+    # The SLA rules' auto-issue threshold, enforced: a theme with that many
+    # negative reports and no issue answering for them gets one opened here,
+    # graded the way the suggestion would have been. Counted after the linking
+    # above, so a theme that already has an open issue never qualifies.
+    auto_opened: dict[str, FeedbackIssueRead] = {}
+    for label in labels:
+        measured = stats.get(label)
+        if (
+            label in open_issues
+            or measured is None
+            or measured.unlinked_negatives < rules.auto_issue_threshold
+        ):
+            continue
+        auto_opened[label] = await create_issue(
+            session,
+            principal,
+            FeedbackIssueCreate(
+                title=label[:200],
+                theme=label,
+                severity=_severity_for(
+                    measured.size,
+                    measured.negatives / measured.size if measured.size else 0.0,
+                    rules.auto_issue_threshold,
+                ),
+            ),
+            request=request,
+            auto_reports=measured.unlinked_negatives,
+        )
+
     agents = await _agent_names(
-        session, principal, (item.agent_id for cluster in kept for item in cluster.members)
+        session,
+        principal,
+        (items[position].agent_id for cluster in themes.values() for position in cluster.members),
     )
 
     reads: list[ClusterRead] = []
-    clustered = 0
-    for cluster in kept:
-        label = cluster.label()
-        ratings = [item.rating for item in cluster.members if item.rating is not None]
-        negatives = sum(
-            1 for item in cluster.members if item.sentiment == Sentiment.NEGATIVE.value
+    for label, cluster in themes.items():
+        members = [items[position] for position in cluster.members]
+        measured = stats.get(label)
+        size = measured.size if measured else len(members)
+        negatives = (
+            measured.negatives
+            if measured
+            else sum(1 for item in members if item.sentiment == Sentiment.NEGATIVE.value)
         )
-        size = len(cluster.members)
         share = negatives / size if size else 0.0
-        for item in cluster.members:
-            item.theme = label[:120]
-            clustered += 1
-
-        moments = [item.submitted_at for item in cluster.members]
-        representatives = sorted(
-            cluster.members,
-            key=lambda member: (
-                -_jaccard(_tokenise(member.body), cluster.leader),
-                member.submitted_at,
-            ),
-        )[:3]
+        issue = open_issues.get(label) or auto_opened.get(label)
         reads.append(
             ClusterRead(
                 cluster_id=_slug(label),
-                theme=label[:120],
+                theme=label,
                 size=size,
-                keywords=[word for word, _ in cluster.counts.most_common(8)],
+                new_members=len(members),
+                keywords=cluster.keywords(8),
                 negative_share=round(share, 3),
-                avg_rating=round(sum(ratings) / len(ratings), 2) if ratings else None,
+                avg_rating=measured.avg_rating if measured else None,
                 agents=sorted(
-                    {
-                        agents.get(item.agent_id or "", "")
-                        for item in cluster.members
-                        if item.agent_id
-                    }
+                    {agents.get(item.agent_id or "", "") for item in members if item.agent_id}
                     - {""}
                 ),
-                sources=sorted({item.source for item in cluster.members}),
-                first_seen_at=min(moments) if moments else None,
-                last_seen_at=max(moments) if moments else None,
+                sources=sorted({item.source for item in members}),
+                first_seen_at=measured.first_seen_at if measured else None,
+                last_seen_at=measured.last_seen_at if measured else None,
                 suggested_issue_title=label[:200],
                 suggested_severity=_severity_for(size, share, rules.auto_issue_threshold),
-                meets_auto_issue_threshold=size >= rules.auto_issue_threshold,
+                meets_auto_issue_threshold=label in auto_opened,
+                issue_auto_opened=label in auto_opened,
+                open_issue_id=issue.id if issue else None,
+                open_issue_ref=issue.issue_ref if issue else None,
                 examples=[
                     FeedbackExample(
                         id=member.id,
@@ -1075,7 +1535,7 @@ async def analyze(
                         agent_name=agents.get(member.agent_id or ""),
                         submitted_at=member.submitted_at,
                     )
-                    for member in representatives
+                    for member in (items[position] for position in cluster.representatives(3))
                 ],
             )
         )
@@ -1092,11 +1552,15 @@ async def analyze(
         detail=(
             f"Clustered {clustered} of {len(items)} item(s) into {len(reads)} theme(s) "
             f"over {payload.window_days} day(s)"
+            + (f"; linked {linked} report(s) to open issues" if linked else "")
+            + (f"; opened {len(auto_opened)} issue(s) automatically" if auto_opened else "")
         ),
         metadata={
             "analysed": len(items),
             "clustered": clustered,
             "clusters": len(reads),
+            "linked_to_issues": linked,
+            "issues_auto_opened": [issue.issue_ref for issue in auto_opened.values()],
             "similarity": payload.similarity,
             "window_days": payload.window_days,
         },
@@ -1108,6 +1572,8 @@ async def analyze(
         analysed=len(items),
         clustered=clustered,
         unclustered=unclustered,
+        linked_to_issues=linked,
+        issues_auto_opened=len(auto_opened),
         clusters=reads,
         window_days=payload.window_days,
         similarity=payload.similarity,
@@ -1213,7 +1679,8 @@ async def _recount_issue(
     ).scalar_one()
     issue = await session.get(FeedbackIssue, issue_id)
     if issue is not None and issue.workspace_id == principal.workspace_id:
-        issue.feedback_count = int(count)
+        # A cached count is bookkeeping about the issue, not an edit of it.
+        await stamp(session, [issue], feedback_count=int(count))
     return int(count)
 
 
@@ -1243,17 +1710,26 @@ async def _decorate_issues(
                 )
             ).all()
         }
-        backlog = {
-            str(issue_id): item_id
-            for issue_id, item_id in (
-                await session.execute(
-                    select(BacklogItem.issue_id, BacklogItem.id).where(
-                        BacklogItem.workspace_id == principal.workspace_id,
-                        BacklogItem.issue_id.in_(ids),
-                    )
+        # An issue may have shipped items behind it and one still planning it.
+        # The row names the one Create Fix Task should act on: the item still
+        # open (the same one ``_planning_item`` finds), else the latest shipped.
+        shipped: dict[str, str] = {}
+        planning: dict[str, str] = {}
+        for linked_issue_id, item_id, item_status in (
+            await session.execute(
+                select(BacklogItem.issue_id, BacklogItem.id, BacklogItem.status)
+                .where(
+                    BacklogItem.workspace_id == principal.workspace_id,
+                    BacklogItem.issue_id.in_(ids),
                 )
-            ).all()
-        }
+                .order_by(BacklogItem.created_at.asc(), BacklogItem.id.asc())
+            )
+        ).all():
+            if item_status == BacklogStatus.DONE.value:
+                shipped[str(linked_issue_id)] = item_id
+            else:
+                planning.setdefault(str(linked_issue_id), item_id)
+        backlog = {**shipped, **planning}
 
     agents = await _agent_names(session, principal, (issue.agent_id for issue in issues))
     users = await _user_names(session, (issue.assigned_to_user_id for issue in issues))
@@ -1376,6 +1852,7 @@ async def create_issue(
     payload: FeedbackIssueCreate,
     *,
     request: Request | None = None,
+    auto_reports: int | None = None,
 ) -> FeedbackIssueRead:
     """Open an issue from a cluster, a theme or a hand-picked set of feedback.
 
@@ -1383,6 +1860,11 @@ async def create_issue(
     cached count is set from those rows, and the SLA due date is computed on the
     business-hours clock the rules configure — so the Issues tab is never a
     detached list of titles.
+
+    ``auto_reports`` is set only by the clustering pass, when it opens the issue
+    because that many reports reached the SLA rules' threshold. The issue and
+    its audit row then say so: the actor is whoever ran the pass, the decision
+    was the rule's.
     """
     principal.require(Role.MEMBER)
     rules = await get_sla_rules(session, principal)
@@ -1429,7 +1911,13 @@ async def create_issue(
         workspace_id=principal.workspace_id,
         issue_ref=_ref("iss"),
         title=payload.title,
-        description=payload.description,
+        description=payload.description
+        or (
+            f"Opened automatically: {auto_reports} similar negative reports reached "
+            f"the auto-issue threshold of {rules.auto_issue_threshold}."
+            if auto_reports is not None
+            else None
+        ),
         theme=theme,
         severity=payload.severity.value,
         status=IssueStatus.OPEN.value,
@@ -1468,14 +1956,20 @@ async def create_issue(
         entity_label=issue.issue_ref,
         source_screen=SOURCE_SCREEN,
         detail=(
-            f"{payload.severity.value} issue '{issue.title}' opened from "
-            f"{len(items)} feedback item(s); due {issue.sla_due_at.isoformat()}"
+            f"{payload.severity.value} issue '{issue.title}' opened "
+            + (
+                f"automatically at {auto_reports} similar negative report(s) "
+                if auto_reports is not None
+                else ""
+            )
+            + f"from {len(items)} feedback item(s); due {issue.sla_due_at.isoformat()}"
         ),
         metadata={
             "theme": theme,
             "severity": payload.severity.value,
             "linked_feedback": len(items),
             "assigned_team": issue.assigned_team,
+            "automatic": auto_reports is not None,
         },
         request=request,
     )
@@ -1698,6 +2192,28 @@ async def list_backlog(
     return await _decorate_backlog(session, principal, rows), total
 
 
+async def _planning_item(
+    session: AsyncSession, principal: Principal, issue_id: str
+) -> BacklogItem | None:
+    """The backlog item still planning this issue, or None.
+
+    Read with ``first()``, oldest first: nothing in the schema stops two rows
+    naming one issue, and workspaces that already hold such a pair must get the
+    designed 409 from this check, not a 500 from a query that assumed one row.
+    """
+    return (
+        await session.execute(
+            select(BacklogItem)
+            .where(
+                BacklogItem.workspace_id == principal.workspace_id,
+                BacklogItem.issue_id == issue_id,
+                BacklogItem.status != BacklogStatus.DONE.value,
+            )
+            .order_by(BacklogItem.created_at.asc(), BacklogItem.id.asc())
+        )
+    ).scalars().first()
+
+
 async def create_backlog_item(
     session: AsyncSession,
     principal: Principal,
@@ -1705,15 +2221,31 @@ async def create_backlog_item(
     *,
     request: Request | None = None,
 ) -> BacklogItemRead:
-    """Add an improvement candidate, optionally straight from one feedback item."""
+    """Add an improvement candidate, optionally straight from one feedback item.
+
+    A candidate raised from a feedback row inherits that row's issue, and an
+    issue with a dozen reports behind it has a dozen rows offering this action.
+    So the one-item-per-issue rule ``promote_issue`` holds is held here too:
+    the second ask answers 409 naming the item already planning the issue.
+    """
     principal.require(Role.MEMBER)
 
-    issue_id = payload.issue_id
-    if issue_id:
-        issue_id = (await get_issue(session, principal, issue_id)).id
+    issue: FeedbackIssue | None = None
+    if payload.issue_id:
+        issue = await get_issue(session, principal, payload.issue_id)
     if payload.feedback_id:
         item = await get_feedback(session, principal, payload.feedback_id)
-        issue_id = issue_id or item.issue_id
+        if issue is None and item.issue_id:
+            issue = await get_issue(session, principal, item.issue_id)
+    issue_id = issue.id if issue is not None else None
+
+    if issue is not None:
+        existing = await _planning_item(session, principal, issue.id)
+        if existing is not None:
+            raise Conflict(
+                f"Issue {issue.issue_ref} is already on the backlog.",
+                details={"backlog_item_id": existing.id, "issue_id": issue.id},
+            )
 
     backlog_item = BacklogItem(
         workspace_id=principal.workspace_id,
@@ -1760,8 +2292,10 @@ async def promote_issue(
 ) -> BacklogItemRead:
     """Put an issue on the backlog.
 
-    An issue gets one backlog item: asking twice returns a conflict naming the
-    existing one rather than quietly forking the work.
+    An issue gets one backlog item at a time: asking twice returns a conflict
+    naming the existing one rather than quietly forking the work. An item that
+    has already shipped does not count — Done is terminal, so planning a
+    reopened issue again has to be able to make a new row.
     """
     principal.require(Role.MEMBER)
     issue = await get_issue(session, principal, issue_id)
@@ -1770,14 +2304,7 @@ async def promote_issue(
             f"Issue {issue.issue_ref} is marked Wont Fix. Reopen it before planning work."
         )
 
-    existing = (
-        await session.execute(
-            select(BacklogItem).where(
-                BacklogItem.workspace_id == principal.workspace_id,
-                BacklogItem.issue_id == issue.id,
-            )
-        )
-    ).scalar_one_or_none()
+    existing = await _planning_item(session, principal, issue.id)
     if existing is not None:
         raise Conflict(
             f"Issue {issue.issue_ref} is already on the backlog.",

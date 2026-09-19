@@ -26,6 +26,11 @@ export interface BatchOptions {
   maxItems?: number;
   /** Flush once the pending body would exceed this many bytes. */
   maxBytes?: number;
+  /**
+   * Spans one request may carry, summed across the traces in it. Default 1000,
+   * which is the server's ceiling; `/ingest/config` may narrow it.
+   */
+  maxSpans?: number;
   /** Flush at least this often, in milliseconds. */
   flushIntervalMs?: number;
   /** Drop the oldest items past this depth rather than growing without bound. */
@@ -55,7 +60,11 @@ export interface FulcrumOpsOptions {
   /** Default agent for traces that do not name their own. Falls back to `FULCRUM_OPS_AGENT`. */
   agent?: string;
 
-  /** Per-request timeout in milliseconds. Default 30000. */
+  /**
+   * Per-request timeout in milliseconds. Default 30000. Falls back to
+   * `FULCRUM_OPS_TIMEOUT_MS`, then to `FULCRUM_OPS_TIMEOUT_SECONDS` — the name
+   * and unit the Python SDK reads, so one fleet-wide setting covers both.
+   */
   timeoutMs?: number;
   batch?: BatchOptions;
   retry?: RetryOptions;
@@ -82,7 +91,10 @@ export interface FulcrumOpsOptions {
    * long-running traces whose spans should appear before the trace finishes.
    */
   streamSpans?: boolean;
-  /** Turn all reporting off. Defaults to true only when no API key was found. */
+  /**
+   * Whether anything is reported. Defaults to true when an API key was found
+   * and `FULCRUM_OPS_DISABLED` is not set; an explicit value here wins over both.
+   */
   enabled?: boolean;
   /** Called for every failure the SDK absorbs. */
   onError?: ErrorHandler;
@@ -131,7 +143,7 @@ export const DEFAULT_BASE_URL = 'http://127.0.0.1:8080/api/v1';
 
 const DEFAULTS = {
   timeoutMs: 30_000,
-  batch: { maxItems: 100, maxBytes: 4 * 1024 * 1024, flushIntervalMs: 5_000, maxQueueSize: 10_000 },
+  batch: { maxItems: 100, maxBytes: 4 * 1024 * 1024, maxSpans: 1_000, flushIntervalMs: 5_000, maxQueueSize: 10_000 },
   retry: { maxAttempts: 3, backoffMs: 500, maxBackoffMs: 30_000 },
   samplingRate: 1,
 } as const;
@@ -154,6 +166,22 @@ function numberFromEnv(name: string): number | undefined {
 
 function clamp(value: number, low: number, high: number): number {
   return Math.min(Math.max(value, low), high);
+}
+
+/**
+ * The request timeout the environment asks for, in milliseconds.
+ *
+ * Two spellings, because a compose file or a Kubernetes env block is shared by
+ * a fleet and not by a language: the Python SDK reads
+ * `FULCRUM_OPS_TIMEOUT_SECONDS`, and an operator who set that to keep telemetry
+ * from stalling their agents meant the TypeScript ones too. The millisecond
+ * name is this SDK's own and wins when both are set.
+ */
+function timeoutFromEnv(): number | undefined {
+  const millis = numberFromEnv('FULCRUM_OPS_TIMEOUT_MS');
+  if (millis !== undefined) return millis;
+  const seconds = numberFromEnv('FULCRUM_OPS_TIMEOUT_SECONDS');
+  return seconds === undefined ? undefined : seconds * 1000;
 }
 
 /**
@@ -203,6 +231,7 @@ export function resolveOptions(options: FulcrumOpsOptions = {}): ResolvedOptions
   const batch: Required<BatchOptions> = {
     maxItems: Math.max(1, Math.trunc(options.batch?.maxItems ?? DEFAULTS.batch.maxItems)),
     maxBytes: Math.max(1_024, Math.trunc(options.batch?.maxBytes ?? DEFAULTS.batch.maxBytes)),
+    maxSpans: Math.max(1, Math.trunc(options.batch?.maxSpans ?? DEFAULTS.batch.maxSpans)),
     flushIntervalMs: Math.max(50, Math.trunc(options.batch?.flushIntervalMs ?? DEFAULTS.batch.flushIntervalMs)),
     maxQueueSize: Math.max(1, Math.trunc(options.batch?.maxQueueSize ?? DEFAULTS.batch.maxQueueSize)),
   };
@@ -216,7 +245,12 @@ export function resolveOptions(options: FulcrumOpsOptions = {}): ResolvedOptions
   // A client with no key is not an error: it is a developer running the app
   // locally without credentials. Reporting turns itself off and everything else
   // keeps working.
-  const enabled = options.enabled ?? Boolean(apiKey);
+  //
+  // `FULCRUM_OPS_DISABLED` is the fleet-wide kill switch — the one line an
+  // operator adds to silence telemetry in CI or in the middle of an incident,
+  // without a deploy — and it means the same here as in the Python SDK. Only
+  // an explicit `enabled` in code outranks it.
+  const enabled = options.enabled ?? (Boolean(apiKey) && boolFromEnv('FULCRUM_OPS_DISABLED') !== true);
 
   return {
     apiKey,
@@ -224,7 +258,7 @@ export function resolveOptions(options: FulcrumOpsOptions = {}): ResolvedOptions
     workspace: options.workspace?.trim() || readEnv('FULCRUM_OPS_WORKSPACE'),
     environment: options.environment?.trim() || readEnv('FULCRUM_OPS_ENVIRONMENT'),
     agent: options.agent?.trim() || readEnv('FULCRUM_OPS_AGENT'),
-    timeoutMs: Math.max(1, Math.trunc(options.timeoutMs ?? numberFromEnv('FULCRUM_OPS_TIMEOUT_MS') ?? DEFAULTS.timeoutMs)),
+    timeoutMs: Math.max(1, Math.trunc(options.timeoutMs ?? timeoutFromEnv() ?? DEFAULTS.timeoutMs)),
     batch,
     retry,
     samplingRate,

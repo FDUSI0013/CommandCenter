@@ -33,6 +33,8 @@ import contextlib
 import dataclasses
 import datetime as dt
 import json
+import uuid
+import weakref
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Sequence
 from typing import Any, Final, TypeVar
@@ -50,6 +52,7 @@ from ..core.errors import (
     TelemetryBackendUnavailable,
     ValidationFailed,
 )
+from ..core.ttlcache import SingleFlightCache
 from ..db.base import new_id
 from ..db.session import get_sessionmaker
 from ..engine import (
@@ -60,6 +63,7 @@ from ..engine import (
     EngineUnavailable,
     get_engine_client,
 )
+from ..engine import deadline as engine_deadline
 from ..models.identity import Role
 from ..models.registry import Agent, Platform, RiskLevel
 from ..schemas.runs import (
@@ -113,7 +117,8 @@ MAX_SCAN_AGENTS: Final[int] = 100
 #: Rows always read per project, however many projects there are.
 MIN_ROWS_PER_AGENT: Final[int] = 50
 
-#: Concurrent engine calls one request may have in flight.
+#: Project reads the run screens may have in flight at once -- in this process,
+#: not per request. See :func:`_scan_gate`.
 SCAN_CONCURRENCY: Final[int] = 8
 
 #: Spans read for one trace when building the tree or the replay step list.
@@ -347,6 +352,24 @@ def window_for(time_range: TimeRange, *, end: dt.datetime | None = None) -> tupl
     return finish - dt.timedelta(seconds=time_range.seconds), finish
 
 
+def _in_window(trace: dict[str, Any], since: dt.datetime, until: dt.datetime) -> bool:
+    """Did this run start inside the window the caller asked about?
+
+    The store is asked for the window, so this is normally a no-op -- and it is
+    applied anyway, because the table and the KPI row state a window and must
+    not show what is outside it. Two things can hand back a row that is: rows
+    shared between requests were read for a window a few seconds older than
+    this one, and a store that does not honour the time bound returns its newest
+    rows whatever was asked, which would make "previous period" a copy of the
+    current one. A run with no readable start time is kept: there is nothing to
+    judge it by, and dropping it would hide it from every window.
+
+    Not applied to the live stream, whose window is about arrival, not start.
+    """
+    started = _instant(trace.get("start_time"))
+    return started is None or since <= started <= until
+
+
 # --------------------------------------------------------------------------- #
 # Telemetry scanning
 # --------------------------------------------------------------------------- #
@@ -380,13 +403,25 @@ async def _agents_for(
     ``Running`` rows every few seconds to one project instead of all of them.
     """
     stmt = _provisioned_agents_stmt(principal)
-    bound = principal.api_key_agent_id
-    if bound and agent_id and agent_id != bound:
+    if not may_read_agent(principal, agent_id):
         return []
-    scoped = agent_id or bound
+    scoped = agent_id or principal.api_key_agent_id
     if scoped:
         stmt = stmt.where(Agent.id == scoped)
     return list((await session.execute(stmt.limit(MAX_SCAN_AGENTS))).scalars().all())
+
+
+def may_read_agent(principal: Principal, agent_id: str | None) -> bool:
+    """False when the caller's key is bound to an agent other than ``agent_id``.
+
+    The list narrows its scan with this; the reads that address one run or one
+    agent directly -- the inspector, the trace, the replay, the history browser,
+    the stream -- refuse with it. Without the second half the scoping rule held
+    for the table only: a bound key could still read any neighbour's prompts and
+    responses by asking for the run by id.
+    """
+    bound = principal.api_key_agent_id
+    return not (bound and agent_id and agent_id != bound)
 
 
 async def agent_count(session: AsyncSession, principal: Principal) -> int:
@@ -483,6 +518,21 @@ def _grid(moment: dt.datetime, step: float, *, up: bool) -> int:
     return int(-(-ticks // 1)) if up else int(ticks // 1)
 
 
+#: A window that closed long ago -- the KPI row's "previous period" -- is read on
+#: a grid this coarse and the rows kept this long. Nothing is being written into
+#: it, yet it was read afresh for every KPI row, and the KPI row is asked for
+#: again on every run that arrives: half of that screen's store queries went on
+#: re-reading an hour that had not changed. Off whenever the scan memory is off.
+SETTLED_GRID_SECONDS: Final[float] = 300.0
+SETTLED_CACHE_SECONDS: Final[float] = 300.0
+
+#: Small on purpose: an entry is a project's rows for a whole window.
+_settled_scans: SingleFlightCache[tuple[list[dict[str, Any]], bool]] = SingleFlightCache(
+    ttl=lambda: SETTLED_CACHE_SECONDS if settings.runs_scan_cache_seconds > 0 else 0.0,
+    max_entries=32,
+)
+
+
 async def _scan_project(
     client: EngineClient,
     agent: Agent,
@@ -490,6 +540,7 @@ async def _scan_project(
     since: dt.datetime,
     until: dt.datetime,
     limit: int,
+    settled: bool = False,
 ) -> tuple[list[dict[str, Any]], bool]:
     """One project's traces in the window, shared with whoever else wants them.
 
@@ -497,10 +548,30 @@ async def _scan_project(
     rows within the same few seconds. The window is snapped to a grid for the
     key only, so requests a moment apart share one read; the read itself uses
     the exact window it was asked for.
+
+    A ``settled`` window is different in one respect: the read is widened to the
+    grid as well, so that everyone asking during the next few minutes is asking
+    for the same rows. The caller keeps only the rows inside the window it
+    actually asked about (:func:`_in_window`), so the figures are as exact as
+    they were; a cap that falls inside the wider read is reported as a cap.
     """
     step = settings.runs_scan_cache_seconds
     if step <= 0:
         return await _read_project(client, agent, since=since, until=until, limit=limit)
+    if settled:
+        first = _grid(since, SETTLED_GRID_SECONDS, up=False)
+        last = _grid(until, SETTLED_GRID_SECONDS, up=True)
+        rows, truncated = await _settled_scans.get(
+            (str(agent.engine_project_id), first, last, limit),
+            lambda: _read_project(
+                client,
+                agent,
+                since=dt.datetime.fromtimestamp(first * SETTLED_GRID_SECONDS, dt.UTC),
+                until=dt.datetime.fromtimestamp(last * SETTLED_GRID_SECONDS, dt.UTC),
+                limit=limit,
+            ),
+        )
+        return list(rows), truncated
     key = (
         str(agent.engine_project_id),
         _grid(since, step, up=False),
@@ -548,6 +619,71 @@ async def _read_project(
     return rows[:limit], truncated
 
 
+#: One gate per event loop -- which in a worker is one per process. Keyed by loop
+#: because a semaphore belongs to the loop it first waited on, and the test
+#: suite runs each test on a loop of its own.
+_scan_gates: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _scan_gate() -> asyncio.Semaphore:
+    """The one queue every project read of the run screens waits in.
+
+    The bound used to be made afresh for each scan, so it capped one request and
+    nothing else: the KPI row alone ran two scans and had sixteen searches in
+    flight, and a table, a KPI row, a poller and a few stream subscribers
+    arriving together had as many as they had projects between them -- against a
+    store with four cores. Held per process, the bound is the most this worker
+    asks of the store for these screens, however many people are looking.
+    """
+    loop = asyncio.get_running_loop()
+    gate = _scan_gates.get(loop)
+    if gate is None:
+        gate = _scan_gates[loop] = asyncio.Semaphore(SCAN_CONCURRENCY)
+    return gate
+
+
+async def _all_or_none(work: Iterable[Awaitable[T]]) -> list[T]:
+    """``gather``, except that the first failure stops whatever has not finished.
+
+    ``gather`` hands the first failure to its caller and leaves the rest running.
+    Here the rest are project reads still queued at the gate: the request has
+    already answered 503, and each of them would go on to ask a struggling store
+    a question nobody is waiting for. Cancelled, the queued ones never start. An
+    exchange already on the wire is shielded by the adapter and ends on its own.
+    """
+    tasks = [asyncio.ensure_future(item) for item in work]
+    try:
+        return list(await asyncio.gather(*tasks))
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        raise
+
+
+def _covered_from(capped: Iterable[list[dict[str, Any]]]) -> dt.datetime | None:
+    """From when a scan is whole, given the rows of each project that hit its cap.
+
+    A capped project hands back its newest rows, so it was read in full from its
+    oldest row onwards and not at all before it. The scan as a whole is complete
+    from the latest of those edges. ``None`` when no project was capped, and
+    when a capped project's rows carry no start time: the edge is then unknown,
+    and an unknown edge is not reported as the start of the window.
+    """
+    edges: list[dt.datetime] = []
+    for rows in capped:
+        starts = [
+            started
+            for started in (_instant(row.get("start_time")) for row in rows)
+            if started is not None
+        ]
+        if not starts:
+            return None
+        edges.append(min(starts))
+    return max(edges) if edges else None
+
+
 async def _scan(
     client: EngineClient,
     agents: Sequence[Agent],
@@ -555,10 +691,15 @@ async def _scan(
     since: dt.datetime,
     until: dt.datetime,
     budget: int = MAX_SCAN_TRACES,
-) -> tuple[list[tuple[Agent, list[dict[str, Any]]]], bool]:
-    """Read the window across every in-scope project, with bounded concurrency."""
+    settled: bool = False,
+) -> tuple[list[tuple[Agent, list[dict[str, Any]]]], bool, dt.datetime | None]:
+    """Read the window across every in-scope project, with bounded concurrency.
+
+    Returns the rows per project, whether any project hit its row cap, and --
+    when one did -- the instant from which the scan is whole.
+    """
     if not agents:
-        return [], False
+        return [], False, None
 
     # Most projects are quiet most of the time. Asking once which ones have been
     # written to since the window opened turns "one store query per project"
@@ -567,24 +708,48 @@ async def _scan(
     quiet = [agent for agent in agents if not _may_have_runs(activity, agent, since)]
     agents = [agent for agent in agents if _may_have_runs(activity, agent, since)]
     if not agents:
-        return [(agent, []) for agent in quiet], False
+        return [(agent, []) for agent in quiet], False, None
 
     # The row budget is shared between the projects actually read, so skipping
     # the quiet ones also raises the ceiling on the busy ones.
     per_agent = max(MIN_ROWS_PER_AGENT, budget // len(agents))
-    semaphore = asyncio.Semaphore(SCAN_CONCURRENCY)
+    gate = _scan_gate()
+    abandoned = False
 
     async def one(agent: Agent) -> tuple[Agent, list[dict[str, Any]], bool]:
-        async with semaphore:
-            rows, truncated = await _scan_project(
-                client, agent, since=since, until=until, limit=per_agent
-            )
+        nonlocal abandoned
+        async with gate:
+            # The first failure is the scan's answer. Leaving the gate wakes the
+            # next read in line a moment before the cancellation below reaches
+            # it, so it looks before it asks; what it returns is never read.
+            if abandoned:
+                return agent, [], False
+            try:
+                rows, truncated = await _scan_project(
+                    client,
+                    agent,
+                    since=since,
+                    until=until,
+                    limit=per_agent,
+                    settled=settled,
+                )
+            except BaseException:
+                abandoned = True
+                raise
         return agent, rows, truncated
 
-    results = await asyncio.gather(*(one(agent) for agent in agents))
+    # The gate makes scans queue, and a queue behind a slow store can outlast
+    # the console's patience; the deadline keeps this API the one that answers.
+    # Nothing inside it touches the database.
+    try:
+        async with engine_deadline(what="run scan"):
+            results = await _all_or_none(one(agent) for agent in agents)
+    except EngineError as exc:
+        raise _telemetry_error(exc) from exc
     truncated = any(flag for _, _, flag in results)
+    covered_from = _covered_from(rows for _, rows, flag in results if flag)
     scanned = [(agent, rows) for agent, rows, _ in results]
-    return scanned + [(agent, []) for agent in quiet], truncated
+    return scanned + [(agent, []) for agent in quiet], truncated, covered_from
 
 
 # --------------------------------------------------------------------------- #
@@ -864,10 +1029,14 @@ def _map_detail(trace: dict[str, Any], agent: Agent, principal: Principal) -> Ru
     )
 
     tags = trace.get("tags")
+    input_text = _payload_text(trace.get("input"))
+    response_text = _payload_text(trace.get("output"))
+    span_count = _int(trace.get("span_count"))
     return RunDetail(
         **row.model_dump(),
-        input=_payload_text(trace.get("input")),
-        response=_payload_text(trace.get("output")),
+        input=input_text,
+        response=response_text,
+        metadata=meta,
         environment=str(meta["environment"]) if meta.get("environment") else agent.environment,
         guardrails=RunGuardrails(
             prompt_injection_check=str(injection) if injection else None,
@@ -892,11 +1061,14 @@ def _map_detail(trace: dict[str, Any], agent: Agent, principal: Principal) -> Ru
         ),
         feedback_scores=scores,
         tags=[str(tag) for tag in tags] if isinstance(tags, list) else [],
-        span_count=_int(trace.get("span_count")),
+        span_count=span_count,
         llm_span_count=_int(trace.get("llm_span_count")),
         flagged_for_review=FLAG_SCORE_NAME in score_values,
         trace_available=True,
-        replay_supported=_int(trace.get("span_count")) > 0,
+        # A run reported as one decorated call has no spans and is still worth
+        # opening: the replay steps through what the run itself recorded.
+        replay_supported=span_count > 0
+        or bool(input_text or response_text or error_message),
     )
 
 
@@ -965,9 +1137,15 @@ class _Scope:
 async def _scope(
     session: AsyncSession, principal: Principal, filters: RunFilters
 ) -> _Scope:
+    agents = await _agents_for(session, principal, filters.agent_id)
+    # Narrowed to one agent -- by the filter, or by a key bound to it -- the scan
+    # covers everything that was asked about. Counting the workspace's other
+    # agents against it reported every such view as capped, and a capped view
+    # is one whose totals are a floor and whose trend is withheld.
+    narrowed = bool(filters.agent_id or principal.api_key_agent_id)
     return _Scope(
-        agents=await _agents_for(session, principal, filters.agent_id),
-        total_agents=await agent_count(session, principal),
+        agents=agents,
+        total_agents=len(agents) if narrowed else await agent_count(session, principal),
     )
 
 
@@ -979,6 +1157,7 @@ async def _gather(
     since: dt.datetime,
     until: dt.datetime,
     budget: int = MAX_SCAN_TRACES,
+    settled: bool = False,
 ) -> tuple[list[_Scanned], ScanInfo]:
     """Scan the window, map every trace, keep the ones the filters select.
 
@@ -987,21 +1166,36 @@ async def _gather(
     """
     scanned: list[_Scanned] = []
     truncated = False
+    covered_from: dt.datetime | None = None
     if scope.agents:
-        batches, truncated = await _scan(
-            _client(), scope.agents, since=since, until=until, budget=budget
+        batches, truncated, covered_from = await _scan(
+            _client(),
+            scope.agents,
+            since=since,
+            until=until,
+            budget=budget,
+            settled=settled,
         )
         for agent, traces in batches:
             for trace in traces:
-                scanned.append(_scan_run(trace, agent, principal))
+                if _in_window(trace, since, until):
+                    scanned.append(_scan_run(trace, agent, principal))
+
+    # Whole projects left unread have no edge to report: nothing of theirs was
+    # read at any hour. Otherwise the edge is stated inside the window that was
+    # asked about -- a shared or widened read can have been capped outside it.
+    unread_agents = scope.total_agents > len(scope.agents)
+    if covered_from is not None:
+        covered_from = None if unread_agents else min(max(covered_from, since), until)
 
     info = ScanInfo(
         runs_scanned=len(scanned),
         agents_scanned=len(scope.agents),
         agents_total=scope.total_agents,
-        truncated=truncated or scope.total_agents > len(scope.agents),
+        truncated=truncated or unread_agents,
         window_start=since,
         window_end=until,
+        covered_from=covered_from,
     )
     return [item for item in scanned if filters.matches(item.run)], info
 
@@ -1051,9 +1245,11 @@ async def run_history(
     """One agent's complete run history, newest first, one cursor page at a time.
 
     This is Replay Studio's browser: unlike the Live Runs window it has no
-    time floor — every run the store still holds is reachable by paging. One
-    project, one engine call per page; the cursor is the engine's own
-    ``last_retrieved_id``, so a page is O(page) however deep the history goes.
+    time floor — every run the store still holds is reachable by paging. What
+    it does have is a time bound on every search it sends (see
+    :func:`_history_page`): asked without one, the store works through the
+    project's whole past to hand back fifty rows, and in production that took
+    longer than the adapter waits on every agent with a real history.
     """
     agent = (
         await session.execute(
@@ -1062,7 +1258,7 @@ async def run_history(
             )
         )
     ).scalar_one_or_none()
-    if agent is None:
+    if agent is None or not may_read_agent(principal, agent.id):
         raise NotFound(f"Agent '{agent_id}' does not exist.")
     if not agent.engine_project_id:
         # Never provisioned means never a single run; an empty page says so
@@ -1070,23 +1266,132 @@ async def run_history(
         return RunHistoryPage(agent_id=agent.id, agent_name=agent.name, items=[])
 
     wanted = max(1, min(limit, ENGINE_PAGE_SIZE))
-    batch = await _call(
-        _client().search_traces(
-            project_id=agent.engine_project_id,
-            limit=wanted,
-            last_retrieved_id=cursor,
-            truncate=True,
-            strip_attachments=True,
-        )
+    client = _client()
+    # Opening Replay Studio asks for the first page of the first agent, and asks
+    # again on every visit; the answer is shared for as long as a table scan is,
+    # and forgotten the moment this process writes to the project.
+    batch, exhausted = await telemetry_cache.project_scans.get(
+        (str(agent.engine_project_id), "history", cursor or "", wanted),
+        lambda: _history_page(client, agent, cursor=cursor, wanted=wanted),
     )
     rows = [row for row in batch if isinstance(row, dict) and row.get("id")]
     items = [_map_run(row, agent, principal) for row in rows]
-    # A short page is the engine's end-of-stream signal — judged on the raw
-    # batch, so a dropped unaddressable row can never silently end the history.
-    next_cursor = str(rows[-1]["id"]) if len(batch) >= wanted and rows else None
+    # Exhaustion is judged on the raw batch, so a dropped unaddressable row can
+    # never silently end the history.
+    next_cursor = _history_cursor(rows[-1]) if rows and not exhausted else None
     return RunHistoryPage(
         agent_id=agent.id, agent_name=agent.name, items=items, next_cursor=next_cursor
     )
+
+
+#: How far below its upper bound each successive history search reaches. A busy
+#: agent fills a page from the first; a quiet one falls through to the wider
+#: ones, which are cheap for the same reason they are needed: they hold few rows.
+HISTORY_REACH: Final[tuple[dt.timedelta, ...]] = (
+    dt.timedelta(days=1),
+    dt.timedelta(days=7),
+    dt.timedelta(days=30),
+    dt.timedelta(days=90),
+    dt.timedelta(days=365),
+)
+
+#: Added above the instant a page is bounded by. It absorbs a reporter's clock
+#: running a little ahead of ours and the rounding of the cursor's timestamp.
+HISTORY_SLACK: Final[dt.timedelta] = dt.timedelta(minutes=5)
+
+#: Separates the two halves of a history cursor. Not a character a UUID holds.
+_CURSOR_MARK: Final[str] = "~"
+
+
+def _id_instant(run_id: str) -> dt.datetime | None:
+    """When a time-ordered (version 7) id was minted: its first 48 bits are
+    epoch milliseconds. Any other id says nothing about time."""
+    try:
+        parsed = uuid.UUID(run_id)
+        if parsed.version != 7:
+            return None
+        return dt.datetime.fromtimestamp((parsed.int >> 80) / 1000.0, dt.UTC)
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def _history_cursor(row: dict[str, Any]) -> str:
+    """Where the next page resumes: the last row's id, and when that run began.
+
+    The id is what the store resumes from. The instant is what lets the next
+    search be bounded from above, so a page deep in a long history is as cheap
+    as the first. It travels in the cursor because only this page knows it.
+    """
+    run_id = str(row["id"])
+    started = _instant(row.get("start_time"))
+    if started is None:
+        return run_id
+    return f"{run_id}{_CURSOR_MARK}{int(started.timestamp() * 1000) + 1}"
+
+
+def _read_history_cursor(cursor: str | None) -> tuple[str | None, dt.datetime]:
+    """The id to resume after, and the instant nothing on the page is newer than.
+
+    Rows come back in id order and ids are time-ordered, so the later of "when
+    the last row's id was minted" and "when that run began" bounds everything
+    still to come. A cursor that carries neither -- a bare id that is not time
+    ordered -- is bounded by now, which is always true and merely less tight.
+    """
+    if not cursor:
+        return None, _now() + HISTORY_SLACK
+    run_id, _, stamp = cursor.partition(_CURSOR_MARK)
+    marks = [_id_instant(run_id)]
+    if stamp.isdigit():
+        with contextlib.suppress(ValueError, OverflowError, OSError):
+            marks.append(dt.datetime.fromtimestamp(int(stamp) / 1000.0, dt.UTC))
+    known = [mark for mark in marks if mark is not None]
+    return run_id, (max(known) if known else _now()) + HISTORY_SLACK
+
+
+async def _history_page(
+    client: EngineClient, agent: Agent, *, cursor: str | None, wanted: int
+) -> tuple[list[dict[str, Any]], bool]:
+    """One page of an agent's history, and whether the history ends with it.
+
+    Every search is bounded above by the cursor's instant and below by a floor
+    that steps back until a page fills. The last search has no floor at all, so
+    nothing the store holds is unreachable; by then the year below the bound is
+    known to hold less than a page, which is what makes it affordable. Floors
+    older than the agent itself are skipped -- they could only repeat the answer
+    the last search gives.
+    """
+    last_id, upper = _read_history_cursor(cursor)
+    born = _as_utc(agent.created_at) if agent.created_at else None
+    floors: list[dt.datetime | None] = [
+        upper - reach
+        for reach in HISTORY_REACH
+        if born is None or upper - reach > born
+    ]
+    floors.append(None)
+
+    batch: list[dict[str, Any]] = []
+    # The searches run one after another, so it is their sum that has to fit
+    # inside the console's patience, not each of them.
+    try:
+        async with engine_deadline(what="run history"):
+            for floor in floors:
+                batch = await _call(
+                    client.search_traces(
+                        project_id=agent.engine_project_id,
+                        limit=wanted,
+                        last_retrieved_id=last_id,
+                        from_time=floor,
+                        to_time=upper,
+                        truncate=True,
+                        strip_attachments=True,
+                    )
+                )
+                if len(batch) >= wanted:
+                    return batch, False
+    except EngineError as exc:
+        raise _telemetry_error(exc) from exc
+    # A short page from the search with no floor is the end of the history.
+    return batch, True
 
 
 async def export_runs(
@@ -1117,7 +1422,9 @@ async def get_run(
     if not isinstance(trace, dict) or not trace.get("id"):
         raise NotFound(f"Run '{run_id}' does not exist.")
     agent = await _agent_for_project(session, principal, trace.get("project_id"))
-    if agent is None:
+    # A key bound to one agent gets the same answer for a neighbour's run as for
+    # another workspace's: it does not exist.
+    if agent is None or not may_read_agent(principal, agent.id):
         raise NotFound(f"Run '{run_id}' does not exist.")
     return _map_detail(trace, agent, principal), agent, trace
 
@@ -1137,7 +1444,9 @@ async def get_run_inspector(
     if detail.guardrails.verdicts or not detail.span_count:
         return detail
 
-    spans = await _fetch_spans(_client(), agent, run_id)
+    # Verdicts live in a span's guardrail keys and its metadata, never in its
+    # payload text, so the payloads are not downloaded to look for them.
+    spans = await _fetch_spans(_client(), agent, run_id, truncate=True)
     verdicts = [
         verdict
         for span in spans
@@ -1169,6 +1478,7 @@ async def get_response(
         model=detail.model,
         occurred_at=detail.occurred_at,
         response=detail.response,
+        error=detail.errors.message,
         output_tokens=detail.output_tokens,
         character_count=len(detail.response),
     )
@@ -1180,9 +1490,15 @@ async def get_response(
 
 
 async def _fetch_spans(
-    client: EngineClient, agent: Agent, run_id: str
+    client: EngineClient, agent: Agent, run_id: str, *, truncate: bool = False
 ) -> list[dict[str, Any]]:
-    """Every span of one trace, cursored, capped at :data:`MAX_SPANS`."""
+    """Every span of one trace, cursored, capped at :data:`MAX_SPANS`.
+
+    The trace tree and the replay show payloads and read them whole. A caller
+    that only wants what was recorded *about* the spans asks for them truncated,
+    which is the difference between a few kilobytes and every prompt and
+    completion the run produced.
+    """
     rows: list[dict[str, Any]] = []
     cursor: str | None = None
     while len(rows) < MAX_SPANS:
@@ -1193,7 +1509,7 @@ async def _fetch_spans(
                 project_id=agent.engine_project_id,
                 limit=wanted,
                 last_retrieved_id=cursor,
-                truncate=False,
+                truncate=truncate,
             )
         )
         usable = [row for row in batch if isinstance(row, dict) and row.get("id")]
@@ -1294,6 +1610,12 @@ async def get_trace_tree(
         span_count=len(spans),
         total_tokens=sum(span.tokens for span in spans) or detail.tokens,
         total_cost=round(sum(span.cost for span in spans) or detail.cost, 6),
+        # The run's own payload. For a run with no spans it is all there is,
+        # and without it this modal had a header and nothing under it.
+        input=detail.input,
+        response=detail.response,
+        error=detail.errors.message,
+        metadata=detail.metadata,
         spans=_build_tree(spans),
     )
 
@@ -1408,6 +1730,65 @@ def _replay_step(index: int, span: RunSpan, raw: dict[str, Any]) -> ReplayStep:
     )
 
 
+def _steps_from_run(detail: RunDetail) -> list[ReplayStep]:
+    """The steps of a run that recorded no spans, built from the run itself.
+
+    One decorated call with nothing nested under it arrives as a trace with its
+    input, its output and perhaps an error -- and no spans. That is a complete
+    account of a small run, and the player showed it as "0 of 0 steps". What
+    was asked becomes a Prompt step and what came back (or went wrong) becomes a
+    Response step carrying the run's own model, tokens, cost and duration.
+    Nothing here is inferred: a half that was not recorded produces no step, and
+    ``span_id`` stays null because there is no span behind either.
+    """
+    steps: list[ReplayStep] = []
+    if detail.input:
+        steps.append(
+            ReplayStep(
+                index=1,
+                kind=ReplayStepKind.PROMPT,
+                title="Prompt",
+                detail="Recorded on the run",
+                started_at=detail.occurred_at,
+                offset_ms=0.0,
+                prompt=_preview(detail.input, SPAN_PREVIEW_CHARS),
+                has_full_payload=True,
+            )
+        )
+    error = detail.errors.message
+    if detail.response or error:
+        failed = bool(error) or detail.status is RunStatus.FAILED
+        bits = [bit for bit in (detail.model, "Recorded on the run") if bit]
+        if detail.tokens:
+            bits.append(f"{detail.tokens} tokens")
+        steps.append(
+            ReplayStep(
+                index=len(steps) + 1,
+                kind=ReplayStepKind.RESPONSE,
+                title="Response",
+                detail=" · ".join(bits),
+                started_at=detail.occurred_at,
+                offset_ms=0.0,
+                duration_ms=(
+                    round(detail.duration_seconds * 1000.0, 3)
+                    if detail.duration_seconds is not None
+                    else None
+                ),
+                response=_preview(detail.response, SPAN_PREVIEW_CHARS) or None,
+                model=detail.model,
+                tokens=detail.tokens,
+                input_tokens=detail.input_tokens,
+                output_tokens=detail.output_tokens,
+                cost=detail.cost,
+                guardrails=detail.guardrails.verdicts,
+                status="fail" if failed else "done",
+                error=error,
+                has_full_payload=bool(detail.response),
+            )
+        )
+    return steps
+
+
 async def get_replay(
     session: AsyncSession, principal: Principal, run_id: str
 ) -> ReplaySession:
@@ -1418,6 +1799,10 @@ async def get_replay(
     verdicts, tokens, cost and offset from the run's start. Fidelity is the
     share of steps whose input *and* output were both captured — a run ingested
     without payloads replays as a timeline, and says so instead of pretending.
+
+    A run with no spans at all replays from what the run itself recorded
+    (:func:`_steps_from_run`), and the session always carries the run's own
+    input, response, error and metadata beside the steps.
     """
     detail, agent, trace = await get_run(session, principal, run_id)
     trace_start = _instant(trace.get("start_time"))
@@ -1430,6 +1815,9 @@ async def get_replay(
         _replay_step(index, span, by_id.get(span.id, {}))
         for index, span in enumerate(ordered, start=1)
     ]
+    steps_from_trace = not steps
+    if steps_from_trace:
+        steps = _steps_from_run(detail)
     captured = sum(1 for step in steps if step.has_full_payload)
 
     transcript: list[TranscriptMessage] = []
@@ -1464,12 +1852,17 @@ async def get_replay(
 
     return ReplaySession(
         run=RunRead(**detail.model_dump(include=set(RunRead.model_fields))),
+        input=detail.input,
+        response=detail.response,
+        error=detail.errors.message,
+        metadata=detail.metadata,
         steps=steps,
         transcript=transcript,
         total_duration_ms=round(total_ms, 3),
         step_count=len(steps),
         captured_steps=captured,
         fidelity=round(captured / len(steps) * 100, 1) if steps else 0.0,
+        steps_from_trace=steps_from_trace and bool(steps),
         replayable=bool(steps),
     )
 
@@ -1559,8 +1952,10 @@ async def summarise(
 
     The selected window and the window immediately before it are scanned
     concurrently, so every "vs last 24h" delta on the screen is a measured
-    change rather than a guess. Fallback and escalation counts come from the
-    same scan: they are recorded on the run's metadata by the ingest contract.
+    change rather than a guess -- and when either scan hit its cap there is no
+    delta at all, because there is then nothing measured to subtract. Fallback
+    and escalation counts come from the same scan: they are recorded on the
+    run's metadata by the ingest contract.
     """
     # The scope is resolved once, before the concurrency starts: the two scans
     # below share this request's session and it serves one operation at a time.
@@ -1592,20 +1987,32 @@ async def _summarise(
     since, until = window_for(time_range)
     previous_since, previous_until = window_for(time_range, end=since)
 
-    (current, info), (previous, _) = await asyncio.gather(
-        _gather(scope, principal, filters=filters, since=since, until=until),
-        _gather(
-            scope,
-            principal,
-            filters=filters,
-            since=previous_since,
-            until=previous_until,
-            budget=MAX_SCAN_TRACES // 2,
-        ),
+    # Both windows are read under the same cap. Reading the earlier one under
+    # half of it made a steady agent look like it had doubled its traffic: the
+    # same runs, counted to 2,000 on one side and to 1,000 on the other.
+    (current, info), (previous, previous_info) = await _all_or_none(
+        (
+            _gather(scope, principal, filters=filters, since=since, until=until),
+            _gather(
+                scope,
+                principal,
+                filters=filters,
+                since=previous_since,
+                until=previous_until,
+                # Closed a whole window ago: read once, shared for minutes.
+                settled=True,
+            ),
+        )
     )
 
     now_agg = _fold(current)
     was_agg = _fold(previous)
+
+    # A capped window holds "the most recent N runs", not "the runs". Two of
+    # those cannot be subtracted, and neither can one of them and a full count,
+    # so a change is reported only when both windows were read whole. The
+    # figures themselves still travel, each with the scan that produced it.
+    comparable = not (info.truncated or previous_info.truncated)
 
     buckets = _buckets(current, since, until)
     token_series = [
@@ -1638,25 +2045,31 @@ async def _summarise(
         time_range=time_range,
         total_runs=now_agg.runs,
         total_runs_previous=was_agg.runs,
-        total_runs_delta_percent=_percent_delta(now_agg.runs, was_agg.runs),
+        total_runs_delta_percent=(
+            _percent_delta(now_agg.runs, was_agg.runs) if comparable else None
+        ),
         success_rate=now_agg.success_rate,
         success_rate_previous=was_agg.success_rate,
         success_rate_delta_points=(
             round(now_agg.success_rate - was_agg.success_rate, 1)
-            if now_agg.success_rate is not None and was_agg.success_rate is not None
+            if comparable
+            and now_agg.success_rate is not None
+            and was_agg.success_rate is not None
             else None
         ),
         avg_latency_seconds=now_agg.avg_latency,
         avg_latency_previous_seconds=was_agg.avg_latency,
         avg_latency_delta_seconds=(
             round(now_agg.avg_latency - was_agg.avg_latency, 3)
-            if now_agg.avg_latency is not None and was_agg.avg_latency is not None
+            if comparable
+            and now_agg.avg_latency is not None
+            and was_agg.avg_latency is not None
             else None
         ),
         policy_violations=now_agg.violations,
         policy_violations_previous=was_agg.violations,
-        policy_violations_delta_percent=_percent_delta(
-            now_agg.violations, was_agg.violations
+        policy_violations_delta_percent=(
+            _percent_delta(now_agg.violations, was_agg.violations) if comparable else None
         ),
         tokens_used=SparkKpi(
             label="Tokens Used",
@@ -1686,6 +2099,8 @@ async def _summarise(
         ),
         tenants=tenants,
         scan=info,
+        previous_scan=previous_info,
+        comparable=comparable,
     )
 
 
@@ -1850,7 +2265,7 @@ async def stream_runs(
                 continue
 
             until = _now()
-            batches, _ = await _scan(
+            batches, _, _ = await _scan(
                 _client(),
                 agents,
                 since=since - dt.timedelta(seconds=STREAM_OVERLAP_SECONDS),

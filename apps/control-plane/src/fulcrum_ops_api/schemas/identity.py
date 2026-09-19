@@ -353,6 +353,14 @@ class MemberRead(BaseModel):
     joined_at: dt.datetime
     password_set: bool = Field(description="False until the account has a usable password")
     is_current_user: bool = False
+    shared_account: bool = Field(
+        False,
+        description=(
+            "True when the account also belongs to another workspace. Its password, "
+            "profile and active flag are then the person's own: an admin here can change "
+            "the role or remove the membership, and a PATCH of anything else answers 403"
+        ),
+    )
 
 
 class MemberCreate(BaseModel):
@@ -395,7 +403,12 @@ class MemberCreate(BaseModel):
 
 
 class MemberUpdate(BaseModel):
-    """Partial update of someone else's record. Every field is optional."""
+    """Partial update of someone else's record. Every field is optional.
+
+    ``role`` belongs to the membership. Everything else belongs to the account,
+    which is platform-wide, and is refused with 403 when the account also
+    belongs to another workspace (``MemberRead.shared_account``).
+    """
 
     full_name: str | None = Field(None, min_length=1, max_length=160)
     job_title: str | None = Field(None, max_length=120)
@@ -403,12 +416,19 @@ class MemberUpdate(BaseModel):
     avatar_initials: str | None = Field(None, max_length=4)
     role: str | None = None
     is_active: bool | None = Field(
-        None, description="Deactivating blocks sign-in everywhere, not just here"
+        None,
+        description=(
+            "Deactivating blocks sign-in everywhere, so it is allowed only for an account "
+            "that belongs to this workspace alone; otherwise remove the membership"
+        ),
     )
     password: str | None = Field(
         None,
         max_length=MAX_PASSWORD_LENGTH,
-        description="Set a sign-in password for a member who has none, or reset one",
+        description=(
+            "Set a sign-in password for a member who has none, or reset one. Refused for "
+            "an account shared with another workspace, and for your own"
+        ),
     )
 
     @field_validator("password")

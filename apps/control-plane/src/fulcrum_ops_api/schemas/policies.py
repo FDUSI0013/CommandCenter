@@ -64,14 +64,83 @@ VERSION_PATTERN: Final[str] = r"^v\d+\.\d+\.\d+$"
 
 MAX_IMPORT_ITEMS: Final[int] = 200
 
+#: Every signal the enforcement path resolves for a trace or span. This is the
+#: key set of ``services.ingest._signals`` — the suite pins the two together —
+#: and it lives here so a rule body can be checked at write time without the
+#: wire layer importing the ingest pipeline. A name outside it never resolves,
+#: and a clause that never resolves either blocks everything (fail-closed) or
+#: silently enforces nothing (fail-open); neither is what its author meant.
+KNOWN_SIGNALS: Final[frozenset[str]] = frozenset(
+    {
+        "agent_id",
+        "agent_name",
+        "agent_slug",
+        "agent_risk",
+        "action_risk",
+        "agent_status",
+        "agent_tags",
+        "team",
+        "environment",
+        "platform",
+        "entity",
+        "name",
+        "span_type",
+        "tool_name",
+        "model",
+        "provider",
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "cost_usd",
+        "duration_ms",
+        "tags",
+        "has_error",
+        "thread_id",
+        "content",
+        "content_length",
+    }
+)
+
+#: A feedback score is not in the closed vocabulary — judges are named by the
+#: workspace — so it is addressed explicitly, as ``score:<name>``. The prefix is
+#: what tells a deliberate score reference apart from a mistyped signal.
+SCORE_SIGNAL_PREFIX: Final[str] = "score:"
+
+
+def is_resolvable_signal(signal: str) -> bool:
+    """Whether the enforcement path can ever resolve ``signal``.
+
+    Compared the way ingest compiles a rule: trimmed and case-folded.
+    """
+    name = signal.strip().lower()
+    if name.startswith(SCORE_SIGNAL_PREFIX):
+        return len(name) > len(SCORE_SIGNAL_PREFIX)
+    return name in KNOWN_SIGNALS
+
+
+def enforced_mode(rules: Any, fallback: str) -> str:
+    """The enforcement a stored policy really applies.
+
+    The enforcement path reads ``rules.action.mode`` and falls back to the
+    ``enforcement`` column only when the body carries none. Every write keeps
+    the two equal; this exists for rows written before that was true, so what a
+    reviewer is shown is what is being enforced rather than a label beside it.
+    """
+    action = rules.get("action") if isinstance(rules, dict) else None
+    mode = action.get("mode") if isinstance(action, dict) else None
+    return mode if isinstance(mode, str) and mode else fallback
+
 
 class PolicyCondition(BaseModel):
-    """One clause evaluated against the request an agent is about to make.
+    """One clause evaluated against the trace or span an agent reports.
 
-    ``signal`` names a value the enforcement path resolves at decision time
-    (``action_risk``, ``safety_score``, ``data_classification``, ``tokens_used``).
-    The control plane does not interpret signals itself; it guarantees only that
-    the clause is well formed and that a reviewer can read it.
+    ``signal`` names a value the enforcement path resolves at decision time:
+    one of :data:`KNOWN_SIGNALS` (``action_risk``, ``total_tokens``,
+    ``tool_name``, ``content`` ...) or a feedback score written as
+    ``score:<name>``. The schema guarantees the clause is well formed; the
+    service checks the signal against the vocabulary whenever a rule body is
+    written or a policy is activated, so a stored body from before the
+    vocabulary was enforced stays readable.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -175,8 +244,12 @@ class PolicyRules(BaseModel):
         max_length=25,
         description="Agent ids, principals or tags exempt from this rule.",
     )
+    # Open unless the author says otherwise. A signal that is absent is the
+    # normal case, not an attack — ``tool_name`` is empty on every trace and on
+    # every span that is not a tool call — so a body that merely omits this
+    # field must not opt in to treating absence as a match.
     fail_mode: RuleFailMode = Field(
-        "closed", description="Behaviour when a signal cannot be resolved."
+        "open", description="Behaviour when a signal cannot be resolved."
     )
 
 
@@ -191,7 +264,9 @@ class PolicyCreate(BaseModel):
     ``rules`` may be omitted. The create form collects category, risk and
     enforcement before the rule editor is opened, so the service derives one
     starter condition from those answers rather than storing an empty body that
-    would silently match nothing.
+    would silently match nothing. A policy created that way is saved
+    ``Inactive`` whatever ``status`` asked for: nobody has read the derived
+    rule yet, and a rule nobody has read must not start refusing telemetry.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -304,9 +379,12 @@ class PolicyRead(BaseModel):
     last_evaluated_at: dt.datetime | None = None
     last_triggered_at: dt.datetime | None = None
 
-    # Rollups owned by the governance aggregation job. They are shown as stored
-    # and never recomputed per request, which is why the KPI endpoint queries
-    # the violation table directly instead of summing these columns.
+    # Rollups recomputed in bulk by ``services.policies.refresh_rollups`` on the
+    # scheduler's clock. They are shown as stored and never recomputed per
+    # request, which is why the KPI endpoint queries the violation table
+    # directly instead of summing these columns. ``last_evaluated_at`` and
+    # ``applies_tools`` have no producer: render the first as "—" when null and
+    # do not present the second as a measured count.
     violations_30d: int = 0
     blocked_30d: int = 0
     requests_30d: int = 0
@@ -320,6 +398,15 @@ class PolicyRead(BaseModel):
     updated_at: dt.datetime
     created_by: str | None = None
     updated_by: str | None = None
+
+    @model_validator(mode="after")
+    def _show_what_is_enforced(self) -> PolicyRead:
+        # Writes keep the column and ``rules.action.mode`` equal. A row saved
+        # before they did can still disagree, and then the badge has to show the
+        # mode ingest applies — a "Log Only" chip on a policy that is blocking
+        # is the one thing this table must never say.
+        self.enforcement = enforced_mode(self.rules, self.enforcement)
+        return self
 
 
 class PolicyViolationRead(BaseModel):
@@ -419,6 +506,21 @@ class PolicyActionResponse(BaseModel):
     )
 
 
+class PolicyBindingRead(BaseModel):
+    """One explicit policy-to-agent attachment, as the inspector's Scope tab lists it."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    policy_id: str
+    agent_id: str
+    agent_name: str | None = Field(
+        None, description="Null when the agent has since been deleted."
+    )
+    bound_at: dt.datetime
+    bound_by: str | None = None
+
+
 #: What to do when an imported definition collides with an existing name.
 ImportConflictMode = Literal["skip", "replace", "fail"]
 
@@ -441,7 +543,12 @@ class PolicyImportRequest(BaseModel):
 
 
 class PolicyImportIssue(BaseModel):
-    """One definition that could not be imported, reported without failing the batch."""
+    """One definition the import could not apply as written.
+
+    Usually it was skipped. It is also how the batch reports a definition that
+    was imported but not activated, because its rule body had to be derived.
+    Neither fails the batch.
+    """
 
     index: int = Field(description="Zero-based position in the submitted list.")
     name: str

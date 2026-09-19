@@ -230,14 +230,34 @@ async def create_agent(
 
 
 @router.get("/{agent_id}", response_model=AgentDetail, summary="Get an agent")
-async def get_agent(principal: CurrentPrincipal, session: Db, agent_id: str) -> AgentDetail:
+async def get_agent(
+    principal: CurrentPrincipal,
+    session: Db,
+    agent_id: str,
+    include_versions: Annotated[
+        bool,
+        Query(
+            description=(
+                "Send false to skip the prompt version history, as the registry's "
+                "side inspector does: it shows none, and it is a telemetry read"
+            )
+        ),
+    ] = True,
+) -> AgentDetail:
     """Everything the nine detail tabs need in one round trip: identity and
-    configuration, linked connectors, bound policies, run counters and the
-    latency series from the telemetry engine, and the prompt version history.
+    configuration, linked connectors, bound policies, run counters from the
+    telemetry engine, and the prompt version history.
+
+    The page is mostly our own data, so it does not fail with the telemetry
+    store. When the store is down or slow the response is still 200: `stats` is
+    null (never zeros), `versions` is empty, `telemetry_error` says why, and
+    `agent.metrics` carries the last measured figures with their `computed_at`.
 
     An agent in another workspace answers 404, not 403.
     """
-    return await service.get_detail(session, principal, agent_id)
+    return await service.get_detail(
+        session, principal, agent_id, include_versions=include_versions
+    )
 
 
 @router.patch("/{agent_id}", response_model=AgentRead, summary="Update an agent")

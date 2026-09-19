@@ -130,6 +130,14 @@ export class StubServer {
   /** Require an `Authorization` header. */
   requireAuth = true;
 
+  /**
+   * The two whole-request ceilings the real ingest path enforces, with its
+   * defaults. Spans are summed across every trace in the body; past either
+   * limit the request is answered 413 and nothing in it is stored.
+   */
+  maxBatchSpans = 1_000;
+  maxBodyBytes = 8 * 1024 * 1024;
+
   async start(): Promise<string> {
     this.server = createServer((request, response) => {
       void this.handle(request, response);
@@ -176,6 +184,8 @@ export class StubServer {
     this.requests.length = 0;
     this.injected.clear();
     this.config = { ...DEFAULT_CONFIG };
+    this.maxBatchSpans = 1_000;
+    this.maxBodyBytes = 8 * 1024 * 1024;
   }
 
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -228,6 +238,64 @@ export class StubServer {
     if (ingestMatch && request.method === 'POST') {
       const kind = ingestMatch[1]!;
       const items = Array.isArray(parsed?.[kind]) ? (parsed[kind] as unknown[]) : [];
+
+      const bodyBytes = Buffer.byteLength(raw, 'utf8');
+      if (bodyBytes > this.maxBodyBytes) {
+        send(response, 413, {
+          error: {
+            code: 'payload_too_large',
+            message: `The body is ${bodyBytes} bytes; this endpoint accepts ${this.maxBodyBytes}.`,
+            details: { max_bytes: this.maxBodyBytes, received_bytes: bodyBytes },
+          },
+        });
+        return;
+      }
+      const spanTotal =
+        kind === 'spans'
+          ? items.length
+          : kind === 'traces'
+            ? items.reduce<number>((total, item) => {
+                const nested = (item as { spans?: unknown } | null)?.spans;
+                return total + (Array.isArray(nested) ? nested.length : 0);
+              }, 0)
+            : 0;
+      if (spanTotal > this.maxBatchSpans) {
+        send(response, 413, {
+          error: {
+            code: 'payload_too_large',
+            message: `This batch carries ${spanTotal} spans; the limit is ${this.maxBatchSpans}. Split it and retry.`,
+            details: { spans: spanTotal, max_spans: this.maxBatchSpans },
+          },
+        });
+        return;
+      }
+
+      // The telemetry store behind the real ingest path takes a request whole
+      // or not at all. When it refuses one, every item in it comes back
+      // rejected — the offending one and its neighbours alike.
+      const refusal = kind === 'traces' || kind === 'spans' ? storeRefusal(items) : undefined;
+      if (refusal) {
+        send(response, 200, {
+          received: items.length,
+          accepted: 0,
+          rejected: items.length,
+          blocked: 0,
+          spans_accepted: 0,
+          scores_accepted: 0,
+          events_recorded: 0,
+          guardrails_evaluated: true,
+          agents: ['agent-1'],
+          results: items.map((_item, index) => ({
+            index,
+            outcome: 'rejected',
+            code: 'telemetry_rejected',
+            reason: `The telemetry store refused this batch: ${refusal}`,
+          })),
+          duration_ms: 1,
+        });
+        return;
+      }
+
       send(response, 200, {
         received: items.length,
         accepted: items.length,
@@ -277,6 +345,39 @@ export class StubServer {
 
     send(response, 404, { error: { code: 'not_found', message: `No route for ${path}.` } });
   }
+}
+
+const UUID_V7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+/**
+ * Why the telemetry store would refuse a traces or spans request, if it would.
+ *
+ * Two of its rules are ones the control plane's own validation lets through:
+ * every trace and span id must be a *version 7* UUID, and an `error_info` must
+ * carry a traceback. A stand-in that took any UUID and any error is how the
+ * SDK came to send both.
+ */
+function storeRefusal(items: unknown[]): string | undefined {
+  const units: Array<Record<string, unknown>> = [];
+  for (const item of items) {
+    if (!item || typeof item !== 'object') continue;
+    const unit = item as Record<string, unknown>;
+    units.push(unit);
+    if (Array.isArray(unit.spans)) units.push(...(unit.spans as Array<Record<string, unknown>>));
+  }
+  for (const unit of units) {
+    for (const field of ['id', 'trace_id']) {
+      const value = unit[field];
+      if (value !== undefined && value !== null && !UUID_V7.test(String(value))) {
+        return `${field} must be a version 7 UUID; received ${String(value)}.`;
+      }
+    }
+    const error = unit.error_info as { traceback?: unknown } | null | undefined;
+    if (error && (typeof error.traceback !== 'string' || error.traceback.trim().length === 0)) {
+      return 'error_info.traceback must not be blank.';
+    }
+  }
+  return undefined;
 }
 
 function send(response: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {

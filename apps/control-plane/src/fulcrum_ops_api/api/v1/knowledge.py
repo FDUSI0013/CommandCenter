@@ -208,6 +208,12 @@ async def create_source(
     response, job_id = await service.start_sync(
         session, principal, source.id, request=request
     )
+    # Commit BEFORE the job is scheduled. The session dependency commits after
+    # the response has gone out, which is after BackgroundTasks have run, so
+    # the job's own session would otherwise look for a row no other connection
+    # can see yet, find nothing and give up -- leaving the new source Syncing
+    # at 0% with nothing working on it.
+    await session.commit()
     background.add_task(service.run_sync, source.id, principal.workspace_id, job_id)
     return KnowledgeActionResponse(
         source=response.source,
@@ -299,6 +305,10 @@ async def sync_source(
     response, job_id = await service.start_sync(
         session, principal, source_id, request=request
     )
+    # Commit first, for the reason given in create_source above: a job that
+    # starts ahead of this commit rewrites the sync block from the snapshot
+    # before it, dropping who started the sync and when.
+    await session.commit()
     background.add_task(service.run_sync, source_id, principal.workspace_id, job_id)
     return response
 

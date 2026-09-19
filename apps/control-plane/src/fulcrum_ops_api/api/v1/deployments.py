@@ -124,6 +124,28 @@ async def _read_one(
     return (await _read_deployments(session, principal, [deployment]))[0]
 
 
+async def _start_pipeline(
+    session: Db, background: BackgroundTasks, principal: Principal, deployment_id: str
+) -> None:
+    """Make the request's writes durable, THEN hand the deployment to the runner.
+
+    The request-scoped session commits when its dependency exits, and under the
+    FastAPI this service runs on that is after the response has been sent --
+    which is after ``BackgroundTasks`` have run. The runner works on its own
+    connection, so a runner scheduled first looks for a row (or an ``Approved``
+    gate) nobody else can see yet, finds nothing to do and exits for good: the
+    release sits Queued, or parked behind a gate that reads Approved, with its
+    environment locked. SQLite happens to lose that race every time; Postgres
+    with a warm pool does not.
+
+    Call it last, after everything else in the route that can still fail: what
+    is committed here stays committed. The dependency's own commit afterwards
+    is a no-op, and the rows stay readable (``expire_on_commit`` is off).
+    """
+    await session.commit()
+    background.add_task(deployments_service.run_pipeline, deployment_id, principal.workspace_id)
+
+
 # --------------------------------------------------------------------------- #
 # Environments
 # --------------------------------------------------------------------------- #
@@ -369,10 +391,9 @@ async def create_deployment(
     deployment = await deployments_service.create_deployment(
         session, principal, payload, request=request
     )
-    background.add_task(
-        deployments_service.run_pipeline, deployment.id, principal.workspace_id
-    )
-    return await _read_one(session, principal, deployment)
+    read = await _read_one(session, principal, deployment)
+    await _start_pipeline(session, background, principal, deployment.id)
+    return read
 
 
 @deployments_router.get(
@@ -477,9 +498,7 @@ async def promote_deployment(
     promoted = await deployments_service.promote_deployment(
         session, principal, deployment_id, payload, request=request
     )
-    background.add_task(
-        deployments_service.run_pipeline, promoted.id, principal.workspace_id
-    )
+    await _start_pipeline(session, background, principal, promoted.id)
     return ActionResult(
         message=f"{promoted.version} queued as {promoted.deployment_ref}.",
         entity_id=promoted.id,
@@ -540,9 +559,10 @@ async def approve_deployment(
         session, principal, deployment_id, decision, request=request
     )
     if resumed:
-        background.add_task(
-            deployments_service.run_pipeline, deployment.id, principal.workspace_id
-        )
+        # The runner must be able to see the Approved gate: until it is
+        # committed the stage still reads Running to every other connection,
+        # and a runner that finds the gate shut exits without a second look.
+        await _start_pipeline(session, background, principal, deployment.id)
         message = f"{deployment.deployment_ref} approved; the pipeline is resuming."
     else:
         message = f"{deployment.deployment_ref} rejected and halted."
@@ -580,9 +600,7 @@ async def rollback_deployment(
         payload or DeploymentRollbackRequest(),
         request=request,
     )
-    background.add_task(
-        deployments_service.run_pipeline, rollback.id, principal.workspace_id
-    )
+    await _start_pipeline(session, background, principal, rollback.id)
     return ActionResult(
         message=f"Rolling back to {rollback.version} as {rollback.deployment_ref}.",
         entity_id=rollback.id,

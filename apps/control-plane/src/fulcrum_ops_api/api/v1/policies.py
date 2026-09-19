@@ -26,6 +26,7 @@ from ...models.governance import (
 )
 from ...schemas.policies import (
     PolicyActionResponse,
+    PolicyBindingRead,
     PolicyCloneRequest,
     PolicyCreate,
     PolicyDeactivateRequest,
@@ -35,6 +36,7 @@ from ...schemas.policies import (
     PolicySummary,
     PolicyUpdate,
     PolicyViolationRead,
+    enforced_mode,
 )
 from ...services import policies as service
 from ..common import ListParams, Page, list_params, to_csv
@@ -114,6 +116,8 @@ Params = Annotated[ListParams, Depends(list_params)]
 
 def _csv_row(policy: Policy) -> dict[str, Any]:
     row: dict[str, Any] = {key: getattr(policy, key, None) for key, _ in EXPORT_COLUMNS}
+    # The file says what the table says: the mode the rule body enforces.
+    row["enforcement"] = enforced_mode(policy.rules, policy.enforcement)
     for key in ("last_triggered_at", "updated_at"):
         value = row.get(key)
         if isinstance(value, dt.datetime):
@@ -268,9 +272,12 @@ async def create_policy(
 ) -> PolicyRead:
     """Create a policy and, unless told otherwise, start enforcing it.
 
-    The rule body is validated against the condition/action/severity schema. If
-    it is omitted, an opening condition is derived from the category, risk level
-    and enforcement mode supplied here.
+    The rule body is validated against the condition/action/severity schema and
+    its signals against the vocabulary the enforcement path resolves. If it is
+    omitted, an opening condition is derived from the category, risk level and
+    enforcement mode supplied here, and the policy is saved ``Inactive`` whatever
+    ``status`` asked for — read ``status`` from the response. A derived rule is a
+    draft; it enforces nothing until somebody has reviewed and activated it.
     """
     policy = await service.create_policy(session, principal, body, request=request)
     return PolicyRead.model_validate(policy)
@@ -323,6 +330,10 @@ async def update_policy(
     Send ``expected_updated_at`` to make the write conditional: if another
     editor saved in the meantime the request is rejected with 409 rather than
     overwriting their change. A new rule body bumps the policy version.
+
+    ``enforcement`` and ``rules.action.mode`` are one setting. Change either and
+    the other follows, so the badge and the enforcement path cannot disagree;
+    change both to different values and the request is refused with 422.
     """
     policy = await service.update_policy(session, principal, policy_id, body, request=request)
     return PolicyRead.model_validate(policy)
@@ -429,3 +440,86 @@ async def clone_policy(
         request=request,
     )
     return _action_response(policy, f"{policy.name} created as an inactive draft.")
+
+
+# ---------------------------------------------------------------------------
+# Bindings
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/{policy_id}/bindings",
+    response_model=list[PolicyBindingRead],
+    summary="List a policy's agent bindings",
+)
+async def list_bindings(
+    principal: CurrentPrincipal,
+    session: Db,
+    policy_id: str,
+) -> list[PolicyBindingRead]:
+    """The agents explicitly bound to a policy, as opposed to matched by its scope."""
+    rows = await service.list_bindings(session, principal, policy_id)
+    return [
+        PolicyBindingRead.model_validate(binding).model_copy(update={"agent_name": name})
+        for binding, name in rows
+    ]
+
+
+@router.post(
+    "/{policy_id}/bindings/{agent_id}",
+    response_model=PolicyActionResponse,
+    summary="Bind a policy to an agent",
+)
+async def bind_agent(
+    principal: CurrentPrincipal,
+    session: Db,
+    policy_id: str,
+    agent_id: str,
+    request: Request,
+) -> PolicyActionResponse:
+    """Attach a policy to one agent regardless of the policy's scope.
+
+    Idempotent: binding an agent that is already bound answers 200 with the same
+    shape and changes nothing. An Active policy governs the agent from its next
+    trace.
+    """
+    policy, affected, bound, created = await service.bind_agent(
+        session, principal, policy_id, agent_id, request=request
+    )
+    return _action_response(
+        policy,
+        f"{policy.name} is now bound to this agent."
+        if created
+        else f"{policy.name} was already bound to this agent.",
+        agents_affected=affected,
+        bound_agents=bound,
+    )
+
+
+@router.delete(
+    "/{policy_id}/bindings/{agent_id}",
+    response_model=PolicyActionResponse,
+    summary="Unbind a policy from an agent",
+)
+async def unbind_agent(
+    principal: CurrentPrincipal,
+    session: Db,
+    policy_id: str,
+    agent_id: str,
+    request: Request,
+) -> PolicyActionResponse:
+    """Remove an explicit binding; idempotent like its counterpart.
+
+    The policy keeps applying to the agent if its scope matches on its own.
+    """
+    policy, affected, bound, removed = await service.unbind_agent(
+        session, principal, policy_id, agent_id, request=request
+    )
+    return _action_response(
+        policy,
+        f"{policy.name} is no longer bound to this agent."
+        if removed
+        else f"{policy.name} was not bound to this agent.",
+        agents_affected=affected,
+        bound_agents=bound,
+    )

@@ -10,6 +10,7 @@
 #   - every XML file under deploy/ is well-formed (XML comments may not contain
 #     "--", which is easy to write in a decorative rule and invalid);
 #   - the compose file parses and names no image without a tag;
+#   - the edge proxy's Caddyfile adapts cleanly (when caddy is installed here);
 #   - every shell script under deploy/ and engine/ parses.
 
 set -uo pipefail
@@ -40,6 +41,23 @@ if untagged:
     print('images without an explicit tag:'); [print('  ', u) for u in untagged]; sys.exit(1)
 print('  ok   every image is tagged')
 " "$ROOT/deploy/docker-compose.yml"; then :; else fail=1; fi
+
+echo
+echo "== edge =="
+# `adapt` parses the Caddyfile and resolves every directive without opening a
+# port or a log file, so it runs anywhere. A typo in a proxy block is otherwise
+# found by `systemctl reload caddy` failing on the production host.
+if command -v caddy >/dev/null 2>&1; then
+  if FULCRUM_SITE_ADDRESSES=localhost caddy adapt --config "$ROOT/deploy/Caddyfile" --adapter caddyfile >/dev/null 2>&1; then
+    echo "  ok   deploy/Caddyfile"
+  else
+    echo "  FAIL deploy/Caddyfile"
+    FULCRUM_SITE_ADDRESSES=localhost caddy adapt --config "$ROOT/deploy/Caddyfile" --adapter caddyfile 2>&1 >/dev/null | tail -3 | sed 's/^/       /'
+    fail=1
+  fi
+else
+  echo "  skip deploy/Caddyfile (caddy is not installed here; run this check on a machine that has it before deploying an edited Caddyfile)"
+fi
 
 echo
 echo "== shell =="

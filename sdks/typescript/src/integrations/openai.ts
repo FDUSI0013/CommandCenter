@@ -10,12 +10,26 @@
  *
  * Streaming is handled properly rather than skipped: a streamed call resolves
  * before the first token, so closing the span there would report a 40ms
- * duration for a 12-second generation. The returned async iterable is wrapped
- * instead, and the span closes when the stream is exhausted, with the usage
- * chunk OpenAI sends at the end.
+ * duration for a 12-second generation. The returned stream is watched instead,
+ * and the span closes when it is exhausted, with the usage chunk OpenAI sends
+ * at the end.
+ *
+ * "Untouched" is meant literally. The promise that comes back is OpenAI's own
+ * `APIPromise` and the stream is OpenAI's own `Stream`, not stand-ins, so
+ * `.withResponse()`, `.asResponse()`, `.tee()` and `.toReadableStream()` keep
+ * working exactly as they do on an uninstrumented client.
  */
 
-import { isAsyncIterable, loadOptionalPackage, pick, proxyMethod } from './shared.js';
+import {
+  canonicalUsage,
+  isAsyncIterable,
+  isThenable,
+  loadOptionalPackage,
+  observeIteration,
+  observePromise,
+  pick,
+  proxyMethod,
+} from './shared.js';
 import type { FulcrumOps } from '../client.js';
 import type { Span } from '../trace.js';
 
@@ -35,6 +49,19 @@ export interface WrapOpenAIOptions {
   captureInput?: boolean;
   /** Record the response as span output. Defaults to the client's setting. */
   captureOutput?: boolean;
+  /**
+   * Ask for token usage on streamed Chat Completions, by adding
+   * `stream_options: { include_usage: true }` to calls that did not set it.
+   *
+   * OpenAI reports no usage on a streamed completion unless asked, so without
+   * this a streamed call's tokens and cost are blank. It is off by default
+   * because it is not free of side effects: the stream gains one final chunk
+   * whose `choices` is empty (code indexing `chunk.choices[0].delta` unguarded
+   * will trip on it), and an OpenAI-compatible endpoint that predates the
+   * option may refuse the request. Turn it on where neither applies. The
+   * Responses API always reports usage and needs nothing.
+   */
+  streamUsage?: boolean;
 }
 
 interface CallShape {
@@ -42,93 +69,73 @@ interface CallShape {
   messages?: unknown;
   input?: unknown;
   stream?: boolean;
+  stream_options?: Record<string, unknown> | null;
 }
 
 function usageOf(response: unknown): Record<string, number> | undefined {
-  const usage = pick<Record<string, unknown>>(response, 'usage');
-  if (!usage) return undefined;
-  const out: Record<string, number> = {};
-  for (const [key, value] of Object.entries(usage)) {
-    if (typeof value === 'number') out[key] = value;
-  }
-  return Object.keys(out).length > 0 ? out : undefined;
+  return canonicalUsage(pick(response, 'usage'));
 }
 
 /**
- * Wrap the returned stream so the span closes when the caller finishes reading.
+ * Watch the returned stream so the span closes when the caller finishes reading.
  *
- * Delegation is total: `tee`, `controller` and everything else OpenAI hangs off
- * its stream object stay reachable, because the wrapper is a proxy over the
- * original with only `Symbol.asyncIterator` replaced.
+ * The caller gets OpenAI's own `Stream` back — `tee`, `controller`,
+ * `toReadableStream` and its private state all intact — with the reads observed
+ * from the side. See `observeIteration` for why it is not a proxy.
+ *
+ * The span is deferred first: the usual caller returns the stream from the
+ * function that asked for it, so the trace around the call closes before the
+ * first token is read, and would otherwise take this span down with it.
  */
-function wrapStream(stream: AsyncIterable<unknown>, span: Span, captureOutput: boolean): AsyncIterable<unknown> {
-  return new Proxy(stream as object, {
-    get(target, property, receiver) {
-      if (property !== Symbol.asyncIterator) return Reflect.get(target, property, receiver);
-      return function iterate(): AsyncIterator<unknown> {
-        const inner = (target as AsyncIterable<unknown>)[Symbol.asyncIterator]();
-        const chunks: unknown[] = [];
-        let closed = false;
+function watchStream<T extends AsyncIterable<unknown>>(stream: T, span: Span, captureOutput: boolean): T {
+  span.defer();
+  let chunks = 0;
+  let text = '';
+  let usage: Record<string, number> | undefined;
+  let model: string | undefined;
+  let closed = false;
 
-        const finish = (error?: unknown) => {
-          if (closed) return;
-          closed = true;
-          const usage = chunks.map((chunk) => usageOf(chunk)).filter(Boolean).pop();
-          if (usage) span.setUsage(usage);
-          span.end({
-            output: captureOutput ? { chunks: chunks.length, text: collectText(chunks) } : undefined,
-            error,
-          });
-        };
-
-        return {
-          async next(...args: [] | [undefined]) {
-            try {
-              const result = await inner.next(...args);
-              if (result.done) finish();
-              else chunks.push(result.value);
-              return result;
-            } catch (error) {
-              finish(error);
-              throw error;
-            }
-          },
-          async return(value?: unknown) {
-            finish();
-            return inner.return ? inner.return(value) : { done: true, value };
-          },
-          async throw(error?: unknown) {
-            finish(error);
-            if (inner.throw) return inner.throw(error);
-            throw error;
-          },
-          [Symbol.asyncIterator]() {
-            return this;
-          },
-        } as AsyncIterator<unknown>;
-      };
+  return observeIteration(stream, {
+    onItem(chunk) {
+      if (closed) return;
+      chunks += 1;
+      if (captureOutput) text += textOf(chunk);
+      // Chat Completions puts usage on its last chunk and the model on every
+      // one. The Responses API puts both on the `response` its terminal event
+      // (`response.completed`) carries, and nowhere on the event itself.
+      const response = pick<unknown>(chunk, 'response');
+      usage = usageOf(chunk) ?? usageOf(response) ?? usage;
+      model = pick<string>(chunk, 'model') ?? pick<string>(response, 'model') ?? model;
     },
-  }) as AsyncIterable<unknown>;
+    onEnd(error) {
+      if (closed) return;
+      closed = true;
+      if (usage) span.setUsage(usage);
+      if (typeof model === 'string' && model) span.setModel(model);
+      span.end({ output: captureOutput ? { chunks, text } : undefined, error });
+    },
+  });
 }
 
-/** Reassemble the text of a streamed completion, for the span's output. */
-function collectText(chunks: readonly unknown[]): string {
-  let text = '';
-  for (const chunk of chunks) {
-    const choices = pick<Array<Record<string, unknown>>>(chunk, 'choices');
-    if (Array.isArray(choices)) {
-      for (const choice of choices) {
-        const delta = pick<Record<string, unknown>>(choice, 'delta', 'message');
-        const content = delta && typeof delta.content === 'string' ? delta.content : undefined;
-        if (content) text += content;
-      }
-      continue;
+/** The text one streamed chunk adds to the completion, for the span's output. */
+function textOf(chunk: unknown): string {
+  const choices = pick<Array<Record<string, unknown>>>(chunk, 'choices');
+  if (Array.isArray(choices)) {
+    let text = '';
+    for (const choice of choices) {
+      const delta = pick<Record<string, unknown>>(choice, 'delta', 'message');
+      const content = delta && typeof delta.content === 'string' ? delta.content : undefined;
+      if (content) text += content;
     }
-    // The Responses API streams `response.output_text.delta` events.
-    const delta = pick<string>(chunk, 'delta');
-    if (typeof delta === 'string') text += delta;
+    return text;
   }
-  return text;
+  // The Responses API streams typed events. Only `response.output_text.delta`
+  // is the answer; tool-call arguments and reasoning summaries arrive as
+  // string deltas too and are not.
+  const type = pick<string>(chunk, 'type');
+  const delta = pick<string>(chunk, 'delta');
+  if (typeof delta !== 'string') return '';
+  return type === undefined || type === 'response.output_text.delta' ? delta : '';
 }
 
 /**
@@ -158,24 +165,45 @@ export function wrapOpenAI<T extends OpenAILike>(
           ...(options.captureInput === false ? {} : { input: body }),
         });
 
+        // Opt-in only, and never over the caller's own choice: see `streamUsage`.
+        let callArgs = args;
+        if (
+          options.streamUsage === true &&
+          methodName === 'chat.completions.create' &&
+          body.stream === true &&
+          body.stream_options?.include_usage === undefined
+        ) {
+          const withUsage = { ...body, stream_options: { ...(body.stream_options ?? {}), include_usage: true } };
+          callArgs = [withUsage, ...args.slice(1)] as never[];
+        }
+
         let result: unknown;
         try {
-          result = original(...args);
+          result = original(...callArgs);
         } catch (error) {
           // A synchronous throw is argument validation, not a model failure.
           span.end({ error });
           throw error;
         }
 
-        if (!(result instanceof Promise)) {
+        if (!isThenable(result)) {
           span.end({ output: options.captureOutput === false ? undefined : result });
           return result;
         }
 
-        return result.then(
-          (value) => {
+        // What goes back is OpenAI's own `APIPromise`, so `.withResponse()` and
+        // `.asResponse()` are still there. The caller may read it more than
+        // once (`await` it, then `.finally()` it), so the first look decides.
+        let seen = false;
+        let handedBack: unknown;
+        return observePromise(result, {
+          onValue(value) {
+            if (seen) return handedBack;
+            seen = true;
+            handedBack = value;
             if (body.stream === true && isAsyncIterable(value)) {
-              return wrapStream(value, span, options.captureOutput !== false);
+              handedBack = watchStream(value, span, options.captureOutput !== false);
+              return handedBack;
             }
             const usage = usageOf(value);
             if (usage) span.setUsage(usage);
@@ -184,11 +212,15 @@ export function wrapOpenAI<T extends OpenAILike>(
             span.end({ output: options.captureOutput === false ? undefined : value });
             return value;
           },
-          (error: unknown) => {
+          onError(error) {
             span.end({ error });
-            throw error;
           },
-        );
+          onRawResponse() {
+            // The body is the caller's to read, so there is no output or usage
+            // to record — only that the call came back, and when.
+            span.end({});
+          },
+        });
       };
 
   let wrapped = openai as OpenAILike;

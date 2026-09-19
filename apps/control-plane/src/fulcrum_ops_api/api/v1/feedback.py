@@ -176,6 +176,12 @@ async def analyze_feedback(
     the same clusters. Each cluster comes back with its size, keywords,
     representative examples, a suggested issue title and a suggested severity,
     which is exactly what `POST /feedback/issues` takes next.
+
+    Themes earlier passes persisted take new reports too, and a theme with an
+    open issue hands its unlinked reports to that issue (`open_issue_id`,
+    `linked_to_issues`). A theme whose unanswered negative reports reach the SLA
+    rules' `auto_issue_threshold` has its issue opened by the pass itself
+    (`issue_auto_opened`).
     """
     return await service.analyze(session, principal, payload, request=request)
 
@@ -187,7 +193,12 @@ async def analyze_feedback(
 
 @router.get("/sla-rules", response_model=SlaRules, summary="Get the SLA rules")
 async def get_sla_rules(principal: CurrentPrincipal, session: Db) -> SlaRules:
-    """The triage SLA, routing and escalation rules the issue clock runs on."""
+    """The SLA & Routing rules.
+
+    The business-hours clock, the severity windows, routing and the auto-issue
+    threshold are acted on. The triage and escalation hours are the team's
+    stated targets: recorded and audited, not swept for.
+    """
     return await service.get_sla_rules(session, principal)
 
 
@@ -392,7 +403,10 @@ async def create_backlog_item(
     """Record an improvement candidate, with or without an issue behind it.
 
     This is the Add to Backlog action on a feedback row: pass `feedback_id` and
-    the item inherits that feedback's issue when it has one.
+    the item inherits that feedback's issue when it has one. An issue is planned
+    by one item at a time, so when that issue already has an item that has not
+    shipped the answer is 409, with the existing item in `details.backlog_item_id`
+    — the same answer `POST /feedback/issues/{id}/backlog` gives.
     """
     return await service.create_backlog_item(session, principal, payload, request=request)
 
@@ -516,7 +530,12 @@ async def submit_feedback(
     ingest scope may call it. Send `feedback_ref` to make the submission
     idempotent — a repeat answers 409 naming the item that already exists. The
     row is written even if the telemetry mirror fails; `scored_in_telemetry`
-    reports which happened.
+    reports which happened, and is true only when the run belongs to an agent of
+    this workspace and the score was filed under that run's own project.
+
+    While the collection settings have PII scrubbing on, email addresses, phone
+    numbers, SSNs and card numbers in the comment are replaced before it is
+    stored or mirrored; `pii_scrubbed` on the row lists the kinds that were found.
     """
     return await service.submit(session, principal, payload, request=request)
 

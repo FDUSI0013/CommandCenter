@@ -23,26 +23,100 @@
 		Content-Security-Policy "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
 	}
 
-	# API + docs + streaming
+	# Every proxy block below carries the same three settings, for three reasons.
+	#
+	# lb_try_duration / lb_try_interval. The control plane is one container. While
+	# it restarts — every deploy, every out-of-memory kill, every autoheal —
+	# nothing listens on 8080 for 15 to 40 seconds, and with no retry window the
+	# edge answered each request in that gap with an instant 502: the console
+	# said it could not reach the control plane, and an agent's ingest POST was
+	# refused outright. Now a request whose connection is refused is held and
+	# re-dialled for up to 30 s. Only a failed DIAL is retried for a POST, so
+	# nothing can be delivered twice: a refused connection sent nothing.
+	#
+	# keepalive 60s. The edge reuses idle upstream connections, by default for two
+	# minutes. If the server behind it drops an idle connection sooner, the edge
+	# will sooner or later send a request down a socket that has just closed —
+	# and a POST cannot be replayed, so that is a 502. The side that reuses must
+	# let go first: 60 s here, 75 s in the control plane (--timeout-keep-alive in
+	# apps/control-plane/Dockerfile; uvicorn's own default is 5 s).
+	#
+	# response_header_timeout. This was `read_timeout 24h` on every API route, so
+	# a request into a wedged worker was held by the edge for a day: only the
+	# browser ever gave up. 150 s is deliberately longer than the longest wait
+	# any client of ours has (the console allows a Prompt Studio run 135 s), so
+	# the edge is never the first to abandon a request that is still being
+	# worked on — and a caller with no timeout of its own gets a 504 in minutes.
+
 	handle /api/* {
-		reverse_proxy 127.0.0.1:8080 {
-			header_up X-Real-IP {remote_host}
-			# SSE: never buffer, and let a stream stay open.
-			flush_interval -1
-			transport http {
-				read_timeout 24h
+		# The two server-sent-event streams. They answer their headers at once,
+		# so the header timeout above still applies; what they need is to be
+		# flushed frame by frame and allowed to stay open. read_timeout is the
+		# wait for the NEXT read, not for the whole response, and both streams
+		# send a keep-alive comment every 15 s: five silent minutes is a dead
+		# stream, not a quiet one.
+		@stream path /api/v1/runs/stream /api/v1/deployments/*/stream
+		handle @stream {
+			reverse_proxy 127.0.0.1:8080 {
+				header_up X-Real-IP {remote_host}
+				flush_interval -1
+				lb_try_duration 30s
+				lb_try_interval 250ms
+				transport http {
+					keepalive 60s
+					response_header_timeout 150s
+					read_timeout 5m
+				}
+			}
+		}
+
+		# Everything else under /api: the API itself and its docs.
+		handle {
+			# The largest body the API accepts is an ingest batch of 8 MiB, and
+			# it refuses more with its own structured 413. This ceiling sits just
+			# above that, for every OTHER route — none of which has a limit of
+			# its own, so a gigabyte of JSON would otherwise be read into a
+			# worker's memory before anything looked at it.
+			request_body {
+				max_size 10MB
+			}
+			reverse_proxy 127.0.0.1:8080 {
+				header_up X-Real-IP {remote_host}
+				lb_try_duration 30s
+				lb_try_interval 250ms
+				transport http {
+					keepalive 60s
+					response_header_timeout 150s
+				}
 			}
 		}
 	}
 
 	handle /health {
-		reverse_proxy 127.0.0.1:8080
+		reverse_proxy 127.0.0.1:8080 {
+			lb_try_duration 30s
+			lb_try_interval 250ms
+			transport http {
+				keepalive 60s
+				# The endpoint bounds its own checks at 3 s each.
+				response_header_timeout 30s
+			}
+		}
 	}
 
 	# OpenTelemetry ingest for agents that already speak OTLP/HTTP.
 	handle /v1/traces {
+		request_body {
+			max_size 10MB
+		}
 		reverse_proxy 127.0.0.1:8080 {
 			header_up X-Real-IP {remote_host}
+			lb_try_duration 30s
+			lb_try_interval 250ms
+			transport http {
+				keepalive 60s
+				response_header_timeout 150s
+			}
 		}
 	}
 

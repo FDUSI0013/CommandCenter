@@ -50,6 +50,16 @@ if TYPE_CHECKING:  # pragma: no cover - typing only; the wire layer stays ORM-fr
 EXPIRING_WINDOW_DAYS: Final[int] = 30
 PRIVILEGED_ACCESS_WINDOW_DAYS: Final[int] = 30
 
+#: States in which a credential is out of service: it may not be revealed or
+#: rotated. Because it cannot be rotated, no rotation or expiry obligation is
+#: scored against it either — otherwise a disabled key with a past deadline
+#: would sit in "Rotation Overdue" for ever, with no verb able to clear it.
+#: The service's SQL aggregates and the per-row flags below share this tuple.
+INERT_STATUSES: Final[tuple[str, ...]] = (
+    SecretStatus.DISABLED.value,
+    SecretStatus.REVOKED.value,
+)
+
 MAX_SECRET_VALUE_CHARS: Final[int] = 8192
 MAX_JUSTIFICATION_CHARS: Final[int] = 1000
 MAX_REASON_CHARS: Final[int] = 500
@@ -122,15 +132,20 @@ class SecretRead(BaseModel):
     @computed_field  # type: ignore[prop-decorator]
     @property
     def is_expiring_soon(self) -> bool:
-        """Lapses inside the window. An already-expired credential counts too."""
-        if self.expires_at is None:
+        """Lapses inside the window. An already-expired credential counts too.
+
+        Never true for a disabled or revoked credential: it is already out of
+        service, so its expiry is nobody's deadline.
+        """
+        if self.status in INERT_STATUSES or self.expires_at is None:
             return False
         return self.expires_at <= _now() + dt.timedelta(days=EXPIRING_WINDOW_DAYS)
 
     @computed_field  # type: ignore[prop-decorator]
     @property
     def is_rotation_overdue(self) -> bool:
-        if self.next_rotation_at is None:
+        """Past its rotation deadline — and still in service, so it can be rotated."""
+        if self.status in INERT_STATUSES or self.next_rotation_at is None:
             return False
         return self.next_rotation_at < _now()
 
@@ -138,7 +153,7 @@ class SecretRead(BaseModel):
     @property
     def rotation_label(self) -> str:
         """The Rotation column verbatim: "Overdue", "Due in 5d", "60d" or "N/A"."""
-        if self.status in (SecretStatus.DISABLED.value, SecretStatus.REVOKED.value):
+        if self.status in INERT_STATUSES:
             return "N/A"
         if self.next_rotation_at is None:
             return "N/A"
@@ -151,7 +166,13 @@ class SecretRead(BaseModel):
     @computed_field  # type: ignore[prop-decorator]
     @property
     def compliance(self) -> str:
-        """The same test the summary's compliance score applies, per row."""
+        """The same test the summary's compliance score applies, per row.
+
+        "N/A" for a disabled or revoked credential: the score is taken over the
+        credentials in service, and this one is not among them.
+        """
+        if self.status in INERT_STATUSES:
+            return "N/A"
         if self.is_expiring_soon or self.is_rotation_overdue:
             return "Non-Compliant"
         return "Compliant"
@@ -197,15 +218,23 @@ class SecretTypeBreakdown(BaseModel):
     """One arc of the donut, and one bar of "Compliance by Secret Type"."""
 
     secret_type: str
+    #: Every credential of this type, in service or not — the donut's arc.
     count: int
+    #: The ones that are not disabled or revoked: the denominator of the bar.
+    in_service: int = 0
     compliant: int
-    compliance_pct: int
+    #: ``compliant / in_service``. None when nothing of this type is in service,
+    #: because there is then nothing to score; the console renders "—".
+    compliance_pct: int | None = None
 
 
 class SecretsSummary(BaseModel):
     """The KPI cards above the vault table, plus the by-type breakdown."""
 
     total: int
+    #: Credentials that are not disabled or revoked. ``expiring_soon``,
+    #: ``rotation_overdue`` and ``compliance_score`` are all taken over these.
+    in_service: int = 0
     active_vaults: int
     expiring_soon: int
     rotation_overdue: int
@@ -324,6 +353,24 @@ class SecretUpdate(BaseModel):
     def _utc(cls, value: dt.datetime | None) -> dt.datetime | None:
         return _as_utc(value)
 
+    @model_validator(mode="after")
+    def _no_null_for_required(self) -> SecretUpdate:
+        """An explicit null clears a field, and these six cannot be cleared.
+
+        Every field here defaults to None so that a PATCH may omit it, which
+        makes ``{"risk": null}`` pass field validation. The columns are NOT
+        NULL, so without this the null reached the database and came back as a
+        500. Keyed on ``model_fields_set``: an omitted field is still fine.
+        """
+        nulled = [
+            name
+            for name in ("name", "secret_type", "vault", "status", "risk", "privileged")
+            if name in self.model_fields_set and getattr(self, name) is None
+        ]
+        if nulled:
+            raise ValueError(f"{', '.join(nulled)} cannot be null")
+        return self
+
 
 class SecretRevealRequest(BaseModel):
     """A reveal must say why. The reason is stored on the access-log row."""
@@ -356,13 +403,21 @@ class SecretRevealResult(BaseModel):
 
 
 class SecretRotateRequest(BaseModel):
-    """Rotate a credential. Omit ``value`` and the control plane mints one."""
+    """Rotate a credential. Omit ``value`` and the control plane mints one.
+
+    For a credential it only points at there is nothing to mint into: omitting
+    ``value`` there records a rotation performed in the external vault.
+    """
 
     value: str | None = Field(
         default=None,
         min_length=1,
         max_length=MAX_SECRET_VALUE_CHARS,
-        description="New plaintext. Omit to have a fresh value generated for you.",
+        description=(
+            "New plaintext. Omit to have a fresh value generated for you — or, "
+            "for a reference-only credential, to record a rotation performed in "
+            "its own vault."
+        ),
     )
     rotation_period_days: int | None = Field(
         default=None,
@@ -385,6 +440,9 @@ class SecretRotateResult(BaseModel):
 
     secret: SecretRead
     generated: bool
+    #: True when nothing was stored or minted: the credential is held in an
+    #: external vault and this call only recorded that it was rotated there.
+    recorded_upstream: bool = False
     value: str | None = None
     rotated_at: dt.datetime
     next_rotation_at: dt.datetime | None = None

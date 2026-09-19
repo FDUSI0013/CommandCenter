@@ -8,6 +8,10 @@
 # into our own registry by deploy/mirror-images.sh. IMAGE_PREFIX selects which:
 #   local build   IMAGE_PREFIX=fulcrum-ops              (the default)
 #   mirrored      IMAGE_PREFIX=<account>.dkr.ecr.<region>.amazonaws.com/fulcrum-ops
+# ENGINE_TAG has no default, deliberately. Unset, it used to expand to nothing —
+# an image reference ending in ":" and an error about a malformed name that
+# never mentions the variable. Which engine build a host runs is a decision, so
+# compose now refuses to start until .env makes it.
 # The datastore images are stock upstream builds, pulled at deploy time.
 
 name: fulcrum-ops
@@ -19,6 +23,16 @@ x-logging: &logging
   logging:
     driver: json-file
     options: { max-size: "20m", max-file: "5" }
+
+# `restart: unless-stopped` reacts to a process that EXITS. A process that is
+# still running but no longer answering — a wedged JVM, a deadlocked server —
+# is merely reported "unhealthy", for ever. deploy/autoheal.sh (host cron, once a
+# minute) restarts unhealthy containers, and only the ones that carry this label.
+# It is on the four stateless services. The datastores are left out on purpose:
+# one that is unhealthy is usually recovering — replaying a log, loading a
+# snapshot — and restarting it in the middle of that makes things worse.
+x-autoheal: &autoheal
+  fulcrum.autoheal: "true"
 
 services:
   # ---------------------------------------------------------------- state DB
@@ -53,8 +67,59 @@ services:
       ZOO_MY_ID: 1
       ZOO_SERVERS: server.1=analytics-keeper:2888:3888;2181
       ZOO_4LW_COMMANDS_WHITELIST: "*"
+      # The image ships with autopurge OFF (interval 0): every snapshot and every
+      # 64 MB pre-allocated transaction log is kept for ever, in a volume nobody
+      # looks at. Purge hourly and keep the three newest snapshots (the minimum
+      # the keeper accepts) with the logs that belong to them.
+      ZOO_AUTOPURGE_PURGEINTERVAL: 1
+      ZOO_AUTOPURGE_SNAPRETAINCOUNT: 3
+      # The image's start script defaults the heap to -Xmx1000m, which is more
+      # than this container is allowed: the JVM believes it has room the cgroup
+      # will not give it, and the kernel kills the keeper once the heap grows
+      # into it — stalling every analytics insert. Appended after the default, so
+      # this is the -Xmx the JVM honours. The coordination state of a one-node
+      # store is a few megabytes; 512 MB is generous.
+      JVMFLAGS: "-Xmx512m"
     volumes:
       - analytics-keeper:/data
+      # The transaction log lives in /datalog, which the image declares as a
+      # VOLUME — so with nothing mounted here Docker backs it with an ANONYMOUS
+      # volume. That log is the only durable record of everything since the last
+      # snapshot (up to 100,000 transactions). `docker compose down && up`, or a
+      # `docker volume prune`, orphans an anonymous volume: the keeper restarts
+      # from the snapshot alone, silently rolled back, the replicated tables'
+      # metadata no longer agrees with it, and they go read-only — ingest fails
+      # for every agent until somebody runs SYSTEM RESTORE REPLICA by hand.
+      #
+      # A HOST THAT RAN THE EARLIER FILE must move its log across BEFORE this
+      # takes effect, or the first `up -d` causes exactly that rollback:
+      #   deploy/migrate-keeper-datalog.sh        (see deploy/README.md, Upgrades)
+      - analytics-keeper-datalog:/datalog
+    # A guard for the host where that step was forgotten. A keeper that finds a
+    # snapshot but no transaction log does not complain: it starts from the
+    # snapshot and carries on, rolled back — or, on a host that has only ever
+    # written its first snapshot, completely empty. So refuse to start in that
+    # state and say why; the store waits, read-only, and nothing is lost. The
+    # migration script recognises this situation and recovers from it. Anything
+    # else is handed to the image's own entrypoint and command, unchanged.
+    # ($$ is compose's escape for a literal $.)
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        shopt -s nullglob
+        snapshots=(/data/version-2/snapshot.*)
+        logs=(/datalog/version-2/log.*)
+        if [ "$${#snapshots[@]}" -gt 0 ] && [ "$${#logs[@]}" -eq 0 ]; then
+          echo "REFUSING TO START: /data holds a snapshot but /datalog holds no transaction log." >&2
+          echo "This host kept its log on an anonymous volume, and starting without it would" >&2
+          echo "silently roll the keeper back. Run deploy/migrate-keeper-datalog.sh (see" >&2
+          echo "deploy/README.md, Upgrades). Do NOT run 'docker volume prune' first: the log is" >&2
+          echo "on a volume that now looks unused." >&2
+          sleep 60
+          exit 1
+        fi
+        exec /docker-entrypoint.sh zkServer.sh start-foreground
     healthcheck:
       test: ["CMD-SHELL", "echo ruok | nc -w 2 127.0.0.1 2181 | grep imok"]
       interval: 10s
@@ -63,7 +128,8 @@ services:
       start_period: 20s
     deploy:
       resources:
-        limits: { memory: 600M }
+        # 512 MB of heap plus the JVM's own metaspace, stacks and buffers.
+        limits: { memory: 768M }
 
   # Healthchecks address 127.0.0.1 rather than localhost throughout this file.
   # This VPC has IPv6 disabled: "localhost" resolves to ::1 first, the probe is
@@ -154,8 +220,9 @@ services:
 
   # ----------------------------------------------------- user metric sandbox
   metric-runner:
-    image: ${IMAGE_PREFIX:-fulcrum-ops}/metric-runner:${ENGINE_TAG}
+    image: ${IMAGE_PREFIX:-fulcrum-ops}/metric-runner:${ENGINE_TAG:?set in .env}
     <<: [*restart, *logging]
+    labels: *autoheal
     environment:
       PYTHONUNBUFFERED: 1
       # The image bakes in "docker", which starts docker-in-docker and needs
@@ -172,6 +239,10 @@ services:
       # and that loop ran ~450 times an hour at a full core — invisibly, since
       # the gunicorn master survived and the container never restarted.
       PYTHON_CODE_EXECUTOR_PARALLEL_NUM: ${METRIC_RUNNER_PARALLEL:-4}
+    # CPU weight under contention (default 1024). See the note on control-plane:
+    # user-supplied metric code is the last thing on this host that should win
+    # a fight for a core.
+    cpu_shares: 256
     healthcheck:
       test: ["CMD-SHELL", "wget -q -T 4 -O /dev/null http://127.0.0.1:8000/healthcheck || exit 1"]
       interval: 20s
@@ -186,8 +257,17 @@ services:
 
   # -------------------------------------------------------- safety inference
   safety-scanner:
-    image: ${IMAGE_PREFIX:-fulcrum-ops}/safety-scanner:${ENGINE_TAG}
+    image: ${IMAGE_PREFIX:-fulcrum-ops}/safety-scanner:${ENGINE_TAG:?set in .env}
     <<: [*restart, *logging]
+    labels: *autoheal
+    environment:
+      # The inference runtime sizes its thread pools from the HOST's core count
+      # (4), not from the two cores the limit below allows. Four busy threads on
+      # a two-core quota spend their time being throttled and context-switched,
+      # which makes every scan slower, not faster. Match the pools to the quota.
+      OMP_NUM_THREADS: "2"
+      MKL_NUM_THREADS: "2"
+    cpu_shares: 512
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:5000/healthcheck', timeout=4).status==200 else 1)"]
       interval: 20s
@@ -202,8 +282,9 @@ services:
   # Private telemetry engine. No published ports: reachable only as
   # http://telemetry-engine:8080 from inside this network.
   telemetry-engine:
-    image: ${IMAGE_PREFIX:-fulcrum-ops}/telemetry-engine:${ENGINE_TAG}
+    image: ${IMAGE_PREFIX:-fulcrum-ops}/telemetry-engine:${ENGINE_TAG:?set in .env}
     <<: [*restart, *logging]
+    labels: *autoheal
     hostname: telemetry-engine
     command: ["bash", "-c", "./run_db_migrations.sh && ./entrypoint.sh"]
     environment:
@@ -257,8 +338,13 @@ services:
       timeout: 10s
       retries: 60
       start_period: 60s
+    # tmpfs pages are charged to this container's memory limit. Unsized, /tmp
+    # may grow to half the host's RAM on paper, and what actually stops it is
+    # the kernel killing the JVM. The heap takes 3 of the 4 GB (MaxRAMPercentage
+    # above), so 1 GB is all /tmp could ever have had; saying so turns that kill
+    # into an ordinary "no space left" on the one write that was too big.
     tmpfs:
-      - /tmp
+      - /tmp:size=1g
     deploy:
       resources:
         limits: { memory: 4G }
@@ -271,6 +357,7 @@ services:
       dockerfile: apps/control-plane/Dockerfile
     image: fulcrum-ops/control-plane:${APP_TAG:-local}
     <<: [*restart, *logging]
+    labels: *autoheal
     environment:
       FULCRUM_OPS_ENVIRONMENT: production
       FULCRUM_OPS_SECRET_KEY: ${APP_SECRET_KEY:?set in .env}
@@ -300,13 +387,43 @@ services:
       - "127.0.0.1:8080:8080"   # Caddy on the host is the only client
     depends_on:
       app-db: { condition: service_healthy }
-      telemetry-engine: { condition: service_healthy }
+      # Started, not healthy. The governance half of the product works without
+      # the engine and says so; waiting for a healthy engine meant a control-plane
+      # hotfix could not be deployed (`up -d control-plane` refused) at exactly
+      # the moment the engine was the thing that was broken.
+      telemetry-engine: { condition: service_started }
+    # CPU weight under contention (default 1024; it costs nothing while cores are
+    # idle). Four cores are shared with a scanner running model inference and a
+    # runner executing user code, and either can take all of them. The API and
+    # its database are what a person at the console and an agent at ingest are
+    # waiting for, so they are served first: 2048 here and on app-db, 1024 for
+    # the engine and its stores, 512 for the scanner, 256 for the runner.
+    cpu_shares: 2048
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=5).status==200 else 1)"]
+      # LIVENESS, not readiness: "is this process answering HTTP". /health says
+      # 503 when the engine (or the database) is down, and that is the right
+      # answer for a person or a monitor — but deploy/autoheal.sh restarts what
+      # this probe calls unhealthy, and restarting the API cannot mend the
+      # engine: it would only take login and the governance screens down with
+      # it, in a loop, for as long as the engine stayed away. So 200 and 503 both
+      # pass; no answer inside five seconds, or a refused connection, fails.
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import sys, urllib.error, urllib.request
+          try:
+              urllib.request.urlopen("http://127.0.0.1:8080/health", timeout=5)
+          except urllib.error.HTTPError as answered:
+              sys.exit(0 if answered.code == 503 else 1)
       interval: 15s
-      timeout: 10s
-      retries: 20
-      start_period: 30s
+      timeout: 8s
+      # One minute of silence is a wedged process. It was five (20 x 15 s).
+      retries: 4
+      # Migrations run before the server binds. Failures inside this window do
+      # not count and the first success ends it, so a generous value is free.
+      start_period: 180s
     deploy:
       resources:
         # Four workers at ~240 MB each sat at 870 MB of a 1 GB limit — one busy
@@ -336,6 +453,7 @@ services:
       POSTGRES_PASSWORD: ${APP_DB_PASSWORD:?set in .env}
     volumes:
       - app-db:/var/lib/postgresql/data
+    cpu_shares: 2048   # every API request waits on this; see control-plane
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${APP_DB_USER:-fulcrum} -d ${APP_DB_NAME:-fulcrum_ops}"]
       interval: 10s
@@ -349,6 +467,7 @@ volumes:
   state-db:
   analytics-db:
   analytics-keeper:
+  analytics-keeper-datalog:
   cache:
   blob-store:
   app-db:

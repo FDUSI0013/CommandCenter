@@ -59,6 +59,41 @@ DEFAULT_PROMPT: Dict[str, Any] = {
 }
 
 
+#: The event kinds and fields the real ``POST /ingest/events`` accepts. Its row
+#: model is closed (``extra="forbid"``) and its kind is an enum, so a row with
+#: any other kind, or one unknown field, is refused whole. The stub used to take
+#: whatever it was sent, which is how ``report_issue()`` shipped an event the
+#: control plane has never accepted with every test green.
+EVENT_KINDS = ("guardrail.triggered", "policy.violation", "feedback.submitted")
+EVENT_FIELDS = frozenset(
+    {
+        "kind", "ref", "occurred_at", "agent", "trace_id", "span_id",
+        "guardrail", "action_taken", "score", "matched", "sample",
+        "policy", "severity", "detail",
+        "rating", "sentiment", "body", "source", "submitted_by",
+    }
+)  # fmt: skip
+
+
+def event_refusal(item: Any) -> Optional[str]:
+    """Why the real endpoint would reject this event row, or ``None`` if it would not."""
+    if not isinstance(item, dict):
+        return "An event must be an object"
+    if item.get("kind") not in EVENT_KINDS:
+        return "kind: Input should be {0}".format(", ".join(EVENT_KINDS))
+    unknown = sorted(set(item) - EVENT_FIELDS)
+    if unknown:
+        return "{0}: Extra inputs are not permitted".format(unknown[0])
+    kind = item["kind"]
+    if kind == "guardrail.triggered" and not str(item.get("guardrail") or "").strip():
+        return "guardrail.triggered needs the guardrail it fired"
+    if kind == "policy.violation" and not str(item.get("policy") or "").strip():
+        return "policy.violation needs the policy that was breached"
+    if kind == "feedback.submitted" and item.get("rating") is None and not item.get("body"):
+        return "feedback.submitted needs a rating or a body"
+    return None
+
+
 class RecordedRequest:
     """One request the stub saw, kept for assertions."""
 
@@ -318,6 +353,9 @@ class StubServer:
         spans_accepted = 0
         for index, item in enumerate(items):
             planned = outcomes[index] if outcomes and index < len(outcomes) else None
+            refusal = event_refusal(item) if kind == "events" and planned is None else None
+            if refusal is not None:
+                planned = {"outcome": "rejected", "code": "malformed", "reason": refusal}
             outcome = (planned or {}).get("outcome", "accepted")
             row: Dict[str, Any] = {"index": index, "outcome": outcome}
             if outcome == "accepted":

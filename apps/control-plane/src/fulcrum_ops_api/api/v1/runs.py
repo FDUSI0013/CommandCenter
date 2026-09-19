@@ -22,6 +22,7 @@ from fastapi.responses import StreamingResponse
 from sse_starlette.event import ServerSentEvent
 from sse_starlette.sse import EventSourceResponse
 
+from ...core.errors import NotFound
 from ...models.registry import Platform, RiskLevel
 from ...schemas.runs import (
     ReplaySession,
@@ -36,6 +37,7 @@ from ...schemas.runs import (
     RunStatus,
     RunStreamEvent,
     RunTrace,
+    ScanInfo,
     TimeRange,
 )
 from ...services import agents as agents_service
@@ -100,6 +102,21 @@ def run_filters(
 
 
 RunFiltersQuery = Annotated[service.RunFilters, Depends(run_filters)]
+
+
+class RunPage(Page[RunRead]):
+    """One page of the run table, and what the table was read from.
+
+    The table is assembled from a capped scan of the window, and `total` counts
+    what that scan held. The KPI row has always said when the cap was reached;
+    the table beside it printed the same floor as though it were the count.
+    `scan.truncated` is how it says so: `total` is then "at least", and the
+    oldest runs of the window are not on any page.
+    """
+
+    scan: ScanInfo | None = None
+
+
 TimeRangeQuery = Annotated[
     TimeRange, Query(alias="time_range", description="Window the table covers")
 ]
@@ -143,7 +160,11 @@ async def get_summary(
     The selected window and the window immediately before it are read
     concurrently, so every "vs last 24h" delta is measured rather than modelled.
     The response carries a `scan` block saying how much telemetry the numbers
-    were computed from.
+    were computed from, and a `previous_scan` block saying the same of the
+    earlier window. When either was capped, `comparable` is false and every
+    `*_delta_*` field is null: there is a figure for each window and no trend.
+    A capped `scan` also carries `covered_from`: the figures, and the sparkline
+    buckets, are measurements from that instant on and a floor before it.
     """
     return await service.summarise(
         session, principal, filters=filters, time_range=time_range
@@ -193,8 +214,11 @@ async def stream_runs(
     """
     if filters.agent_id:
         # Resolve first, so a missing or cross-workspace agent is a clean 404
-        # rather than a stream that silently never emits.
+        # rather than a stream that silently never emits. A key bound to a
+        # different agent gets the same answer for the same reason.
         await agents_service.get_agent(session, principal, filters.agent_id)
+        if not service.may_read_agent(principal, filters.agent_id):
+            raise NotFound(f"Agent '{filters.agent_id}' does not exist.")
 
     slot = await service.acquire_stream_slot()
 
@@ -248,7 +272,8 @@ async def run_history(
 ) -> RunHistoryPage:
     """Replay Studio's browser: every run the store still holds for one agent,
     newest first, one cursor page at a time. Unlike the run table there is no
-    time floor — keep passing `next_cursor` until it comes back null.
+    time floor — keep passing `next_cursor` until it comes back null. The
+    cursor is opaque: it is not a run id, and must be passed back unchanged.
     """
     return await service.run_history(
         session, principal, agent_id, cursor=cursor, limit=limit
@@ -260,25 +285,29 @@ async def run_history(
 # ---------------------------------------------------------------------------
 
 
-@router.get("", response_model=Page[RunRead], summary="List runs")
+@router.get("", response_model=RunPage, summary="List runs")
 async def list_runs(
     principal: CurrentPrincipal,
     session: Db,
     params: ListQuery,
     filters: RunFiltersQuery,
     time_range: TimeRangeQuery = TimeRange.LAST_24_HOURS,
-) -> Page[RunRead]:
+) -> RunPage:
     """One page of the run table, newest first by default.
 
     Runs are read from the telemetry engine for the workspace's own projects
     only. Free-text search covers the run id, agent, input preview, model,
     source, status, tenant and user; `sort` accepts any column key the table
-    renders.
+    renders. `scan` says how much telemetry the page was assembled from; when
+    `scan.truncated` is true, `total` is a floor rather than a count, and
+    `scan.covered_from` is the instant from which every run is on a page.
     """
-    runs, total, _ = await service.list_runs(
+    runs, total, info = await service.list_runs(
         session, principal, params, filters=filters, time_range=time_range
     )
-    return Page.build(runs, total, params.page, params.page_size)
+    page = RunPage.build(runs, total, params.page, params.page_size)
+    page.scan = info
+    return page
 
 
 # ---------------------------------------------------------------------------
@@ -314,7 +343,9 @@ async def get_run_trace(principal: CurrentPrincipal, session: Db, run_id: str) -
     its timing, offset, tokens, cost, payload previews and guardrail verdicts.
 
     Spans with a missing parent are promoted to roots rather than dropped — a
-    partially ingested trace still renders everything that was recorded.
+    partially ingested trace still renders everything that was recorded. A run
+    reported without spans has an empty `spans` and is described by the run's
+    own `input`, `response`, `error` and `metadata`, which are always present.
     """
     return await service.get_trace_tree(session, principal, run_id)
 
@@ -329,7 +360,9 @@ async def get_run_replay(
     guardrail verdicts, tokens, cost, duration and offset from the run's start,
     so the player can scrub to any point. `fidelity` is the share of steps whose
     input and output were both captured — a run ingested without payloads
-    replays as a timeline and reports that honestly.
+    replays as a timeline and reports that honestly. A run reported without
+    spans replays from what the run itself recorded: a Prompt step and a
+    Response step with a null `span_id`, and `steps_from_trace` set.
     """
     return await service.get_replay(session, principal, run_id)
 

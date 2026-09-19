@@ -75,12 +75,39 @@ def _model_name(serialized: Any, kwargs: Dict[str, Any]) -> Optional[str]:
 
 
 def _provider_name(kwargs: Dict[str, Any]) -> Optional[str]:
-    params = kwargs.get("invocation_params")
-    if isinstance(params, dict):
-        provider = params.get("_type") or params.get("ls_provider")
+    """The provider a model run should be priced under.
+
+    LangChain states it outright as ``ls_provider`` — in the callback's
+    ``metadata``, not in ``invocation_params`` where this used to look for it,
+    so that branch never fired. What was sent instead was ``_type``, which names
+    the LangChain *class* (``openai-chat``, ``azure-openai-chat``,
+    ``anthropic-chat``): no price list is filed under any of those, and every
+    LangChain agent's cost came back as zero. ``_type`` is still the fallback,
+    reduced to the provider inside it.
+    """
+    metadata = kwargs.get("metadata")
+    if isinstance(metadata, dict):
+        provider = metadata.get("ls_provider")
         if isinstance(provider, str) and provider:
             return provider
+    params = kwargs.get("invocation_params")
+    if isinstance(params, dict):
+        provider = params.get("ls_provider") or params.get("_type")
+        if isinstance(provider, str) and provider:
+            for suffix in ("-chat", "_chat", "-llm"):
+                if provider.endswith(suffix):
+                    provider = provider[: -len(suffix)]
+            return PROVIDER_ALIASES.get(provider, provider)
     return None
+
+
+#: LangChain class families whose name is not the name their prices are filed under.
+PROVIDER_ALIASES = {
+    "azure-openai": "azure",
+    "azure_openai": "azure",
+    "amazon_bedrock": "bedrock",
+    "amazon-bedrock": "bedrock",
+}
 
 
 def _snake(key: str) -> str:
@@ -223,11 +250,10 @@ class FulcrumOpsCallbackHandler:
         capture_input: bool = True,
         capture_output: bool = True,
     ) -> None:
-        if fulcrum is None:
-            from ..client import get_client
-
-            fulcrum = get_client()
-        self._client = fulcrum
+        # ``None`` means "the default client at the time of each run". A handler
+        # built at import, before ``configure()`` has run, otherwise keeps the
+        # throwaway client that existed then, which ``configure()`` closes.
+        self._fulcrum = fulcrum
         self._agent = agent
         self._trace_name = trace_name
         self._tags = list(tags or [])
@@ -243,6 +269,18 @@ class FulcrumOpsCallbackHandler:
 
     # ------------------------------------------------------------- internals
 
+    @property
+    def _client(self) -> Optional[Any]:
+        if self._fulcrum is not None:
+            return self._fulcrum
+        from ..client import get_client
+
+        try:
+            return get_client()
+        except Exception:  # noqa: BLE001 - a client that cannot be built is not LangChain's problem
+            logger.debug("fulcrum-ops: no default client available", exc_info=True)
+            return None
+
     def _open(
         self,
         run_id: Any,
@@ -253,7 +291,8 @@ class FulcrumOpsCallbackHandler:
         tags: Optional[Sequence[str]] = None,
     ) -> Optional[Any]:
         """Open a span for a run, rooting a trace when the run has no parent."""
-        if self._client is None:
+        client = self._client
+        if client is None:
             return None
         key = str(run_id)
         parent_key = str(parent_run_id) if parent_run_id is not None else None
@@ -280,7 +319,7 @@ class FulcrumOpsCallbackHandler:
 
             # No parent: this run is the whole invocation as far as the console
             # is concerned, so it becomes the trace.
-            trace = self._client.trace(
+            trace = client.trace(
                 self._trace_name or name,
                 input=captured,
                 agent=self._agent,

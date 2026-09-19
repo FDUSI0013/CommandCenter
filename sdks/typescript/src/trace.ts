@@ -29,6 +29,7 @@ import {
   clampText,
 } from './limits.js';
 import { applyRedaction } from './redaction.js';
+import { unrefTimer } from './runtime.js';
 import { normaliseMetadata, normaliseTags, normaliseUsage, toErrorInfo, toJsonObject } from './serialize.js';
 import type { CompiledRedactionRule } from './redaction.js';
 import type {
@@ -55,7 +56,23 @@ export interface TraceSink {
   streamSpans(): boolean;
   /** Default agent for items that do not name one. */
   defaultAgent(): string | undefined;
+  /**
+   * A closed trace is waiting on a deferred span before it reports. Optional:
+   * a sink that does not track them only loses the ability to push them out
+   * early on shutdown.
+   */
+  holdTrace?(trace: Trace): void;
+  /** The trace from `holdTrace` has now reported. */
+  releaseTrace?(trace: Trace): void;
 }
+
+/**
+ * How long a closed trace waits for a deferred span before reporting without it.
+ *
+ * Long enough for any generation a person is still reading; short enough that a
+ * stream somebody abandoned without closing does not cost the run.
+ */
+export const DEFERRED_SPAN_GRACE_MS = 5 * 60_000;
 
 /** A score attached to a trace or span before it closes. */
 export interface ScoreInput {
@@ -75,7 +92,12 @@ interface CommonOptions {
   tags?: string[];
   agent?: string;
   startTime?: Date | number | string;
-  /** Supply an id to make a retry idempotent. Must be a UUID. */
+  /**
+   * Supply an id to make a retry idempotent. Must be a version 7 UUID — mint it
+   * with `newId()`. The telemetry store takes no other kind, and refuses the
+   * whole request over one that is not, so anything else (a `randomUUID()`
+   * included) is replaced; read the id actually in use back from `.id`.
+   */
   id?: string;
 }
 
@@ -117,7 +139,9 @@ function normaliseScore(score: ScoreInput): FeedbackScoreIn | undefined {
   if (category) out.category_name = category;
   const reason = clampText(score.reason, MAX_SCORE_REASON_LENGTH);
   if (reason) out.reason = reason;
-  const source = clampText(score.source, MAX_SCORE_SOURCE_LENGTH);
+  // Lower-cased: the store's provenance enum is lower case, and a value it does
+  // not recognise costs the whole score request rather than the one score.
+  const source = clampText(score.source, MAX_SCORE_SOURCE_LENGTH)?.toLowerCase();
   if (source) out.source = source;
   return out;
 }
@@ -194,6 +218,22 @@ abstract class Unit {
     return this;
   }
 
+  /**
+   * @internal Take on what `other` recorded, wherever this unit has nothing of
+   * its own.
+   *
+   * For the trace the client opens around a span that had no run to belong to:
+   * that span is the whole run, and the trace is the row the console lists, so
+   * an input, output or failure set on the span only — `span.setInput(...)`
+   * after it opened, `span.end({ output })` — has to show on the trace too.
+   */
+  adopt(other: Unit): this {
+    this.input ??= other.input;
+    this.output ??= other.output;
+    this.errorInfo ??= other.errorInfo;
+    return this;
+  }
+
   /** Which agent this item belongs to. */
   setAgent(agent: string): this {
     this.agent = clampText(agent, MAX_AGENT_LENGTH);
@@ -235,6 +275,7 @@ export class Span extends Unit {
   private provider: string | undefined;
   private usage: Record<string, number> | undefined;
   private cost: number | undefined;
+  private deferred = false;
   private readonly children: Span[] = [];
 
   constructor(
@@ -267,6 +308,21 @@ export class Span extends Unit {
     return this;
   }
 
+  /** The trace this span belongs to, when it was opened through one. */
+  get ownerTrace(): Trace | undefined {
+    return this.owner;
+  }
+
+  /** What kind of work this span represents. */
+  get spanType(): SpanType {
+    return this.type;
+  }
+
+  /** The model recorded on this span so far, if any. */
+  get modelName(): string | undefined {
+    return this.model;
+  }
+
   /** Record token counters. Provider-native key names are preserved. */
   setUsage(usage: Record<string, number>): this {
     this.usage = normaliseUsage({ ...(this.usage ?? {}), ...usage });
@@ -287,6 +343,27 @@ export class Span extends Unit {
     return child;
   }
 
+  /**
+   * Say that this span will be closed by something that outlives the code
+   * which opened it.
+   *
+   * A streamed model call is the case: the function that made the call returns
+   * the stream and its trace closes, while the generation — and the tokens,
+   * the text and the real duration — are still to come. A trace closes every
+   * span left open, so without this the span is cut off at the hand-over and
+   * everything learned afterwards is discarded. A deferred span is left
+   * running instead, and the trace reports once it has ended.
+   */
+  defer(): this {
+    if (!this.ended) this.deferred = true;
+    return this;
+  }
+
+  /** Whether `defer()` was called on this span. */
+  get isDeferred(): boolean {
+    return this.deferred;
+  }
+
   /** Close the span. A second call is a no-op. */
   end(options: EndOptions = {}): this {
     if (this.ended) return this;
@@ -295,7 +372,12 @@ export class Span extends Unit {
     if (options.model) this.setModel(options.model);
     this.applyEnd(options);
     this.ended = true;
-    if (this.sink.streamSpans()) this.sink.submitSpan(this.toWire());
+    // Sampling is decided once, on the trace, and a span goes where its trace
+    // goes. Posting the spans of a run that was sampled out leaves orphans in
+    // the store that no trace will ever claim, and each one is charged to the
+    // ingest quota — so a 10% sampling rate would still cost 100% of the spans.
+    if (this.sink.streamSpans() && this.owner?.sampled !== false) this.sink.submitSpan(this.toWire());
+    if (this.deferred) this.owner?.deferredSpanEnded(this);
     return this;
   }
 
@@ -334,6 +416,10 @@ export class Span extends Unit {
 export class Trace extends Unit {
   private threadId: string | undefined;
   private readonly spans: Span[] = [];
+  /** Deferred spans a closed trace is still waiting on before it reports. */
+  private readonly waitingOn = new Set<Span>();
+  private holdTimer: ReturnType<typeof setTimeout> | undefined;
+  private reported = false;
   /** False when sampling decided this trace is not reported. */
   readonly sampled: boolean;
 
@@ -374,14 +460,56 @@ export class Trace extends Unit {
    * Any span still open is closed first, with the trace's end time — an
    * unclosed span would otherwise arrive with a null `end_time` and show as a
    * zero-duration step in Replay Studio.
+   *
+   * The exception is a span that was `defer()`red: it is still doing the work
+   * it describes (a stream being read after the function that opened it has
+   * returned), so the trace holds its report until that span ends, or until
+   * `DEFERRED_SPAN_GRACE_MS` has passed, whichever comes first.
    */
   end(options: EndOptions = {}): this {
     if (this.ended) return this;
     this.applyEnd(options);
     this.ended = true;
     for (const span of this.spans) {
-      if (!span.isEnded) span.end({ endTime: this.endTime });
+      if (span.isEnded) continue;
+      if (span.isDeferred && this.sampled) this.waitingOn.add(span);
+      else span.end({ endTime: this.endTime });
     }
+    if (this.waitingOn.size === 0) return this.report();
+
+    this.holdTimer = setTimeout(() => this.release(), DEFERRED_SPAN_GRACE_MS);
+    // Waiting for a stream must never be the reason a process stays alive; the
+    // client's exit hook releases whatever is still held.
+    unrefTimer(this.holdTimer);
+    this.sink.holdTrace?.(this);
+    return this;
+  }
+
+  /** @internal Called by a deferred span as it ends. */
+  deferredSpanEnded(span: Span): void {
+    if (!this.waitingOn.delete(span)) return;
+    if (this.waitingOn.size === 0) this.release();
+  }
+
+  /**
+   * Report a held trace now, closing whatever it was still waiting on.
+   *
+   * A no-op for a trace that is open, was never held, or has already reported.
+   */
+  release(): this {
+    if (!this.ended || this.reported) return this;
+    if (this.holdTimer !== undefined) clearTimeout(this.holdTimer);
+    this.holdTimer = undefined;
+    const waiting = Array.from(this.waitingOn);
+    this.waitingOn.clear();
+    for (const span of waiting) span.end();
+    this.sink.releaseTrace?.(this);
+    return this.report();
+  }
+
+  private report(): this {
+    if (this.reported) return this;
+    this.reported = true;
     if (this.sampled) this.sink.submitTrace(this.toWire());
     return this;
   }
@@ -409,9 +537,29 @@ export class Trace extends Unit {
     if (agent) wire.agent = agent;
     // With `streamSpans` the spans have already been posted on their own;
     // sending them again here would double-count them.
-    if (!this.sink.streamSpans() && this.spans.length > 0) {
-      wire.spans = this.spans.map((span) => span.toWire());
+    if (!this.sink.streamSpans()) {
+      if (this.spans.length > 0) wire.spans = this.spans.map((span) => span.toWire());
+      return wire;
     }
+    // The control plane reads a run's model off the spans nested in its trace,
+    // and a streamed trace arrives with none — so Live Runs would show the
+    // model the agent was registered with, or nothing, instead of the one that
+    // ran. The trace says it itself, by the rule the control plane would have
+    // applied, unless the caller's own metadata already names one.
+    const model = this.modelThatRan();
+    if (model && !wire.metadata?.model) wire.metadata = { ...(wire.metadata ?? {}), model };
     return wire;
+  }
+
+  /** The last `llm` span's model; failing that, the last model any span named. */
+  private modelThatRan(): string | undefined {
+    let fallback: string | undefined;
+    for (let index = this.spans.length - 1; index >= 0; index -= 1) {
+      const span = this.spans[index]!;
+      if (!span.modelName) continue;
+      if (span.spanType === 'llm') return span.modelName;
+      fallback ??= span.modelName;
+    }
+    return fallback;
   }
 }

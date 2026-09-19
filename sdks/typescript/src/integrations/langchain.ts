@@ -17,7 +17,7 @@
  * `instanceof`-check it.
  */
 
-import { loadOptionalPackage } from './shared.js';
+import { canonicalUsage, loadOptionalPackage } from './shared.js';
 import type { FulcrumOps } from '../client.js';
 import type { Span, Trace } from '../trace.js';
 import type { SpanType } from '../types.js';
@@ -70,7 +70,10 @@ function usageFrom(output: unknown): Record<string, number> | undefined {
     for (const [key, value] of Object.entries(candidate as Record<string, unknown>)) {
       if (typeof value === 'number') out[toSnake(key)] = value;
     }
-    if (Object.keys(out).length > 0) return out;
+    // An Anthropic model behind LangChain reports `input_tokens`; same
+    // counters, same names as the direct wrappers give them.
+    const usage = canonicalUsage(out);
+    if (usage) return usage;
   }
   return undefined;
 }

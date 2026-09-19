@@ -16,7 +16,7 @@
  */
 
 import { BYTE_BUDGET_RATIO, MAX_EVENTS_PER_BATCH, MAX_SCORES_PER_BATCH, MAX_SPANS_PER_BATCH, MAX_TRACES_PER_BATCH } from './limits.js';
-import { FulcrumOpsError, toFulcrumError } from './errors.js';
+import { FulcrumOpsError, PayloadTooLargeError, toFulcrumError } from './errors.js';
 import { approximateBytes } from './serialize.js';
 import { unrefTimer } from './runtime.js';
 import { SDK_NAME, SDK_VERSION } from './version.js';
@@ -30,11 +30,14 @@ export type QueueKind = 'traces' | 'spans' | 'scores' | 'events';
 interface QueuedItem {
   payload: TraceIn | SpanIn | ScoreIn | EventIn;
   bytes: number;
+  /** Spans this item adds to a request: a trace's nested spans, or 1 for a span. */
+  spans: number;
 }
 
 interface Buffer {
   items: QueuedItem[];
   bytes: number;
+  spans: number;
   /** Serialises sends for this kind. */
   inFlight: Promise<void>;
 }
@@ -54,6 +57,13 @@ export interface QueueOptions {
   transport: Transport;
   maxItems: number;
   maxBytes: number;
+  /**
+   * Spans one request may carry, summed across every trace in it. The server
+   * counts them that way and refuses the whole request past its ceiling, so a
+   * hundred tool-heavy traces are not "100 items" to it. Defaults to the
+   * server's own limit.
+   */
+  maxSpans?: number | undefined;
   flushIntervalMs: number;
   maxQueueSize: number;
   /** Batch-level default agent, written into every body envelope. */
@@ -74,10 +84,10 @@ const HARD_LIMITS: Record<QueueKind, number> = {
 
 export class BatchQueue {
   private readonly buffers: Record<QueueKind, Buffer> = {
-    traces: { items: [], bytes: 0, inFlight: Promise.resolve() },
-    spans: { items: [], bytes: 0, inFlight: Promise.resolve() },
-    scores: { items: [], bytes: 0, inFlight: Promise.resolve() },
-    events: { items: [], bytes: 0, inFlight: Promise.resolve() },
+    traces: { items: [], bytes: 0, spans: 0, inFlight: Promise.resolve() },
+    spans: { items: [], bytes: 0, spans: 0, inFlight: Promise.resolve() },
+    scores: { items: [], bytes: 0, spans: 0, inFlight: Promise.resolve() },
+    events: { items: [], bytes: 0, spans: 0, inFlight: Promise.resolve() },
   };
 
   private timer: ReturnType<typeof setTimeout> | undefined;
@@ -95,7 +105,9 @@ export class BatchQueue {
   constructor(private options: QueueOptions) {}
 
   /** Update batching limits in place, after `/ingest/config` narrows them. */
-  reconfigure(patch: Partial<Pick<QueueOptions, 'maxItems' | 'maxBytes' | 'flushIntervalMs' | 'maxQueueSize' | 'agent'>>): void {
+  reconfigure(
+    patch: Partial<Pick<QueueOptions, 'maxItems' | 'maxBytes' | 'maxSpans' | 'flushIntervalMs' | 'maxQueueSize' | 'agent'>>,
+  ): void {
     this.options = { ...this.options, ...patch };
   }
 
@@ -107,6 +119,16 @@ export class BatchQueue {
   /** Items per request: what the caller asked for, capped by what the server takes. */
   private batchSize(kind: QueueKind): number {
     return Math.max(1, Math.min(this.options.maxItems, HARD_LIMITS[kind]));
+  }
+
+  /** Spans per request, summed across the items in it. */
+  private spanLimit(): number {
+    return Math.max(1, Math.min(this.options.maxSpans ?? MAX_SPANS_PER_BATCH, MAX_SPANS_PER_BATCH));
+  }
+
+  /** Bytes per request the queue aims for, leaving headroom under the server's ceiling. */
+  private byteBudget(): number {
+    return this.options.maxBytes * BYTE_BUDGET_RATIO;
   }
 
   private pendingCount(): number {
@@ -132,14 +154,18 @@ export class BatchQueue {
 
     const buffer = this.buffers[kind];
     const bytes = approximateBytes(payload);
-    buffer.items.push({ payload, bytes });
+    const spans = spansIn(kind, payload);
+    buffer.items.push({ payload, bytes, spans });
     buffer.bytes += bytes;
+    buffer.spans += spans;
 
     this.enforceQueueCeiling(kind);
 
-    const itemLimit = this.batchSize(kind);
-    const byteLimit = this.options.maxBytes * BYTE_BUDGET_RATIO;
-    if (buffer.items.length >= itemLimit || buffer.bytes >= byteLimit) {
+    if (
+      buffer.items.length >= this.batchSize(kind) ||
+      buffer.bytes >= this.byteBudget() ||
+      buffer.spans >= this.spanLimit()
+    ) {
       void this.flushKind(kind);
       return;
     }
@@ -159,7 +185,10 @@ export class BatchQueue {
 
     const excess = buffer.items.length - ceiling;
     const removed = buffer.items.splice(0, excess);
-    for (const item of removed) buffer.bytes -= item.bytes;
+    for (const item of removed) {
+      buffer.bytes -= item.bytes;
+      buffer.spans -= item.spans;
+    }
     this.stats.dropped += removed.length;
     this.report(
       'enqueue',
@@ -207,6 +236,44 @@ export class BatchQueue {
     return buffer.inFlight;
   }
 
+  /**
+   * Cut one request's worth off the front of a buffer.
+   *
+   * Whichever of three budgets runs out first ends the chunk: item count, spans
+   * summed across the items, or bytes. The server enforces all three on the
+   * request as a whole and answers 413 for the lot, so cutting by count alone
+   * turns "this agent's traces carry fifteen spans each" into a hundred runs
+   * lost per request. At least one item is always taken, even an oversized
+   * one: it is the server's job to refuse it, and holding it back would wedge
+   * everything queued behind it.
+   */
+  private takeChunk(kind: QueueKind): QueuedItem[] {
+    const buffer = this.buffers[kind];
+    const maxItems = this.batchSize(kind);
+    const maxSpans = this.spanLimit();
+    const budget = this.byteBudget();
+
+    let count = 0;
+    let bytes = 0;
+    let spans = 0;
+    while (count < buffer.items.length && count < maxItems) {
+      const item = buffer.items[count]!;
+      if (count > 0 && (bytes + item.bytes > budget || spans + item.spans > maxSpans)) break;
+      bytes += item.bytes;
+      spans += item.spans;
+      count += 1;
+    }
+
+    const chunk = buffer.items.splice(0, count);
+    buffer.bytes -= bytes;
+    buffer.spans -= spans;
+    if (buffer.items.length === 0) {
+      buffer.bytes = 0;
+      buffer.spans = 0;
+    }
+    return chunk;
+  }
+
   private async drain(kind: QueueKind, options: { keepalive?: boolean }): Promise<void> {
     const buffer = this.buffers[kind];
 
@@ -214,43 +281,58 @@ export class BatchQueue {
       // Chunk by the configured batch size, not just the server's ceiling.
       // A flush triggered by `maxItems` cannot send synchronously — it is
       // chained onto `inFlight` — so by the time it runs, a caller in a tight
-      // loop may have enqueued well past the limit. Slicing at `maxItems` here
-      // is what keeps "batch of 100" meaning batches of 100 rather than one
-      // request with everything that piled up in the meantime.
-      const chunk = buffer.items.splice(0, this.batchSize(kind));
-      for (const item of chunk) buffer.bytes -= item.bytes;
-      if (buffer.items.length === 0) buffer.bytes = 0;
+      // loop may have enqueued well past the limit. Cutting here is what keeps
+      // "batch of 100" meaning batches of 100 rather than one request with
+      // everything that piled up in the meantime.
+      await this.send(kind, this.takeChunk(kind), options);
+    }
+  }
 
-      const body = {
-        agent: this.options.agent ?? null,
-        sdk: SDK_NAME,
-        sdk_version: SDK_VERSION,
-        [kind]: chunk.map((item) => item.payload),
-      };
+  private async send(kind: QueueKind, chunk: QueuedItem[], options: { keepalive?: boolean }): Promise<void> {
+    if (chunk.length === 0) return;
+    const body = {
+      agent: this.options.agent ?? null,
+      sdk: SDK_NAME,
+      sdk_version: SDK_VERSION,
+      [kind]: chunk.map((item) => item.payload),
+    };
 
-      try {
-        const result = await this.options.transport.request<IngestBatchResult>({
-          method: 'POST',
-          path: `/ingest/${kind}`,
-          body,
-          keepalive: options.keepalive === true,
-        });
-        this.stats.sent += chunk.length;
-        this.stats.accepted += result?.accepted ?? 0;
-        this.stats.rejected += result?.rejected ?? 0;
-        this.stats.blocked += result?.blocked ?? 0;
-        if (result) this.options.onResult?.(kind, result);
-        this.debug(
-          `${kind}: sent ${chunk.length}, accepted ${result?.accepted ?? 0}, rejected ${result?.rejected ?? 0}, blocked ${result?.blocked ?? 0}`,
-        );
-      } catch (thrown) {
-        // The transport already exhausted its retries. Re-queueing here would
-        // build an unbounded retry loop on top of a bounded one, so the batch
-        // is counted as lost and reported.
-        this.stats.failedBatches += 1;
-        this.stats.dropped += chunk.length;
-        this.report(`flush:${kind}`, toFulcrumError(thrown, `Could not report ${chunk.length} ${kind}.`));
+    try {
+      const result = await this.options.transport.request<IngestBatchResult>({
+        method: 'POST',
+        path: `/ingest/${kind}`,
+        body,
+        keepalive: options.keepalive === true,
+      });
+      this.stats.sent += chunk.length;
+      this.stats.accepted += result?.accepted ?? 0;
+      this.stats.rejected += result?.rejected ?? 0;
+      this.stats.blocked += result?.blocked ?? 0;
+      if (result) this.options.onResult?.(kind, result);
+      this.debug(
+        `${kind}: sent ${chunk.length}, accepted ${result?.accepted ?? 0}, rejected ${result?.rejected ?? 0}, blocked ${result?.blocked ?? 0}`,
+      );
+    } catch (thrown) {
+      // "Too large" is the one refusal that is about the request rather than
+      // about what is in it, and the server says so: "Split it and retry". The
+      // budgets above are estimates — the deployment's limits may be tighter
+      // than the defaults and the bootstrap document not yet read — so a 413
+      // on several items is halved and resent instead of costing every run in
+      // it. The recursion is bounded by log2 of the chunk, and a single item
+      // that is still too large falls through to be dropped and reported.
+      if (thrown instanceof PayloadTooLargeError && chunk.length > 1) {
+        const middle = Math.ceil(chunk.length / 2);
+        this.debug(`${kind}: ${chunk.length} items were refused as too large; resending as two halves`);
+        await this.send(kind, chunk.slice(0, middle), options);
+        await this.send(kind, chunk.slice(middle), options);
+        return;
       }
+      // The transport already exhausted its retries. Re-queueing here would
+      // build an unbounded retry loop on top of a bounded one, so the batch
+      // is counted as lost and reported.
+      this.stats.failedBatches += 1;
+      this.stats.dropped += chunk.length;
+      this.report(`flush:${kind}`, toFulcrumError(thrown, `Could not report ${chunk.length} ${kind}.`));
     }
   }
 
@@ -288,4 +370,12 @@ export class BatchQueue {
     // eslint-disable-next-line no-console
     console.debug(`[fulcrum-ops] ${message}`);
   }
+}
+
+/** How many spans an item contributes to the request it travels in. */
+function spansIn(kind: QueueKind, payload: TraceIn | SpanIn | ScoreIn | EventIn): number {
+  if (kind === 'spans') return 1;
+  if (kind !== 'traces') return 0;
+  const nested = (payload as TraceIn).spans;
+  return Array.isArray(nested) ? nested.length : 0;
 }

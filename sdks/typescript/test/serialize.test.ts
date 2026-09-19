@@ -159,10 +159,11 @@ describe('toErrorInfo', () => {
   });
 
   it('renders a thrown non-Error too, because JavaScript allows it', () => {
+    // No stack to report, but never no traceback: the store requires one.
     assert.deepEqual(toErrorInfo('a bare string'), {
       exception_type: 'Error',
       message: 'a bare string',
-      traceback: null,
+      traceback: 'Error: a bare string',
     });
   });
 
@@ -209,5 +210,12 @@ describe('id minting', () => {
   it('rejects an id the API would refuse', () => {
     assert.equal(isValidId('not-a-uuid'), false);
     assert.equal(isValidId(''), false);
+  });
+
+  it('rejects a UUID of any version but 7, which the telemetry store refuses', () => {
+    assert.equal(isValidId('11111111-1111-4111-8111-111111111111'), false);
+    assert.equal(isValidId('00000000-0000-0000-0000-000000000000'), false);
+    assert.equal(isValidId('0192f0c1-7e3a-7b2c-9d4e-5f6a7b8c9d0e'), true);
+    assert.equal(isValidId('0192F0C1-7E3A-7B2C-9D4E-5F6A7B8C9D0E'), true);
   });
 });

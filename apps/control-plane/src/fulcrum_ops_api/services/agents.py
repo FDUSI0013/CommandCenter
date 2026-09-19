@@ -19,7 +19,11 @@ Three invariants hold in every function below:
 
 Telemetry failures surface as :class:`TelemetryBackendUnavailable` with the
 adapter's exception as the cause. Nothing here substitutes a number when the
-engine cannot answer: the caller gets an error, not a plausible zero.
+engine cannot answer: the caller gets an error, not a plausible zero. The one
+read that does not fail with the engine is the detail page, because most of it
+is our own rows and the buttons on it are how an operator deactivates an agent
+*during* an outage -- it is served with ``stats`` null and ``telemetry_error``
+set, which is still not a number.
 """
 
 from __future__ import annotations
@@ -37,6 +41,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..api.common import ListParams, apply_filters, apply_search, apply_sort, paginate
 from ..api.deps import Principal
+from ..core.config import settings
 from ..core.errors import (
     Conflict,
     NotFound,
@@ -44,6 +49,7 @@ from ..core.errors import (
     TelemetryBackendUnavailable,
     ValidationFailed,
 )
+from ..core.ttlcache import SingleFlightCache
 from ..db.base import new_id, stamp
 from ..engine import (
     EngineBadRequest,
@@ -53,7 +59,7 @@ from ..engine import (
     EngineUnavailable,
     get_engine_client,
 )
-from ..models.governance import Policy, PolicyBinding, PolicyViolation
+from ..models.governance import Policy, PolicyBinding, PolicyEnforcement, PolicyViolation
 from ..models.identity import Role, User
 from ..models.registry import (
     Agent,
@@ -87,8 +93,6 @@ from ..schemas.agents import (
     AgentVersionRead,
     DiffLine,
     MetadataChange,
-    MetricPoint,
-    MetricSeries,
     NamedScore,
     RetryPolicy,
     slugify,
@@ -103,13 +107,8 @@ ENTITY_TYPE: Final[str] = "agent"
 
 MAX_EXPORT_ROWS: Final[int] = 5_000
 
-#: Window the detail screen's counters and latency chart cover.
+#: Window the detail screen's counters cover.
 STATS_WINDOW_DAYS: Final[int] = 30
-
-#: Metric the engine reports run duration under, and the bucket width we ask
-#: for. Thirty daily buckets is what the detail chart plots.
-LATENCY_METRIC: Final[str] = "DURATION"
-LATENCY_INTERVAL: Final[str] = "DAILY"
 
 #: Versions are commits of the agent's system prompt, kept in the telemetry
 #: engine's prompt library under the agent's project name. One prompt per
@@ -391,11 +390,92 @@ def _metrics_of(agent: Agent) -> AgentMetrics | None:
         return None
 
 
+#: Enforcement outcomes that only record a match. Everything else intervened in
+#: a run, which is what makes an otherwise Allowed agent read as Warned.
+PASSIVE_ACTIONS: Final[tuple[str, ...]] = (
+    PolicyEnforcement.LOG_ONLY.value,
+    PolicyEnforcement.ALLOW.value,
+)
+
+#: ``PolicyEnforcement`` is declared strongest first; a lower rank is stronger.
+_ENFORCEMENT_RANK: Final[dict[str, int]] = {
+    member.value: rank for rank, member in enumerate(PolicyEnforcement)
+}
+
+#: Above this many rows the violations are selected by workspace rather than by
+#: naming every agent: the CSV export shapes up to 5,000 at once.
+_MAX_NAMED_AGENTS: Final[int] = 500
+
+
+def _tripped_policy(window_start: dt.datetime) -> Any:
+    """EXISTS: an enforcement intervened in one of this agent's runs in the window."""
+    return (
+        select(PolicyViolation.id)
+        .where(
+            PolicyViolation.workspace_id == Agent.workspace_id,
+            PolicyViolation.agent_id == Agent.id,
+            PolicyViolation.occurred_at >= window_start,
+            PolicyViolation.action_taken.not_in(PASSIVE_ACTIONS),
+        )
+        .exists()
+    )
+
+
+async def _strongest_enforcement(
+    session: AsyncSession, agents: Sequence[Agent]
+) -> dict[str, str]:
+    """Agent id -> the strongest enforcement recorded against it in the window."""
+    if not agents:
+        return {}
+    window_start = _now() - dt.timedelta(days=STATS_WINDOW_DAYS)
+    stmt = (
+        select(PolicyViolation.agent_id, PolicyViolation.action_taken)
+        .where(
+            PolicyViolation.workspace_id.in_({agent.workspace_id for agent in agents}),
+            PolicyViolation.occurred_at >= window_start,
+            PolicyViolation.action_taken.not_in(PASSIVE_ACTIONS),
+        )
+        .distinct()
+    )
+    if len(agents) <= _MAX_NAMED_AGENTS:
+        stmt = stmt.where(PolicyViolation.agent_id.in_([agent.id for agent in agents]))
+    else:
+        stmt = stmt.where(PolicyViolation.agent_id.is_not(None))
+    strongest: dict[str, str] = {}
+    unknown = len(_ENFORCEMENT_RANK)
+    for agent_id, action in (await session.execute(stmt)).all():
+        held = strongest.get(agent_id)
+        if held is None or _ENFORCEMENT_RANK.get(action, unknown) < _ENFORCEMENT_RANK.get(
+            held, unknown
+        ):
+            strongest[agent_id] = action
+    return strongest
+
+
+def _policy_status_of(agent: Agent, strongest: str | None) -> PolicyStatus:
+    """The Policy Status the registry shows for one agent.
+
+    The stored column is a *gate*: Blocked and Approval Required refuse
+    activation and Run Agent, and are set by a person or an approval, never
+    inferred. Nothing ever moved it off Allowed, so the column and its filter
+    read "Allowed" for every agent however often policy had stepped in. The one
+    state that is not a gate is Warned, and that one is derived: an Allowed
+    agent whose runs an enforcement intervened in during the window reads as
+    Warned. A gate is never shown that is not in force -- which enforcement it
+    was travels separately, as ``strongest_enforcement_30d``.
+    """
+    stored = PolicyStatus(agent.policy_status)
+    if stored is PolicyStatus.ALLOWED and strongest is not None:
+        return PolicyStatus.WARNED
+    return stored
+
+
 async def read_agents(
     session: AsyncSession, agents: Sequence[Agent]
 ) -> list[AgentRead]:
-    """Shape rows for the table, resolving owner names in one extra statement."""
+    """Shape rows for the table: owner names and policy verdicts, one statement each."""
     labels = await _owner_labels(session, {a.owner_user_id or "" for a in agents})
+    enforced = await _strongest_enforcement(session, agents)
     reads: list[AgentRead] = []
     for agent in agents:
         name, email = labels.get(agent.owner_user_id or "", (None, None))
@@ -410,7 +490,8 @@ async def read_agents(
                 environment=EnvironmentType(agent.environment),
                 status=AgentStatus(agent.status),
                 risk=RiskLevel(agent.risk),
-                policy_status=PolicyStatus(agent.policy_status),
+                policy_status=_policy_status_of(agent, enforced.get(agent.id)),
+                strongest_enforcement_30d=enforced.get(agent.id),
                 owner_user_id=agent.owner_user_id,
                 owner_name=name,
                 owner_email=email,
@@ -477,11 +558,24 @@ async def _list_stmt(
             Agent.environment: environment.value if environment else None,
             Agent.status: status.value if status else None,
             Agent.risk: risk.value if risk else None,
-            Agent.policy_status: policy_status.value if policy_status else None,
             Agent.team: team,
             Agent.owner_user_id: (await _owner_ids(session, owner)) if owner else None,
         },
     )
+    if policy_status is not None:
+        # The filter selects what the column *shows* (see ``_policy_status_of``):
+        # Warned is derived for an Allowed agent policy has stepped in on, so
+        # those rows belong under Warned and not under Allowed.
+        tripped = _tripped_policy(_now() - dt.timedelta(days=STATS_WINDOW_DAYS))
+        allowed = Agent.policy_status == PolicyStatus.ALLOWED.value
+        if policy_status is PolicyStatus.ALLOWED:
+            stmt = stmt.where(allowed, ~tripped)
+        elif policy_status is PolicyStatus.WARNED:
+            stmt = stmt.where(
+                or_(Agent.policy_status == PolicyStatus.WARNED.value, allowed & tripped)
+            )
+        else:
+            stmt = stmt.where(Agent.policy_status == policy_status.value)
     return apply_sort(stmt, params, SORTABLE, default=Agent.name, default_desc=False)
 
 
@@ -741,38 +835,39 @@ def _empty_stats(window_start: dt.datetime, window_end: dt.datetime) -> AgentRun
     return AgentRunStats(window_start=window_start, window_end=window_end)
 
 
-def _empty_series() -> MetricSeries:
-    return MetricSeries(name="Average latency", unit="seconds", interval=LATENCY_INTERVAL)
-
-
 async def _run_stats(
     client: EngineClient,
-    agent: Agent,
+    project_id: str | None,
     window_start: dt.datetime,
     window_end: dt.datetime,
 ) -> AgentRunStats:
-    """Counters for one agent's project over the window, read from the engine."""
+    """Counters for one agent's project over the window, read from the engine.
+
+    Read from the *trace*-stats endpoint, addressed by the project's id. The
+    project-stats listing looks like the obvious source and is the wrong one
+    twice over: its rows carry usage only as a per-trace average -- there is no
+    ``usage_sum.*`` and no ``span_count`` on them, so Tokens read 0 for every
+    agent -- and it selects by a *substring* of the project name, so an agent
+    whose name is a prefix of twenty others could be shown a neighbour's
+    numbers. Trace stats answer for exactly one project and report the sums.
+    """
     payload = await _call(
-        client.get_project_stats(
-            name=agent.engine_project_name,
+        client.get_trace_stats(
+            project_id=project_id,
             from_time=window_start,
             to_time=window_end,
-            size=20,
         )
     )
-    rows = _rows(payload)
-    matching = [
-        row
-        for row in rows
-        if not agent.engine_project_id
-        or row.get("project_id") in (agent.engine_project_id, None)
-    ]
-    metrics = _flatten_metrics(matching or payload)
+    metrics = _flatten_metrics(payload)
 
-    run_count = int(_pick(metrics, "trace_count", "count", "traces") or 0)
-    error_count = int(_pick(metrics, "error_count.count", "error_count", "errors", "failed") or 0)
+    # Only the exact name: ``_pick`` falls back to a substring match, and
+    # "count" is a substring of nearly every other metric in the reply.
+    run_count = int(metrics.get("trace_count") or 0)
+    # An object with a deviation in one engine release, a bare count in another.
+    error_count = int(_pick(metrics, "error_count.count", "error_count") or 0)
     # No bare "duration" alias: the stats row nests percentiles under it, and a
-    # substring match would report a p50 as the average.
+    # substring match would report a p50 as the average. The engine reports no
+    # mean today, so this stays None and the median speaks for latency instead.
     duration_avg = _pick(metrics, "duration.avg", "duration_avg", "avg_duration")
     scores = [
         NamedScore(name=name, value=value)
@@ -788,7 +883,7 @@ async def _run_stats(
         completion = _pick(metrics, "usage_sum.completion_tokens")
         if prompt is not None or completion is not None:
             tokens = (prompt or 0.0) + (completion or 0.0)
-    span_average = _pick(metrics, "span_count", "spans")
+    span_average = metrics.get("span_count")
 
     return AgentRunStats(
         window_start=window_start,
@@ -813,46 +908,59 @@ async def _run_stats(
     )
 
 
-async def _latency_series(
-    client: EngineClient,
-    agent: Agent,
-    window_start: dt.datetime,
-    window_end: dt.datetime,
-) -> MetricSeries:
-    """Daily average latency for the detail screen's chart."""
-    if not agent.engine_project_id:
-        return _empty_series()
-    payload = await _call(
-        client.get_project_metrics(
-            agent.engine_project_id,
-            metric_type=LATENCY_METRIC,
-            interval=LATENCY_INTERVAL,
-            interval_start=window_start,
-            interval_end=window_end,
+#: One agent's window counters, for a few seconds, keyed by agent id. The
+#: registry opens the first row's detail on every visit, the detail page reloads
+#: itself after every action, and "Try again" on a slow page used to stack a
+#: second aggregate on top of the first; now they all share one read, and a
+#: reload that lands while it is still running waits on it instead of starting
+#: another. Counters half a minute old are harmless -- the page already says
+#: when they were computed. Per process; a failure is never remembered.
+_stats_memory: SingleFlightCache[AgentRunStats] = SingleFlightCache(
+    ttl=lambda: settings.agent_stats_cache_seconds, max_entries=512
+)
+
+
+def forget_stats(agent_id: str | None = None) -> None:
+    """Drop the remembered counters for one agent, or for all of them."""
+    if agent_id is None:
+        _stats_memory.invalidate()
+    else:
+        _stats_memory.invalidate(lambda key: key == agent_id)
+
+
+async def _remembered_run_stats(
+    agent: Agent, window_start: dt.datetime, window_end: dt.datetime
+) -> AgentRunStats:
+    # Plain values, not the row: the computation can outlive the request that
+    # started it, and with it the session the row belongs to.
+    agent_id, project_id = agent.id, agent.engine_project_id
+
+    async def compute() -> AgentRunStats:
+        # Bounded here as well as where it is awaited, so an aggregate nobody is
+        # waiting for any more stops retrying instead of running on for minutes.
+        return await asyncio.wait_for(
+            _run_stats(_client(), project_id, window_start, window_end),
+            settings.agent_detail_read_timeout_seconds,
         )
-    )
-    rows = _rows(payload)
-    chosen: list[dict[str, Any]] = []
-    for row in rows:
-        data = row.get("data") or row.get("points")
-        if isinstance(data, list) and data:
-            chosen = [point for point in data if isinstance(point, dict)]
-            # Prefer an average/p50 line when the engine returns several.
-            name = str(row.get("name") or "").lower()
-            if "avg" in name or "p50" in name or "duration" in name:
-                break
-    points = [
-        MetricPoint(
-            at=at,
-            value=_ms_to_seconds(_number(point.get("value"))),
-        )
-        for point in chosen
-        if (at := _instant(point.get("time") or point.get("timestamp") or point.get("at")))
-        is not None
-    ]
-    series = _empty_series()
-    series.points = points
-    return series
+
+    return await _stats_memory.get(agent_id, compute)
+
+
+async def _telemetry_read(read: Awaitable[T]) -> tuple[T | None, str | None]:
+    """Await one of the detail page's telemetry reads: its answer, or why not.
+
+    The page is mostly our own rows -- identity, grants, policies, the
+    Activate, Deactivate and Edit buttons -- and none of that may wait on, or
+    fail with, the telemetry store. So a read gets a few seconds, and a read
+    that fails costs the page that one panel and a sentence saying so, never
+    the page. No figure is substituted for the answer that did not arrive.
+    """
+    try:
+        return await asyncio.wait_for(read, settings.agent_detail_read_timeout_seconds), None
+    except TimeoutError:
+        return None, "The telemetry store did not answer in time."
+    except (TelemetryBackendUnavailable, NotFound) as exc:
+        return None, exc.message
 
 
 def _configuration(agent: Agent, owner_name: str | None, tools: list[str]) -> AgentConfiguration:
@@ -878,24 +986,95 @@ def _configuration(agent: Agent, owner_name: str | None, tools: list[str]) -> Ag
     )
 
 
-def _cache_metrics(agent: Agent, stats: AgentRunStats) -> bool:
-    """Fold the engine's answer into the row's cache; True when it changed.
+#: Enforcement outcomes that put a human in the loop: what "Escalations (30d)"
+#: counts out of the window's violations.
+ESCALATING_ACTIONS: Final[tuple[str, ...]] = (
+    PolicyEnforcement.ESCALATE.value,
+    PolicyEnforcement.REQUIRE_APPROVAL.value,
+)
+
+
+async def _governance_counts(
+    session: AsyncSession, principal: Principal, agent_id: str, window_start: dt.datetime
+) -> tuple[int, int]:
+    """Violations, and how many of them escalated, recorded against one agent.
+
+    Counted from our own violation rows -- the same rows the Policy Center and
+    the registry's KPI card count -- so the agent's page cannot disagree with
+    them. One statement, answered from ``ix_policy_violations_agent``.
+    """
+    violations, escalations = (
+        await session.execute(
+            select(
+                func.count(PolicyViolation.id),
+                func.coalesce(
+                    func.sum(
+                        case((PolicyViolation.action_taken.in_(ESCALATING_ACTIONS), 1), else_=0)
+                    ),
+                    0,
+                ),
+            ).where(
+                PolicyViolation.workspace_id == principal.workspace_id,
+                PolicyViolation.agent_id == agent_id,
+                PolicyViolation.occurred_at >= window_start,
+            )
+        )
+    ).one()
+    return int(violations or 0), int(escalations or 0)
+
+
+def _health(stats: AgentRunStats, *, violations: int, blocked_grants: int) -> int | None:
+    """The composite score on the Agent Health card, or None before any run.
+
+    It is made only of things the same card lists beside it: how often the
+    agent's runs succeed, less 5 for each policy violation in the window (at
+    most 30) and 10 for each connector grant that is blocked. An agent with no
+    runs has no success rate and therefore no score -- not a score of zero.
+    """
+    if not stats.run_count or stats.success_rate is None:
+        return None
+    score = stats.success_rate - min(30, 5 * violations) - 10 * blocked_grants
+    return max(0, min(100, round(score)))
+
+
+def _cache_metrics(
+    agent: Agent, stats: AgentRunStats, *, violations: int, escalations: int
+) -> tuple[dict[str, Any], dt.datetime] | None:
+    """Fold the engine's answer into the cache the row should now hold.
 
     The registry list renders hundreds of rows without one engine call per row,
     which is only possible if something keeps that cache warm; opening an agent
     is the natural moment, so a detail read refreshes it.
 
-    The write is skipped when the numbers are unchanged. Rewriting an identical
-    cache would move ``updated_at`` and make another editor's optimistic
-    concurrency guard fail for no reason.
+    Returns the new cache and its timestamp, or None when the numbers are
+    unchanged and there is nothing to write. The row itself is not touched
+    here: assigning to it would make the unit of work UPDATE it, and any ORM
+    UPDATE moves ``updated_at`` -- the token the Edit Agent modal sends back --
+    so merely *looking* at an agent made the next edit of it answer 409. The
+    caller stores the result with :func:`stamp`, which does not.
     """
     computed_at = _now()
     metrics = AgentMetrics(
         runs_30d=stats.run_count,
         success_rate_30d=stats.success_rate,
-        avg_latency_seconds=stats.avg_duration_seconds,
+        # The engine reports latency as percentiles and no mean. A card that
+        # reads "—" for every agent for ever is not honesty, it is a missing
+        # number: the median is the measured figure, so it stands in here and
+        # travels under its own name as well for a console that labels it so.
+        avg_latency_seconds=(
+            stats.avg_duration_seconds
+            if stats.avg_duration_seconds is not None
+            else stats.p50_duration_seconds
+        ),
+        p50_latency_seconds=stats.p50_duration_seconds,
         tokens_30d=stats.total_tokens,
         cost_30d=stats.total_cost,
+        # Counted a moment ago from our own rows, so written as counted. They
+        # used to be "carried forward" from a previous refresh that nothing ever
+        # wrote -- and a carry-forward that treats 0 as missing could never
+        # have let a count fall back to zero either.
+        escalations_30d=escalations,
+        violations_30d=violations,
         eval_score=next(
             (score.value for score in stats.feedback_scores if "eval" in score.name.lower()),
             None,
@@ -903,30 +1082,41 @@ def _cache_metrics(agent: Agent, stats: AgentRunStats) -> bool:
         computed_at=computed_at,
     )
     cache = metrics.model_dump(mode="json")
-    # Counters the engine does not report stay at whatever the previous refresh
-    # recorded rather than being reset to zero.
+    # A counter the engine does not report stays at whatever a previous refresh
+    # recorded rather than being reset.
     previous = agent.metrics_cache if isinstance(agent.metrics_cache, dict) else {}
-    for key in ("tool_calls_30d", "escalations_30d", "violations_30d"):
-        if not cache.get(key) and previous.get(key):
-            cache[key] = previous[key]
+    if cache.get("tool_calls_30d") is None and previous.get("tool_calls_30d"):
+        cache["tool_calls_30d"] = previous["tool_calls_30d"]
 
     comparable = {k: v for k, v in cache.items() if k != "computed_at"}
     if previous and {k: v for k, v in previous.items() if k != "computed_at"} == comparable:
-        return False
+        return None
+    return cache, computed_at
 
-    agent.metrics_cache = cache
-    agent.metrics_cached_at = computed_at
-    return True
+
+async def _no_versions() -> list[AgentVersionRead]:
+    return []
 
 
 async def get_detail(
-    session: AsyncSession, principal: Principal, agent_id: str
+    session: AsyncSession,
+    principal: Principal,
+    agent_id: str,
+    *,
+    include_versions: bool = True,
 ) -> AgentDetail:
     """Everything the nine tabs need, in one response.
 
-    The three telemetry reads run concurrently; an unprovisioned agent skips
-    them entirely and reports ``telemetry_available=False`` rather than an
-    empty-looking set of zeros.
+    Our own rows are read first and always answer. The two telemetry reads --
+    the window's counters and the prompt history -- then run side by side, each
+    on a short leash (:func:`_telemetry_read`): one that fails or is slow leaves
+    its panel empty and ``telemetry_error`` saying why, and the rest of the page
+    is served. ``stats`` is then null, never a row of zeros, and the header
+    keeps the last figures that *were* measured, dated by ``computed_at``.
+
+    An unprovisioned agent skips the reads entirely and reports
+    ``telemetry_available=False``. ``include_versions=False`` is for the
+    registry's side inspector, which shows no history and should not pay for it.
     """
     agent = await get_agent(session, principal, agent_id)
     window_end = _now()
@@ -934,27 +1124,57 @@ async def get_detail(
 
     connectors = await _linked_connectors(session, principal, agent.id)
     policies = await _policy_bindings(session, principal, agent.id)
+    violations, escalations = await _governance_counts(
+        session, principal, agent.id, window_start
+    )
 
     telemetry_available = agent.is_provisioned
+    telemetry_error: str | None = None
+    stats: AgentRunStats | None
+    versions: list[AgentVersionRead]
     if telemetry_available:
-        client = _client()
-        stats, series, versions = await asyncio.gather(
-            _run_stats(client, agent, window_start, window_end),
-            _latency_series(client, agent, window_start, window_end),
-            _versions(client, agent),
+        # Everything this page needs from our own database has been read. End
+        # the transaction so the pooled connection goes back *before* the wait
+        # on the telemetry store, not after it: held across a slow aggregate, a
+        # few open detail pages were enough to drain a worker's pool. Rows stay
+        # loaded (``expire_on_commit=False``); the cache write below opens a
+        # short transaction of its own.
+        await session.commit()
+        (stats, stats_error), (history, history_error) = await asyncio.gather(
+            _telemetry_read(_remembered_run_stats(agent, window_start, window_end)),
+            _telemetry_read(_versions_of(agent) if include_versions else _no_versions()),
         )
-        if _cache_metrics(agent, stats):
-            await session.flush()
-            # ``updated_at`` is a server-side onupdate: the UPDATE expired it
-            # rather than refetching it, so read it back before the row is
-            # serialised.
-            await session.refresh(agent)
+        versions = history or []
+        telemetry_error = stats_error or history_error
+        if stats is not None:
+            # Observations about the agent, not edits of it: stamped, so the
+            # token the Edit Agent modal holds does not move under it.
+            observed: dict[str, Any] = {}
+            refreshed = _cache_metrics(
+                agent, stats, violations=violations, escalations=escalations
+            )
+            if refreshed is not None:
+                observed["metrics_cache"], observed["metrics_cached_at"] = refreshed
+            health = _health(
+                stats,
+                violations=violations,
+                blocked_grants=sum(1 for connector in connectors if connector.is_blocked),
+            )
+            if health is not None and health != agent.health:
+                observed["health"] = health
+            if observed:
+                await stamp(session, [agent], **observed)
     else:
         stats = _empty_stats(window_start, window_end)
-        series = _empty_series()
         versions = []
 
     read = (await read_agents(session, [agent]))[0]
+    # The governance counts are ours and were read a moment ago, so they are
+    # served as read -- over a cache written on an earlier visit, and when there
+    # is no cache at all, in which case the run figures beside them stay null.
+    read.metrics = (read.metrics or AgentMetrics()).model_copy(
+        update={"violations_30d": violations, "escalations_30d": escalations}
+    )
     return AgentDetail(
         agent=read,
         configuration=_configuration(
@@ -964,8 +1184,8 @@ async def get_detail(
         policies=policies,
         versions=versions,
         stats=stats,
-        latency_series=series,
         telemetry_available=telemetry_available,
+        telemetry_error=telemetry_error,
     )
 
 
@@ -1493,9 +1713,14 @@ async def trigger_run(
         trace["input"] = {"input": payload.input}
 
     await _call(_client().create_traces_batch([trace]))
+    forget_stats(agent.id)
 
+    # A run is not an edit. ``last_used_at`` is bookkeeping and is stamped as
+    # such; ``updated_by`` is deliberately not written -- assigning it made the
+    # unit of work UPDATE the row, which moved ``updated_at`` and answered the
+    # next Edit Agent with 409, and put the operator's name beside "Last
+    # Modified" for a change they never made. The audit row below says who ran it.
     await stamp(session, [agent], last_used_at=started_at)
-    agent.updated_by = principal.actor
     await audit.record(
         session,
         principal=principal,
@@ -1567,12 +1792,41 @@ async def _prompt_row(client: EngineClient, agent: Agent) -> dict[str, Any] | No
     return None
 
 
+#: (project id, prompt name) -> the engine's id for that prompt. A prompt's id
+#: never changes, so once found it is not looked up again: the search by name
+#: was a second engine call in front of every version listing, run in sequence.
+#: Only a *found* prompt is remembered -- "no prompt yet" stops being true the
+#: moment the first version is committed, possibly through another worker.
+_prompt_ids: dict[tuple[str | None, str], str] = {}
+_MAX_PROMPT_IDS: Final[int] = 4096
+
+
 async def _raw_versions(client: EngineClient, agent: Agent) -> list[dict[str, Any]]:
+    key = (agent.engine_project_id, _prompt_name(agent))
+    remembered = _prompt_ids.get(key)
+    if remembered is not None:
+        try:
+            return _rows(await client.list_versions(remembered, size=MAX_VERSIONS))
+        except EngineNotFound:
+            # Deleted in the engine, and perhaps made again under a new id:
+            # forget it and find the prompt by name as if for the first time.
+            _prompt_ids.pop(key, None)
+        except EngineError as exc:
+            raise _telemetry_error(exc) from exc
+
     prompt = await _prompt_row(client, agent)
     if prompt is None or not prompt.get("id"):
         return []
-    payload = await _call(client.list_versions(str(prompt["id"]), size=MAX_VERSIONS))
+    prompt_id = str(prompt["id"])
+    if len(_prompt_ids) >= _MAX_PROMPT_IDS:
+        _prompt_ids.clear()
+    _prompt_ids[key] = prompt_id
+    payload = await _call(client.list_versions(prompt_id, size=MAX_VERSIONS))
     return _rows(payload)
+
+
+async def _versions_of(agent: Agent) -> list[AgentVersionRead]:
+    return await _versions(_client(), agent)
 
 
 async def _versions(client: EngineClient, agent: Agent) -> list[AgentVersionRead]:

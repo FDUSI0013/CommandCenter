@@ -20,12 +20,13 @@ gateway republishes them under ``/api/v1/private``.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import datetime as dt
 import json
 import logging
 import random
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from typing import Any, Final
 
 import httpx
@@ -108,6 +109,38 @@ class EngineNotFound(EngineBadRequest):
 
     def __init__(self, body: str = "") -> None:
         super().__init__(404, body)
+
+
+@contextlib.asynccontextmanager
+async def deadline(
+    seconds: float | None = None, *, what: str = "telemetry read"
+) -> AsyncIterator[None]:
+    """Bound everything one request asks of the engine, taken together.
+
+    Per-call timeouts bound one exchange. A screen makes many -- a page per
+    project, a series per metric, some of them one after another -- and nothing
+    bounded their sum, so a slow store held a request (and the worker and the
+    database connection under it) long after the console stopped listening at
+    30 s. Wrap the *engine* fan-out in this and the request answers a typed
+    ``EngineTimeout`` (the API's 503) inside ``engine_fanout_deadline_seconds``::
+
+        async with deadline():
+            pages = await asyncio.gather(*(scan(p) for p in projects))
+
+    Expiry cancels whatever is awaited inside. Exchanges already on the wire
+    are shielded (see ``EngineClient._exchange``) and finish under their own
+    timeouts; what stops is every further page and every call still queued
+    behind a semaphore. Keep SQL on the request's session OUTSIDE the block: a
+    statement cancelled half way invalidates its connection.
+    """
+    limit = settings.engine_fanout_deadline_seconds if seconds is None else seconds
+    try:
+        async with asyncio.timeout(limit) as scope:
+            yield
+    except TimeoutError as exc:
+        if not scope.expired():
+            raise  # somebody else's timeout, passing through
+        raise EngineTimeout(f"{what} did not finish within {limit:g}s") from exc
 
 
 # --------------------------------------------------------------------------
@@ -226,6 +259,7 @@ class EngineClient:
         *,
         timeout_seconds: float | None = None,
         connect_timeout_seconds: float | None = None,
+        read_timeout_seconds: float | None = None,
         max_connections: int | None = None,
         retries: int | None = None,
         checker_base_url: str | None = None,
@@ -255,6 +289,12 @@ class EngineClient:
         self._timeout_seconds = timeout_seconds or settings.engine_timeout_seconds
         self._connect_timeout_seconds = (
             connect_timeout_seconds or settings.engine_connect_timeout_seconds
+        )
+        # The leash on an aggregate a screen is waiting for; never longer than
+        # the client-wide timeout it is an exception to.
+        self._read_timeout_seconds = min(
+            read_timeout_seconds or settings.engine_read_timeout_seconds,
+            self._timeout_seconds,
         )
         self._transport = transport
         self._client = self._build_http_client()
@@ -433,10 +473,17 @@ class EngineClient:
         headers: Mapping[str, str] | None = None,
         timeout_seconds: float | None = None,
     ) -> httpx.Response:
-        """Issue one call, retrying only what is safe to replay.
+        """Issue one call, retrying only what is safe -- and useful -- to replay.
 
         Connect failures and 5xx are retried on GET/PUT/DELETE; POST is never
         retried because the engine's POSTs create telemetry.
+
+        A read timeout is never retried, on any verb. The request was delivered
+        and the engine is still working on it: there is no cancel on this wire,
+        so replaying it starts a second copy of the same heavy query beside the
+        first, at the moment the store has least to spare. Three 30 s attempts
+        are how one slow aggregate became a 90 s request that the console had
+        given up on after 30. The caller is told once, and promptly.
         """
         method = method.upper()
         attempts = 1
@@ -482,9 +529,16 @@ class EngineClient:
                 raise EngineUnavailable(
                     f"no free connection to the engine for {method} {path}"
                 ) from exc
-            except httpx.TimeoutException as exc:
-                last_error = EngineTimeout(f"engine timed out on {method} {path}")
+            except httpx.ConnectTimeout as exc:
+                # Nothing was delivered, so there is nothing to duplicate: this
+                # is the engine restarting or a network blip, and worth another
+                # go. (Listed before its parent class, which is not.)
+                last_error = EngineTimeout(
+                    f"engine did not accept a connection for {method} {path}"
+                )
                 last_cause = exc
+            except httpx.TimeoutException as exc:
+                raise EngineTimeout(f"engine timed out on {method} {path}") from exc
             except httpx.TransportError as exc:
                 last_error = EngineUnavailable(
                     f"engine is unreachable on {method} {path}"
@@ -531,7 +585,23 @@ class EngineClient:
         )
         return _decode(response)
 
-    async def _stream(self, path: str, payload: JsonObject) -> list[JsonObject]:
+    def _screen_read(self, timeout_seconds: float | None) -> float:
+        """The timeout for an aggregate a person is waiting on.
+
+        One 30 s timeout used to cover everything from an ingest write to a
+        KPI tile. The rollups behind a screen -- stats, metric series, cost --
+        default to ``engine_read_timeout_seconds`` instead; a caller that is
+        not a screen (an export, an evaluation) says so by passing its own.
+        """
+        return self._read_timeout_seconds if timeout_seconds is None else timeout_seconds
+
+    async def _stream(
+        self,
+        path: str,
+        payload: JsonObject,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> list[JsonObject]:
         """Call one of the engine's streaming search endpoints.
 
         These do not return a JSON document: they return newline-delimited JSON
@@ -539,12 +609,17 @@ class EngineClient:
         makes the engine refuse the request outright with 406 Not Acceptable —
         the search never runs, so the failure looks like an empty result rather
         than a rejected one until you read the engine's access log.
+
+        ``timeout_seconds`` is left to the caller: the same search feeds a
+        screen's scan (which should pass ``settings.engine_read_timeout_seconds``)
+        and an export paging 2000 rows at a time (which should not).
         """
         response = await self._send(
             "POST",
             path,
             json_body=payload,
             headers={"accept": "application/octet-stream"},
+            timeout_seconds=timeout_seconds,
         )
         return _decode_lines(response)
 
@@ -649,6 +724,7 @@ class EngineClient:
         from_time: dt.datetime | str | None = None,
         to_time: dt.datetime | str | None = None,
         sorting: Filters = None,
+        timeout_seconds: float | None = None,
     ) -> JsonObject:
         return await self._request(
             "GET",
@@ -662,6 +738,7 @@ class EngineClient:
                 to_time=_iso(to_time),
                 sorting=_json_param(sorting),
             ),
+            timeout_seconds=self._screen_read(timeout_seconds),
         )
 
     async def get_project_metrics(
@@ -675,6 +752,7 @@ class EngineClient:
         trace_filters: Filters = None,
         span_filters: Filters = None,
         thread_filters: Filters = None,
+        timeout_seconds: float | None = None,
     ) -> JsonObject:
         return await self._request(
             "POST",
@@ -688,6 +766,7 @@ class EngineClient:
                 span_filters=span_filters,
                 thread_filters=thread_filters,
             ),
+            timeout_seconds=self._screen_read(timeout_seconds),
         )
 
     # -- traces ------------------------------------------------------------
@@ -749,6 +828,7 @@ class EngineClient:
         strip_attachments: bool = False,
         from_time: dt.datetime | str | None = None,
         to_time: dt.datetime | str | None = None,
+        timeout_seconds: float | None = None,
     ) -> list[JsonObject]:
         """Cursor-paged export stream; capped at 2000 rows per call."""
         return await self._stream(
@@ -765,6 +845,7 @@ class EngineClient:
                 from_time=_iso(from_time),
                 to_time=_iso(to_time),
             ),
+            timeout_seconds=timeout_seconds,
         )
 
     async def get_trace(
@@ -785,6 +866,7 @@ class EngineClient:
         search: str | None = None,
         from_time: dt.datetime | str | None = None,
         to_time: dt.datetime | str | None = None,
+        timeout_seconds: float | None = None,
     ) -> JsonObject:
         return await self._request(
             "GET",
@@ -797,6 +879,7 @@ class EngineClient:
                 from_time=_iso(from_time),
                 to_time=_iso(to_time),
             ),
+            timeout_seconds=self._screen_read(timeout_seconds),
         )
 
     async def update_trace(self, trace_id: str, **fields: Any) -> None:
@@ -874,6 +957,7 @@ class EngineClient:
         truncate: bool = True,
         from_time: dt.datetime | str | None = None,
         to_time: dt.datetime | str | None = None,
+        timeout_seconds: float | None = None,
     ) -> list[JsonObject]:
         return await self._stream(
             f"{API_ROOT}/spans/search",
@@ -890,6 +974,7 @@ class EngineClient:
                 from_time=_iso(from_time),
                 to_time=_iso(to_time),
             ),
+            timeout_seconds=timeout_seconds,
         )
 
     async def get_span(
@@ -912,6 +997,7 @@ class EngineClient:
         search: str | None = None,
         from_time: dt.datetime | str | None = None,
         to_time: dt.datetime | str | None = None,
+        timeout_seconds: float | None = None,
     ) -> JsonObject:
         return await self._request(
             "GET",
@@ -926,6 +1012,7 @@ class EngineClient:
                 from_time=_iso(from_time),
                 to_time=_iso(to_time),
             ),
+            timeout_seconds=self._screen_read(timeout_seconds),
         )
 
     # -- threads (Memory and State screen) ---------------------------------
@@ -997,6 +1084,7 @@ class EngineClient:
         strip_attachments: bool = False,
         from_time: dt.datetime | str | None = None,
         to_time: dt.datetime | str | None = None,
+        timeout_seconds: float | None = None,
     ) -> list[JsonObject]:
         return await self._stream(
             f"{API_ROOT}/traces/threads/search",
@@ -1011,6 +1099,7 @@ class EngineClient:
                 from_time=_iso(from_time),
                 to_time=_iso(to_time),
             ),
+            timeout_seconds=timeout_seconds,
         )
 
     async def get_thread_stats(
@@ -1022,6 +1111,7 @@ class EngineClient:
         search: str | None = None,
         from_time: dt.datetime | str | None = None,
         to_time: dt.datetime | str | None = None,
+        timeout_seconds: float | None = None,
     ) -> JsonObject:
         return await self._request(
             "GET",
@@ -1034,6 +1124,7 @@ class EngineClient:
                 from_time=_iso(from_time),
                 to_time=_iso(to_time),
             ),
+            timeout_seconds=self._screen_read(timeout_seconds),
         )
 
     # -- feedback scores ---------------------------------------------------
@@ -1743,6 +1834,7 @@ class EngineClient:
         interval_start: dt.datetime | str,
         interval_end: dt.datetime | str,
         project_ids: Ids = None,
+        timeout_seconds: float | None = None,
     ) -> JsonObject:
         """Total spend over a window; backs the cost tiles."""
         return await self._request(
@@ -1753,6 +1845,7 @@ class EngineClient:
                 interval_start=_iso(interval_start),
                 interval_end=_iso(interval_end),
             ),
+            timeout_seconds=self._screen_read(timeout_seconds),
         )
 
     async def get_cost_series(
@@ -1761,6 +1854,7 @@ class EngineClient:
         interval_start: dt.datetime | str,
         interval_end: dt.datetime | str,
         project_ids: Ids = None,
+        timeout_seconds: float | None = None,
     ) -> JsonObject:
         """Daily spend, for the cost trend chart."""
         return await self._request(
@@ -1772,6 +1866,7 @@ class EngineClient:
                 interval_start=_iso(interval_start),
                 interval_end=_iso(interval_end),
             ),
+            timeout_seconds=self._screen_read(timeout_seconds),
         )
 
     async def get_workspace_usage(
@@ -1783,6 +1878,7 @@ class EngineClient:
         interval_end: dt.datetime | str | None = None,
         project_ids: Ids = None,
         filters: Filters = None,
+        timeout_seconds: float | None = None,
     ) -> JsonObject:
         """Token and volume series aggregated across the workspace."""
         return await self._request(
@@ -1796,6 +1892,7 @@ class EngineClient:
                 interval_end=_iso(interval_end),
                 filters=filters,
             ),
+            timeout_seconds=self._screen_read(timeout_seconds),
         )
 
     async def list_token_usage_names(self, *, project_ids: Ids = None) -> JsonObject:

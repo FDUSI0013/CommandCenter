@@ -12,10 +12,11 @@ from __future__ import annotations
 
 import datetime as dt
 import enum
+import ipaddress
 from typing import Any, Final
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from ..models.registry import ConnectionStatus, HealthState
 
@@ -81,6 +82,21 @@ def redact_config(config: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
+def is_link_local_host(host: str | None) -> bool:
+    """True for an address literal in the link-local range.
+
+    That range is where cloud hosts publish instance metadata and credentials.
+    Nothing an operator integrates with lives there, and the probe reports the
+    status and latency of whatever it is pointed at. Private ranges and internal
+    names are deliberately *not* refused: an MCP server on the same network is
+    an ordinary thing to connect.
+    """
+    try:
+        return ipaddress.ip_address((host or "").strip("[]")).is_link_local
+    except ValueError:
+        return False  # a name, not an address literal
+
+
 def _validate_endpoints(config: dict[str, Any]) -> dict[str, Any]:
     """Reject an endpoint the probe could not call, at the edge rather than later."""
     for key in ENDPOINT_CONFIG_KEYS:
@@ -92,6 +108,8 @@ def _validate_endpoints(config: dict[str, Any]) -> dict[str, Any]:
         parsed = urlparse(raw.strip())
         if parsed.scheme not in ("http", "https") or not parsed.netloc:
             raise ValueError(f"config.{key} must be an absolute http(s) URL")
+        if is_link_local_host(parsed.hostname):
+            raise ValueError(f"config.{key} must not be a link-local (instance metadata) address")
     return config
 
 
@@ -130,7 +148,14 @@ class ConnectionRead(BaseModel):
     latency_ms: int | None = Field(None, description="Latency of the last successful probe")
     linked_agent_count: int = 0
     syncs_today: int = 0
-    note: str | None = None
+    note: str | None = Field(None, description="The operator's free text; a probe never writes it")
+    status_detail: str | None = Field(
+        None,
+        description=(
+            "What the last test or sync saw, when it was not a clean answer; null after a "
+            "healthy one. Read-only: derived from the activity feed"
+        ),
+    )
 
     config: dict[str, Any] = Field(
         default_factory=dict, description="Non-secret settings; credential-shaped keys are redacted"
@@ -149,6 +174,23 @@ class ConnectionRead(BaseModel):
     @classmethod
     def _redact(cls, value: dict[str, Any]) -> dict[str, Any]:
         return redact_config(value)
+
+    @model_validator(mode="after")
+    def _syncs_today_means_today(self) -> ConnectionRead:
+        """Report no syncs today for a tile that was last synced on another day.
+
+        The stored counter is reset by the *next* sync, not by midnight, so on
+        a day nobody has synced yet it still holds the previous day's total --
+        and the tile said "Last Sync: 1d ago, Syncs Today 5". Deciding it here
+        covers the list, the single read and every write that answers a tile.
+        """
+        synced = self.last_sync_at
+        if synced is not None and synced.tzinfo is None:
+            synced = synced.replace(tzinfo=dt.UTC)
+        today = dt.datetime.now(dt.UTC).date()
+        if synced is None or synced.astimezone(dt.UTC).date() != today:
+            self.syncs_today = 0
+        return self
 
 
 class ConnectionActivityRead(BaseModel):
@@ -276,12 +318,24 @@ class ConnectionTestOutcome(BaseModel):
 
 
 class ConnectionSyncOutcome(BaseModel):
-    """What one sync recorded."""
+    """What one sync found, and whether it counts as one."""
 
     connection_id: str
     name: str
-    synced_at: dt.datetime
+    synced: bool = Field(
+        True, description="False when the endpoint did not answer, so nothing was synchronised"
+    )
+    status: ActivityStatus = Field(
+        ActivityStatus.SUCCESS, description="Warning when the endpoint answered 4xx/5xx"
+    )
+    synced_at: dt.datetime | None = Field(None, description="Null when nothing was synchronised")
     syncs_today: int
+    linked_agent_count: int = Field(0, description="Agents registered on this platform")
+    reachable: bool | None = Field(
+        None, description="Null when no endpoint is configured, so nothing was probed"
+    )
+    http_status: int | None = None
+    latency_ms: int | None = None
     detail: str
 
 
@@ -359,11 +413,20 @@ class ConnectionTraffic(BaseModel):
     kind: str
     window_days: int
     agents: int = Field(description="Agents on this platform that could report")
-    runs: int = Field(description="Runs observed across those agents in the window")
+    runs: int | None = Field(
+        description=(
+            "Runs observed across those agents in the window; null when the store did "
+            "not report them in time, which is not the same as none"
+        )
+    )
     tool_calls: list[ConnectionToolCall] = Field(default_factory=list)
     data_flows: list[ConnectionDataFlow] = Field(default_factory=list)
     truncated: bool = Field(
-        False, description="True when the span scan hit its cap and totals are a floor"
+        False,
+        description=(
+            "True when an agent had more spans than its share of the scan cap, or the "
+            "scan ran out of time: the totals are a floor"
+        ),
     )
     attributable: bool = Field(
         True,

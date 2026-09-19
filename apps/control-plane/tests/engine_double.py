@@ -307,7 +307,28 @@ class EngineDouble:
         #: Guardrail verdicts the inline checker hands back, newest wins.
         self.checker_verdicts: list[JsonObject] = []
         self.checker_requests: list[JsonObject] = []
+        #: The real scanner does not answer with a fixed list: it answers ONE row
+        #: per requested validation, in request order, each computed from that
+        #: validation's own type and config and named only by its type. Set this
+        #: to ``(text, validation) -> row`` to get that behaviour; the row's
+        #: ``type`` is filled in from the request when the callable leaves it out.
+        self.checker_handler: Callable[[str, JsonObject], JsonObject] | None = None
         self.healthy = True
+        #: The real engine validates a write batch as a whole, before storing
+        #: any of it: every trace and span id must be a version 7 UUID, a
+        #: parent reference must be a UUID, and an error must carry a traceback.
+        #: One row that fails costs the batch a 400. Opt-in, because older tests
+        #: were written against a double that took anything.
+        self.strict_writes = False
+        #: Awaited with ``(method, path)`` before a request is served. A round
+        #: trip to the real engine takes long enough for the rest of the world
+        #: to move; this is where a test makes it move.
+        self.before_dispatch: Callable[[str, str], Any] | None = None
+        #: The real engine answers a span search 200 and THEN streams. A query
+        #: that dies part way cannot change the status any more, so the failure
+        #: arrives as a row of the stream: no ``id``, an error ``code`` and a
+        #: ``message``. Set this and every span search ends with that row.
+        self.span_stream_error: JsonObject | None = None
 
         self._routes = self._build_routes()
 
@@ -401,6 +422,8 @@ class EngineDouble:
                 parsed_body = body.decode("utf-8", "replace")
         self.calls.append(RecordedCall(method=method, path=path, query=query, body=parsed_body))
 
+        if self.before_dispatch is not None:
+            await self.before_dispatch(method, path)
         status, payload, headers = self._dispatch(method, path, query, parsed_body)
         await self._respond(send, status, payload, headers)
 
@@ -800,10 +823,22 @@ class EngineDouble:
             and _within(row, "start_time", start, end)
         ]
 
+        # The real engine buckets on the *calendar* unit it was asked for, in
+        # UTC: the hour, the day, or the week starting Monday 00:00. A bucket
+        # is stamped with where it starts, so the first one of a window that
+        # opens mid-week is stamped BEFORE interval_start. A reader that lays
+        # its own grid from the window start loses that bucket.
+        interval = str((body or {}).get("interval") or "HOURLY").upper()
+
         def bucket_of(row: Mapping[str, Any]) -> str | None:
             moment = _parse_instant(row.get("start_time"))
             if moment is None:
                 return None
+            moment = moment.astimezone(dt.UTC)
+            if interval == "WEEKLY":
+                moment = moment - dt.timedelta(days=moment.weekday())
+            if interval in ("DAILY", "WEEKLY"):
+                moment = moment.replace(hour=0)
             return _iso(moment.replace(minute=0, second=0, microsecond=0))
 
         grouped: dict[str, list[Mapping[str, Any]]] = {}
@@ -965,10 +1000,36 @@ class EngineDouble:
         if row is not None:
             self._store_trace(row)
 
+    def _check_write(self, row: Mapping[str, Any], *, entity: str) -> None:
+        """What the real engine refuses a whole write batch for (``strict_writes``)."""
+        if not self.strict_writes:
+            return
+        checked = [("id", f"{entity} id")]
+        if entity == "Span":
+            checked.append(("trace_id", "Trace id"))
+        for key, label in checked:
+            value = str(row.get(key) or "")
+            if value and (len(value) != 36 or value[14] != "7"):
+                raise EngineFailure(400, {"message": f"{label} must be a version 7 UUID"})
+        parent = row.get("parent_span_id")
+        if parent is not None:
+            try:
+                uuid.UUID(str(parent))
+            except ValueError as exc:
+                raise EngineFailure(400, {"message": "Unable to process JSON"}) from exc
+        error = row.get("error_info")
+        if isinstance(error, Mapping) and not str(error.get("traceback") or "").strip():
+            raise EngineFailure(
+                422, {"errors": ["error_info.traceback must not be blank"]}
+            )
+
     def _create_traces(self, _match: re.Match, _query: dict, body: Any) -> None:
         rows = (body or {}).get("traces")
         if not isinstance(rows, list):
             raise EngineFailure(400, {"errors": ["'traces' must be an array"]})
+        for row in rows:
+            if isinstance(row, Mapping):
+                self._check_write(row, entity="Trace")
         for row in rows:
             if not isinstance(row, Mapping):
                 raise EngineFailure(400, {"errors": ["each trace must be an object"]})
@@ -1163,6 +1224,9 @@ class EngineDouble:
         rows = (body or {}).get("spans")
         if not isinstance(rows, list):
             raise EngineFailure(400, {"errors": ["'spans' must be an array"]})
+        for row in rows:
+            if isinstance(row, Mapping):
+                self._check_write(row, entity="Span")
         touched: set[str] = set()
         for row in rows:
             if not isinstance(row, Mapping):
@@ -1232,7 +1296,10 @@ class EngineDouble:
             and row["id"] not in exclude
             and _matches_filters(row, payload.get("filters"))
         ]
-        return self._ndjson(self._cursor(rows, payload.get("last_retrieved_id"), payload))
+        page = self._cursor(rows, payload.get("last_retrieved_id"), payload)
+        if self.span_stream_error is not None:
+            page = [*page, self.span_stream_error]
+        return self._ndjson(page)
 
     def _get_span(self, match: re.Match, _query: dict, _body: Any) -> JsonObject:
         span = self.spans.get(match.group(1))
@@ -1296,7 +1363,12 @@ class EngineDouble:
                     # The engine gives a thread its own surrogate id as well as
                     # the business id the caller addressed it by.
                     "id": f"{project_id}:{thread_id}",
-                    "thread_model_id": f"{project_id}:{thread_id}",
+                    # The surrogate is a UUID of the engine's own making. It is
+                    # NOT the row's ``id``, and it is what a thread search pages
+                    # by (see ``_search_threads``).
+                    "thread_model_id": str(
+                        uuid.uuid5(uuid.NAMESPACE_URL, f"{project_id}:{thread_id}")
+                    ),
                     "thread_id": thread_id,
                     "project_id": project_id,
                     "project_name": project["name"] if project else None,
@@ -1373,6 +1445,17 @@ class EngineDouble:
 
     def _search_threads(self, _match: re.Match, _query: dict, body: Any) -> tuple:
         payload = body or {}
+        # The real engine deserialises the cursor as a UUID and refuses the
+        # request outright when it is anything else -- a thread's business id,
+        # say, which is what a caller that pages by ``id`` sends.
+        after = payload.get("last_retrieved_thread_model_id")
+        if after:
+            try:
+                uuid.UUID(str(after))
+            except ValueError:
+                raise EngineFailure(
+                    400, {"errors": ["last_retrieved_thread_model_id must be a UUID"]}
+                ) from None
         rows = self._thread_scope(payload.get("project_id"), payload.get("project_name"))
         rows = [
             row
@@ -1560,8 +1643,17 @@ class EngineDouble:
     def _list_prompts(self, _match: re.Match, query: dict, _body: Any) -> JsonObject:
         name = self._query_one(query, "name")
         project_id = self._query_one(query, "project_id")
+        # The listing is the registry's public view of a prompt: identity, tags,
+        # timestamps and ``version_count``. The head version -- and with it the
+        # template and the commit metadata -- is only on GET /prompts/{id}. The
+        # double used to return both here, which hid a Prompt Studio table that
+        # was blank in production.
         rows = [
-            dict(prompt)
+            {
+                key: value
+                for key, value in prompt.items()
+                if key not in ("latest_version", "metadata")
+            }
             for prompt in self.prompts.values()
             if (not name or str(prompt["name"]).startswith(name))
             and (not project_id or prompt.get("project_id") == project_id)
@@ -1590,7 +1682,16 @@ class EngineDouble:
         self.prompts[prompt["id"]] = prompt
         self.prompt_versions[prompt["id"]] = []
         if payload.get("template"):
-            self._append_version(prompt, {"template": payload.get("template")})
+            # What is supplied at create time -- metadata, change description --
+            # is recorded on the first commit, as the registry does.
+            self._append_version(
+                prompt,
+                {
+                    "template": payload.get("template"),
+                    "metadata": payload.get("metadata"),
+                    "change_description": payload.get("change_description"),
+                },
+            )
         return prompt
 
     def _append_version(self, prompt: JsonObject, version: Mapping[str, Any]) -> JsonObject:
@@ -2123,6 +2224,14 @@ class EngineDouble:
         """The inline checker: answers with whatever verdicts a test staged."""
         payload = body or {}
         self.checker_requests.append(dict(payload))
+        if self.checker_handler is not None:
+            text = str(payload.get("text") or "")
+            rows = []
+            for validation in payload.get("validations") or []:
+                row = dict(self.checker_handler(text, dict(validation)))
+                row.setdefault("type", validation.get("type"))
+                rows.append(row)
+            return {"text": payload.get("text"), "validations": rows}
         return {
             "text": payload.get("text"),
             "validations": [dict(row) for row in self.checker_verdicts],

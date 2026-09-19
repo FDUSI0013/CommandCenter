@@ -20,11 +20,13 @@
       </div>
     </div>
     <nav class="nav" id="nav"></nav>
-    <div class="user-card" id="userCard">
-      <div class="avatar av-purple">JS</div>
+    <!-- Empty and hidden until /auth/me answers: the shell must never show a
+         person who is not the one signed in (app.js renderUserCard fills it). -->
+    <div class="user-card" id="userCard" style="visibility:hidden">
+      <div class="avatar av-purple"></div>
       <div class="user-meta">
-        <div class="user-name">Johan Smith</div>
-        <div class="user-role">Engineering Lead</div>
+        <div class="user-name"></div>
+        <div class="user-role"></div>
       </div>
       <span class="user-caret" id="userCaret"></span>
     </div>

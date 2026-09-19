@@ -37,6 +37,8 @@ __all__ = [
     "BudgetCreate",
     "BudgetRead",
     "BudgetUpdate",
+    "CapacityReading",
+    "CapacityReport",
     "CapacityRow",
     "CapacitySeries",
     "CapacityStatus",
@@ -53,6 +55,7 @@ __all__ = [
     "QuotaExportDataset",
     "QuotaForecast",
     "QuotaIncreaseRequest",
+    "QuotaOverview",
     "QuotaPeriod",
     "QuotaRead",
     "QuotaResource",
@@ -292,7 +295,9 @@ class BudgetRead(BaseModel):
     period_start: dt.datetime
     period_end: dt.datetime
     resets_in_days: int | None = None
-    resets_label: str | None = Field(None, description='e.g. "Resets in 18 days"')
+    resets_label: str | None = Field(
+        None, description='e.g. "Resets in 18 days"; "Period ended" once it has'
+    )
 
     status: LimitStatus
     health: LimitHealth = LimitHealth.HEALTHY
@@ -305,7 +310,11 @@ class BudgetRead(BaseModel):
 
     created_at: dt.datetime
     updated_at: dt.datetime = Field(
-        description="Also moves when spend is rolled up from measured cost"
+        description=(
+            "Moves on an edit and on a manual re-measure. The scheduled roll-up of "
+            "spend is bookkeeping and does not move it, so it is safe to send back "
+            "as `expected_updated_at`"
+        )
     )
 
 
@@ -401,6 +410,45 @@ class CapacitySeries(BaseModel):
     points: list[MetricPoint] = Field(default_factory=list)
     average_percent: float | None = None
     latest_percent: float | None = None
+
+
+class CapacityReading(BaseModel):
+    """One measurement of one pool, as the system that took it reports it.
+
+    Utilisation and status are not accepted. Both are derived from ``used`` and
+    ``provisioned`` with the thresholds every other chip on the screen uses, so
+    the Capacity Health score and its label can never disagree with the row.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=120, description="e.g. 'GPU Capacity (A100)'")
+    resource_type: str = Field(
+        min_length=1, max_length=40, description="Family: GPU, CPU, Memory, Disk, Network…"
+    )
+    region: str | None = Field(None, max_length=60)
+    provisioned: float = Field(gt=0, description="What the pool has, in ``unit``")
+    used: float = Field(ge=0, description="What is in use, in ``unit``")
+    unit: str = Field("units", min_length=1, max_length=24)
+    measured_at: dt.datetime | None = Field(
+        None, description="When the reading was taken; defaults to now"
+    )
+
+    @field_validator("name", "resource_type", "unit")
+    @classmethod
+    def _trim(cls, value: str) -> str:
+        trimmed = value.strip()
+        if not trimmed:
+            raise ValueError("must not be blank")
+        return trimmed
+
+
+class CapacityReport(BaseModel):
+    """A batch of readings from one reporter — a node exporter, a cron job."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    readings: list[CapacityReading] = Field(min_length=1, max_length=100)
 
 
 class CapacityRow(BaseModel):
@@ -607,6 +655,27 @@ class QuotaSummary(BaseModel):
     forecast_spend_usd: float | None = Field(
         None, description="Period-end projection shown beside the spend chart"
     )
+
+
+class QuotaOverview(BaseModel):
+    """The KPI row and every cost panel, measured once.
+
+    Each member is exactly what its own route answers -- ``summary`` is
+    ``/quota/summary``, ``models`` is every row of ``/quota/cost-breakdown`` and
+    so on -- in that route's default order. They are views of one measurement,
+    so a screen that wants several asks here and the telemetry store is asked
+    once rather than once per panel. The breakdowns arrive whole: they are a
+    handful of rows, and the console sorts and pages them itself.
+    """
+
+    summary: QuotaSummary
+    models: list[ModelCostRow] = Field(default_factory=list)
+    services: list[ServiceCostRow] = Field(default_factory=list)
+    drivers: list[CostDriverRow] = Field(default_factory=list)
+    teams: list[TeamAllocationRow] = Field(
+        default_factory=list, description="Sparklines are filled for the first ten"
+    )
+    insights: list[InsightRead] = Field(default_factory=list)
 
 
 class QuotaSpendSeries(BaseModel):

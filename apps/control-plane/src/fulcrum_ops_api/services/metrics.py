@@ -18,6 +18,22 @@ reshaped here. Three rules hold throughout:
 
 The window helpers, the project rollups and the row-paginator are also used by
 ``services.quota``, which needs the same measurements to attribute spend.
+
+**What one page costs the store.** Every number here is an aggregation over the
+telemetry store, and the screen asks for the same ones several times over: the
+KPI row, the model table and the platform donut all want the current window's
+per-project rollup, and four of the six charts want the same per-project run
+counts. Asked naively that was 4N+6 simultaneous aggregations for N agents on
+every page load, every window flip and every column sort. Three things keep it
+in hand, all in the "Engine reads" section below:
+
+* windows that end "now" are snapped to a shared boundary, so requests made a
+  moment apart ask the *same* question;
+* each engine measurement is remembered for ``metrics_cache_seconds`` and
+  computed once however many callers want it (``core.ttlcache``) -- keyed per
+  project, so a failed page retries only what failed and the "all agents" and
+  single-agent views share what they can;
+* at most ``metrics_engine_concurrency`` of them run against the store at once.
 """
 
 from __future__ import annotations
@@ -26,15 +42,17 @@ import asyncio
 import dataclasses
 import datetime as dt
 import math
-from collections.abc import Callable, Iterable, Sequence
-from typing import Any, Final
+from collections.abc import Awaitable, Callable, Iterable, Sequence
+from typing import Any, Final, TypeVar
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..api.common import ListParams
 from ..api.deps import Principal
+from ..core.config import settings
 from ..core.errors import TelemetryBackendUnavailable, ValidationFailed
+from ..core.ttlcache import SingleFlightCache
 from ..engine import (
     EngineBadRequest,
     EngineClient,
@@ -43,6 +61,7 @@ from ..engine import (
     EngineUnavailable,
     get_engine_client,
 )
+from ..engine.client import deadline as engine_deadline
 from ..models.governance import ApprovalRequest, ApprovalStatus, PolicyViolation
 from ..models.registry import Agent
 from ..schemas.metrics import (
@@ -52,6 +71,7 @@ from ..schemas.metrics import (
     MetricKpi,
     MetricPoint,
     MetricSeries,
+    MetricsOverview,
     MetricsSeriesResponse,
     MetricsSummary,
     MetricWindow,
@@ -183,14 +203,38 @@ def now() -> dt.datetime:
     return dt.datetime.now(dt.UTC)
 
 
+#: A window that ends "now" ends on the next of these boundaries instead. A
+#: minute is invisible on a day-long window and five are invisible on a week.
+WINDOW_SNAP: Final[dt.timedelta] = dt.timedelta(minutes=1)
+LONG_WINDOW_SNAP: Final[dt.timedelta] = dt.timedelta(minutes=5)
+LONG_WINDOW: Final[dt.timedelta] = dt.timedelta(days=7)
+
+
+def snap_window_end(moment: dt.datetime, span: dt.timedelta) -> dt.datetime:
+    """Round the end of a "to now" window up onto a shared boundary.
+
+    ``now()`` has microsecond precision, so the KPI row, the charts and the
+    breakdown tables of one page load each measured a *different* window, a few
+    milliseconds apart -- identical numbers, but nothing could be shared between
+    them and the store ran every aggregation once per panel. Snapped, they ask
+    the same question and one answer serves them all.
+
+    Up, not down: a run that landed a second ago has to be inside the window it
+    was asked about. The few minutes of future this admits hold no telemetry.
+    """
+    step = (LONG_WINDOW_SNAP if span >= LONG_WINDOW else WINDOW_SNAP).total_seconds()
+    return dt.datetime.fromtimestamp(math.ceil(moment.timestamp() / step) * step, dt.UTC)
+
+
 def resolve_window(window: MetricWindow, *, at: dt.datetime | None = None) -> Range:
     """Turn ``30d`` into the two instants it means, plus the comparison window.
 
     The comparison window is the same span ending where this one starts, so a
-    "vs prior 30d" delta compares equal amounts of time.
+    "vs prior 30d" delta compares equal amounts of time. An explicit ``at`` is
+    honoured to the microsecond; only "now" is snapped (``snap_window_end``).
     """
-    end = at or now()
     span = dt.timedelta(days=window.days)
+    end = at or snap_window_end(now(), span)
     start = end - span
     return Range(start=start, end=end, previous_start=start - span, previous_end=start)
 
@@ -201,16 +245,20 @@ def resolve_window_days(days: int, *, at: dt.datetime | None = None) -> Range:
     ``MetricWindow`` covers the four spans the Metrics screen offers; screens
     with their own window control need the arithmetic without the vocabulary.
     """
-    end = at or now()
     span = dt.timedelta(days=max(1, int(days)))
+    end = at or snap_window_end(now(), span)
     start = end - span
     return Range(start=start, end=end, previous_start=start - span, previous_end=start)
 
 
 def month_to_date(*, at: dt.datetime | None = None) -> Range:
     """The current calendar month so far, against the same span last month."""
-    end = at or now()
-    start = end.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    moment = at or now()
+    start = moment.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    # The month is taken from the real instant and only then is the end
+    # snapped: in the last minutes of a month the snapped end is the first of
+    # the next one, which is where this month stops, not where a new one starts.
+    end = at or snap_window_end(moment, moment - start)
     previous_start = (start - dt.timedelta(days=1)).replace(day=1)
     # Same elapsed distance into the previous month, so a mid-month comparison
     # is like-for-like rather than a full month against a partial one.
@@ -227,22 +275,35 @@ def default_interval(window: MetricWindow) -> MetricInterval:
 def floor_to_bucket(
     moment: dt.datetime, interval: MetricInterval, origin: dt.datetime
 ) -> dt.datetime:
-    """Snap an instant down onto its bucket start."""
+    """Snap an instant down onto its bucket start.
+
+    Every width is a *calendar* unit in UTC -- the hour, the day, the week from
+    Monday 00:00 -- because that is how the engine buckets, and a grid that
+    disagrees with the engine's cannot place the engine's points. Weeks used to
+    be anchored on the window start instead (``origin``, kept for callers that
+    pass it): the engine's first weekly bucket, stamped the Monday *before* a
+    window that opens mid-week, then fell off the front of the grid, and every
+    later week was credited to whichever window-anchored bucket held its Monday.
+    """
+    del origin
+    moment = moment.replace(tzinfo=dt.UTC) if moment.tzinfo is None else moment.astimezone(dt.UTC)
     if interval is MetricInterval.HOURLY:
         return moment.replace(minute=0, second=0, microsecond=0)
+    midnight = moment.replace(hour=0, minute=0, second=0, microsecond=0)
     if interval is MetricInterval.DAILY:
-        return moment.replace(hour=0, minute=0, second=0, microsecond=0)
-    # Weekly buckets are anchored on the window start rather than on a calendar
-    # week, so the first and last buckets are always full-width.
-    elapsed = moment - origin
-    weeks = int(elapsed.total_seconds() // dt.timedelta(days=7).total_seconds())
-    return origin + dt.timedelta(days=7 * weeks)
+        return midnight
+    return midnight - dt.timedelta(days=midnight.weekday())
 
 
 def bucket_starts(
     start: dt.datetime, end: dt.datetime, interval: MetricInterval
 ) -> list[dt.datetime]:
-    """Every bucket start from ``start`` to ``end``, inclusive of the last partial."""
+    """Every bucket start from ``start`` to ``end``, inclusive of the last partial.
+
+    The first bucket is the calendar bucket ``start`` falls in, so it usually
+    opens before the window does and holds only the part of it inside the
+    window -- exactly as the engine's first bucket does.
+    """
     step = {
         MetricInterval.HOURLY: dt.timedelta(hours=1),
         MetricInterval.DAILY: dt.timedelta(days=1),
@@ -403,6 +464,78 @@ def _match_percentile(
 
 
 # ---------------------------------------------------------------------------
+# Engine reads: bounded, and shared between the callers that want them
+# ---------------------------------------------------------------------------
+
+T = TypeVar("T")
+
+#: One entry per engine measurement -- a project's token total, a project's
+#: metric series, a window's stats walk or cost. Values are what the engine
+#: reported, normalised; they are shared between requests, so every reader
+#: treats them as read-only. Registry attributes (an agent's model, platform,
+#: team) are deliberately *not* in here: rollups are rebuilt around the fresh
+#: ``AgentProject`` on every request, so an edit shows at once.
+_memory: SingleFlightCache[Any] = SingleFlightCache(
+    ttl=lambda: settings.metrics_cache_seconds, max_entries=4096
+)
+
+_gate: tuple[asyncio.AbstractEventLoop, asyncio.Semaphore] | None = None
+
+
+def forget() -> None:
+    """Forget every remembered measurement. For tests and for operators."""
+    _memory.invalidate()
+
+
+def _engine_gate() -> asyncio.Semaphore:
+    """This worker's bound on concurrent analytics reads.
+
+    Built on first use, per event loop, rather than at import: a semaphore
+    belongs to the loop it first waits on, the application has exactly one, and
+    the test suite has one per test.
+    """
+    global _gate
+    loop = asyncio.get_running_loop()
+    if _gate is None or _gate[0] is not loop:
+        _gate = (loop, asyncio.Semaphore(max(1, settings.metrics_engine_concurrency)))
+    return _gate[1]
+
+
+async def _bounded(call: Callable[[], Awaitable[T]]) -> T:
+    """One engine read, queued behind the worker-wide bound."""
+    async with _engine_gate():
+        return await call()
+
+
+async def _shared(
+    key: tuple[Any, ...], compute: Callable[[], Awaitable[T]], *, fresh: bool = False
+) -> T:
+    """``compute()``, or the answer somebody else got for the same key.
+
+    ``fresh`` neither reads nor writes the memory: it is for a caller that
+    *persists* what it measures and so must not be handed a remembered number.
+    """
+    if fresh:
+        return await compute()
+    return await _memory.get(key, compute)
+
+
+async def _answered(work: Awaitable[T], *, what: str) -> T:
+    """Await one request's engine fan-out under the one-request deadline.
+
+    Bounding concurrency means calls queue, and a queue behind a slow store can
+    outlast the console's patience; the deadline makes this API the one that
+    answers, with the typed 503. Work already shared through ``_shared`` is not
+    lost to it -- it finishes on its own and is there for the retry.
+    """
+    try:
+        async with engine_deadline(what=what):
+            return await work
+    except EngineError as exc:
+        raise telemetry_unavailable(exc) from exc
+
+
+# ---------------------------------------------------------------------------
 # Workspace projects and per-project rollups
 # ---------------------------------------------------------------------------
 
@@ -506,23 +639,36 @@ async def _stats_by_project(
     wanted: set[str],
     start: dt.datetime,
     end: dt.datetime,
+    *,
+    fresh: bool = False,
 ) -> dict[str, dict[str, Any]]:
-    """Walk the engine's project statistics and keep only our namespaces."""
-    found: dict[str, dict[str, Any]] = {}
-    page = 1
-    while page <= MAX_STAT_PAGES and len(found) < len(wanted):
-        payload = await client.get_project_stats(
-            page=page, size=STAT_PAGE_SIZE, from_time=start, to_time=end
-        )
-        rows = _records(payload)
-        for row in rows:
-            identifier = row.get("id") or row.get("project_id")
-            if isinstance(identifier, str) and identifier in wanted:
-                found[identifier] = row
-        if len(rows) < STAT_PAGE_SIZE:
-            break
-        page += 1
-    return found
+    """Walk the engine's project statistics and keep only our namespaces.
+
+    The walk is remembered whole, under the set of namespaces it was for: the
+    KPI row, the model table and the platform donut all want exactly this, for
+    exactly the same set, within the same second.
+    """
+
+    async def walk() -> dict[str, dict[str, Any]]:
+        found: dict[str, dict[str, Any]] = {}
+        page = 1
+        while page <= MAX_STAT_PAGES and len(found) < len(wanted):
+            payload = await _bounded(
+                lambda page=page: client.get_project_stats(
+                    page=page, size=STAT_PAGE_SIZE, from_time=start, to_time=end
+                )
+            )
+            rows = _records(payload)
+            for row in rows:
+                identifier = row.get("id") or row.get("project_id")
+                if isinstance(identifier, str) and identifier in wanted:
+                    found[identifier] = row
+            if len(rows) < STAT_PAGE_SIZE:
+                break
+            page += 1
+        return found
+
+    return await _shared(("project-stats", frozenset(wanted), start, end), walk, fresh=fresh)
 
 
 def _stat_map(payload: Any) -> dict[str, float]:
@@ -554,18 +700,23 @@ async def _project_token_totals(
     projects: Sequence[AgentProject],
     start: dt.datetime,
     end: dt.datetime,
+    *,
+    fresh: bool = False,
 ) -> dict[str, float | None]:
     """Total tokens per namespace over the window.
 
     The project-stats endpoint reports usage only as a per-trace *average*
     (avgMap), which cannot honestly be turned back into a total. The
     trace-stats endpoint reports the actual sums under ``usage_sum.*``, so
-    tokens are read there — one call per namespace, in parallel.
+    tokens are read there — one call per namespace, a bounded number at a
+    time, each remembered under its own namespace.
     """
 
-    async def one(project: AgentProject) -> tuple[str, float | None]:
-        payload = await client.get_trace_stats(
-            project_id=project.project_id, from_time=start, to_time=end
+    async def read(project: AgentProject) -> float | None:
+        payload = await _bounded(
+            lambda: client.get_trace_stats(
+                project_id=project.project_id, from_time=start, to_time=end
+            )
         )
         values = _stat_map(payload)
         total = values.get("usage_sum.total_tokens")
@@ -573,12 +724,20 @@ async def _project_token_totals(
             prompt = values.get("usage_sum.prompt_tokens")
             completion = values.get("usage_sum.completion_tokens")
             if prompt is None and completion is None:
-                return project.project_id, None
+                return None
             total = (prompt or 0.0) + (completion or 0.0)
-        return project.project_id, total
+        return total
+
+    async def one(project: AgentProject) -> tuple[str, float | None]:
+        key = ("trace-tokens", project.project_id, start, end)
+        return project.project_id, await _shared(key, lambda: read(project), fresh=fresh)
 
     results = await asyncio.gather(*(one(project) for project in projects))
     return dict(results)
+
+
+def _stat_runs(row: dict[str, Any]) -> int:
+    return int(_measure(row, "trace_count", "traces", "total_traces", "run_count") or 0)
 
 
 async def project_rollups(
@@ -586,21 +745,37 @@ async def project_rollups(
     projects: Sequence[AgentProject],
     start: dt.datetime,
     end: dt.datetime,
+    *,
+    fresh: bool = False,
 ) -> list[ProjectRollup]:
     """Measure every namespace of the workspace over one window.
 
     A namespace the engine has no statistics for yields a rollup of zero runs
     and unreported measures — that is an agent which has not been used in the
     window, not a failure.
+
+    The engine measurements underneath are shared for ``metrics_cache_seconds``
+    with every other caller asking about the same window. Pass ``fresh=True``
+    when the result is going to be *stored* -- a budget's rolled-up spend, say
+    -- rather than shown: a remembered number is fine on a screen that redraws
+    in a minute and wrong in a row that is compared against a threshold.
     """
     if not projects:
         return []
     try:
-        stats, tokens_by_project = await asyncio.gather(
-            _stats_by_project(
-                client, {project.project_id for project in projects}, start, end
-            ),
-            _project_token_totals(client, projects, start, end),
+        stats = await _stats_by_project(
+            client, {project.project_id for project in projects}, start, end, fresh=fresh
+        )
+        # Tokens cost one aggregation per namespace, and a namespace with no
+        # runs in the window has no tokens to sum -- so only the ones the stats
+        # walk found busy are asked. On a fleet where most agents are idle on
+        # any given day that is most of the calls this function used to make.
+        tokens_by_project = await _project_token_totals(
+            client,
+            [p for p in projects if _stat_runs(stats.get(p.project_id, {})) > 0],
+            start,
+            end,
+            fresh=fresh,
         )
     except EngineError as exc:
         raise telemetry_unavailable(exc) from exc
@@ -613,9 +788,7 @@ async def project_rollups(
         rollups.append(
             ProjectRollup(
                 project=project,
-                runs=int(
-                    _measure(row, "trace_count", "traces", "total_traces", "run_count") or 0
-                ),
+                runs=_stat_runs(row),
                 # The engine reports the failure tally as an object with a
                 # deviation attached: {"count": N, "deviation": M}.
                 errors=_measure(row, "error_count.count", "error_count", "errors", "failed_count"),
@@ -692,11 +865,15 @@ async def cost_total(
     """Billed spend over a window, from the engine's cost accounting."""
     if not projects:
         return None
+    project_ids = [project.project_id for project in projects]
     try:
-        payload = await client.get_cost_summary(
-            interval_start=start,
-            interval_end=end,
-            project_ids=[project.project_id for project in projects],
+        payload = await _shared(
+            ("cost-summary", frozenset(project_ids), start, end),
+            lambda: _bounded(
+                lambda: client.get_cost_summary(
+                    interval_start=start, interval_end=end, project_ids=project_ids
+                )
+            ),
         )
     except EngineError as exc:
         raise telemetry_unavailable(exc) from exc
@@ -907,6 +1084,46 @@ def paginate_rows(
 # ---------------------------------------------------------------------------
 
 
+@dataclasses.dataclass(frozen=True)
+class _Measured:
+    """Both windows of one request, measured: what every KPI is derived from."""
+
+    span: Range
+    projects: list[AgentProject]
+    current: list[ProjectRollup]
+    previous: list[ProjectRollup]
+    cost_now: float | None
+    cost_before: float | None
+
+
+async def _measure_windows(
+    session: AsyncSession,
+    principal: Principal,
+    window: MetricWindow,
+    agent_ids: Sequence[str] | None,
+) -> _Measured:
+    client = get_engine_client()
+    span = resolve_window(window)
+    projects = await workspace_projects(session, principal, agent_ids)
+    current, previous, cost_now, cost_before = await _answered(
+        asyncio.gather(
+            project_rollups(client, projects, span.start, span.end),
+            project_rollups(client, projects, span.previous_start, span.previous_end),
+            cost_total(client, projects, span.start, span.end),
+            cost_total(client, projects, span.previous_start, span.previous_end),
+        ),
+        what="the metrics summary",
+    )
+    return _Measured(
+        span=span,
+        projects=projects,
+        current=current,
+        previous=previous,
+        cost_now=cost_now,
+        cost_before=cost_before,
+    )
+
+
 async def summarise(
     session: AsyncSession,
     principal: Principal,
@@ -919,16 +1136,35 @@ async def summarise(
     the same namespaces, so a delta reflects a change in behaviour rather than a
     change in what was counted.
     """
-    client = get_engine_client()
-    span = resolve_window(window)
-    projects = await workspace_projects(session, principal, agent_ids)
+    return _summary(window, await _measure_windows(session, principal, window, agent_ids))
 
-    current, previous, cost_now, cost_before = await asyncio.gather(
-        project_rollups(client, projects, span.start, span.end),
-        project_rollups(client, projects, span.previous_start, span.previous_end),
-        cost_total(client, projects, span.start, span.end),
-        cost_total(client, projects, span.previous_start, span.previous_end),
+
+async def overview(
+    session: AsyncSession,
+    principal: Principal,
+    window: MetricWindow,
+    agent_ids: Sequence[str] | None = None,
+) -> MetricsOverview:
+    """The KPI row, the model table and the platform donut from one measurement.
+
+    All three are views of the current window's per-agent rollup. Served apart,
+    each route measures it again -- and the shared memory only helps when the
+    three requests happen to reach the same worker. Served together it is
+    measured once by construction.
+    """
+    measured = await _measure_windows(session, principal, window, agent_ids)
+    return MetricsOverview(
+        summary=_summary(window, measured),
+        models=to_model_rows(_model_rows(measured.current)),
+        platforms=to_platform_rows(_platform_rows(measured.current)),
     )
+
+
+def _summary(window: MetricWindow, measured: _Measured) -> MetricsSummary:
+    """Shape two measured windows into the six cards."""
+    span, projects = measured.span, measured.projects
+    current, previous = measured.current, measured.previous
+    cost_now, cost_before = measured.cost_now, measured.cost_before
     head = aggregate(current)
     tail = aggregate(previous)
     caption = window.comparison_label
@@ -1049,17 +1285,34 @@ def fold_sum(
     interval: MetricInterval,
 ) -> list[float | None]:
     """Sum measured points into the shared bucket grid."""
-    index = {start: position for position, start in enumerate(starts)}
     slots: list[float | None] = [None] * len(starts)
-    origin = starts[0] if starts else None
-    if origin is None:
-        return slots
-    for moment, value in points:
-        position = index.get(floor_to_bucket(moment, interval, origin))
-        if position is None:
-            continue
+    for position, value in _placed(points, starts, interval):
         slots[position] = value if slots[position] is None else (slots[position] or 0.0) + value
     return slots
+
+
+def _placed(
+    points: Iterable[tuple[dt.datetime, float]],
+    starts: Sequence[dt.datetime],
+    interval: MetricInterval,
+) -> Iterable[tuple[int, float]]:
+    """Each measured point with the position of the bucket it belongs to.
+
+    A point stamped before the grid opens is credited to the first bucket, not
+    discarded. Every read is already limited to the window, so such a point is
+    in-window data carrying a coarser stamp than the grid, and dropping it made
+    a chart's total fall short of the KPI card above it without a word. Nothing
+    is credited backwards from beyond the last bucket: the engine pads the far
+    end of a series with empty buckets, and those are not measurements.
+    """
+    if not starts:
+        return
+    index = {start: position for position, start in enumerate(starts)}
+    for moment, value in points:
+        floored = floor_to_bucket(moment, interval, starts[0])
+        position = 0 if floored < starts[0] else index.get(floored)
+        if position is not None:
+            yield position, value
 
 
 def fold_mean(
@@ -1068,16 +1321,9 @@ def fold_mean(
     interval: MetricInterval,
 ) -> list[float | None]:
     """Average points into buckets — the right reduction for a latency line."""
-    index = {start: position for position, start in enumerate(starts)}
     sums: list[float] = [0.0] * len(starts)
     counts: list[int] = [0] * len(starts)
-    origin = starts[0] if starts else None
-    if origin is None:
-        return [None] * len(starts)
-    for moment, value in points:
-        position = index.get(floor_to_bucket(moment, interval, origin))
-        if position is None:
-            continue
+    for position, value in _placed(points, starts, interval):
         sums[position] += value
         counts[position] += 1
     return [
@@ -1111,32 +1357,27 @@ async def engine_series(
         return {}
 
     if metric_type == ENGINE_TOKEN_USAGE:
-        try:
-            payload = await client.get_workspace_usage(
-                metric_type=WORKSPACE_METRIC,
-                interval=ENGINE_INTERVAL[interval],
-                interval_start=start,
-                interval_end=end,
-                project_ids=[project.project_id for project in projects],
+        project_ids = [project.project_id for project in projects]
+
+        async def usage() -> dict[str, list[tuple[dt.datetime, float]]]:
+            payload = await _bounded(
+                lambda: client.get_workspace_usage(
+                    metric_type=WORKSPACE_METRIC,
+                    interval=ENGINE_INTERVAL[interval],
+                    interval_start=start,
+                    interval_end=end,
+                    project_ids=project_ids,
+                )
             )
+            return named_series(payload)
+
+        key = ("workspace-usage", frozenset(project_ids), ENGINE_INTERVAL[interval], start, end)
+        try:
+            return await _shared(key, usage)
         except EngineError as exc:
             raise telemetry_unavailable(exc) from exc
-        return named_series(payload)
 
-    async def one(project: AgentProject) -> dict[str, list[tuple[dt.datetime, float]]]:
-        payload = await client.get_project_metrics(
-            project.project_id,
-            metric_type=metric_type,
-            interval=ENGINE_INTERVAL[interval],
-            interval_start=start,
-            interval_end=end,
-        )
-        return named_series(payload)
-
-    try:
-        per_project = await asyncio.gather(*(one(project) for project in projects))
-    except EngineError as exc:
-        raise telemetry_unavailable(exc) from exc
+    per_project = await _per_project_series(client, projects, metric_type, interval, start, end)
 
     merged: dict[str, dict[dt.datetime, float]] = {}
     for series in per_project:
@@ -1160,17 +1401,34 @@ async def _per_project_series(
     ``engine_series`` sums the projects together, which is the right reduction
     for counts and the wrong one for rates and percentiles — those have to be
     weighted by each project's traffic before they may be combined.
+
+    Each project's payload is remembered on its own, so the runs chart, the
+    success-rate chart and both latency lines -- which all need the run counts
+    -- read them once between them, whichever request gets there first.
     """
 
-    async def one(project: AgentProject) -> dict[str, list[tuple[dt.datetime, float]]]:
-        payload = await client.get_project_metrics(
-            project.project_id,
-            metric_type=metric_type,
-            interval=ENGINE_INTERVAL[interval],
-            interval_start=start,
-            interval_end=end,
+    async def read(project: AgentProject) -> dict[str, list[tuple[dt.datetime, float]]]:
+        payload = await _bounded(
+            lambda: client.get_project_metrics(
+                project.project_id,
+                metric_type=metric_type,
+                interval=ENGINE_INTERVAL[interval],
+                interval_start=start,
+                interval_end=end,
+            )
         )
         return named_series(payload)
+
+    async def one(project: AgentProject) -> dict[str, list[tuple[dt.datetime, float]]]:
+        key = (
+            "project-series",
+            project.project_id,
+            metric_type,
+            ENGINE_INTERVAL[interval],
+            start,
+            end,
+        )
+        return await _shared(key, lambda: read(project))
 
     try:
         return list(await asyncio.gather(*(one(project) for project in projects)))
@@ -1178,12 +1436,73 @@ async def _per_project_series(
         raise telemetry_unavailable(exc) from exc
 
 
+PerProject = list[dict[str, list[tuple[dt.datetime, float]]]]
+
+
+class _SeriesReads:
+    """One request's per-project reads, each made once however many lines use it.
+
+    Four of the six engine lines are derived from the per-project run counts --
+    runs sums them, success rate and both latency lines weight by them -- and
+    the two latency lines come out of the *same* duration payload. Resolved
+    line by line, the six-line export read the run counts four times and the
+    durations twice: 7N+2 aggregations for N agents, 5N of them repeats.
+
+    Reads start on first use, so a request for cost or violations alone reads
+    nothing per project.
+    """
+
+    def __init__(
+        self,
+        client: EngineClient,
+        projects: Sequence[AgentProject],
+        interval: MetricInterval,
+        span: Range,
+    ) -> None:
+        self.client = client
+        self.projects = projects
+        self.interval = interval
+        self.span = span
+        self._reads: dict[str, asyncio.Task[PerProject]] = {}
+
+    def per_project(self, metric_type: str) -> asyncio.Task[PerProject]:
+        read = self._reads.get(metric_type)
+        if read is None:
+            read = asyncio.ensure_future(
+                _per_project_series(
+                    self.client,
+                    self.projects,
+                    metric_type,
+                    self.interval,
+                    self.span.start,
+                    self.span.end,
+                )
+            )
+            # Several lines await this one task; whichever fails first ends the
+            # request, and the outcome must not then be reported as unobserved.
+            read.add_done_callback(lambda done: done.cancelled() or done.exception())
+            self._reads[metric_type] = read
+        return read
+
+
+def _sum_lines(lines: Sequence[Sequence[float | None]], size: int) -> list[float | None]:
+    """Bucket-wise sum of several folded lines; a bucket nobody reported stays empty."""
+    return [sum_optional(line[position] for line in lines) for position in range(size)]
+
+
+async def _run_count_values(
+    reads: _SeriesReads, starts: Sequence[dt.datetime]
+) -> list[float | None]:
+    """Runs per bucket: each project's count line, folded, then summed."""
+    counts = await reads.per_project(ENGINE_TRACE_COUNT)
+    return _sum_lines(
+        [fold_sum(collapse_series(series), starts, reads.interval) for series in counts],
+        len(starts),
+    )
+
+
 async def _success_rate_values(
-    client: EngineClient,
-    projects: Sequence[AgentProject],
-    interval: MetricInterval,
-    starts: Sequence[dt.datetime],
-    span: Range,
+    reads: _SeriesReads, starts: Sequence[dt.datetime]
 ) -> list[float | None]:
     """Per-bucket success rate across the workspace.
 
@@ -1192,13 +1511,11 @@ async def _success_rate_values(
     — rate × runs — and only then summed. A bucket where a project reports runs
     but no rate is unknown, not perfect.
     """
-    if not projects:
+    interval = reads.interval
+    if not reads.projects:
         return [None] * len(starts)
     counts, rates = await asyncio.gather(
-        _per_project_series(client, projects, ENGINE_TRACE_COUNT, interval, span.start, span.end),
-        _per_project_series(
-            client, projects, ENGINE_TRACE_ERROR_RATE, interval, span.start, span.end
-        ),
+        reads.per_project(ENGINE_TRACE_COUNT), reads.per_project(ENGINE_TRACE_ERROR_RATE)
     )
     totals = [0.0] * len(starts)
     failed = [0.0] * len(starts)
@@ -1224,24 +1541,22 @@ async def _success_rate_values(
 
 
 async def _latency_percentile_values(
-    client: EngineClient,
-    projects: Sequence[AgentProject],
-    wanted: str,
-    interval: MetricInterval,
-    starts: Sequence[dt.datetime],
-    span: Range,
+    reads: _SeriesReads, wanted: str, starts: Sequence[dt.datetime]
 ) -> list[float | None]:
     """Runs-weighted per-bucket percentile across the workspace, in seconds.
 
     Summing percentiles across projects is meaningless; as with the KPI row's
     ``_weighted_percentile``, each project's line is weighted by its run count,
     which is exact for one project and a stated approximation for several.
+
+    The duration payload carries every percentile the engine computes, so the
+    p50 and the p90 line are two picks from one read.
     """
-    if not projects:
+    interval = reads.interval
+    if not reads.projects:
         return [None] * len(starts)
     counts, durations = await asyncio.gather(
-        _per_project_series(client, projects, ENGINE_TRACE_COUNT, interval, span.start, span.end),
-        _per_project_series(client, projects, ENGINE_DURATION, interval, span.start, span.end),
+        reads.per_project(ENGINE_TRACE_COUNT), reads.per_project(ENGINE_DURATION)
     )
     weights = [0.0] * len(starts)
     accumulated = [0.0] * len(starts)
@@ -1270,11 +1585,15 @@ async def cost_points(
 ) -> list[tuple[dt.datetime, float]]:
     if not projects:
         return []
+    project_ids = [project.project_id for project in projects]
     try:
-        payload = await client.get_cost_series(
-            interval_start=start,
-            interval_end=end,
-            project_ids=[project.project_id for project in projects],
+        payload = await _shared(
+            ("cost-series", frozenset(project_ids), start, end),
+            lambda: _bounded(
+                lambda: client.get_cost_series(
+                    interval_start=start, interval_end=end, project_ids=project_ids
+                )
+            ),
         )
     except EngineError as exc:
         raise telemetry_unavailable(exc) from exc
@@ -1319,25 +1638,31 @@ async def _governance_points(
     return [(stamp, 1.0) for stamp in stamps if stamp is not None]
 
 
-async def _series_values(
-    session: AsyncSession,
-    principal: Principal,
-    client: EngineClient,
-    projects: Sequence[AgentProject],
-    metric: SeriesMetric,
-    interval: MetricInterval,
-    starts: Sequence[dt.datetime],
-    span: Range,
+GOVERNANCE_METRICS: Final[tuple[SeriesMetric, ...]] = (
+    SeriesMetric.VIOLATIONS,
+    SeriesMetric.ESCALATIONS,
+)
+
+
+async def _engine_line(
+    reads: _SeriesReads, metric: SeriesMetric, starts: Sequence[dt.datetime]
 ) -> list[float | None]:
-    """Resolve one metric onto the shared bucket grid."""
-    if metric in (SeriesMetric.VIOLATIONS, SeriesMetric.ESCALATIONS):
-        points = await _governance_points(session, principal, metric, span.start, span.end)
-        # A governance chart counts events, so an empty bucket is a measured
-        # zero rather than an absent measurement.
-        folded = fold_sum(points, starts, interval)
-        return [0.0 if value is None else value for value in folded]
+    """Resolve one engine-measured metric onto the shared bucket grid."""
+    client, projects, interval, span = reads.client, reads.projects, reads.interval, reads.span
 
     if metric is SeriesMetric.COST:
+        if interval is MetricInterval.HOURLY:
+            # The workspace cost endpoint takes no interval and answers in
+            # *days*. Folded onto an hourly grid that was one spike at 00:00
+            # carrying the whole of today, and yesterday evening's share of the
+            # window gone altogether. The per-project COST series does honour
+            # HOURLY, and it is the same money: a trace's cost is the sum of
+            # its spans', which is what the workspace endpoint adds up.
+            costs = await reads.per_project(ENGINE_COST)
+            return _sum_lines(
+                [fold_sum(collapse_series(series), starts, interval) for series in costs],
+                len(starts),
+            )
         return fold_sum(await cost_points(client, projects, span.start, span.end), starts, interval)
 
     if metric is SeriesMetric.TOKENS:
@@ -1347,18 +1672,13 @@ async def _series_values(
         return fold_sum(collapse_series(series), starts, interval)
 
     if metric is SeriesMetric.RUNS:
-        series = await engine_series(
-            client, projects, ENGINE_TRACE_COUNT, interval, span.start, span.end
-        )
-        return fold_sum(collapse_series(series), starts, interval)
+        return await _run_count_values(reads, starts)
 
     if metric in (SeriesMetric.LATENCY_P50, SeriesMetric.LATENCY_P90):
         wanted = "p50" if metric is SeriesMetric.LATENCY_P50 else "p90"
-        return await _latency_percentile_values(
-            client, projects, wanted, interval, starts, span
-        )
+        return await _latency_percentile_values(reads, wanted, starts)
 
-    return await _success_rate_values(client, projects, interval, starts, span)
+    return await _success_rate_values(reads, starts)
 
 
 async def series(
@@ -1382,14 +1702,36 @@ async def series(
     starts = bucket_starts(span.start, span.end, grid_interval)
     projects = await workspace_projects(session, principal, agent_ids)
 
-    resolved = await asyncio.gather(
-        *(
-            _series_values(
-                session, principal, client, projects, metric, grid_interval, starts, span
-            )
-            for metric in metrics
+    # Our own tables first, one statement at a time and outside the engine
+    # deadline: a session runs one statement at once, and a statement cancelled
+    # half way costs the request its connection.
+    governance: dict[SeriesMetric, list[float | None]] = {}
+    for metric in metrics:
+        if metric in GOVERNANCE_METRICS and metric not in governance:
+            points = await _governance_points(session, principal, metric, span.start, span.end)
+            # A governance chart counts events, so an empty bucket is a
+            # measured zero rather than an absent measurement.
+            folded = fold_sum(points, starts, grid_interval)
+            governance[metric] = [0.0 if value is None else value for value in folded]
+
+    reads = _SeriesReads(client, projects, grid_interval, span)
+    measured = list(
+        dict.fromkeys(metric for metric in metrics if metric not in GOVERNANCE_METRICS)
+    )
+    engine_lines = dict(
+        zip(
+            measured,
+            await _answered(
+                asyncio.gather(*(_engine_line(reads, metric, starts) for metric in measured)),
+                what="the metrics charts",
+            ),
+            strict=True,
         )
     )
+    resolved = [
+        governance[metric] if metric in GOVERNANCE_METRICS else engine_lines[metric]
+        for metric in metrics
+    ]
 
     lines: list[MetricSeries] = []
     for metric, values in zip(metrics, resolved, strict=True):
@@ -1458,10 +1800,26 @@ async def model_rows(
     available without asking the engine to group by a span attribute, and it is
     exact for the overwhelmingly common case of one model per agent.
     """
+    return _model_rows(await _current_rollups(session, principal, window, agent_ids))
+
+
+async def _current_rollups(
+    session: AsyncSession,
+    principal: Principal,
+    window: MetricWindow,
+    agent_ids: Sequence[str] | None,
+) -> list[ProjectRollup]:
+    """The current window's per-agent rollup, which both breakdowns group."""
     client = get_engine_client()
     span = resolve_window(window)
     projects = await workspace_projects(session, principal, agent_ids)
-    rollups = await project_rollups(client, projects, span.start, span.end)
+    return await _answered(
+        project_rollups(client, projects, span.start, span.end),
+        what="the metrics breakdown",
+    )
+
+
+def _model_rows(rollups: Sequence[ProjectRollup]) -> list[dict[str, Any]]:
     overall = aggregate(rollups)
 
     rows: list[dict[str, Any]] = []
@@ -1500,10 +1858,10 @@ async def platform_rows(
     agent_ids: Sequence[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Runs by platform, for the donut beside the model table."""
-    client = get_engine_client()
-    span = resolve_window(window)
-    projects = await workspace_projects(session, principal, agent_ids)
-    rollups = await project_rollups(client, projects, span.start, span.end)
+    return _platform_rows(await _current_rollups(session, principal, window, agent_ids))
+
+
+def _platform_rows(rollups: Sequence[ProjectRollup]) -> list[dict[str, Any]]:
     overall = aggregate(rollups)
 
     rows: list[dict[str, Any]] = []

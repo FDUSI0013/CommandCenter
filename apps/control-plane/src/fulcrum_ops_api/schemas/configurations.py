@@ -578,7 +578,11 @@ class ConfigurationVersionCreate(BaseModel):
     """Cut a new revision — the New Version dialog."""
 
     version: str | None = Field(
-        None, description="Defaults to the next minor of the current version."
+        None,
+        description=(
+            "Defaults to the next minor of the current version that no revision, "
+            "drafts included, already holds."
+        ),
     )
     payload: dict[str, Any] | None = Field(
         None, description="Defaults to a copy of the current body."

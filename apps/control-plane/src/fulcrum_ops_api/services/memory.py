@@ -31,29 +31,36 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import datetime as dt
-import json
-from collections.abc import Iterable, Mapping, Sequence
+import hashlib
+import time
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any, Final
 
 from fastapi import Request
-from sqlalchemy import Select, func, nullslast, select
+from sqlalchemy import Select, case, func, nullslast, select
+from sqlalchemy import update as sa_update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..api.common import ListParams, apply_filters, apply_search, apply_sort, paginate
 from ..api.deps import Principal
+from ..core.config import settings
 from ..core.errors import (
+    AppError,
     Conflict,
     NotFound,
     PreconditionFailed,
     TelemetryBackendUnavailable,
     ValidationFailed,
 )
+from ..core.ttlcache import SingleFlightCache
+from ..db.base import stamp
 from ..engine import (
     EngineBadRequest,
     EngineClient,
     EngineError,
     EngineNotFound,
+    deadline,
     get_engine_client,
 )
 from ..models.governance import AuditEvent
@@ -61,6 +68,7 @@ from ..models.identity import Role, User
 from ..models.registry import Agent, MemoryStore, MemoryStoreStatus, MemoryStoreType
 from ..schemas.memory import (
     ACTIVE_SESSION_WINDOW_HOURS,
+    BACKUP_CAPTURES,
     LIVE_SESSION_WINDOW_MINUTES,
     THREAD_BACKED_TYPES,
     AgentStateRead,
@@ -87,7 +95,7 @@ from ..schemas.memory import (
     SyncState,
     retention_label,
 )
-from . import audit
+from . import audit, telemetry_cache
 
 SOURCE_SCREEN: Final[str] = "Memory & State Management"
 ENTITY_TYPE: Final[str] = "memory_store"
@@ -114,12 +122,19 @@ CONCURRENT_ENGINE_CALLS: Final[int] = 8
 #: caller to narrow by agent.
 MAX_THREAD_WINDOW: Final[int] = 200
 
-#: Purge and backup sweep sizes. The batch is one engine round trip; the batch
-#: count bounds a single run so one purge cannot hold a connection for minutes.
+#: Purge sweep sizes. The batch is one engine round trip; the batch count bounds
+#: one listing, and ``settings.memory_purge_budget_seconds`` bounds the run.
 PURGE_BATCH: Final[int] = 500
 MAX_PURGE_BATCHES: Final[int] = 20
-BACKUP_BATCH: Final[int] = 500
-MAX_BACKUP_BATCHES: Final[int] = 10
+
+#: How long the store table waits on telemetry for its live Records and Sessions
+#: figures before it is served without them. The table is our own data.
+STORE_COUNTS_DEADLINE_SECONDS: Final[float] = 8.0
+
+#: First key of the two-int advisory lock that keeps a store to one purge at a
+#: time across workers. A key space of its own: the audit chain's and the
+#: scheduler's locks can never collide with it.
+PURGE_LOCK_NAMESPACE: Final[int] = 0x4D505247  # "MPRG"
 
 #: Rows the retention-policy tab resolves labels for.
 MAX_POLICY_DETAIL_ROWS: Final[int] = 500
@@ -411,6 +426,60 @@ async def _projects(
     return [EngineProject(project_name=principal.engine_workspace)]
 
 
+async def _store_projects(
+    session: AsyncSession,
+    principal: Principal,
+    store: MemoryStore,
+    *,
+    agent_id: str | None = None,
+) -> list[EngineProject]:
+    """Engine projects of the agents bound to one store — and of nobody else.
+
+    An agent is bound to the store its memory policy names, which is the same
+    pairing the Agent State tab shows in its Store column. It is the only link
+    between a store and the threads in the telemetry store that the registry
+    holds, so it is the whole scope of anything done *to* a store.
+
+    Purge used to sweep :func:`_projects` — every provisioned agent in the
+    workspace — so purging a 7-day Development store deleted the Production
+    agents' history with it. There is deliberately no fallback here: a store no
+    agent names owns no threads, and the answer is an empty list, never the
+    workspace.
+    """
+    stmt = (
+        select(Agent.id, Agent.name, Agent.engine_project_name, Agent.engine_project_id)
+        .where(
+            Agent.workspace_id == principal.workspace_id,
+            Agent.memory_policy == store.name,
+            Agent.engine_project_name.is_not(None),
+        )
+        .order_by(nullslast(Agent.last_used_at.desc()), Agent.name.asc())
+        .limit(MAX_PROJECT_FANOUT)
+    )
+    if agent_id is not None:
+        stmt = stmt.where(Agent.id == agent_id)
+    return [
+        EngineProject(
+            project_name=str(project_name),
+            project_id=project_id,
+            agent_id=identifier,
+            agent_name=name,
+        )
+        for identifier, name, project_name, project_id in (await session.execute(stmt)).all()
+    ]
+
+
+def _scope(project: EngineProject) -> dict[str, str]:
+    """Address a project by id when the registry knows it.
+
+    A name costs the engine a name-to-id lookup on every call, and a fan-out
+    makes that call once per agent.
+    """
+    if project.project_id:
+        return {"project_id": project.project_id}
+    return {"project_name": project.project_name}
+
+
 async def _gather(calls: Iterable[Any]) -> list[Any]:
     """Run bounded-concurrency engine calls, surfacing the first failure."""
     semaphore = asyncio.Semaphore(CONCURRENT_ENGINE_CALLS)
@@ -436,23 +505,28 @@ async def _fetch_threads(
     """
     client = _engine()
     size = max(1, min(want, MAX_THREAD_WINDOW))
+
+    async def page_of(project: EngineProject) -> Any:
+        try:
+            return await client.list_threads(
+                page=1,
+                size=size,
+                **_scope(project),
+                search=search,
+                from_time=from_time,
+                truncate=True,
+            )
+        except EngineNotFound:
+            # A project that has never received telemetry does not exist yet.
+            # That is this project's answer, not the workspace's: it used to
+            # empty the whole tab for every other agent as well.
+            return None
+
     try:
-        payloads = await _gather(
-            [
-                client.list_threads(
-                    page=1,
-                    size=size,
-                    project_name=project.project_name,
-                    search=search,
-                    from_time=from_time,
-                    truncate=True,
-                )
-                for project in projects
-            ]
-        )
-    except EngineNotFound:
-        # A project that has never received telemetry does not exist yet.
-        return [], 0
+        # One slow project must not hold the tab past the point the console
+        # stops listening; the fan-out answers together or refuses together.
+        async with deadline(what="reading conversation threads"):
+            payloads = await _gather([page_of(project) for project in projects])
     except EngineError as exc:
         raise _unavailable(exc) from exc
 
@@ -471,12 +545,64 @@ async def _fetch_threads(
     return rows, total
 
 
-async def _count_threads(
-    projects: Sequence[EngineProject], *, from_time: dt.datetime | None = None
-) -> int:
-    """How many threads match, without materialising them."""
-    _, total = await _fetch_threads(projects, want=1, from_time=from_time)
-    return total
+#: (project, "all" | "active") -> how many threads it holds. Even at ``size=1``
+#: a thread listing is an aggregation over the project's traces, and the KPI
+#: row, the Agent State tab and every thread-backed store row each asked for one
+#: per agent on every load and after every action. They now share an answer for
+#: ``settings.memory_counts_cache_seconds``; a purge forgets the projects it
+#: swept, so its own figures are never the remembered ones.
+_thread_counts: SingleFlightCache[int] = SingleFlightCache(
+    ttl=lambda: settings.memory_counts_cache_seconds, max_entries=512
+)
+
+
+def _count_key(project: EngineProject) -> str:
+    return project.project_id or project.project_name
+
+
+async def _project_thread_count(project: EngineProject, *, active: bool) -> int:
+    """One project's thread count: every thread, or those inside the active window."""
+
+    async def measure() -> int:
+        since = (
+            dt.datetime.now(dt.UTC) - dt.timedelta(hours=ACTIVE_SESSION_WINDOW_HOURS)
+            if active
+            else None
+        )
+        try:
+            payload = await _engine().list_threads(
+                page=1, size=1, **_scope(project), from_time=since, truncate=True
+            )
+        except EngineNotFound:
+            return 0  # never received telemetry, so it holds no threads
+        return _total_of(payload, len(_rows_of(payload)))
+
+    return await _thread_counts.get(
+        (_count_key(project), "active" if active else "all"), measure
+    )
+
+
+def _forget_counts(projects: Iterable[EngineProject]) -> None:
+    keys = {_count_key(project) for project in projects}
+    _thread_counts.invalidate(
+        lambda key: isinstance(key, tuple) and bool(key) and key[0] in keys
+    )
+
+
+async def _count_threads(projects: Sequence[EngineProject], *, active: bool = False) -> int:
+    """How many threads the projects hold, without materialising any.
+
+    Fails closed: a project that cannot be counted makes the sum wrong, and a
+    wrong number on a KPI card is worse than the 503 this raises instead.
+    """
+    try:
+        async with deadline(what="counting conversation threads"):
+            counts = await _gather(
+                [_project_thread_count(project, active=active) for project in projects]
+            )
+    except EngineError as exc:
+        raise _unavailable(exc) from exc
+    return sum(counts)
 
 
 def _slice(rows: Sequence[ThreadRow], params: ListParams) -> list[ThreadRow]:
@@ -560,11 +686,85 @@ async def _backup_counts(
     return {entity_id: int(count) for entity_id, count in rows if entity_id}
 
 
+async def _live_counts(
+    session: AsyncSession, principal: Principal, stores: Sequence[MemoryStore]
+) -> dict[str, tuple[int | None, int | None, int]]:
+    """``(records, active sessions, bound agents)`` for each thread-backed store.
+
+    Nothing ever wrote these stores' counter columns — no job, no ingest hook,
+    no SDK verb — so Records and Sessions read 0 for ever however busy the
+    agents were. The telemetry store already knows both figures, so they are
+    read from it, over the agents bound to each store and through the same
+    short memory the KPI row uses.
+
+    The store table is our own data and keeps answering when telemetry does
+    not: a read that fails or runs long leaves the two figures null — not
+    measured — which the console renders as a dash, never as a zero.
+    """
+    names = {store.name: store.id for store in stores if store.store_type in THREAD_BACKED_TYPES}
+    if not names:
+        return {}
+    rows = (
+        await session.execute(
+            select(Agent.memory_policy, Agent.engine_project_name, Agent.engine_project_id)
+            .where(
+                Agent.workspace_id == principal.workspace_id,
+                Agent.memory_policy.in_(list(names)),
+                Agent.engine_project_name.is_not(None),
+            )
+            .order_by(nullslast(Agent.last_used_at.desc()), Agent.name.asc())
+        )
+    ).all()
+    bound: dict[str, list[EngineProject]] = {store_id: [] for store_id in names.values()}
+    for policy, project_name, project_id in rows:
+        bound[names[str(policy)]].append(
+            EngineProject(project_name=str(project_name), project_id=project_id)
+        )
+
+    # The fan-out is capped like every other on this screen. A store whose
+    # agents do not fit under the cap is left unmeasured rather than half
+    # counted: a partial sum looks exactly like a total.
+    projects: list[EngineProject] = []
+    unmeasured: set[str] = set()
+    for store_id, group in bound.items():
+        if len(projects) + len(group) > MAX_PROJECT_FANOUT:
+            unmeasured.add(store_id)
+            continue
+        projects.extend(group)
+    measured: dict[tuple[str, bool], int] = {}
+    try:
+        async with deadline(STORE_COUNTS_DEADLINE_SECONDS, what="counting store records"):
+            counts = await _gather(
+                [
+                    _project_thread_count(project, active=active)
+                    for project in projects
+                    for active in (False, True)
+                ]
+            )
+        keys = [(_count_key(project), active) for project in projects for active in (False, True)]
+        measured = dict(zip(keys, counts, strict=True))
+    except EngineError:
+        measured = {}
+
+    live: dict[str, tuple[int | None, int | None, int]] = {}
+    for store_id, group in bound.items():
+        if store_id in unmeasured or (projects and not measured):
+            live[store_id] = (None, None, len(group))
+            continue
+        live[store_id] = (
+            sum(measured[(_count_key(project), False)] for project in group),
+            sum(measured[(_count_key(project), True)] for project in group),
+            len(group),
+        )
+    return live
+
+
 async def _decorate(
     session: AsyncSession, principal: Principal, stores: Sequence[MemoryStore]
 ) -> list[MemoryStoreRead]:
     owners = await _owners(session, (store.owner_user_id for store in stores))
     backups = await _backup_counts(session, principal, [store.id for store in stores])
+    live = await _live_counts(session, principal, stores)
     payload: list[MemoryStoreRead] = []
     for store in stores:
         owner_name, owner_team = owners.get(store.owner_user_id or "", (None, None))
@@ -574,6 +774,7 @@ async def _decorate(
                 owner_name=owner_name,
                 owner_team=owner_team,
                 backup_count=backups.get(store.id, 0),
+                live=live.get(store.id),
             )
         )
     return payload
@@ -667,19 +868,6 @@ def _slices(counts: Mapping[str, int], total: int) -> list[MemoryCountSlice]:
     ]
 
 
-async def _grouped(
-    session: AsyncSession, principal: Principal, column: Any
-) -> dict[str, int]:
-    rows = (
-        await session.execute(
-            select(column, func.count(MemoryStore.id))
-            .where(MemoryStore.workspace_id == principal.workspace_id)
-            .group_by(column)
-        )
-    ).all()
-    return {str(label): int(count) for label, count in rows}
-
-
 async def _purge_totals(
     session: AsyncSession, principal: Principal, since: dt.datetime
 ) -> tuple[int, int]:
@@ -709,45 +897,100 @@ async def _purge_totals(
     return purged, runs
 
 
+async def _bound_projects(session: AsyncSession, principal: Principal) -> list[EngineProject]:
+    """Projects of every agent bound to *some* thread-backed store in the workspace.
+
+    An agent has one memory policy, so it is bound to at most one store and no
+    thread is counted twice.
+    """
+    rows = (
+        await session.execute(
+            select(Agent.id, Agent.name, Agent.engine_project_name, Agent.engine_project_id)
+            .where(
+                Agent.workspace_id == principal.workspace_id,
+                Agent.engine_project_name.is_not(None),
+                Agent.memory_policy.in_(
+                    select(MemoryStore.name).where(
+                        MemoryStore.workspace_id == principal.workspace_id,
+                        MemoryStore.store_type.in_(sorted(THREAD_BACKED_TYPES)),
+                    )
+                ),
+            )
+            .order_by(nullslast(Agent.last_used_at.desc()), Agent.name.asc())
+            .limit(MAX_PROJECT_FANOUT)
+        )
+    ).all()
+    return [
+        EngineProject(
+            project_name=str(project_name),
+            project_id=project_id,
+            agent_id=identifier,
+            agent_name=name,
+        )
+        for identifier, name, project_name, project_id in rows
+    ]
+
+
 async def summarise(session: AsyncSession, principal: Principal) -> MemorySummary:
     """The six KPI cards and the three breakdowns, in one round trip.
 
     Every store-side number is a SQL aggregate over the whole workspace rather
-    than over the page on screen; Active Sessions is the live thread count from
-    the telemetry store, so the card is empty-but-honest rather than stale when
-    the engine is unreachable — that condition surfaces as a 503.
+    than over the page on screen. Active Sessions and the thread-backed share of
+    Stored Memories are live thread counts from the telemetry store, so the row
+    is empty-but-honest rather than stale when the engine is unreachable — that
+    condition surfaces as a 503.
+
+    The reported figures — records, usage, latency — are aggregated over the
+    stores that *have* a reporter. A thread-backed store's counter columns are
+    never written, and folding their zeros in dragged every average towards
+    nothing.
     """
     workspace = MemoryStore.workspace_id == principal.workspace_id
+    reported = MemoryStore.store_type.not_in(sorted(THREAD_BACKED_TYPES))
     totals = (
         await session.execute(
             select(
-                func.count(MemoryStore.id).label("stores"),
                 func.coalesce(func.sum(MemoryStore.record_count), 0).label("records"),
                 func.avg(MemoryStore.avg_retrieval_latency_ms).label("latency"),
                 func.avg(MemoryStore.usage_percent).label("usage"),
-                func.max(MemoryStore.last_backup_at).label("last_backup_at"),
-            ).where(workspace)
+            ).where(workspace, reported)
         )
     ).one()
 
-    by_status = await _grouped(session, principal, MemoryStore.status)
-    by_type = await _grouped(session, principal, MemoryStore.store_type)
-    by_environment = await _grouped(session, principal, MemoryStore.environment)
-
-    over_threshold = (
+    # One grouped statement instead of three GROUP BYs and three counts: the
+    # breakdowns are folded from it here.
+    over = case((MemoryStore.usage_percent >= USAGE_WARNING_PERCENT, 1), else_=0)
+    groups = (
         await session.execute(
-            select(func.count(MemoryStore.id)).where(
-                workspace, MemoryStore.usage_percent >= USAGE_WARNING_PERCENT
+            select(
+                MemoryStore.status,
+                MemoryStore.store_type,
+                MemoryStore.environment,
+                func.count(MemoryStore.id),
+                func.coalesce(func.sum(over), 0),
+                func.max(MemoryStore.last_backup_at),
             )
+            .where(workspace)
+            .group_by(MemoryStore.status, MemoryStore.store_type, MemoryStore.environment)
         )
-    ).scalar_one()
-    thread_backed = (
-        await session.execute(
-            select(func.count(MemoryStore.id)).where(
-                workspace, MemoryStore.store_type.in_(sorted(THREAD_BACKED_TYPES))
-            )
-        )
-    ).scalar_one()
+    ).all()
+    by_status: dict[str, int] = {}
+    by_type: dict[str, int] = {}
+    by_environment: dict[str, int] = {}
+    stores = over_threshold = thread_backed = 0
+    last_backup_at: dt.datetime | None = None
+    for status, store_type, environment, count, over_count, backed_up in groups:
+        count = int(count)
+        stores += count
+        by_status[str(status)] = by_status.get(str(status), 0) + count
+        by_type[str(store_type)] = by_type.get(str(store_type), 0) + count
+        by_environment[str(environment)] = by_environment.get(str(environment), 0) + count
+        if store_type in THREAD_BACKED_TYPES:
+            thread_backed += count
+        else:
+            over_threshold += int(over_count or 0)
+        if backed_up is not None and (last_backup_at is None or backed_up > last_backup_at):
+            last_backup_at = backed_up
 
     since = dt.datetime.now(dt.UTC) - dt.timedelta(days=PURGE_WINDOW_DAYS)
     purged, purge_runs = await _purge_totals(session, principal, since)
@@ -762,17 +1005,16 @@ async def summarise(session: AsyncSession, principal: Principal) -> MemorySummar
     ).scalar_one()
 
     projects = await _projects(session, principal)
-    window_start = dt.datetime.now(dt.UTC) - dt.timedelta(
-        hours=ACTIVE_SESSION_WINDOW_HOURS
+    bound = await _bound_projects(session, principal) if thread_backed else []
+    active_sessions, threads = await asyncio.gather(
+        _count_threads(projects, active=True), _count_threads(bound)
     )
-    active_sessions = await _count_threads(projects, from_time=window_start)
 
-    stores = int(totals.stores or 0)
     active = int(by_status.get(MemoryStoreStatus.ACTIVE.value, 0))
     return MemorySummary(
         stores=stores,
         active_sessions=active_sessions,
-        stored_memories=int(totals.records or 0),
+        stored_memories=int(totals.records or 0) + threads,
         avg_retrieval_latency_ms=(
             round(float(totals.latency), 1) if totals.latency is not None else None
         ),
@@ -784,9 +1026,9 @@ async def summarise(session: AsyncSession, principal: Principal) -> MemorySummar
         paused_stores=int(by_status.get(MemoryStoreStatus.PAUSED.value, 0)),
         degraded_stores=int(by_status.get(MemoryStoreStatus.DEGRADED.value, 0)),
         avg_usage_percent=round(float(totals.usage), 1) if totals.usage is not None else None,
-        stores_over_capacity_threshold=int(over_threshold or 0),
-        thread_backed_stores=int(thread_backed or 0),
-        last_backup_at=totals.last_backup_at,
+        stores_over_capacity_threshold=over_threshold,
+        thread_backed_stores=thread_backed,
+        last_backup_at=last_backup_at,
         backups_in_window=int(backups_in_window or 0),
         by_type=_slices(by_type, stores),
         by_status=_slices(by_status, stores),
@@ -888,6 +1130,7 @@ async def update_store(
         rows = await _decorate(session, principal, [store])
         return rows[0]
 
+    renamed_from: str | None = None
     if "name" in changes and changes["name"] != store.name:
         clash = (
             await session.execute(
@@ -898,6 +1141,23 @@ async def update_store(
         ).scalar_one_or_none()
         if clash is not None:
             raise Conflict(f"A memory store named '{changes['name']}' already exists.")
+        renamed_from = store.name
+        width = Agent.memory_policy.type.length or 0
+        if width and len(changes["name"]) > width:
+            bound = (
+                await session.execute(
+                    select(func.count(Agent.id)).where(
+                        Agent.workspace_id == principal.workspace_id,
+                        Agent.memory_policy == store.name,
+                    )
+                )
+            ).scalar_one()
+            if bound:
+                raise ValidationFailed(
+                    f"{bound} agent(s) name this store as their memory policy, which "
+                    f"holds at most {width} characters. Choose a shorter name.",
+                    details={"field": "name", "max_length": width},
+                )
 
     counters = {
         "usage_percent",
@@ -918,6 +1178,22 @@ async def update_store(
         await session.rollback()
         raise Conflict(f"A memory store named '{changes.get('name')}' already exists.") from exc
 
+    if renamed_from is not None:
+        # Agents are bound to a store by its name, and that binding is the whole
+        # scope of the store's records and purge. A rename that left them naming
+        # the old one would quietly unbind every agent, so it is carried through
+        # — as a consequence of this edit, not an edit of theirs, hence the
+        # untouched concurrency token.
+        await session.execute(
+            sa_update(Agent)
+            .where(
+                Agent.workspace_id == principal.workspace_id,
+                Agent.memory_policy == renamed_from,
+            )
+            .values(memory_policy=store.name, updated_at=Agent.updated_at)
+            .execution_options(synchronize_session=False)
+        )
+
     await audit.record(
         session,
         principal=principal,
@@ -935,6 +1211,67 @@ async def update_store(
     await session.refresh(store)
     rows = await _decorate(session, principal, [store])
     return rows[0]
+
+
+async def delete_store(
+    session: AsyncSession,
+    principal: Principal,
+    store_id: str,
+    *,
+    request: Request | None = None,
+) -> None:
+    """Remove a store from the registry. The audit trail survives the deletion.
+
+    Only the registry row goes: nothing is deleted from the telemetry store or
+    from any backend, and the store's backups stay on the ledger because they
+    are audit rows. A store that agents still name is refused — removing it
+    would silently leave those agents' memory under no retention policy at all.
+    """
+    principal.require(Role.ADMIN)
+    store = await get_store(session, principal, store_id)
+
+    bound = (
+        await session.execute(
+            select(Agent.name)
+            .where(
+                Agent.workspace_id == principal.workspace_id,
+                Agent.memory_policy == store.name,
+            )
+            .order_by(Agent.name.asc())
+        )
+    ).scalars().all()
+    if bound:
+        shown = ", ".join(bound[:5]) + (" and others" if len(bound) > 5 else "")
+        raise PreconditionFailed(
+            f"'{store.name}' is still named as the memory policy of {len(bound)} agent(s): "
+            f"{shown}. Point them at another store first.",
+            details={"bound_agents": len(bound)},
+        )
+    if store.id in _purging:
+        raise Conflict(f"A purge of '{store.name}' is running. Wait for it to finish.")
+
+    await audit.record(
+        session,
+        principal=principal,
+        action="memory.store_deleted",
+        entity_type=ENTITY_TYPE,
+        entity_id=store.id,
+        entity_label=store.name,
+        source_screen=SOURCE_SCREEN,
+        detail=(
+            f"Removed {store.store_type} store ({store.environment}, "
+            f"{store.retention_policy or 'no'} retention); no records were deleted"
+        ),
+        metadata={
+            "store_type": store.store_type,
+            "environment": store.environment,
+            "retention_days": store.retention_days,
+            "backend": store.backend,
+        },
+        request=request,
+    )
+    await session.delete(store)
+    await session.flush()
 
 
 async def update_retention(
@@ -1033,14 +1370,18 @@ async def list_records(
 ) -> tuple[list[MemoryRecordRead], int]:
     """One page of the store's records, read live from the telemetry store.
 
-    Records are the conversation threads the store holds. The control plane does
-    not partition threads per store, so the view is the workspace's thread stream
-    — narrow it with ``agent_id`` to get one agent's memory.
+    Records are the conversation threads of the agents bound to the store — the
+    same scope its Records figure counts and its purge sweeps, so what this
+    lists as expiring is exactly what a purge would remove. It used to list the
+    whole workspace's threads under every store. ``agent_id`` narrows it to one
+    of those agents; a store no agent names holds no records.
     """
     store = await get_store(session, principal, store_id)
     _require_thread_backed(store, "Browse")
 
-    projects = await _projects(session, principal, agent_id=agent_id)
+    projects = await _store_projects(session, principal, store, agent_id=agent_id)
+    if not projects:
+        return [], 0
     rows, total = await _fetch_threads(
         projects, want=params.offset + params.page_size, search=params.q
     )
@@ -1182,22 +1523,23 @@ async def list_agent_state(
     provisioned = [agent for agent in agents if agent.engine_project_name][:MAX_PROJECT_FANOUT]
     counts: dict[str, int] = {}
     if provisioned:
-        client = _engine()
         try:
-            payloads = await _gather(
-                [
-                    client.list_threads(
-                        page=1, size=1, project_name=agent.engine_project_name, truncate=True
-                    )
-                    for agent in provisioned
-                ]
-            )
-        except EngineNotFound:
-            payloads = []
+            async with deadline(what="counting agent sessions"):
+                totals = await _gather(
+                    [
+                        _project_thread_count(
+                            EngineProject(
+                                project_name=str(agent.engine_project_name),
+                                project_id=agent.engine_project_id,
+                            ),
+                            active=False,
+                        )
+                        for agent in provisioned
+                    ]
+                )
         except EngineError as exc:
             raise _unavailable(exc) from exc
-        for agent, payload in zip(provisioned, payloads, strict=False):
-            counts[agent.id] = _total_of(payload, len(_rows_of(payload)))
+        counts = {agent.id: total for agent, total in zip(provisioned, totals, strict=True)}
 
     rows: list[AgentStateRead] = []
     for agent in agents:
@@ -1295,35 +1637,202 @@ async def list_retention_policies(
 # ---------------------------------------------------------------------------
 
 
-async def _sweep(
-    client: EngineClient, project: EngineProject, cutoff: dt.datetime, *, delete: bool
-) -> tuple[int, bool]:
-    """Walk one project's expired traces, deleting them or just counting them.
+@dataclasses.dataclass
+class _PurgeProgress:
+    """What one purge has done so far.
 
-    When deleting, the cursor deliberately does not advance: the rows just
-    removed are gone, so the next batch starts at the head of what is left.
+    Kept outside the sweep so that a sweep which fails half way still knows what
+    it removed before it failed. Those deletions happened; the audit row and the
+    response have to say so whatever became of the rest.
     """
-    swept = 0
+
+    candidates: int = 0
+    records: int = 0
+    traces: int = 0
+    capped: bool = False
+    failure: EngineError | None = None
+    written: set[str] = dataclasses.field(default_factory=set)
+
+
+#: Stores with a purge running in this process. The advisory lock below covers
+#: the other workers; this covers databases that have no such lock.
+_purging: set[str] = set()
+
+
+async def _claim_purge(session: AsyncSession, store: MemoryStore) -> None:
+    """Keep a store to one purge at a time, or answer 409.
+
+    The console gives up on a request after 30 s and the operator clicks again;
+    two sweeps of the same threads then race, and each reports the other's
+    deletions as its own. The lock is transaction-scoped, so it is released by
+    the commit or rollback that ends the purge and cannot be leaked by a
+    cancelled request. It is tried, never waited on: the second caller is told,
+    not parked on a pooled connection.
+    """
+    busy = Conflict(f"A purge of '{store.name}' is already running. Wait for it to finish.")
+    if store.id in _purging:
+        raise busy
+    if session.get_bind().dialect.name == "postgresql":
+        digest = hashlib.sha256(store.id.encode()).digest()
+        key = int.from_bytes(digest[:4], "big", signed=True)
+        held = await session.execute(
+            select(func.pg_try_advisory_xact_lock(PURGE_LOCK_NAMESPACE, key))
+        )
+        if not held.scalar():
+            raise busy
+    _purging.add(store.id)
+
+
+def _last_moment(row: Mapping[str, Any]) -> dt.datetime | None:
+    """The latest instant a thread row mentions, whichever field carries it.
+
+    Expiry is judged on the most recent of them, so a thread is only ever called
+    expired when *nothing* about it is newer than the cutoff.
+    """
+    moments = [
+        moment
+        for moment in (
+            _instant(row.get(key))
+            for key in ("last_updated_at", "end_time", "start_time", "created_at")
+        )
+        if moment is not None
+    ]
+    return max(moments) if moments else None
+
+
+async def _expired_threads(
+    client: EngineClient, project: EngineProject, cutoff: dt.datetime
+) -> tuple[list[str], bool]:
+    """Ids of one project's threads whose last activity is past retention.
+
+    The store is asked for the project's threads and nothing more: no time
+    window is sent, because which window property this endpoint honours has
+    never been verified, and a window that is silently ignored would hand back
+    the newest threads as though they were the oldest. Each row is judged here,
+    on its own timestamps.
+    """
+    expired: list[str] = []
     cursor: str | None = None
     for _ in range(MAX_PURGE_BATCHES):
-        rows = await client.search_traces(
-            project_name=project.project_name,
-            to_time=cutoff,
+        batch = await client.search_threads(
+            **_scope(project),
+            limit=PURGE_BATCH,
+            last_retrieved_thread_model_id=cursor,
+            truncate=True,
+        )
+        rows = [row for row in batch if isinstance(row, dict)]
+        for row in rows:
+            thread_id = str(row.get("thread_id") or row.get("id") or "")
+            last = _last_moment(row)
+            if thread_id and last is not None and last < cutoff:
+                expired.append(thread_id)
+        cursor = _thread_cursor(rows)
+        if len(rows) < PURGE_BATCH or cursor is None:
+            return expired, False
+    return expired, True
+
+
+def _thread_cursor(rows: Sequence[Mapping[str, Any]]) -> str | None:
+    """Where the next page of a thread search resumes.
+
+    The engine pages threads by ``thread_model_id``, its own surrogate UUID. A
+    thread's ``id`` is the *caller's* business id — any string at all — and
+    sending that as the cursor is refused with a 400 on the second page of any
+    project that has one.
+    """
+    if not rows:
+        return None
+    return str(rows[-1].get("thread_model_id") or "") or None
+
+
+async def _thread_traces(
+    client: EngineClient, project: EngineProject, thread_id: str, cutoff: dt.datetime
+) -> list[str]:
+    """Ids of the traces one expired thread is made of; empty if it is not expired.
+
+    Every row is checked again before its id is handed to a delete. The filter
+    is a request, and a store that ignored it would answer with the whole
+    project: a row that does not carry this thread's id is never deleted. And a
+    thread with even one trace newer than the cutoff is still being written to,
+    whatever its own row said, so none of it goes.
+    """
+    ids: list[str] = []
+    cursor: str | None = None
+    for _ in range(MAX_PURGE_BATCHES):
+        batch = await client.search_traces(
+            **_scope(project),
+            filters=[{"field": "thread_id", "operator": "=", "value": thread_id}],
             limit=PURGE_BATCH,
             last_retrieved_id=cursor,
             truncate=True,
         )
-        ids = [str(row["id"]) for row in rows if isinstance(row, dict) and row.get("id")]
-        if not ids:
-            return swept, False
-        if delete:
-            await client.delete_traces(ids, project_id=project.project_id)
-        else:
-            cursor = ids[-1]
-        swept += len(ids)
-        if len(ids) < PURGE_BATCH:
-            return swept, False
-    return swept, True
+        rows = [row for row in batch if isinstance(row, dict) and row.get("id")]
+        for row in rows:
+            if str(row.get("thread_id") or "") != thread_id:
+                continue
+            started = _instant(row.get("start_time"))
+            if started is None or started >= cutoff:
+                return []
+            ids.append(str(row["id"]))
+        if len(rows) < PURGE_BATCH:
+            break
+        cursor = str(rows[-1]["id"])
+    return ids
+
+
+async def _sweep(
+    client: EngineClient,
+    project: EngineProject,
+    cutoff: dt.datetime,
+    progress: _PurgeProgress,
+    *,
+    delete: bool,
+    out_of_time: Callable[[], bool],
+) -> None:
+    """Remove one project's expired threads, or just count them.
+
+    Only traces that belong to an expired conversation thread are ever
+    addressed. An agent's ordinary runs carry no thread id; they are run
+    history, not memory, and no retention policy on a memory store reaches them.
+    """
+    expired, capped = await _expired_threads(client, project, cutoff)
+    progress.candidates += len(expired)
+    progress.capped = progress.capped or capped
+    if not delete:
+        return
+
+    for start in range(0, len(expired), CONCURRENT_ENGINE_CALLS):
+        if out_of_time():
+            progress.capped = True
+            return
+        group = expired[start : start + CONCURRENT_ENGINE_CALLS]
+        found = await _gather(
+            [_thread_traces(client, project, thread_id, cutoff) for thread_id in group]
+        )
+        # One delete per batch of ids rather than per thread, but counted per
+        # thread: a record is gone when the last of its traces is.
+        left = [len(traces) for traces in found]
+        pending = [(index, trace_id) for index, traces in enumerate(found) for trace_id in traces]
+        for offset in range(0, len(pending), PURGE_BATCH):
+            chunk = pending[offset : offset + PURGE_BATCH]
+            await client.delete_traces(
+                [trace_id for _, trace_id in chunk], project_id=project.project_id
+            )
+            progress.traces += len(chunk)
+            if project.project_id:
+                progress.written.add(project.project_id)
+            for index, _ in chunk:
+                left[index] -= 1
+                if left[index] == 0:
+                    progress.records += 1
+
+
+async def _threads_held(projects: Sequence[EngineProject]) -> int | None:
+    """Threads the projects hold right now, or None when the store cannot say."""
+    try:
+        return await _count_threads(projects)
+    except AppError:
+        return None
 
 
 async def purge_store(
@@ -1334,12 +1843,22 @@ async def purge_store(
     *,
     request: Request | None = None,
 ) -> MemoryPurgeResult:
-    """Delete everything past the store's retention window.
+    """Delete the conversation records past the store's retention window.
 
-    This is the real deletion, not a marker: expired traces are removed from the
-    telemetry store in batches, and the registry's record count and usage are
-    reduced by exactly what went. ``dry_run`` walks the same window and reports
-    what would go without touching anything.
+    This is the real deletion, not a marker, so it is fenced on every side:
+
+    * **Whose.** Only the agents bound to this store (:func:`_store_projects`)
+      are swept. A store no agent names is refused: it owns nothing the control
+      plane can identify, and "everything in the workspace" is not an answer.
+    * **What.** Only conversation threads whose *last* activity is past the
+      window, removed whole. Runs that belong to no thread are never touched.
+    * **On whose word.** A real purge carries the store's name in ``confirm``.
+      ``dry_run`` walks the same threads, needs no confirmation, and reports
+      what would go and whose it is without touching anything.
+    * **On the record.** Whatever was deleted is audited by this request, even
+      when the telemetry store fails part way through or the time budget runs
+      out: the response then says ``partial`` or ``capped`` and the run is
+      simply repeated. Only a purge that deleted nothing is allowed to fail.
     """
     principal.require(Role.OPERATOR)
     store = await get_store(session, principal, store_id)
@@ -1354,45 +1873,108 @@ async def purge_store(
         raise PreconditionFailed(
             f"'{store.name}' is paused. Resume it before running a purge."
         )
+    if not payload.dry_run and (payload.confirm or "").strip() != store.name:
+        raise ValidationFailed(
+            "A purge deletes conversation records permanently. Confirm it by sending "
+            f"'confirm' set to the store's exact name, '{store.name}'.",
+            details={"field": "confirm"},
+        )
+
+    projects = await _store_projects(session, principal, store)
+    if not projects:
+        raise PreconditionFailed(
+            f"No provisioned agent names '{store.name}' as its memory policy, so the "
+            "control plane cannot tell which conversation records belong to it and "
+            "will not delete any. Set the memory policy of the agents that use this "
+            "store to its name, then run the purge again.",
+            details={"bound_agents": 0},
+        )
 
     cutoff = dt.datetime.now(dt.UTC) - dt.timedelta(days=store.retention_days)
-    projects = await _projects(session, principal)
     client = _engine()
+    progress = _PurgeProgress()
+    stop_at = time.monotonic() + settings.memory_purge_budget_seconds
 
-    purged = 0
-    capped = False
+    def out_of_time() -> bool:
+        return time.monotonic() >= stop_at
+
+    claimed = not payload.dry_run
+    if claimed:
+        await _claim_purge(session, store)
     try:
         for project in projects:
-            swept, hit_cap = await _sweep(client, project, cutoff, delete=not payload.dry_run)
-            purged += swept
-            capped = capped or hit_cap
-    except EngineNotFound:
-        purged, capped = 0, False
-    except EngineBadRequest as exc:
-        raise ValidationFailed(
-            "The telemetry store refused the purge window.",
-            details={"cutoff": cutoff.isoformat()},
-        ) from exc
+            if out_of_time():
+                progress.capped = True
+                break
+            try:
+                await _sweep(
+                    client,
+                    project,
+                    cutoff,
+                    progress,
+                    delete=not payload.dry_run,
+                    out_of_time=out_of_time,
+                )
+            except EngineNotFound:
+                # A project that has never received telemetry holds nothing to expire.
+                continue
     except EngineError as exc:
-        raise _unavailable(exc) from exc
+        progress.failure = exc
+    finally:
+        if claimed:
+            _purging.discard(store.id)
 
-    before = store.record_count
-    if not payload.dry_run and purged:
-        remaining = max(0, before - purged)
-        # Usage is a share of provisioned capacity, so it falls with the rows.
-        scaled = int(round(store.usage_percent * remaining / before)) if before else 0
-        store.record_count = remaining
-        store.usage_percent = max(0, min(100, scaled))
-        store.last_updated_at = dt.datetime.now(dt.UTC)
-        store.updated_by = principal.actor
-    remaining = store.record_count
-    usage = store.usage_percent
+    if progress.failure is not None and not progress.traces:
+        # Nothing was removed, so there is nothing to account for: fail whole.
+        if isinstance(progress.failure, EngineBadRequest):
+            raise ValidationFailed(
+                "The telemetry store refused the purge.",
+                details={"cutoff": cutoff.isoformat()},
+            ) from progress.failure
+        raise _unavailable(progress.failure) from progress.failure
+    partial = progress.failure is not None
+
+    if progress.traces:
+        # The run screens remember these projects' rows for a few seconds.
+        for project_id in progress.written:
+            telemetry_cache.project_written(project_id)
+        # A purge acts on the store; it does not edit it, so the row's
+        # concurrency token stays where the console last read it.
+        await stamp(session, [store], last_updated_at=dt.datetime.now(dt.UTC))
+        _forget_counts(projects)
+    remaining = await _threads_held(projects)
+
+    agents = [project.agent_name or project.project_name for project in projects]
+    whose = f"{len(agents)} agent(s)"
+    if payload.dry_run:
+        message = (
+            f"{progress.candidates} record(s) held by {whose} are past "
+            f"{store.retention_policy} retention. Nothing was deleted."
+        )
+    else:
+        message = (
+            f"Removed {progress.records} expired record(s) "
+            f"({progress.traces} trace(s)) held by {whose}."
+        )
+        if partial:
+            message += (
+                " The telemetry store stopped answering part way; run the purge "
+                "again to finish."
+            )
+        elif progress.capped:
+            message += " More remain; run the purge again."
 
     detail = (
-        f"Dry run: {purged} record(s) past {store.retention_policy} retention"
+        f"Dry run: {progress.candidates} record(s) past {store.retention_policy} retention"
         if payload.dry_run
-        else f"Purged {purged} record(s) past {store.retention_policy} retention"
+        else (
+            f"Purged {progress.records} record(s) ({progress.traces} trace(s)) "
+            f"past {store.retention_policy} retention"
+        )
     )
+    detail = f"{detail}; agents: {', '.join(agents)}"
+    if partial:
+        detail = f"{detail}; stopped early, the telemetry store failed part way"
     if payload.reason:
         detail = f"{detail} ({payload.reason})"
     await audit.record(
@@ -1405,13 +1987,18 @@ async def purge_store(
         source_screen=SOURCE_SCREEN,
         detail=detail,
         metadata={
-            "purged_records": 0 if payload.dry_run else purged,
-            "candidate_records": purged,
+            "purged_records": progress.records,
+            "purged_traces": progress.traces,
+            "candidate_records": progress.candidates,
             "dry_run": payload.dry_run,
             "cutoff": cutoff.isoformat(),
             "retention_days": store.retention_days,
             "projects": len(projects),
-            "capped": capped,
+            "agents": agents,
+            "agent_ids": [project.agent_id for project in projects],
+            "capped": progress.capped,
+            "partial": partial,
+            "failure": type(progress.failure).__name__ if progress.failure else None,
         },
         request=request,
     )
@@ -1423,11 +2010,16 @@ async def purge_store(
         dry_run=payload.dry_run,
         cutoff=cutoff,
         retention_days=store.retention_days,
-        purged_records=purged,
+        candidate_records=progress.candidates,
+        purged_records=progress.records,
+        purged_traces=progress.traces,
         remaining_records=remaining,
-        usage_percent=usage,
+        usage_percent=None,
         projects=len(projects),
-        capped=capped,
+        agents=agents,
+        capped=progress.capped,
+        partial=partial,
+        message=message,
     )
 
 
@@ -1471,7 +2063,24 @@ def _backup_read(event: AuditEvent) -> MemoryBackupRead:
         payload_bytes=_int_or_none(metadata.get("payload_bytes")),
         window_from=_instant(metadata.get("window_from")),
         projects=_int_or_none(manifest.get("projects")) or 0,
+        # True of every row, old and new: no backup ever kept a thread.
+        threads_captured=False,
+        captured=list(BACKUP_CAPTURES),
     )
+
+
+#: Said on every backup and restore response. The console's copy used to
+#: promise that a backup "captures the store's current records" and that a
+#: restore "replaces the store's current contents"; neither was ever true.
+BACKUP_NOTICE: Final[str] = (
+    "This snapshot holds the store's governed state (retention policy and status) "
+    "and a count of its conversation threads. The threads themselves are not "
+    "copied, so a purge cannot be undone from it."
+)
+RESTORE_NOTICE: Final[str] = (
+    "Conversation threads were not restored: a backup holds the store's governed "
+    "state, never its records, so anything purged since it was taken stays deleted."
+)
 
 
 async def backup_store(
@@ -1482,65 +2091,38 @@ async def backup_store(
     *,
     request: Request | None = None,
 ) -> MemoryBackupResult:
-    """Snapshot a store: export its threads through the adapter, record the manifest.
+    """Snapshot a store's governed state, and say plainly that is all it is.
 
-    The export is streamed from the telemetry store and measured here; the bytes
-    stay inside the telemetry store's own storage domain, and what the control
-    plane persists is the manifest — what was captured, how much of it, and the
-    state the store was in — which is exactly what a restore replays.
+    What is recorded is the manifest: the retention policy and status a restore
+    can put back, and how many conversation threads the store's agents held at
+    that moment. The threads are counted, not copied — the control plane has
+    nowhere to keep a second copy of them — and the response, the ledger row and
+    the audit detail all say so, because the one thing a backup must never do is
+    let someone purge on the strength of it.
 
-    A store that has been backed up before is exported incrementally from the
-    last backup unless ``full`` is set.
+    This used to page every thread of every project in the workspace into one
+    list, serialise it to measure a "payload size", and throw it away: up to
+    160,000 rows held and a blocking ``json.dumps`` on the event loop, to
+    produce a number describing data that was not kept. The count now costs one
+    cheap call per bound agent and nothing is held.
     """
     principal.require(Role.OPERATOR)
     store = await get_store(session, principal, store_id)
     _require_thread_backed(store, "Back up")
 
-    window_from = None if payload.full else store.last_backup_at
-    kind = BackupKind.FULL if window_from is None else BackupKind.INCREMENTAL
-    projects = await _projects(session, principal)
-    client = _engine()
-
-    exported: list[dict[str, Any]] = []
-    capped = False
-    try:
-        for project in projects:
-            cursor: str | None = None
-            for _ in range(MAX_BACKUP_BATCHES):
-                batch = await client.search_threads(
-                    project_name=project.project_name,
-                    from_time=window_from,
-                    limit=BACKUP_BATCH,
-                    last_retrieved_thread_model_id=cursor,
-                    truncate=True,
-                )
-                rows = [row for row in batch if isinstance(row, dict)]
-                if not rows:
-                    break
-                exported.extend(rows)
-                cursor = str(rows[-1].get("id") or "") or None
-                if len(rows) < BACKUP_BATCH or cursor is None:
-                    break
-            else:
-                capped = True
-    except EngineNotFound:
-        exported = []
-    except EngineError as exc:
-        raise _unavailable(exc) from exc
-
-    payload_bytes = len(json.dumps(exported, default=str).encode("utf-8"))
+    projects = await _store_projects(session, principal, store)
+    threads = await _count_threads(projects) if projects else 0
+    agents = [project.agent_name or project.project_name for project in projects]
     now = dt.datetime.now(dt.UTC)
-    status = BackupStatus.PARTIAL if capped else BackupStatus.COMPLETED
 
     manifest = {
-        "record_count": len(exported),
-        "payload_bytes": payload_bytes,
+        "record_count": threads,
         "projects": len(projects),
-        "store_record_count": store.record_count,
-        "store_usage_percent": store.usage_percent,
+        "agents": agents,
         "store_status": store.status,
         "retention_policy": store.retention_policy,
         "retention_days": store.retention_days,
+        "threads_captured": False,
     }
     event = await audit.record(
         session,
@@ -1551,36 +2133,43 @@ async def backup_store(
         entity_label=store.name,
         source_screen=SOURCE_SCREEN,
         detail=(
-            f"{kind.value} backup: {len(exported)} thread(s), {payload_bytes} byte(s)"
+            f"Snapshot of governed state ({store.retention_policy or 'no'} retention, "
+            f"{store.status}); {threads} thread(s) counted, none copied"
             + (f" ({payload.note})" if payload.note else "")
         ),
         metadata={
-            "kind": kind.value,
-            "status": status.value,
-            "record_count": len(exported),
-            "payload_bytes": payload_bytes,
-            "window_from": window_from.isoformat() if window_from else None,
+            "kind": BackupKind.FULL.value,
+            "status": BackupStatus.COMPLETED.value,
+            "record_count": threads,
+            "payload_bytes": None,
+            "window_from": None,
             "note": payload.note,
+            "threads_captured": False,
             "manifest": manifest,
         },
         request=request,
     )
 
-    store.last_backup_at = now
-    store.updated_by = principal.actor
+    # Bookkeeping about the store, not an edit of it: the concurrency token the
+    # console holds must survive taking a snapshot.
+    await stamp(session, [store], last_backup_at=now)
     await session.flush()
 
     return MemoryBackupResult(
         backup_id=event.id,
         store_id=store.id,
         name=store.name,
-        kind=kind,
-        status=status,
-        record_count=len(exported),
-        payload_bytes=payload_bytes,
-        window_from=window_from,
+        kind=BackupKind.FULL,
+        status=BackupStatus.COMPLETED,
+        record_count=threads,
+        payload_bytes=None,
+        window_from=None,
         created_at=event.occurred_at,
         projects=len(projects),
+        agents=agents,
+        threads_captured=False,
+        captured=list(BACKUP_CAPTURES),
+        notice=BACKUP_NOTICE,
     )
 
 
@@ -1627,12 +2216,16 @@ async def restore_store(
     *,
     request: Request | None = None,
 ) -> MemoryRestoreResult:
-    """Put a store back into the state one backup captured.
+    """Put a store's governed state back to what one backup captured.
 
-    The manifest holds the governed state — record count, usage, retention and
-    status — so that is what comes back. Threads deleted from the telemetry store
-    since the snapshot are not resurrected by this call, and the response says
-    so rather than implying otherwise.
+    Governed state is the retention policy and the status, and that is all that
+    comes back. Threads deleted from the telemetry store since the snapshot are
+    not resurrected — no backup ever held them — and the response says so in
+    ``threads_restored`` and ``notice`` rather than leaving a toast to imply it.
+
+    Counters are deliberately *not* restored. They used to be: the record count
+    jumped back to its pre-purge figure while the records stayed deleted, which
+    made the screen agree with the operator's hope instead of with the store.
     """
     principal.require(Role.ADMIN)
     store = await get_store(session, principal, store_id)
@@ -1652,14 +2245,11 @@ async def restore_store(
         )
 
     restored: list[str] = []
-    record_count = _int_or_none(manifest.get("store_record_count"))
-    if record_count is not None and record_count != store.record_count:
-        store.record_count = record_count
-        restored.append("record_count")
-    usage = _int_or_none(manifest.get("store_usage_percent"))
-    if usage is not None and usage != store.usage_percent:
-        store.usage_percent = max(0, min(100, usage))
-        restored.append("usage_percent")
+    previous = {
+        "retention_days": store.retention_days,
+        "retention_policy": store.retention_policy,
+        "status": store.status,
+    }
     retention_days = _int_or_none(manifest.get("retention_days"))
     if retention_days is not None and retention_days != store.retention_days:
         store.retention_days = retention_days
@@ -1668,15 +2258,23 @@ async def restore_store(
         )
         restored.append("retention_policy")
     status = manifest.get("store_status")
-    if isinstance(status, str) and status and status != store.status:
+    if (
+        isinstance(status, str)
+        and status != store.status
+        and status in {member.value for member in MemoryStoreStatus}
+    ):
         store.status = status
         restored.append("status")
 
     now = dt.datetime.now(dt.UTC)
-    store.last_updated_at = now
-    store.updated_by = principal.actor
+    if restored:
+        store.last_updated_at = now
+        store.updated_by = principal.actor
 
-    detail = f"Restored from backup {event.id} taken {event.occurred_at.isoformat()}"
+    detail = (
+        f"Restored governed state ({', '.join(restored) or 'nothing had changed'}) from "
+        f"backup {event.id} taken {event.occurred_at.isoformat()}; no threads restored"
+    )
     if payload.reason:
         detail = f"{detail} ({payload.reason})"
     await audit.record(
@@ -1691,6 +2289,8 @@ async def restore_store(
         metadata={
             "backup_id": event.id,
             "fields_restored": restored,
+            "threads_restored": False,
+            "previous": previous,
             "backup_taken_at": event.occurred_at.isoformat(),
         },
         request=request,
@@ -1698,14 +2298,21 @@ async def restore_store(
     await session.flush()
     await session.refresh(store)
 
+    projects = await _store_projects(session, principal, store)
     return MemoryRestoreResult(
         backup_id=event.id,
         store_id=store.id,
         name=store.name,
         restored_at=now,
-        record_count=store.record_count,
-        usage_percent=store.usage_percent,
+        record_count=(
+            (await _threads_held(projects) if projects else 0)
+            if store.store_type in THREAD_BACKED_TYPES
+            else store.record_count
+        ),
+        usage_percent=None,
         retention_policy=store.retention_policy,
         status=MemoryStoreStatus(store.status),
         fields_restored=restored,
+        threads_restored=False,
+        notice=RESTORE_NOTICE,
     )

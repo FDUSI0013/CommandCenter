@@ -18,7 +18,14 @@ import datetime as dt
 from decimal import Decimal
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
 from ..models.identity import Role
 from ..models.licensing import (
@@ -281,6 +288,16 @@ class LicenseSuspendRequest(BaseModel):
     release_seats: bool = False
 
 
+class LicenseRevokeRequest(BaseModel):
+    """Body for ``POST /licensing/tenants/{id}/revoke``.
+
+    There is no ``release_seats`` here: revocation is terminal, and a licence
+    that serves nobody holds no seats, so they are always released.
+    """
+
+    reason: str | None = Field(default=None, max_length=1000)
+
+
 # --------------------------------------------------------------------------- #
 # Seats
 # --------------------------------------------------------------------------- #
@@ -357,7 +374,15 @@ class EntitlementRead(BaseModel):
 
 
 class EntitlementUsageRead(BaseModel):
-    """Metered usage for one meter against the plan's included allowance."""
+    """Metered usage for one meter against the plan's included allowance.
+
+    ``used`` and ``remaining`` are quantities, not money, and go out as JSON
+    numbers. A ``Decimal`` serialises as a string -- right for an invoice line,
+    wrong here: the console formats these with ``toLocaleString``, which leaves a
+    string untouched, so the bar read ``1500000.0000 / 1,000,000``. Whole counts
+    (tokens, runs, seats) go out as integers; only a fractional meter such as
+    ``storage_gb`` is a float.
+    """
 
     metric: UsageMetric
     used: Decimal
@@ -366,6 +391,12 @@ class EntitlementUsageRead(BaseModel):
     utilization_pct: float | None = None
     over_limit: bool = False
     amount_usd: Decimal = Decimal("0")
+
+    @field_serializer("used", "remaining", when_used="json")
+    def _quantity_as_number(self, value: Decimal | None) -> int | float | None:
+        if value is None:
+            return None
+        return int(value) if value == value.to_integral_value() else float(value)
 
 
 class TenantEntitlementsRead(BaseModel):

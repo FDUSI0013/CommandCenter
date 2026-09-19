@@ -214,9 +214,11 @@ class AlertRuleRead(BaseModel):
 class AlertRuleCreate(BaseModel):
     """Define a new rule.
 
-    ``condition`` is stored as written: each source screen evaluates its own
-    shape (a threshold, a rate, a missing heartbeat) and the editor round-trips
-    the document untouched.
+    ``source`` and ``severity`` are what match a rule to the alerts it governs:
+    an alert raised from that screen at that severity names the rule, and a
+    disabled rule silences it. ``condition`` is stored as written (a threshold,
+    a rate, a missing heartbeat) and the editor round-trips the document
+    untouched; it records what the screen alerts on and is not evaluated here.
     """
 
     name: RuleName

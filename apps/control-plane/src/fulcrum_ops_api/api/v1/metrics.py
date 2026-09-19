@@ -1,8 +1,9 @@
 """Metrics routes — the platform-wide telemetry rollup.
 
-Five endpoints back one screen: the six KPI cards, the six trend charts, the
-per-model table with its usage donut, the runs-by-platform donut, and the Export
-button. Every route is a read; the screen has no verbs.
+Six endpoints back one screen: the six KPI cards, the six trend charts, the
+per-model table with its usage donut, the runs-by-platform donut, the Export
+button -- and ``/overview``, which answers the cards and both breakdowns from a
+single measurement. Every route is a read; the screen has no verbs.
 
 Handlers parse, delegate and shape. Window arithmetic, workspace scoping and
 every engine call live in ``services.metrics``.
@@ -20,6 +21,7 @@ from ...schemas.metrics import (
     MetricInterval,
     MetricsDailyRow,
     MetricsExportDataset,
+    MetricsOverview,
     MetricsSeriesResponse,
     MetricsSummary,
     MetricWindow,
@@ -84,6 +86,28 @@ async def get_summary(
     the telemetry store does not report comes back null rather than zero.
     """
     return await service.summarise(session, principal, window, agent_id)
+
+
+@router.get(
+    "/overview",
+    response_model=MetricsOverview,
+    summary="KPI summary and both breakdowns, measured once",
+)
+async def get_overview(
+    principal: CurrentPrincipal,
+    session: Db,
+    window: WindowQuery = MetricWindow.LAST_30D,
+    agent_id: AgentFilter = None,
+) -> MetricsOverview:
+    """Everything on the screen that is not a chart, from one measurement.
+
+    `summary` is exactly what `/metrics/summary` answers; `models` and
+    `platforms` are every row of `/metrics/models` and `/metrics/platforms` in
+    their default order (heaviest first). The breakdowns are a handful of rows,
+    so they arrive whole and the console sorts, searches and pages them itself:
+    a column-header click then costs the telemetry store nothing.
+    """
+    return await service.overview(session, principal, window, agent_id)
 
 
 @router.get(

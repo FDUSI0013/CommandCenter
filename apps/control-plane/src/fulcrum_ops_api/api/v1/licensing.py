@@ -48,6 +48,7 @@ from ...schemas.licensing import (
     LicensePlanCreate,
     LicensePlanRead,
     LicensePlanUpdate,
+    LicenseRevokeRequest,
     LicenseSuspendRequest,
     LicensingSummary,
     SeatAssignmentCreate,
@@ -490,8 +491,9 @@ async def create_license(
 
     A workspace holds at most one current licence — entitlement resolution has
     to be unambiguous — so a second one answers 409 until the existing licence
-    is revoked or has expired. Retired plans cannot be sold. Requires the owner
-    role.
+    is revoked or has expired. Retired plans cannot be sold, and an
+    ``expires_at`` that is not later than the start of the term (``starts_at``,
+    or now when it is omitted) answers 422. Requires the owner role.
     """
     return await service.create_license(session, principal, payload, request)
 
@@ -522,8 +524,13 @@ async def update_license(
 
     Purchased seats cannot drop below the number currently assigned — release
     seats first — and a revoked or expired licence can no longer be amended.
-    Suspension and reactivation have their own endpoints because they carry
-    state the platform owns. Requires the owner role.
+    Suspension, reactivation and revocation have their own endpoints because
+    they carry state the platform owns; sending ``status`` for a suspended
+    licence answers 412 rather than lifting the suspension unchecked. The term
+    is validated only when ``starts_at`` or ``expires_at`` is in the body, so
+    this is also how a lapsed or mis-entered term is corrected: send a later
+    ``expires_at``. Moving to another plan re-resolves the licence's
+    entitlements from the new plan. Requires the owner role.
     """
     return await service.update_license(session, principal, license_id, payload, request)
 
@@ -560,11 +567,37 @@ async def suspend_license(
     """Suspend a licence — the "Suspend Plan" action.
 
     New seat assignment is blocked from this moment on, and entitlement
-    enforcement starts refusing. Seats already held are only released when
+    enforcement starts refusing — which includes agent telemetry: every ingest
+    batch for the workspace answers 402 until the licence is reactivated, and
+    the SDKs drop a 402 rather than retry it. The response says so
+    (``data.ingest_refused``). Seats already held are only released when
     ``release_seats`` is set, because taking a team's access away is a separate,
     deliberate choice. Requires the owner role.
     """
     return await service.suspend_license(session, principal, license_id, payload, request)
+
+
+@router.post(
+    "/tenants/{license_id}/revoke",
+    response_model=ActionResult,
+    summary="Revoke a tenant license",
+)
+async def revoke_license(
+    principal: CurrentPrincipal,
+    session: Db,
+    license_id: str,
+    payload: LicenseRevokeRequest,
+    request: Request,
+) -> ActionResult:
+    """Revoke a licence for good — the way out the 409 on a second licence names.
+
+    Terminal, unlike suspension: the row stays as history, can no longer be
+    amended or reactivated, and stops being the workspace's current licence, so
+    a new one can be issued. Every seat still held is released. An already
+    revoked licence answers 409 and an expired one 412. The optional ``reason``
+    is kept on the audit event. Requires the owner role.
+    """
+    return await service.revoke_license(session, principal, license_id, payload, request)
 
 
 @router.post(

@@ -41,6 +41,7 @@ consumes a tenant's allowance.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import datetime as dt
 import functools
@@ -51,12 +52,13 @@ import re
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
-from typing import Any, Final
+from typing import Any, Final, TypeVar
 
 from fastapi import Request
 from sqlalchemy import Select, func, or_, select
 from sqlalchemy import update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import set_committed_value
 
 from ..api.deps import Principal
 from ..core.config import settings
@@ -112,6 +114,7 @@ from ..models.registry import (
 from ..schemas.ingest import (
     REDACTION_MARKER,
     AutoRegisteredAgent,
+    ErrorInfoIn,
     EventIn,
     GuardrailCandidate,
     GuardrailDescriptor,
@@ -131,6 +134,7 @@ from ..schemas.ingest import (
     SpanType,
     TraceIn,
 )
+from ..schemas.quota import WATCH_PERCENT
 from . import audit, licensing, telemetry_cache
 
 logger = logging.getLogger(__name__)
@@ -173,16 +177,15 @@ MAX_POLICIES_EVALUATED: Final[int] = 500
 #: the request writing a hundred thousand near-identical violations.
 MAX_EVIDENCE_ROWS: Final[int] = 500
 
+#: Most calls one refused batch may cost while the rows at fault are found.
+MAX_ISOLATION_CALLS: Final[int] = 40
+
 #: Content handed to condition matching and to the guardrail evaluator, in
 #: characters. Bounds both regular-expression cost and hook payload size.
 MAX_CONTENT_CHARS: Final[int] = 8_192
 
 #: Longest regular expression a policy condition may carry.
 MAX_PATTERN_LENGTH: Final[int] = 500
-
-#: Utilisation at which a quota flips to Warning. Matches the warning threshold
-#: budgets ship with, so the two surfaces turn amber together.
-QUOTA_WARN_PERCENT: Final[float] = 80.0
 
 #: SDK defaults, overridable per tenant through ``workspaces.settings['ingest']``.
 DEFAULT_SAMPLING_RATE: Final[float] = 1.0
@@ -196,6 +199,17 @@ CONFIG_CACHE_SECONDS: Final[int] = 300
 #: and says why, rather than silently downgrading itself to a warning.
 BLOCKING_ENFORCEMENTS: Final[frozenset[str]] = frozenset(
     {PolicyEnforcement.BLOCK.value, PolicyEnforcement.REQUIRE_APPROVAL.value}
+)
+
+#: Enforcement modes that only record a match. They leave the run "Allowed".
+SILENT_ENFORCEMENTS: Final[frozenset[str]] = frozenset(
+    {PolicyEnforcement.LOG_ONLY.value, PolicyEnforcement.ALLOW.value}
+)
+
+#: Policy states in which a policy is evaluated against telemetry.
+ENFORCED_POLICY_STATUSES: Final[tuple[str, ...]] = (
+    PolicyStatus.ACTIVE.value,
+    PolicyStatus.WARNING.value,
 )
 
 #: Ordered vocabularies a condition may compare with ``lt``/``gte`` and friends.
@@ -277,6 +291,11 @@ def _telemetry_id(value: str | None, *, field: str) -> str:
     here — on its own row — rather than at the far end, where it would take the
     whole batch down with it. Supplying an id makes a retry idempotent, which is
     how the SDKs survive a network timeout without double-counting.
+
+    The store is stricter than this: the UUID has to be version 7, which is what
+    both SDKs and :func:`new_id` mint. A well-formed id of another version still
+    passes here and is refused there; :func:`_push_rows` then narrows the refusal
+    down to the row that carries it, and :func:`_explained` says why.
     """
     if not value:
         return new_id()
@@ -311,11 +330,13 @@ def _compiled(pattern: str) -> re.Pattern[str] | None:
 BatchCall = Callable[[Sequence[Mapping[str, Any]]], Awaitable[Any]]
 
 
-async def _push(call: BatchCall, payload: Sequence[Mapping[str, Any]]) -> str | None:
+async def _push(
+    call: BatchCall, payload: Sequence[Mapping[str, Any]]
+) -> tuple[int, str] | None:
     """Hand one batch to the telemetry store.
 
-    Returns ``None`` on success, or the reason to stamp on every item in the
-    batch when the store refused it. An *unreachable* store is different: the
+    Returns ``None`` on success, or the status and the reason to stamp on the
+    items when the store refused them. An *unreachable* store is different: the
     batch was never seen, so the caller is told to retry rather than being told
     its data was rejected.
     """
@@ -329,10 +350,67 @@ async def _push(call: BatchCall, payload: Sequence[Mapping[str, Any]]) -> str | 
         ) from exc
     except EngineBadRequest as exc:
         logger.warning("telemetry store refused an ingest batch with status %s", exc.status)
-        return f"The telemetry store refused the batch (status {exc.status})."
+        return exc.status, f"The telemetry store refused the batch (status {exc.status})."
     except EngineError as exc:  # pragma: no cover - the adapter raises the two above
         raise TelemetryBackendUnavailable() from exc
     return None
+
+
+#: Refusals that are about what a batch *contains*, and so worth narrowing down.
+#: Anything else -- a throttle, a credential, a size limit -- is about the call,
+#: and asking again in smaller pieces only adds to it.
+_CONTENT_REFUSALS: Final[frozenset[int]] = frozenset({400, 409, 422})
+
+
+async def _push_rows(call: BatchCall, rows: Sequence[Mapping[str, Any]]) -> list[str | None]:
+    """Hand rows to the telemetry store and learn which of them it would not take.
+
+    The store validates a batch as a whole: one row it dislikes -- an id that is
+    not version 7, an error without a traceback, a rule this service has never
+    heard of -- and it refuses every row sent with it. Reporting that refusal
+    against all of them cost forty healthy traces their acceptance for one bad
+    one, which is the opposite of what the per-item results promise.
+
+    So a refused batch is halved and asked again until the rows at fault stand
+    alone. The common case is still one call; one bad row among a thousand costs
+    about twenty. The search is capped, and whatever is still unresolved when
+    the cap is reached is reported refused together, which is no worse than
+    before. Returns one entry per row: ``None`` for stored, else the reason.
+    """
+    refusals: list[str | None] = [None] * len(rows)
+    budget = MAX_ISOLATION_CALLS
+    pending: list[tuple[int, int]] = [(0, len(rows))] if rows else []
+    while pending:
+        low, high = pending.pop()
+        refusal = await _push(call, rows[low:high])
+        if refusal is None:
+            continue
+        status, reason = refusal
+        if high - low == 1 or budget < 2 or status not in _CONTENT_REFUSALS:
+            refusals[low:high] = [reason] * (high - low)
+            continue
+        budget -= 2
+        middle = (low + high) // 2
+        pending.append((middle, high))
+        pending.append((low, middle))
+    return refusals
+
+
+def _is_v7(value: str | None) -> bool:
+    try:
+        return uuid.UUID(str(value)).version == 7
+    except (ValueError, AttributeError, TypeError):
+        return False
+
+
+def _explained(reason: str, *ids: str | None) -> str:
+    """Add the likeliest cause to a store refusal, when the row shows it."""
+    if any(value and not _is_v7(value) for value in ids):
+        return (
+            f"{reason} The store addresses traces and spans by version 7 UUIDs only; "
+            "send one, or omit the id and one is minted."
+        )
+    return reason
 
 
 # ---------------------------------------------------------------------------
@@ -778,7 +856,11 @@ async def _load_policies(
                 select(Policy)
                 .where(
                     Policy.workspace_id == principal.workspace_id,
-                    Policy.status == PolicyStatus.ACTIVE.value,
+                    # Warning is "firing more than its baseline", which is a
+                    # policy that is still in force -- the Policy Center labels
+                    # it "Enforcing with warnings". Reading Active alone meant
+                    # flagging a policy quietly switched it off.
+                    Policy.status.in_(ENFORCED_POLICY_STATUSES),
                 )
                 .order_by(Policy.updated_at.desc())
                 .limit(MAX_POLICIES_EVALUATED)
@@ -894,15 +976,30 @@ def _compare(operator: str, left: Any, right: Any) -> bool | None:
 
 
 def _evaluate(rules: Iterable[_Rule], signals: Mapping[str, Any]) -> list[_Hit]:
-    """Run every applicable policy over one item's signals."""
+    """Run every applicable policy over one item's signals.
+
+    A clause about a signal the item does not carry is *not matched*, whatever
+    the rule's fail mode. Absence is the normal case, not an evasion: a trace
+    has no ``tool_name``, a span that is not a model call has no ``provider``,
+    and a run nobody has scored has no ``safety_score``. Counting absence as a
+    match made a rule like "safety_score below 0.82" -- the body the Policy
+    Center derives for a blank form -- fire on every item in the workspace and,
+    with the default enforcement, refuse all of its telemetry. ``exists`` is
+    the operator for a rule that really is about presence.
+
+    Fail-closed still means what it says for a clause that *is* present and
+    cannot be decided: an expression that does not compile, a value that cannot
+    be ordered.
+    """
     hits: list[_Hit] = []
     for rule in rules:
         matched: list[str] = []
         for condition in rule.conditions:
-            verdict = _compare(condition.operator, signals.get(condition.signal), condition.value)
+            value = signals.get(condition.signal)
+            if value is None and condition.operator != "exists":
+                continue
+            verdict = _compare(condition.operator, value, condition.value)
             if verdict is None:
-                # A signal this deployment cannot resolve counts against the item
-                # under fail-closed, which is the shipped default.
                 verdict = rule.fail_mode == "closed"
             if verdict:
                 matched.append(condition.signal)
@@ -979,6 +1076,66 @@ def _signals(
     return resolved
 
 
+#: Signals that describe a span rather than a run. A trace reported with its
+#: spans nested inside it -- which is how both SDKs report -- is asked about
+#: these through each of those spans.
+_SPAN_SIGNALS: Final[frozenset[str]] = frozenset({"span_type", "tool_name", "provider", "model"})
+_CONTENT_SIGNALS: Final[frozenset[str]] = frozenset({"content", "content_length"})
+
+
+def _nested_hits(
+    rules: Sequence[_Rule], agent: Agent, trace: TraceIn, fired: set[str]
+) -> list[_Hit]:
+    """Policies a trace breaks through one of the spans it carries.
+
+    A rule about a tool, a provider or a span type can only ever be answered by
+    a span, and a trace-level evaluation has none of those to offer -- so such a
+    rule never fired on ``/ingest/traces``, the endpoint nearly all telemetry
+    arrives on. Only the rules that name a span signal are run here, each fires
+    at most once per trace, and the hit is reported against the trace: that is
+    the item the caller sent and the one a block refuses.
+    """
+    pending = [
+        rule
+        for rule in rules
+        if rule.policy_id not in fired
+        and any(condition.signal in _SPAN_SIGNALS for condition in rule.conditions)
+    ]
+    if not pending or not trace.spans:
+        return []
+    wants_content = any(
+        condition.signal in _CONTENT_SIGNALS for rule in pending for condition in rule.conditions
+    )
+    hits: list[_Hit] = []
+    for span in trace.spans:
+        if not pending:
+            break
+        found = _evaluate(
+            pending,
+            _signals(
+                agent,
+                entity="span",
+                name=span.name,
+                span_type=span.type.value,
+                model=span.model,
+                provider=span.provider,
+                usage=span.usage,
+                cost=span.total_estimated_cost,
+                duration_ms=span.duration_ms,
+                tags=span.tags,
+                has_error=span.error_info is not None,
+                scores={score.name: score.value for score in span.feedback_scores},
+                thread_id=trace.thread_id,
+                content=_text_of(span.input, span.output) if wants_content else "",
+            ),
+        )
+        if found:
+            hits.extend(found)
+            done = {hit.rule.policy_id for hit in found}
+            pending = [rule for rule in pending if rule.policy_id not in done]
+    return hits
+
+
 # ---------------------------------------------------------------------------
 # Guardrail evaluation
 # ---------------------------------------------------------------------------
@@ -1044,17 +1201,18 @@ def _advance(value: dt.datetime, period: str) -> dt.datetime:
     return _add_months(value, 1)
 
 
-def _quota_applies(quota: Quota, agents: Sequence[Agent]) -> bool:
+def _quota_covers(quota: Quota, agent: Agent) -> bool:
+    """Whether one agent's traffic counts against one quota."""
     if quota.scope == LimitScope.WORKSPACE.value:
         return True
     if not quota.scope_ref:
         return False
     if quota.scope == LimitScope.AGENT.value:
-        return any(agent.id == quota.scope_ref for agent in agents)
+        return agent.id == quota.scope_ref
     if quota.scope == LimitScope.ENVIRONMENT.value:
-        return any(agent.environment == quota.scope_ref for agent in agents)
+        return agent.environment == quota.scope_ref
     if quota.scope == LimitScope.TEAM.value:
-        return any(agent.team == quota.scope_ref for agent in agents)
+        return agent.team == quota.scope_ref
     return False
 
 
@@ -1085,13 +1243,77 @@ class _Charge:
     amount: float
 
 
+def _quota_amount(quota: Quota, entries: Sequence[_Accepted]) -> float:
+    """What a set of items costs one quota: only the items it actually covers.
+
+    A batch from an unbound key may carry several agents. A quota scoped to one
+    of them -- or to its team or environment -- is charged for that agent's items
+    and nobody else's, not for the whole batch because the agent appears in it.
+    """
+    covered = [entry for entry in entries if _quota_covers(quota, entry.agent)]
+    if quota.resource == QuotaResource.REQUESTS.value:
+        return float(len(covered))
+    return float(sum(entry.tokens for entry in covered))
+
+
+def _quota_status(used: float, limit: float) -> tuple[float, str]:
+    """Utilisation and chip colour, on the thresholds the Quota screen uses.
+
+    Ingest used to keep a threshold of its own (80%) beside the service's (70%),
+    so an edit at 75% turned a quota amber and the next batch turned it back.
+    """
+    utilization = round(used / limit * 100, 1) if limit > 0 else 0.0
+    if limit > 0 and utilization >= 100:
+        return utilization, LimitStatus.EXCEEDED.value
+    if limit > 0 and utilization >= WATCH_PERCENT:
+        return utilization, LimitStatus.WARNING.value
+    return utilization, LimitStatus.ACTIVE.value
+
+
+#: States in which a quota is metered and its chip follows its usage. The others
+#: -- disabled, expired -- are somebody's decision and only a person undoes them.
+_METERED_STATUSES: Final[tuple[str, ...]] = (
+    LimitStatus.ACTIVE.value,
+    LimitStatus.WARNING.value,
+    LimitStatus.EXCEEDED.value,
+)
+
+
+async def _roll_period(session: AsyncSession, quota: Quota, now: dt.datetime) -> None:
+    """Start a quota's next period, if nobody else already has.
+
+    The period elapsed while nothing was reporting: roll it forward to the first
+    window that contains "now" and start the counter again. The reset is guarded
+    on the old ``resets_at`` so that of two workers meeting the same expired
+    quota only one zeroes it; the other matches no row, and neither can wipe out
+    usage the first has counted since. The row is then re-read, so the hard-limit
+    check that follows sees what is stored rather than what this request assumed.
+    """
+    expired = quota.resets_at
+    resets_at = _as_utc(expired)
+    for _ in range(64):
+        if resets_at > now:
+            break
+        resets_at = _advance(resets_at, quota.period)
+    await session.execute(
+        sa_update(Quota)
+        .where(Quota.id == quota.id, Quota.resets_at == expired)
+        .values(
+            used_value=0.0,
+            status=LimitStatus.ACTIVE.value,
+            resets_at=resets_at,
+            # Housekeeping, not an edit: see ``db.base.stamp``.
+            updated_at=Quota.updated_at,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    await session.refresh(quota)
+
+
 async def _prepare_quotas(
     session: AsyncSession,
     principal: Principal,
-    agents: Sequence[Agent],
-    *,
-    requests: int,
-    tokens: int,
+    entries: Sequence[_Accepted],
 ) -> list[_Charge]:
     """Roll elapsed periods, then refuse the batch if a hard quota would break.
 
@@ -1108,13 +1330,7 @@ async def _prepare_quotas(
                     # stopped being read the moment it filled up would refuse
                     # exactly one batch and then wave everything through, and
                     # its period could never roll from the ingest path.
-                    Quota.status.in_(
-                        (
-                            LimitStatus.ACTIVE.value,
-                            LimitStatus.WARNING.value,
-                            LimitStatus.EXCEEDED.value,
-                        )
-                    ),
+                    Quota.status.in_(_METERED_STATUSES),
                     Quota.resource.in_(
                         (QuotaResource.REQUESTS.value, QuotaResource.TOKENS.value)
                     ),
@@ -1128,22 +1344,13 @@ async def _prepare_quotas(
     now = _now()
     charges: list[_Charge] = []
     for quota in rows:
-        if not _quota_applies(quota, agents):
+        if not any(_quota_covers(quota, entry.agent) for entry in entries):
             continue
 
         if quota.resets_at is not None and _as_utc(quota.resets_at) <= now:
-            # The period elapsed while nothing was reporting: roll it forward to
-            # the first window that contains "now" and start the counter again.
-            resets_at = _as_utc(quota.resets_at)
-            for _ in range(64):
-                if resets_at > now:
-                    break
-                resets_at = _advance(resets_at, quota.period)
-            quota.resets_at = resets_at
-            quota.used_value = 0.0
-            quota.status = LimitStatus.ACTIVE.value
+            await _roll_period(session, quota, now)
 
-        amount = float(requests if quota.resource == QuotaResource.REQUESTS.value else tokens)
+        amount = _quota_amount(quota, entries)
         if amount <= 0:
             continue
 
@@ -1168,20 +1375,66 @@ async def _prepare_quotas(
     return charges
 
 
-def _commit_quotas(charges: Sequence[_Charge]) -> list[IngestQuotaState]:
-    """Apply the batch's consumption and re-derive each quota's chip colour."""
+async def _commit_quotas(
+    session: AsyncSession,
+    charges: Sequence[_Charge],
+    entries: Sequence[_Accepted],
+    *,
+    request: Request | None = None,
+) -> list[IngestQuotaState]:
+    """Count what the store actually took, and say so when a threshold is crossed.
+
+    The counter is incremented *in the database*. It used to be read before the
+    hand-off to the telemetry store and written back, as an absolute value,
+    after it -- seconds later, on four workers -- so two batches in flight both
+    started from the same number and the second overwrote the first. Usage was
+    under-reported for the rest of the period and a Block quota let through
+    whatever was lost. ``used_value = used_value + n`` cannot lose an update.
+
+    ``entries`` are the items that survived the hand-off, so a trace the store
+    refused, or the tokens of spans it would not take, are not billed. Quotas are
+    visited in id order so two workers holding several of the same rows cannot
+    deadlock each other.
+    """
     states: list[IngestQuotaState] = []
-    for charge in charges:
+    crossed: list[Quota] = []
+    for charge in sorted(charges, key=lambda item: item.quota.id):
         quota = charge.quota
-        quota.used_value = float(quota.used_value or 0.0) + charge.amount
-        limit = float(quota.limit_value or 0.0)
-        utilization = round(quota.used_value / limit * 100, 1) if limit > 0 else 0.0
-        if limit > 0 and utilization >= 100:
-            quota.status = LimitStatus.EXCEEDED.value
-        elif limit > 0 and utilization >= QUOTA_WARN_PERCENT:
-            quota.status = LimitStatus.WARNING.value
-        else:
-            quota.status = LimitStatus.ACTIVE.value
+        amount = _quota_amount(quota, entries)
+        if amount <= 0:
+            continue
+        row = (
+            await session.execute(
+                sa_update(Quota)
+                .where(Quota.id == quota.id)
+                .values(
+                    used_value=func.coalesce(Quota.used_value, 0.0) + amount,
+                    # Metering is not an edit to the quota: see ``db.base.stamp``.
+                    updated_at=Quota.updated_at,
+                )
+                .returning(Quota.used_value, Quota.limit_value, Quota.status)
+                .execution_options(synchronize_session=False)
+            )
+        ).first()
+        if row is None:  # deleted while the batch was in flight
+            continue
+        used, limit, stored = float(row[0] or 0.0), float(row[1] or 0.0), row[2]
+        utilization, status = _quota_status(used, limit)
+        set_committed_value(quota, "used_value", used)
+        # The status is judged against what is stored *now* -- the increment has
+        # just locked the row -- not against what this request loaded before the
+        # round trip. A quota somebody disabled meanwhile stays disabled, and a
+        # threshold another worker has already crossed is not announced twice.
+        if stored not in _METERED_STATUSES:
+            status = stored
+        elif status != stored:
+            await session.execute(
+                sa_update(Quota)
+                .where(Quota.id == quota.id)
+                .values(status=status, updated_at=Quota.updated_at)
+                .execution_options(synchronize_session=False)
+            )
+            crossed.append(quota)
         states.append(
             IngestQuotaState(
                 id=quota.id,
@@ -1191,15 +1444,48 @@ def _commit_quotas(charges: Sequence[_Charge]) -> list[IngestQuotaState]:
                 scope_ref=quota.scope_ref,
                 unit=quota.unit,
                 limit_value=limit,
-                used_value=float(quota.used_value),
-                remaining=max(limit - float(quota.used_value), 0.0) if limit > 0 else 0.0,
+                used_value=used,
+                remaining=max(limit - used, 0.0) if limit > 0 else 0.0,
                 utilization_pct=utilization,
                 enforcement=quota.enforcement,
-                status=quota.status,
+                status=status,
                 resets_at=quota.resets_at,
             )
         )
+    for quota in crossed:
+        await _announce_quota(session, quota, request=request)
     return states
+
+
+async def _announce_quota(
+    session: AsyncSession, quota: Quota, *, request: Request | None
+) -> None:
+    """Raise the Quota screen's own alert for a threshold this batch crossed.
+
+    The alert -- its wording, severity and de-duplication -- belongs to the quota
+    service, which until now was the only place that raised it and was reachable
+    only from an admin's edit. Ingest is where quotas actually fill up, so a
+    quota went amber, then red, then started refusing telemetry, and nobody was
+    told. The instance still carries the status it was loaded with, which is what
+    lets the service see the transition.
+
+    Strictly best effort, inside a savepoint: the telemetry store has already
+    taken this batch, and a fault in alerting must not turn that into a 500 the
+    reporter answers by sending it all again.
+    """
+    try:
+        from . import quota as quota_service
+    except ImportError:  # pragma: no cover - the service ships with this one
+        return
+    evaluate = getattr(quota_service, "_evaluate_quota", None)
+    if not callable(evaluate):
+        return
+    try:
+        async with session.begin_nested():
+            await evaluate(session, quota, request=request)
+            await session.flush()
+    except Exception:  # noqa: BLE001 - see above: never at the batch's expense
+        logger.exception("quota threshold alert could not be raised for quota %s", quota.id)
 
 
 async def _check_licence(session: AsyncSession, principal: Principal) -> None:
@@ -1284,6 +1570,50 @@ def _trace_model(trace: TraceIn) -> str | None:
     return None
 
 
+#: The store requires a traceback on every error it is given and refuses the
+#: batch without one. Plenty of failures have none to give -- a status code from
+#: an OpenTelemetry span, a non-Error value thrown in JavaScript -- so the gap is
+#: stated rather than left to cost the batch.
+NO_TRACEBACK: Final[str] = "No traceback was reported with this error."
+
+
+def _engine_error(error: ErrorInfoIn | None) -> dict[str, Any] | None:
+    if error is None:
+        return None
+    payload = error.model_dump(exclude_none=True)
+    if not (payload.get("traceback") or "").strip():
+        payload["traceback"] = NO_TRACEBACK
+    return payload
+
+
+def _parent_id(value: str | None) -> str | None:
+    """A parent reference the store can bind, or none at all.
+
+    The store reads this field as a UUID and refuses the whole batch when it
+    cannot. A span that names an unusable parent is still a span: it is stored
+    at the top of its trace rather than costing every span sent with it.
+    """
+    if not value:
+        return None
+    try:
+        return str(uuid.UUID(value))
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
+#: Most tool names stamped on one run; the table draws a handful of chips.
+MAX_RUN_TOOLS: Final[int] = 20
+
+
+def _trace_tools(trace: TraceIn) -> list[str]:
+    """The tools this run called, in call order, each named once."""
+    names: dict[str, None] = {}
+    for span in trace.spans:
+        if span.type is SpanType.TOOL:
+            names.setdefault(span.name, None)
+    return list(names)[:MAX_RUN_TOOLS]
+
+
 def _engine_trace(
     trace: TraceIn,
     trace_id: str,
@@ -1291,6 +1621,8 @@ def _engine_trace(
     *,
     masked: bool,
     redactions: Sequence[str] = (),
+    warned: bool = False,
+    guardrails: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     metadata: dict[str, Any] = {
         **trace.metadata,
@@ -1302,6 +1634,20 @@ def _engine_trace(
         model = _trace_model(trace)
         if model:
             metadata["model"] = model
+    # The run screens read a run's tools and its enforcement verdict off the
+    # trace, so that the table never has to open every run's spans. Nothing
+    # wrote them: a run with five tool calls listed none, and a run a policy had
+    # warned about or masked still read "Allowed". A blocked item is never
+    # stored, so "Warned" is the only verdict there is to record here -- and it
+    # is ours to state, whatever the reporter's metadata says.
+    if not metadata.get("tools") and not metadata.get("tool_calls"):
+        tools = _trace_tools(trace)
+        if tools:
+            metadata["tools"] = tools
+    if warned or masked:
+        metadata["policy"] = "Warned"
+    if guardrails:
+        metadata["guardrails"] = [dict(row) for row in guardrails]
 
     payload: dict[str, Any] = {
         "id": trace_id,
@@ -1314,7 +1660,7 @@ def _engine_trace(
         "metadata": metadata,
         "input": _masked_payload(trace.input, masked, redactions),
         "output": _masked_payload(trace.output, masked, redactions),
-        "error_info": trace.error_info.model_dump(exclude_none=True) if trace.error_info else None,
+        "error_info": _engine_error(trace.error_info),
     }
     return {key: value for key, value in payload.items() if value is not None}
 
@@ -1331,7 +1677,7 @@ def _engine_span(
     payload: dict[str, Any] = {
         "id": span_id,
         "trace_id": trace_id,
-        "parent_span_id": span.parent_span_id,
+        "parent_span_id": _parent_id(span.parent_span_id),
         "project_name": _project(agent),
         "name": span.name,
         "type": span.type.value,
@@ -1345,7 +1691,7 @@ def _engine_span(
         "total_estimated_cost": span.total_estimated_cost,
         "input": _masked_payload(span.input, masked, redactions),
         "output": _masked_payload(span.output, masked, redactions),
-        "error_info": span.error_info.model_dump(exclude_none=True) if span.error_info else None,
+        "error_info": _engine_error(span.error_info),
     }
     return {key: value for key, value in payload.items() if value is not None}
 
@@ -1406,6 +1752,208 @@ class _Accepted:
     redactions: list[str] = dataclasses.field(default_factory=list)
     #: Set once any masking verdict could not say what it matched.
     mask_everything: bool = False
+    #: Spans of this trace that were not stored, and the last reason given.
+    spans_rejected: int = 0
+    span_problem: str | None = None
+    #: What governance decided about an item it let through, for the run's row.
+    warned: bool = False
+    guardrails: list[dict[str, Any]] = dataclasses.field(default_factory=list)
+
+
+T = TypeVar("T")
+
+#: The hand-off always gets at least this long, however slow governance was.
+MIN_STORE_SECONDS: Final[float] = 5.0
+
+
+async def _within_budget(started: float, work: Awaitable[T]) -> T:
+    """Run the hand-off to the telemetry store inside what is left of the budget.
+
+    Each store call inherits the adapter's 30 s timeout and a batch makes up to
+    four of them, so a slow store held a request for a minute or more -- past the
+    30 s at which the SDK gives up and sends the same batch again, to a store
+    that is already behind. Answering 503 inside the reporter's own timeout
+    turns that pile-up into one orderly retry. Abandoning the wait is safe:
+    ids make the retry idempotent, nothing has been charged yet, and the adapter
+    lets an exchange that is already in flight finish on its own.
+    """
+    budget = settings.ingest_budget_seconds
+    if budget <= 0:
+        return await work
+    remaining = max(budget - (time.perf_counter() - started), min(MIN_STORE_SECONDS, budget))
+    try:
+        async with asyncio.timeout(remaining):
+            return await work
+    except TimeoutError as exc:
+        raise TelemetryBackendUnavailable(
+            "The telemetry store did not take this batch in time. Retry this batch."
+        ) from exc
+
+
+@dataclasses.dataclass
+class _Bundle:
+    """One accepted trace shaped for the store, with everything that hangs off it."""
+
+    entry: _Accepted
+    trace: dict[str, Any]
+    trace_scores: list[dict[str, Any]]
+    spans: list[dict[str, Any]] = dataclasses.field(default_factory=list)
+    #: Index-aligned with ``spans``: what each costs a token quota, and its scores.
+    span_tokens: list[int] = dataclasses.field(default_factory=list)
+    span_scores: list[list[dict[str, Any]]] = dataclasses.field(default_factory=list)
+
+
+def _score_rows(
+    scores: Iterable[Any], *, target_id: str, agent: Agent, target: ScoreTarget
+) -> list[dict[str, Any]]:
+    return [
+        _engine_score(
+            score.name,
+            score.value,
+            target_id=target_id,
+            agent=agent,
+            target=target,
+            category_name=score.category_name,
+            reason=score.reason,
+            source=score.source,
+        )
+        for score in scores
+    ]
+
+
+def _lose_span(entry: _Accepted, tokens: int, problem: str) -> None:
+    """Account for a span that will not be stored: counted, explained, not billed."""
+    entry.spans_rejected += 1
+    entry.tokens = max(entry.tokens - tokens, 0)
+    entry.span_problem = problem
+
+
+def _bundle(trace: TraceIn, entry: _Accepted) -> _Bundle:
+    bundle = _Bundle(
+        entry=entry,
+        trace=_engine_trace(
+            trace,
+            entry.trace_id,
+            entry.agent,
+            masked=entry.masked,
+            redactions=entry.redactions,
+            warned=entry.warned,
+            guardrails=entry.guardrails,
+        ),
+        trace_scores=_score_rows(
+            trace.feedback_scores,
+            target_id=entry.trace_id,
+            agent=entry.agent,
+            target=ScoreTarget.TRACE,
+        ),
+    )
+    for span in trace.spans:
+        try:
+            span_id = _telemetry_id(span.id, field="span id")
+        except _BadIdentifier as exc:
+            _lose_span(entry, _billable_tokens(span.usage), str(exc))
+            continue
+        bundle.spans.append(
+            _engine_span(
+                span,
+                span_id=span_id,
+                trace_id=entry.trace_id,
+                agent=entry.agent,
+                masked=entry.masked,
+                redactions=entry.redactions,
+            )
+        )
+        bundle.span_tokens.append(_billable_tokens(span.usage))
+        bundle.span_scores.append(
+            _score_rows(
+                span.feedback_scores, target_id=span_id, agent=entry.agent, target=ScoreTarget.SPAN
+            )
+        )
+    return bundle
+
+
+async def _store_traces(
+    bundles: Sequence[_Bundle], results: list[IngestItemResult]
+) -> tuple[list[_Accepted], int, int]:
+    """Hand traces, their spans and their scores to the store; report what it took.
+
+    Returns the entries whose trace was stored, and how many spans and scores
+    went with them. A trace the store refuses takes its spans and scores with it
+    and is rejected on its own row. A *span* the store refuses does not unmake
+    its trace: the trace stays accepted, and the row says how many of its spans
+    are missing and why -- before, that loss was a log line, the caller was told
+    "accepted", the tenant was billed for the tokens, and the run arrived with
+    no model, no cost and no steps.
+
+    Once the traces are in, their scores and their spans do not depend on each
+    other, so they are sent side by side rather than one after the other.
+    """
+    client = get_engine_client()
+    refusals = await _push_rows(client.create_traces_batch, [bundle.trace for bundle in bundles])
+    for project_id in {str(bundle.entry.agent.engine_project_id) for bundle in bundles}:
+        telemetry_cache.project_written(project_id)
+
+    stored: list[_Bundle] = []
+    for bundle, refusal in zip(bundles, refusals, strict=True):
+        if refusal is None:
+            stored.append(bundle)
+            continue
+        _reject(
+            results,
+            bundle.entry.index,
+            RejectionCode.TELEMETRY_REJECTED,
+            _explained(refusal, bundle.trace.get("id")),
+        )
+
+    async def spans_then_their_scores() -> tuple[int, int]:
+        flat = [(bundle, at) for bundle in stored for at in range(len(bundle.spans))]
+        span_refusals = await _push_rows(
+            client.create_spans_batch, [bundle.spans[at] for bundle, at in flat]
+        )
+        scores: list[dict[str, Any]] = []
+        sent = 0
+        for (bundle, at), refusal in zip(flat, span_refusals, strict=True):
+            if refusal is None:
+                sent += 1
+                scores.extend(bundle.span_scores[at])
+                continue
+            row = bundle.spans[at]
+            _lose_span(
+                bundle.entry,
+                bundle.span_tokens[at],
+                _explained(refusal, row.get("id"), row.get("parent_span_id")),
+            )
+        score_refusals = await _push_rows(client.score_spans_batch, scores)
+        return sent, sum(1 for refusal in score_refusals if refusal is None)
+
+    async def trace_scores() -> int:
+        rows = [score for bundle in stored for score in bundle.trace_scores]
+        score_refusals = await _push_rows(client.score_traces_batch, rows)
+        return sum(1 for refusal in score_refusals if refusal is None)
+
+    # Both are awaited to the end before either failure is raised, so nothing is
+    # left running against the store after the request has answered.
+    outcomes = await asyncio.gather(
+        spans_then_their_scores(), trace_scores(), return_exceptions=True
+    )
+    for outcome in outcomes:
+        if isinstance(outcome, BaseException):
+            raise outcome
+    (spans_sent, span_scores_sent), trace_scores_sent = outcomes
+
+    for bundle in bundles:
+        entry = bundle.entry
+        if entry.spans_rejected and results[entry.index].outcome is ItemOutcome.ACCEPTED:
+            results[entry.index] = results[entry.index].model_copy(
+                update={
+                    "spans_rejected": entry.spans_rejected,
+                    "reason": (
+                        f"The trace was stored, but {entry.spans_rejected} of its "
+                        f"{entry.spans} span(s) were not. {entry.span_problem or ''}"
+                    ).strip(),
+                }
+            )
+    return [bundle.entry for bundle in stored], spans_sent, span_scores_sent + trace_scores_sent
 
 
 async def ingest_traces(
@@ -1450,7 +1998,9 @@ async def ingest_traces(
     hits_by_index: dict[int, list[_Hit]] = {}
 
     for index, trace in parsed.valid:
-        agent = _bind(agents, trace.agent or parsed.envelope.agent, results, index)
+        agent = _bind(
+            agents, trace.agent or parsed.envelope.agent, results, index, source=source
+        )
         if agent is None:
             continue
         blocked_connectors = connector_blocks.get(agent.id)
@@ -1471,14 +2021,17 @@ async def ingest_traces(
 
         content = _text_of(trace.input, trace.output)
         usage = trace.total_usage
+        rules = policies.for_agent(agent)
         hits = _evaluate(
-            policies.for_agent(agent),
+            rules,
             _signals(
                 agent,
                 entity="trace",
                 name=trace.name,
                 span_type=None,
-                model=None,
+                # The model that actually answered, where the spans say; the
+                # registered one only when they do not.
+                model=_trace_model(trace),
                 provider=None,
                 usage=usage,
                 cost=trace.total_cost,
@@ -1490,6 +2043,7 @@ async def ingest_traces(
                 content=content,
             ),
         )
+        hits.extend(_nested_hits(rules, agent, trace, {hit.rule.policy_id for hit in hits}))
         hits_by_index[index] = hits
 
         blocking = next((hit for hit in hits if hit.blocks), None)
@@ -1507,6 +2061,7 @@ async def ingest_traces(
                 spans=len(trace.spans),
                 tokens=_billable_tokens(usage),
                 masked=masked,
+                warned=any(hit.rule.enforcement not in SILENT_ENFORCEMENTS for hit in hits),
             )
         )
         _mark(
@@ -1537,96 +2092,17 @@ async def ingest_traces(
 
     if accepted:
         await _check_licence(session, principal)
-        charges = await _prepare_quotas(
-            session,
-            principal,
-            agents.touched,
-            requests=len(accepted),
-            tokens=sum(entry.tokens for entry in accepted),
+        charges = await _prepare_quotas(session, principal, accepted)
+
+        bundles = [
+            _bundle(trace, entry)
+            for entry in accepted
+            if (trace := parsed.items[entry.index]) is not None
+        ]
+        accepted, spans_sent, scores_sent = await _within_budget(
+            started, _store_traces(bundles, results)
         )
-
-        traces_payload: list[dict[str, Any]] = []
-        spans_payload: list[dict[str, Any]] = []
-        trace_scores: list[dict[str, Any]] = []
-        span_scores: list[dict[str, Any]] = []
-
-        for entry in accepted:
-            trace = parsed.items[entry.index]
-            if trace is None:  # pragma: no cover - ParsedBatch.valid guarantees this
-                continue
-            traces_payload.append(
-                _engine_trace(
-                    trace,
-                    entry.trace_id,
-                    entry.agent,
-                    masked=entry.masked,
-                    redactions=entry.redactions,
-                )
-            )
-            trace_scores.extend(
-                _engine_score(
-                    score.name,
-                    score.value,
-                    target_id=entry.trace_id,
-                    agent=entry.agent,
-                    target=ScoreTarget.TRACE,
-                    category_name=score.category_name,
-                    reason=score.reason,
-                    source=score.source,
-                )
-                for score in trace.feedback_scores
-            )
-            for span in trace.spans:
-                try:
-                    span_id = _telemetry_id(span.id, field="span id")
-                except _BadIdentifier as exc:
-                    logger.info("dropping a span whose id cannot be addressed: %s", exc)
-                    continue
-                spans_payload.append(
-                    _engine_span(
-                        span,
-                        span_id=span_id,
-                        trace_id=entry.trace_id,
-                        agent=entry.agent,
-                        masked=entry.masked,
-                        redactions=entry.redactions,
-                    )
-                )
-                span_scores.extend(
-                    _engine_score(
-                        score.name,
-                        score.value,
-                        target_id=span_id,
-                        agent=entry.agent,
-                        target=ScoreTarget.SPAN,
-                        category_name=score.category_name,
-                        reason=score.reason,
-                        source=score.source,
-                    )
-                    for score in span.feedback_scores
-                )
-
-        client = get_engine_client()
-        refusal = await _push(client.create_traces_batch, traces_payload)
-        for project_id in {str(entry.agent.engine_project_id) for entry in accepted}:
-            telemetry_cache.project_written(project_id)
-        if refusal is not None:
-            for entry in accepted:
-                _reject(results, entry.index, RejectionCode.TELEMETRY_REJECTED, refusal)
-            accepted = []
-        else:
-            span_refusal = await _push(client.create_spans_batch, spans_payload)
-            if span_refusal is None:
-                spans_sent = len(spans_payload)
-            else:
-                logger.warning("spans refused after their traces were stored: %s", span_refusal)
-            trace_score_refusal = await _push(client.score_traces_batch, trace_scores)
-            span_score_refusal = await _push(client.score_spans_batch, span_scores)
-            # scores_accepted must report what the store took, not what we sent.
-            scores_sent = (len(trace_scores) if trace_score_refusal is None else 0) + (
-                len(span_scores) if span_score_refusal is None else 0
-            )
-            quotas = _commit_quotas(charges)
+        quotas = await _commit_quotas(session, charges, accepted, request=request)
 
     violations = await _record_evidence(
         session,
@@ -1641,6 +2117,7 @@ async def ingest_traces(
         request=request,
     )
     await _touch_agents(session, agents, accepted=bool(accepted))
+    await _touch_connectors(session, principal, _tools_used(parsed, accepted))
 
     result = _finish(results, parsed, started, agents, quotas, evaluated, violations)
     result.spans_accepted = spans_sent
@@ -1778,21 +2255,12 @@ async def ingest_spans(
 
     if accepted:
         await _check_licence(session, principal)
-        charges = await _prepare_quotas(
-            session,
-            principal,
-            agents.touched,
-            requests=len(accepted),
-            tokens=sum(entry.tokens for entry in accepted),
-        )
+        charges = await _prepare_quotas(session, principal, accepted)
 
-        payload: list[dict[str, Any]] = []
-        score_payload: list[dict[str, Any]] = []
-        for entry in accepted:
-            span = parsed.items[entry.index]
-            if span is None:  # pragma: no cover - ParsedBatch.valid guarantees this
-                continue
-            payload.append(
+        rows: list[tuple[_Accepted, SpanIn, dict[str, Any]]] = [
+            (
+                entry,
+                span,
                 _engine_span(
                     span,
                     span_id=entry.entity_id,
@@ -1800,33 +2268,43 @@ async def ingest_spans(
                     agent=entry.agent,
                     masked=entry.masked,
                     redactions=entry.redactions,
-                )
+                ),
             )
-            score_payload.extend(
-                _engine_score(
-                    score.name,
-                    score.value,
-                    target_id=entry.entity_id,
-                    agent=entry.agent,
-                    target=ScoreTarget.SPAN,
-                    category_name=score.category_name,
-                    reason=score.reason,
-                    source=score.source,
-                )
-                for score in span.feedback_scores
-            )
+            for entry in accepted
+            if (span := parsed.items[entry.index]) is not None
+        ]
 
-        client = get_engine_client()
-        refusal = await _push(client.create_spans_batch, payload)
-        if refusal is not None:
-            for entry in accepted:
-                _reject(results, entry.index, RejectionCode.TELEMETRY_REJECTED, refusal)
-            accepted = []
-        else:
-            score_refusal = await _push(client.score_spans_batch, score_payload)
-            spans_sent = len(payload)
-            scores_sent = len(score_payload) if score_refusal is None else 0
-            quotas = _commit_quotas(charges)
+        async def store() -> tuple[list[_Accepted], int]:
+            client = get_engine_client()
+            refusals = await _push_rows(client.create_spans_batch, [row for _, _, row in rows])
+            kept: list[_Accepted] = []
+            scores: list[dict[str, Any]] = []
+            for (entry, span, row), refusal in zip(rows, refusals, strict=True):
+                if refusal is not None:
+                    _reject(
+                        results,
+                        entry.index,
+                        RejectionCode.TELEMETRY_REJECTED,
+                        _explained(
+                            refusal, row.get("id"), row.get("trace_id"), row.get("parent_span_id")
+                        ),
+                    )
+                    continue
+                kept.append(entry)
+                scores.extend(
+                    _score_rows(
+                        span.feedback_scores,
+                        target_id=entry.entity_id,
+                        agent=entry.agent,
+                        target=ScoreTarget.SPAN,
+                    )
+                )
+            score_refusals = await _push_rows(client.score_spans_batch, scores)
+            return kept, sum(1 for refusal in score_refusals if refusal is None)
+
+        accepted, scores_sent = await _within_budget(started, store())
+        spans_sent = len(accepted)
+        quotas = await _commit_quotas(session, charges, accepted, request=request)
 
     violations = await _record_evidence(
         session,
@@ -1841,6 +2319,7 @@ async def ingest_spans(
         request=request,
     )
     await _touch_agents(session, agents, accepted=bool(accepted))
+    await _touch_connectors(session, principal, _tools_used(parsed, accepted))
 
     result = _finish(results, parsed, started, agents, quotas, evaluated, violations)
     result.spans_accepted = spans_sent
@@ -1876,8 +2355,9 @@ async def ingest_scores(
         request=request,
     )
 
-    grouped: dict[ScoreTarget, list[dict[str, Any]]] = {target: [] for target in ScoreTarget}
-    targets: dict[int, ScoreTarget] = {}
+    grouped: dict[ScoreTarget, list[tuple[int, dict[str, Any]]]] = {
+        target: [] for target in ScoreTarget
+    }
     accepted: list[_Accepted] = []
 
     for index, score in parsed.valid:
@@ -1893,18 +2373,20 @@ async def ingest_scores(
                 continue
 
         grouped[score.target].append(
-            _engine_score(
-                score.name,
-                score.value,
-                target_id=target_id,
-                agent=agent,
-                target=score.target,
-                category_name=score.category_name,
-                reason=score.reason,
-                source=score.source,
+            (
+                index,
+                _engine_score(
+                    score.name,
+                    score.value,
+                    target_id=target_id,
+                    agent=agent,
+                    target=score.target,
+                    category_name=score.category_name,
+                    reason=score.reason,
+                    source=score.source,
+                ),
             )
         )
-        targets[index] = score.target
         accepted.append(
             _Accepted(index=index, agent=agent, entity_id=target_id, trace_id=target_id)
         )
@@ -1913,33 +2395,29 @@ async def ingest_scores(
     quotas: list[IngestQuotaState] = []
     if accepted:
         await _check_licence(session, principal)
-        charges = await _prepare_quotas(
-            session, principal, agents.touched, requests=len(accepted), tokens=0
-        )
+        charges = await _prepare_quotas(session, principal, accepted)
         client = get_engine_client()
         calls: dict[ScoreTarget, BatchCall] = {
             ScoreTarget.TRACE: client.score_traces_batch,
             ScoreTarget.SPAN: client.score_spans_batch,
             ScoreTarget.THREAD: client.score_threads_batch,
         }
-        for target, payload in grouped.items():
-            refusal = await _push(calls[target], payload)
-            if refusal is None:
-                continue
-            for index, item_target in targets.items():
-                if item_target is target:
-                    _reject(results, index, RejectionCode.TELEMETRY_REJECTED, refusal)
+
+        async def store() -> None:
+            for target, rows in grouped.items():
+                refusals = await _push_rows(calls[target], [row for _, row in rows])
+                for (index, _row), refusal in zip(rows, refusals, strict=True):
+                    if refusal is not None:
+                        _reject(results, index, RejectionCode.TELEMETRY_REJECTED, refusal)
+
+        await _within_budget(started, store())
+        # One score can be refused while the others land, so the tenant is
+        # charged for what was actually stored, not for what was offered before
+        # the store answered.
         accepted = [
             entry for entry in accepted if results[entry.index].outcome is ItemOutcome.ACCEPTED
         ]
-        if accepted:
-            # One target class can be refused while the others land, so the
-            # tenant is charged for what was actually stored, not for what was
-            # offered before the store answered.
-            for charge in charges:
-                if charge.quota.resource == QuotaResource.REQUESTS.value:
-                    charge.amount = float(len(accepted))
-            quotas = _commit_quotas(charges)
+        quotas = await _commit_quotas(session, charges, accepted, request=request)
 
     result = _finish(results, parsed, started, agents, quotas, False, 0)
     result.scores_accepted = len(accepted)
@@ -2031,6 +2509,17 @@ async def ingest_events(
     now = _now()
     recorded = 0
     violations = 0
+    mirrors: list[tuple[FeedbackItem, dict[str, Any]]] = []
+    # The control each reported hit names, and the latest moment it fired. The
+    # column was written once per *event* -- five hundred UPDATEs of one hot row
+    # for a batch about one policy -- and in batch order, so a queue drained
+    # newest-first left "last triggered" at its oldest hit.
+    triggered: dict[str, tuple[GuardrailConfig | Policy, dt.datetime]] = {}
+
+    def fired(control: GuardrailConfig | Policy, at: dt.datetime) -> None:
+        known = triggered.get(control.id)
+        if known is None or at > known[1]:
+            triggered[control.id] = (control, at)
 
     for index, event in parsed.valid:
         agent = agents.lookup(event.agent or parsed.envelope.agent)
@@ -2073,7 +2562,7 @@ async def ingest_events(
                     sample=event.sample,
                 )
             )
-            await stamp(session, [guardrail], last_triggered_at=occurred_at)
+            fired(guardrail, occurred_at)
             recorded += 1
             results[index] = results[index].model_copy(
                 update={"agent_id": agent_id, "guardrail_id": guardrail.id}
@@ -2102,7 +2591,7 @@ async def ingest_events(
                     occurred_at=occurred_at,
                 )
             )
-            await stamp(session, [policy], last_triggered_at=occurred_at)
+            fired(policy, occurred_at)
             recorded += 1
             violations += 1
             results[index] = results[index].model_copy(
@@ -2134,19 +2623,19 @@ async def ingest_events(
             event_metadata=dict(event.detail),
         )
         session.add(item)
-        # The same mirror the console's submit path applies: the rating lands
-        # on the trace as a feedback score, so SDK- and console-submitted
-        # feedback read identically in the telemetry store. Best effort - an
-        # engine outage degrades the mirror, never the capture.
-        from . import feedback as feedback_service
-
-        item.engine_feedback_score_id = await feedback_service.mirror_score(
-            session, principal, item
-        )
+        mirror = _feedback_mirror(item, agent)
+        if mirror is not None:
+            mirrors.append((item, mirror))
         recorded += 1
         results[index] = results[index].model_copy(update={"id": ref, "agent_id": agent_id})
 
+    await _mirror_feedback(mirrors)
     await session.flush()
+    for control, at in triggered.values():
+        # Never backwards: a late report of an old hit is not the latest one.
+        seen = control.last_triggered_at
+        if seen is None or _as_utc(seen) < at:
+            await stamp(session, [control], last_triggered_at=at)
     if recorded:
         await audit.record(
             session,
@@ -2166,6 +2655,77 @@ async def ingest_events(
     result = _finish(results, parsed, started, agents, [], False, violations)
     result.events_recorded = recorded
     return result
+
+
+#: Name the rating is mirrored under, and how long the mirror may take. The
+#: capture is ours and durable; the mirror is a courtesy to the telemetry store
+#: and must not hold the request, or its transaction, waiting for one.
+FEEDBACK_SCORE_NAME: Final[str] = "user_feedback"
+FEEDBACK_MIRROR_SECONDS: Final[float] = 5.0
+
+
+def _feedback_mirror(item: FeedbackItem, agent: Agent | None) -> dict[str, Any] | None:
+    """The feedback score one rated item puts on its trace, or None for nothing.
+
+    The same score the console's submit path writes, so SDK- and console-
+    submitted feedback read identically in the telemetry store. Built from the
+    agent this batch already resolved: the per-item lookup it replaces was one
+    SELECT and one store call for every event, inside the loop.
+
+    The store files a score by project as well as by trace id, and the project
+    travels as a name. Feedback from no agent this workspace knows therefore has
+    nowhere to go: the fallback used to be the *workspace's* name, which is not a
+    project, so the store either refused the score or filed it under a project
+    of that name where no run would ever show it -- and the row still claimed to
+    be scored. Such feedback is kept and simply not mirrored.
+    """
+    if not item.trace_id or item.rating is None or not _is_uuid(item.trace_id):
+        return None
+    if agent is None or not agent.engine_project_name:
+        return None
+    from . import feedback as feedback_service
+
+    row: dict[str, Any] = {
+        "id": item.trace_id,
+        "project_name": agent.engine_project_name,
+        "name": getattr(feedback_service, "TELEMETRY_SCORE_NAME", FEEDBACK_SCORE_NAME),
+        "value": float(item.rating),
+        "category_name": item.sentiment,
+        "source": "sdk",
+    }
+    if item.body:
+        row["reason"] = item.body[:500]
+    return row
+
+
+def _is_uuid(value: str) -> bool:
+    try:
+        uuid.UUID(value)
+    except (ValueError, AttributeError, TypeError):
+        return False
+    return True
+
+
+async def _mirror_feedback(mirrors: Sequence[tuple[FeedbackItem, dict[str, Any]]]) -> None:
+    """Put a batch's ratings on their traces in one call, best effort, briefly.
+
+    An outage, a slow store or a refusal degrades the mirror and never the
+    capture: the item simply keeps no ``engine_feedback_score_id``, which is how
+    every reader already knows the score is not in the store.
+    """
+    if not mirrors:
+        return
+    try:
+        async with asyncio.timeout(FEEDBACK_MIRROR_SECONDS):
+            refusals = await _push_rows(
+                get_engine_client().score_traces_batch, [row for _, row in mirrors]
+            )
+    except (TelemetryBackendUnavailable, TimeoutError):
+        logger.warning("feedback captured but not mirrored: the telemetry store is not answering")
+        return
+    for (item, row), refusal in zip(mirrors, refusals, strict=True):
+        if refusal is None:
+            item.engine_feedback_score_id = f"{item.trace_id}/{row['name']}"
 
 
 def _sentiment(event: EventIn) -> str:
@@ -2471,17 +3031,28 @@ def _block(
 
 
 def _bind(
-    agents: _Agents, wanted: str | None, results: list[IngestItemResult], index: int
+    agents: _Agents,
+    wanted: str | None,
+    results: list[IngestItemResult],
+    index: int,
+    *,
+    source: str = SOURCE_SDK,
 ) -> Agent | None:
     """Attach an item to its agent, refusing a cross-agent write.
 
     A key bound to one agent may not report for another, and saying so plainly
     is safe: the caller already knows which agent its key was issued for.
+
+    An OpenTelemetry export is the exception. Its "agent" is ``service.name``,
+    which every OTel SDK sends whether or not anybody set it (the default is
+    ``unknown_service``) and which names a process, not a registration. Reading
+    it as a claim to be some other agent refused every export made with a bound
+    key, so there the binding simply wins, as the field's own contract says.
     """
     if agents.bound is not None:
         bound = agents.bound
         known = {bound.slug.lower(), bound.name.lower()}
-        if wanted and wanted.strip().lower() not in known:
+        if source != SOURCE_OTLP and wanted and wanted.strip().lower() not in known:
             _reject(
                 results,
                 index,
@@ -2526,6 +3097,7 @@ def _apply_verdicts(
 
     blocked: dict[int, GuardrailVerdict] = {}
     masked: dict[int, list[GuardrailVerdict]] = {}
+    flagged: dict[int, list[dict[str, Any]]] = {}
     for verdict in verdicts:
         if verdict.action == GuardrailAction.BLOCK.value:
             blocked.setdefault(verdict.index, verdict)
@@ -2533,6 +3105,22 @@ def _apply_verdicts(
             # Every masking verdict counts: two guardrails that each found
             # something must both have what they found removed.
             masked.setdefault(verdict.index, []).append(verdict)
+        # A Log verdict is a shadow trial; it shows on the Guardrails screen and
+        # says nothing about the run.
+        if verdict.action in (GuardrailAction.MASK.value, GuardrailAction.WARN.value):
+            labels = verdict.matched.get("labels") if isinstance(verdict.matched, dict) else None
+            flagged.setdefault(verdict.index, []).append(
+                {
+                    "name": verdict.guardrail_name or verdict.guardrail_id,
+                    "result": "Masked"
+                    if verdict.action == GuardrailAction.MASK.value
+                    else "Warned",
+                    # Category labels only -- never the text that matched.
+                    "detail": ", ".join(str(label) for label in labels)
+                    if isinstance(labels, list) and labels
+                    else verdict.reason,
+                }
+            )
 
     survivors: list[_Accepted] = []
     for entry in accepted:
@@ -2548,6 +3136,9 @@ def _apply_verdicts(
                 }
             )
             continue
+        if entry.index in flagged:
+            entry.warned = True
+            entry.guardrails = flagged[entry.index]
         masks = masked.get(entry.index)
         if masks:
             entry.masked = True
@@ -2704,6 +3295,81 @@ async def _touch_agents(session: AsyncSession, agents: _Agents, *, accepted: boo
         return
     await session.flush()
     await stamp(session, agents.touched, last_used_at=_now())
+
+
+#: A connector's ``last_used_at`` is not rewritten more often than this. It is
+#: read to the minute at best, and four workers rewriting one hot row on every
+#: five-second batch is contention for nothing.
+CONNECTOR_TOUCH_SECONDS: Final[float] = 60.0
+
+
+def _tools_used(parsed: ParsedBatch[Any], accepted: Sequence[_Accepted]) -> dict[str, set[str]]:
+    """agent id -> lower-cased names of the tool spans its stored items carried."""
+    used: dict[str, set[str]] = {}
+    for entry in accepted:
+        item = parsed.items[entry.index]
+        spans = item.spans if isinstance(item, TraceIn) else [item]
+        names = {
+            span.name.strip().lower()
+            for span in spans
+            if isinstance(span, SpanIn) and span.type is SpanType.TOOL
+        }
+        if names:
+            used.setdefault(entry.agent.id, set()).update(names)
+    return used
+
+
+async def _touch_connectors(
+    session: AsyncSession, principal: Principal, used: Mapping[str, set[str]]
+) -> None:
+    """Stamp ``last_used_at`` on the connectors an agent's tool calls went through.
+
+    Nothing ever wrote this column, so the Connectors screen showed a dash under
+    Last Used for ever, sorted on nothing and exported an empty column. The
+    evidence ingest has is a tool span from an agent that holds a grant. When
+    the span is named after a connector, that connector is stamped. Usually it
+    is not -- a span is named after a function, a connector after a system --
+    and then every connector the agent is granted is: the column means "a
+    granted agent last called a tool", which is what a reviewer deciding whether
+    a connector is still in use is asking. An agent that called no tool stamps
+    nothing. One read and at most one write per batch, and none for a batch
+    without tool calls.
+    """
+    if not used:
+        return
+    now = _now()
+    stale = now - dt.timedelta(seconds=CONNECTOR_TOUCH_SECONDS)
+    rows = (
+        await session.execute(
+            select(AgentConnector.agent_id, Connector.id, Connector.name, Connector.last_used_at)
+            .join(Connector, Connector.id == AgentConnector.connector_id)
+            .where(
+                AgentConnector.workspace_id == principal.workspace_id,
+                AgentConnector.agent_id.in_(list(used)),
+                Connector.status != ConnectorStatus.BLOCKED.value,
+            )
+        )
+    ).all()
+    held: dict[str, list[tuple[str, str, dt.datetime | None]]] = {}
+    for agent_id, connector_id, name, last_used_at in rows:
+        held.setdefault(agent_id, []).append(
+            (connector_id, (name or "").strip().lower(), last_used_at)
+        )
+    due: set[str] = set()
+    for agent_id, grants in held.items():
+        named = [grant for grant in grants if grant[1] in used[agent_id]]
+        for connector_id, _name, last_used_at in named or grants:
+            if last_used_at is None or _as_utc(last_used_at) < stale:
+                due.add(connector_id)
+    if not due:
+        return
+    await session.execute(
+        sa_update(Connector)
+        .where(Connector.id.in_(due))
+        # Set to itself so that being used is not an edit: see ``db.base.stamp``.
+        .values(last_used_at=now, updated_at=Connector.updated_at)
+        .execution_options(synchronize_session=False)
+    )
 
 
 def _finish(

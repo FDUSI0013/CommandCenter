@@ -2,9 +2,10 @@
 
 An evaluation is one judged scoring pass over a dataset: the control plane
 creates an experiment in the telemetry engine, registers the dataset's cases
-against it, and reads the judged scores back. Four metrics are reported —
-correctness, grounding, faithfulness and safety — because those are the four
-columns the console renders and the four the judge is configured to emit.
+against it, and reads the judged scores back. Four metrics have columns of their
+own — correctness, grounding, faithfulness and safety — because those are the
+four the console renders. A score under any other name (an SDK scorer is named
+after its function) is reported as ``extra_scores`` rather than dropped.
 
 Nothing in this module invents a score. When the engine has not judged a case
 or a metric yet the field is ``None`` and the table shows a dash; a missing
@@ -40,6 +41,12 @@ METRIC_ALIASES: Final[dict[str, str]] = {
     "answer_relevance": "correctness",
     "accuracy": "correctness",
     "exact_match": "correctness",
+    # The comparisons an SDK scorer is most often written as — the SDK names a
+    # score after the scorer function, and its README's example is the first.
+    "contains_expected": "correctness",
+    "contains": "correctness",
+    "equals": "correctness",
+    "levenshtein_ratio": "correctness",
     "grounding": "grounding",
     "groundedness": "grounding",
     "context_recall": "grounding",
@@ -86,9 +93,26 @@ EXPORT_COLUMNS: Final[tuple[tuple[str, str], ...]] = (
 )
 
 
+#: Scores the platform itself writes onto a trace. They are observations about
+#: a run — a thumbs-down, a review flag — not a judge's verdict on a case, so
+#: they never count towards an evaluation.
+NON_JUDGE_SCORES: Final[frozenset[str]] = frozenset({"user_feedback", "flagged_for_review"})
+
+
+def canonical_metric(name: str) -> str:
+    """One spelling per score name: lower snake case, without a ``_metric`` tail.
+
+    The engine's built-in judges report under their class names
+    (``hallucination_metric``, ``answer_relevance_metric``); the tail says
+    nothing, and leaving it on kept every one of them off the alias list.
+    """
+    key = name.strip().lower().replace(" ", "_").replace("-", "_")
+    return key.removesuffix("_metric") or key
+
+
 def normalise_metric(name: str) -> str | None:
     """Map one engine score name onto a column key, or ``None`` if it is not ours."""
-    return METRIC_ALIASES.get(name.strip().lower().replace(" ", "_").replace("-", "_"))
+    return METRIC_ALIASES.get(canonical_metric(name))
 
 
 def _coerce_score(value: Any) -> float | None:
@@ -105,23 +129,33 @@ def _coerce_score(value: Any) -> float | None:
 
 
 def metric_values(scores: Any) -> dict[str, float]:
-    """Reduce any engine score payload to the four columns we publish.
+    """Reduce any engine score payload to the judged scores we publish.
 
     Accepts both shapes the engine uses — a mapping of name to value, and a
     list of ``{"name": …, "value": …}`` rows — because experiments and traces
-    answer with different ones. Unknown names are dropped rather than guessed
-    at, and duplicates of the same metric are averaged.
+    answer with different ones. A name on the alias list lands in one of the
+    four columns, clamped to 0-1. A name that is not is never guessed into a
+    column, but it is not thrown away either: it is kept under its own name, as
+    reported. It is a verdict somebody's scorer produced, and dropping it made a
+    run judged only by such scorers read as not judged at all — Failed, every
+    case Unscored. Duplicates of the same score are averaged; the scores the
+    platform writes itself (:data:`NON_JUDGE_SCORES`) are not verdicts and are
+    left out. Feeding the result back in returns it unchanged, which is what
+    lets the row's cached ``scores`` be read through the same function.
     """
     collected: dict[str, list[float]] = {}
 
     def _offer(raw_name: Any, raw_value: Any) -> None:
-        if not isinstance(raw_name, str):
+        if not isinstance(raw_name, str) or not raw_name.strip():
             return
-        key = normalise_metric(raw_name)
+        source = canonical_metric(raw_name)
         value = _coerce_score(raw_value)
-        if key is None or value is None:
+        if value is None or source in NON_JUDGE_SCORES:
             return
-        source = raw_name.strip().lower().replace(" ", "_").replace("-", "_")
+        key = METRIC_ALIASES.get(source)
+        if key is None:
+            collected.setdefault(source, []).append(value)
+            return
         if source in INVERTED_METRIC_SOURCES:
             value = 1.0 - value
         collected.setdefault(key, []).append(max(0.0, min(1.0, value)))
@@ -137,11 +171,29 @@ def metric_values(scores: Any) -> dict[str, float]:
     return {key: round(sum(values) / len(values), 4) for key, values in collected.items()}
 
 
+def extra_scores(values: dict[str, float | None] | None) -> dict[str, float]:
+    """The judged scores that are not one of the four columns, by their own name."""
+    return {
+        key: value
+        for key, value in (values or {}).items()
+        if key not in METRIC_KEYS and isinstance(value, (int, float))
+    }
+
+
 def average_score(values: dict[str, float | None] | None) -> float | None:
-    """Mean of the metrics that were actually judged, or ``None`` if none were."""
+    """Mean of the metrics that were actually judged, or ``None`` if none were.
+
+    The four columns decide the average whenever any of them was judged. When
+    none was — the run was scored only by scorers under their own names — the
+    average is taken over those instead, restricted to the ones on the 0-1 scale
+    every judged score here is read on: a scorer that reports a count or a
+    latency is shown under its name but cannot be averaged with a ratio.
+    """
     if not values:
         return None
     present = [v for key in METRIC_KEYS if (v := values.get(key)) is not None]
+    if not present:
+        present = [v for v in extra_scores(values).values() if 0.0 <= v <= 1.0]
     if not present:
         return None
     return round(sum(present) / len(present), 4)
@@ -181,7 +233,20 @@ class EvaluationRead(BaseModel):
     grounding: float | None = None
     faithfulness: float | None = None
     safety: float | None = None
-    avg_score: float | None = None
+    extra_scores: dict[str, float] = Field(
+        default_factory=dict,
+        description=(
+            "Judged scores under names that are not one of the four columns, "
+            "e.g. an SDK scorer's own name. Averaged across the run's cases."
+        ),
+    )
+    avg_score: float | None = Field(
+        None,
+        description=(
+            "Mean of the judged columns; when none of the four was judged, the mean "
+            "of the 0-1 scores in extra_scores"
+        ),
+    )
 
     baseline_run_id: str | None = Field(
         None, description="Previous completed run on the same agent and dataset"
@@ -214,7 +279,11 @@ class EvaluationItemRead(BaseModel):
     expected_output: str | None = None
     actual_output: str | None = None
     scores: dict[str, float] = Field(
-        default_factory=dict, description="Judged metrics for this case; empty when unscored"
+        default_factory=dict,
+        description=(
+            "Judged scores for this case: the four columns where judged, and any "
+            "other scorer under its own name. Empty when unscored"
+        ),
     )
     avg_score: float | None = None
     passed: bool | None = Field(
@@ -244,7 +313,15 @@ class EvaluationDetail(EvaluationRead):
     item_page: int = 1
     item_page_size: int = 25
     item_total: int = 0
-    scored_items: int = Field(0, description="Cases the engine has returned a score for")
+    items_unavailable: bool = Field(
+        False,
+        description=(
+            "True when the telemetry store could not be read for the case breakdown. "
+            "items is then empty because it is unknown, not because there are no cases; "
+            "every other field comes from the control plane's own database"
+        ),
+    )
+    scored_items: int = Field(0, description="Cases that carry at least one judged score")
     trend: list[EvaluationTrendPoint] = Field(
         default_factory=list, description="This agent and dataset over time, oldest first"
     )
@@ -348,6 +425,12 @@ class DatasetCreate(BaseModel):
         trimmed = value.strip()
         if not trimmed:
             raise ValueError("must not be blank")
+        if "/" in trimmed:
+            # The name is a path segment of /datasets/{name}/items. A slash in
+            # it — even percent-encoded, which servers decode before routing —
+            # names a different path, so the dataset could be created and
+            # listed but never filled or read.
+            raise ValueError("must not contain '/'")
         return trimmed
 
 

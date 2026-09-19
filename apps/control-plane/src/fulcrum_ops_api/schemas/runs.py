@@ -126,7 +126,8 @@ class RunHistoryPage(BaseModel):
 
     Cursor-paged rather than offset-paged: the history has no time floor, so a
     total would mean scanning the agent's whole project on every page. The
-    cursor is the last row's id; absent means the history is exhausted.
+    cursor is opaque -- pass ``next_cursor`` back exactly as it was received;
+    absent means the history is exhausted.
     """
 
     agent_id: str
@@ -167,6 +168,9 @@ class RunDetail(RunRead):
 
     input: str = ""
     response: str = ""
+    metadata: dict[str, Any] = Field(
+        default_factory=dict, description="The run's own metadata, exactly as it was recorded"
+    )
     environment: str | None = None
     guardrails: RunGuardrails = Field(default_factory=RunGuardrails)
     retrieval: RunRetrieval = Field(default_factory=RunRetrieval)
@@ -178,7 +182,11 @@ class RunDetail(RunRead):
     flagged_for_review: bool = False
     trace_available: bool = True
     replay_supported: bool = Field(
-        True, description="False when the run recorded no spans to step through"
+        True,
+        description=(
+            "False only when there is nothing to step through: no spans, and no "
+            "input, output or error on the run itself"
+        ),
     )
 
 
@@ -199,6 +207,9 @@ class RunResponse(BaseModel):
     model: str | None = None
     occurred_at: dt.datetime
     response: str
+    error: str | None = Field(
+        None, description="Error recorded on the run; a failed run often has no response"
+    )
     output_tokens: int = 0
     character_count: int = 0
 
@@ -240,7 +251,13 @@ class RunSpan(BaseModel):
 
 
 class RunTrace(BaseModel):
-    """The Execution Trace modal: header facts plus the span tree."""
+    """The Execution Trace modal: header facts plus the span tree.
+
+    ``input``, ``response``, ``error`` and ``metadata`` are the run's own, read
+    off the trace rather than its spans. A run reported without spans -- one
+    decorated call, nothing nested -- has an empty ``spans`` and is still fully
+    described by these four.
+    """
 
     run_id: str
     agent: str | None = None
@@ -252,6 +269,12 @@ class RunTrace(BaseModel):
     span_count: int = 0
     total_tokens: int = 0
     total_cost: float = 0.0
+    input: str = Field("", description="The run's own input, in full")
+    response: str = Field("", description="The run's own output, in full")
+    error: str | None = Field(None, description="Error recorded on the run itself")
+    metadata: dict[str, Any] = Field(
+        default_factory=dict, description="The run's own metadata, exactly as it was recorded"
+    )
     spans: list[RunSpan] = Field(default_factory=list, description="Root spans, in start order")
 
 
@@ -317,9 +340,21 @@ class ReplayStep(BaseModel):
 
 
 class ReplaySession(BaseModel):
-    """What Replay Studio loads for one run."""
+    """What Replay Studio loads for one run.
+
+    A run that recorded no spans still replays: its steps are then built from
+    what the run itself recorded -- a Prompt step and a Response step, with
+    ``span_id`` null -- and ``steps_from_trace`` says so. ``input``,
+    ``response``, ``error`` and ``metadata`` are always the run's own.
+    """
 
     run: RunRead
+    input: str = Field("", description="The run's own input, in full")
+    response: str = Field("", description="The run's own output, in full")
+    error: str | None = Field(None, description="Error recorded on the run itself")
+    metadata: dict[str, Any] = Field(
+        default_factory=dict, description="The run's own metadata, exactly as it was recorded"
+    )
     steps: list[ReplayStep] = Field(default_factory=list)
     transcript: list[TranscriptMessage] = Field(default_factory=list)
     total_duration_ms: float = 0.0
@@ -330,7 +365,11 @@ class ReplaySession(BaseModel):
     fidelity: float = Field(
         0.0, description="Share of steps with full payloads, 0-100"
     )
-    replayable: bool = Field(True, description="False when the run recorded no spans")
+    steps_from_trace: bool = Field(
+        False,
+        description="True when the run recorded no spans and the steps were built from the run",
+    )
+    replayable: bool = Field(True, description="False when there is nothing to step through")
 
 
 # ---------------------------------------------------------------------------
@@ -370,6 +409,17 @@ class ScanInfo(BaseModel):
     )
     window_start: dt.datetime
     window_end: dt.datetime
+    covered_from: dt.datetime | None = Field(
+        None,
+        description=(
+            "When the row cap was reached: the instant from which the scan holds "
+            "every run. A capped project contributes its newest rows, so between "
+            "`window_start` and here the window was read only in part -- totals "
+            "are a floor and a sparkline bucket there is not a measurement. Null "
+            "when nothing was capped, and when it cannot be said (more agents than "
+            "one scan covers, or capped rows that carry no start time)"
+        ),
+    )
 
 
 class RunsSummary(BaseModel):
@@ -377,6 +427,11 @@ class RunsSummary(BaseModel):
 
     Every card is computed over the selected window and compared with the
     window immediately before it, so "vs last 24h" is a measured change.
+
+    Both windows are read under the same cap, and each reports what it was
+    computed from (``scan``, ``previous_scan``). When either was capped the two
+    are not comparable: ``comparable`` is false and every ``*_delta_*`` field is
+    null, so the console draws no arrow rather than a trend that did not happen.
     """
 
     time_range: TimeRange
@@ -405,6 +460,16 @@ class RunsSummary(BaseModel):
         default_factory=list, description="Options for the Tenant filter, from the window"
     )
     scan: ScanInfo
+    previous_scan: ScanInfo | None = Field(
+        None, description="What the `*_previous` figures were computed from"
+    )
+    comparable: bool = Field(
+        True,
+        description=(
+            "False when either window hit the scan cap. The deltas are then null: "
+            "a capped window is 'the most recent N runs', which cannot be subtracted"
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------

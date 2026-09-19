@@ -1,6 +1,6 @@
 """Quota, Cost & Capacity routes.
 
-One screen, seven tabs, twenty-four endpoints: the KPI row, the spend and usage
+One screen, seven tabs, twenty-six endpoints: the KPI row, the spend and usage
 charts, the cost breakdowns, the team allocation table, the computed insights,
 the quota and budget registries with their verbs, the capacity readings, the
 event feed and the CSV export.
@@ -34,6 +34,7 @@ from ...schemas.quota import (
     BudgetCreate,
     BudgetRead,
     BudgetUpdate,
+    CapacityReport,
     CapacityRow,
     CapacitySeries,
     CostDriverRow,
@@ -44,6 +45,7 @@ from ...schemas.quota import (
     QuotaExportDataset,
     QuotaForecast,
     QuotaIncreaseRequest,
+    QuotaOverview,
     QuotaPeriod,
     QuotaRead,
     QuotaSummary,
@@ -135,6 +137,29 @@ async def get_summary(
     reading of every pool that has reported.
     """
     return await service.summarise(session, principal, period=period)
+
+
+@router.get(
+    "/overview",
+    response_model=QuotaOverview,
+    summary="KPI summary and every cost panel, measured once",
+)
+async def get_overview(
+    principal: CurrentPrincipal, session: Db, period: PeriodQuery = QuotaPeriod.MTD
+) -> QuotaOverview:
+    """Everything on the Overview and Costs tabs that is not a chart.
+
+    `summary` is exactly what `/quota/summary` answers; `models`, `services`,
+    `drivers`, `teams` and `insights` are every row of `/quota/cost-breakdown`,
+    `/quota/cost-by-service`, `/quota/top-drivers`, `/quota/team-allocation`
+    and `/quota/insights` in their default order. All six are views of one
+    measurement of the period, so asking here costs the telemetry store one
+    measurement where asking the six routes costs six. The first ten teams
+    carry their sparkline.
+    """
+    return QuotaOverview.model_validate(
+        await service.overview(session, principal, period=period)
+    )
 
 
 @router.get(
@@ -377,6 +402,32 @@ async def list_capacity(
     )
 
 
+@router.post(
+    "/capacity",
+    response_model=ActionResult,
+    status_code=status.HTTP_201_CREATED,
+    summary="Report capacity readings",
+)
+async def report_capacity(
+    principal: CurrentPrincipal, session: Db, payload: CapacityReport
+) -> ActionResult:
+    """Record what a reporter measured: up to a hundred readings per call.
+
+    This is how a pool the platform cannot see for itself -- a GPU fleet, a
+    vector store, a network link -- gets onto the Capacity tab; the platform
+    records its own memory, disk and CPU on its own clock. Send `provisioned`
+    and `used`; utilisation and the Healthy/Warning/Critical status are derived
+    here with the thresholds the rest of the screen uses, so they are not
+    accepted. A reading dated in the future, or older than the thirty days of
+    history the screen shows, is refused with 422. Requires the operator role
+    (an API key needs the `admin` scope).
+    """
+    recorded = await service.record_capacity(session, principal, payload)
+    return ActionResult(
+        message=f"{recorded} capacity reading(s) recorded.", data={"recorded": recorded}
+    )
+
+
 @router.get(
     "/capacity-series",
     response_model=CapacitySeries,
@@ -580,9 +631,11 @@ async def create_budget(
 ) -> BudgetRead:
     """Open a spend ceiling for a period.
 
-    Spend starts at zero and is rolled up from measured cost by
-    `POST /quota/budgets/refresh`; it is never supplied by a caller. Requires
-    the admin role.
+    Spend is never supplied by a caller. It is measured as the budget is opened
+    -- a budget created mid-period answers with what the period has already
+    cost, and raises its alert at once if that is past a threshold -- and kept
+    true afterwards by the scheduled roll-up. If the telemetry store cannot
+    answer, the budget still opens, at zero. Requires the admin role.
     """
     return BudgetRead.model_validate(
         await service.create_budget(session, principal, payload, request=request)
@@ -604,8 +657,11 @@ async def refresh_budgets(
 ) -> ActionResult:
     """Re-measure spend for every live budget and evaluate its thresholds.
 
-    This is the job that keeps the bars true, and it is where a threshold
-    crossing raises its alert. Budgets sharing a period are measured with one
+    The platform runs this pass on its own clock; this route is the same pass
+    on demand. It is where a threshold crossing raises its alert. Without
+    `budget_id` it also closes the books on budgets whose period has ended
+    (they come back `Expired`, with their final spend) and opens the current
+    period for recurring ones. Budgets sharing a period are measured with one
     telemetry read. Requires the operator role.
     """
     refreshed = await service.refresh_budgets(
@@ -613,7 +669,11 @@ async def refresh_budgets(
     )
     if not refreshed:
         return ActionResult(message="No live budgets to refresh.", data={"budgets": []})
-    breached = [row for row in refreshed if row["status"] != LimitStatus.ACTIVE.value]
+    breached = [
+        row
+        for row in refreshed
+        if row["status"] in (LimitStatus.WARNING.value, LimitStatus.EXCEEDED.value)
+    ]
     payload = [BudgetRead.model_validate(row).model_dump(mode="json") for row in refreshed]
     return ActionResult(
         message=(
@@ -776,9 +836,11 @@ async def request_increase(
 ) -> ActionResult:
     """Route a bigger ceiling into the approvals queue.
 
-    The quota is not touched: an increase is a decision, and it is recorded
-    where every other governed decision lives. The risk rung — and therefore the
-    SLA — is derived from how much bigger the ask is. Any member may request.
+    The quota is not touched by asking: an increase is a decision, and it is
+    recorded where every other governed decision lives. Approving the request
+    raises the ceiling to the number asked for here, in the same transaction as
+    the approval. The risk rung — and therefore the SLA — is derived from how
+    much bigger the ask is. Any member may request.
     """
     outcome = await service.request_increase(
         session, principal, quota_id, payload, request=request
@@ -786,7 +848,7 @@ async def request_increase(
     return ActionResult(
         message=(
             f"Increase to {outcome['requested_limit']:,.0f} {outcome['unit']} requested; "
-            f"{outcome['request_ref']} is with the approvers."
+            f"{outcome['request_ref']} is with the approvers and is applied on approval."
         ),
         entity_id=quota_id,
         data=outcome,

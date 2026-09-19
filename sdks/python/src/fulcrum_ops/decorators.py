@@ -165,7 +165,7 @@ def trace(  # noqa: C901 - one function, four wrapper shapes; splitting it hides
     metadata: Optional[Dict[str, Any]] = None,
     tags: Optional[Sequence[str]] = None,
     agent: Optional[str] = None,
-    thread_id: Optional[str] = None,
+    thread_id: Union[str, Callable[..., Optional[str]], None] = None,
     client: Optional[Any] = None,
 ) -> Any:
     """Trace a function, coroutine, generator or async generator.
@@ -192,6 +192,16 @@ def trace(  # noqa: C901 - one function, four wrapper shapes; splitting it hides
         arguments are large or sensitive; the workspace's redaction rules apply
         either way.
     :param capture_output: Record the return value.
+    :param thread_id: The conversation this run belongs to: what the Sessions
+        and Memory views group runs by. A decorator is evaluated once, so a
+        string here puts *every* call in the same thread; pass a callable to
+        work it out per call. It is called with the function's own arguments::
+
+            @trace(thread_id=lambda self, email, **_: email.conversation_id)
+            def get_insight(self, email): ...
+
+        When the id is not among the arguments, call
+        ``fulcrum_ops.set_thread_id(...)`` from inside the function instead.
     :param client: Report to this client instead of the default one.
     """
 
@@ -209,9 +219,20 @@ def trace(  # noqa: C901 - one function, four wrapper shapes; splitting it hides
                 logger.debug("fulcrum-ops: no default client available", exc_info=True)
                 return None
 
+        def resolve_thread_id(args: Sequence[Any], kwargs: Dict[str, Any]) -> Optional[str]:
+            if not callable(thread_id):
+                return thread_id
+            try:
+                value = thread_id(*args, **kwargs)
+            except Exception:  # noqa: BLE001 - the caller's lambda must not break the caller's call
+                logger.debug("fulcrum-ops: thread_id() raised for %s", span_name, exc_info=True)
+                return None
+            return None if value is None else str(value)
+
         def open_item(active: Any, args: Sequence[Any], kwargs: Dict[str, Any]) -> Optional[_Item]:
             """Open a trace or a child span, whichever the context calls for."""
             try:
+                conversation = resolve_thread_id(args, kwargs) if thread_id is not None else None
                 captured = (
                     _bind_inputs(target, args, kwargs)
                     if capture_input and active.capture_input
@@ -224,7 +245,7 @@ def trace(  # noqa: C901 - one function, four wrapper shapes; splitting it hides
                         metadata=metadata,
                         tags=tags,
                         agent=agent,
-                        thread_id=thread_id,
+                        thread_id=conversation,
                     )
                     if type == "general":
                         return root
@@ -239,6 +260,13 @@ def trace(  # noqa: C901 - one function, four wrapper shapes; splitting it hides
                     finally:
                         _detach(tokens)
                     return _TypedRoot(root, body)
+                if conversation:
+                    # The function that knows the conversation is not always
+                    # the outermost one. A run that has no thread yet takes it
+                    # from the first step that can name one.
+                    enclosing = _context.current_trace()
+                    if enclosing is not None and not enclosing.thread_id:
+                        enclosing.set_thread_id(conversation)
                 return active.span(
                     span_name,
                     type=type,

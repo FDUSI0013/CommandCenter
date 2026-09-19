@@ -622,7 +622,14 @@ tr.flash-in td{animation:rowIn 1.4s;}
 .screen-error{display:flex;flex-direction:column;align-items:center;gap:10px;padding:44px 20px;text-align:center;color:var(--muted);}
 .screen-error svg{width:26px;height:26px;stroke:var(--red);}
 .screen-error .se-title{font-weight:650;color:var(--text);font-size:14px;}
-@media (prefers-reduced-motion: reduce){.skeleton-row,.card-loading::after{animation:none}}
+/* A dialog action in flight (components.js openModal): the pressed button says
+   so, and the dialog takes programmatic focus without drawing a ring round itself. */
+.btn.loading::before{content:"";width:11px;height:11px;flex-shrink:0;border-radius:50%;border:2px solid currentColor;border-right-color:transparent;animation:spin .7s linear infinite;}
+.modal:focus{outline:none;}
+/* A reload with the previous rows still on screen: dim them so a slow sort or
+   page change does not look like a dead click. */
+.tbl.is-stale tbody{opacity:.5;transition:opacity .12s .15s;}
+@media (prefers-reduced-motion: reduce){.skeleton-row,.card-loading::after,.btn.loading::before{animation:none}}
 
 /* ---- sign-in gate -------------------------------------------------------- */
 #auth-root{position:fixed;inset:0;z-index:400;}

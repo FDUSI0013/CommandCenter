@@ -110,9 +110,70 @@ def _no_run_screen_memory(monkeypatch):
     monkeypatch.setattr(settings, "runs_activity_cache_seconds", 0.0)
     monkeypatch.setattr(settings, "runs_scan_cache_seconds", 0.0)
     monkeypatch.setattr(settings, "runs_summary_cache_seconds", 0.0)
+    monkeypatch.setattr(settings, "agent_stats_cache_seconds", 0.0)
     telemetry_cache.reset()
     yield
     telemetry_cache.reset()
+
+
+@pytest.fixture(autouse=True)
+def _no_metrics_memory(monkeypatch):
+    """The metrics rollups' shared measurements are off for the same reason.
+
+    With them on, a test that takes the store down would still be answered from
+    the measurement made a moment earlier. ``test_audit_metrics`` switches the
+    memory back on for the tests that are about it.
+    """
+    from fulcrum_ops_api.core.config import settings
+
+    monkeypatch.setattr(settings, "metrics_cache_seconds", 0.0)
+
+
+@pytest.fixture(autouse=True)
+def _no_configuration_usage_memory(monkeypatch):
+    """The Configuration Center's Usage tab remembers nothing, for the same reason."""
+    from fulcrum_ops_api.core.config import settings
+
+    monkeypatch.setattr(settings, "configuration_usage_cache_seconds", 0.0)
+
+
+@pytest.fixture(autouse=True)
+def _no_audit_verify_memory(monkeypatch):
+    """A chain replay is never served from memory: a test that tampers with a row
+    and verifies again has to see the break, not the answer from before it."""
+    from fulcrum_ops_api.core.config import settings
+
+    monkeypatch.setattr(settings, "audit_verify_cache_seconds", 0.0)
+
+
+@pytest.fixture(autouse=True)
+def _no_knowledge_scan_memory(monkeypatch):
+    """The knowledge screen's shared retrieval scan is off, for the same reason:
+    a test that takes the store down must be refused, not answered from the scan
+    made a moment earlier. ``test_audit_knowledge`` switches it back on."""
+    from fulcrum_ops_api.core.config import settings
+
+    monkeypatch.setattr(settings, "knowledge_scan_cache_seconds", 0.0)
+
+
+@pytest.fixture(autouse=True)
+def _no_prompt_stats_memory(monkeypatch):
+    """Prompt Studio's per-agent run counters are read afresh, for the same reason:
+    two tests name their agent alike, and the second must not be told the first's
+    runs. ``test_audit_prompts`` switches the memory back on."""
+    from fulcrum_ops_api.core.config import settings
+
+    monkeypatch.setattr(settings, "prompt_stats_cache_seconds", 0.0)
+
+
+@pytest.fixture(autouse=True)
+def _no_memory_counts_memory(monkeypatch):
+    """Memory & State counts its threads afresh, for the same reason: a test that
+    takes the store down must be refused, not told the count from a moment ago.
+    ``test_audit_memory`` switches the memory back on."""
+    from fulcrum_ops_api.core.config import settings
+
+    monkeypatch.setattr(settings, "memory_counts_cache_seconds", 0.0)
 
 
 # ---------------------------------------------------------------------------

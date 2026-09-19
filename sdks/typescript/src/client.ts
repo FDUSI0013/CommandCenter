@@ -23,7 +23,7 @@ import { BatchQueue } from './queue.js';
 import { ContextManager } from './context.js';
 import { PromptClient } from './prompts.js';
 import { Span, Trace } from './trace.js';
-import { Transport } from './transport.js';
+import { Transport, backoffDelay } from './transport.js';
 import { applyRedactionToText, compileRedactionRules } from './redaction.js';
 import { FulcrumOpsError, toFulcrumError } from './errors.js';
 import {
@@ -48,7 +48,7 @@ import {
   clampText,
 } from './limits.js';
 import { normaliseMetadata } from './serialize.js';
-import { onPageHide, onProcessExit } from './runtime.js';
+import { onPageHide, onProcessExit, onTerminationSignal, unrefTimer } from './runtime.js';
 import { resolveOptions } from './options.js';
 import { nowIso, toIso } from './ids.js';
 import type { CompiledRedactionRule } from './redaction.js';
@@ -70,6 +70,28 @@ import type {
 /** A traced function's first argument is the span it is running in. */
 export type TracedBody<T> = (trace: Trace) => T;
 export type SpanBody<T> = (span: Span) => T;
+
+/**
+ * What `traced()` accepts: a trace's options, plus the ones only a span can
+ * carry, because a traced function is a span whenever it is called inside
+ * another — and, given a `type`, a typed step even when it is not.
+ */
+export type TracedOptions = TraceOptions &
+  Pick<SpanOptions, 'type' | 'model' | 'provider' | 'usage' | 'cost'> & {
+    /** `true`: always a span of whatever is in scope. `false`: always a run of its own. */
+    asSpan?: boolean;
+  };
+
+/** A span that opens its own trace may say what only a trace can record. */
+type RootSpanOptions = SpanOptions & Pick<TraceOptions, 'threadId' | 'sampled'>;
+
+/** The options a trace has nowhere to put: set, they make the work a typed step. */
+const SPAN_ONLY_OPTIONS = ['type', 'model', 'provider', 'usage', 'cost'] as const;
+
+function isTypedStep(options: object): boolean {
+  const given = options as Record<string, unknown>;
+  return SPAN_ONLY_OPTIONS.some((option) => given[option] !== undefined);
+}
 
 /** What `client.score()` takes. */
 export interface FeedbackScoreOptions {
@@ -138,6 +160,23 @@ export interface ClientStats extends QueueStats {
   contextBackend: string;
 }
 
+/**
+ * The longest one background bootstrap attempt may run.
+ *
+ * Nobody is waiting on that fetch, so the only thing its timeout decides is how
+ * long a process that has finished its work can be kept alive by it.
+ */
+const BOOTSTRAP_TIMEOUT_MS = 5_000;
+
+/** How one read of the bootstrap document is carried out. */
+interface ConfigFetch {
+  timeoutMs?: number;
+  /** Attempts after the first, inside the transport. */
+  maxAttempts?: number;
+  /** Do not route a failure to `onError`; the caller will decide. */
+  quiet?: boolean;
+}
+
 let defaultClient: FulcrumOps | undefined;
 
 /** The client the module-level `traced()` helper reports to. */
@@ -165,6 +204,9 @@ export class FulcrumOps implements TraceSink {
   private configEtag: string | undefined;
   private configExpiresAt = 0;
   private configInFlight: Promise<IngestConfig | undefined> | undefined;
+  /** The constructor's background attempt, while one is on the wire. */
+  private bootstrapping: Promise<void> | undefined;
+  private bootstrapTimer: ReturnType<typeof setTimeout> | undefined;
 
   private effectiveSamplingRate: number;
   private effectiveCaptureInput: boolean;
@@ -173,6 +215,7 @@ export class FulcrumOps implements TraceSink {
 
   private sampledOut = 0;
   private closed = false;
+  private readonly heldTraces = new Set<Trace>();
   private readonly unregisterExitHooks: Array<() => void> = [];
   private latestQuotas: IngestQuotaState[] = [];
 
@@ -191,6 +234,7 @@ export class FulcrumOps implements TraceSink {
       transport: this.transport,
       maxItems: this.options.batch.maxItems,
       maxBytes: this.options.batch.maxBytes,
+      maxSpans: this.options.batch.maxSpans,
       flushIntervalMs: this.options.batch.flushIntervalMs,
       maxQueueSize: this.options.batch.maxQueueSize,
       agent: this.options.agent,
@@ -200,12 +244,16 @@ export class FulcrumOps implements TraceSink {
     });
 
     if (!this.options.enabled) {
-      this.debug('no API key found; reporting is disabled and every call is a no-op');
+      this.debug(
+        this.options.apiKey
+          ? 'reporting was turned off (`enabled: false` or FULCRUM_OPS_DISABLED); every call is a no-op'
+          : 'no API key found; reporting is disabled and every call is a no-op',
+      );
     }
     if (this.options.enabled && this.options.bootstrap) {
       // Fire-and-forget: start-up must not block on the network, and a failure
       // here only means the SDK keeps its own defaults.
-      void this.config().catch(() => undefined);
+      this.bootstrapInBackground(0);
     }
     if (this.options.flushOnExit) this.installExitHooks();
     if (this.options.setAsDefault && !defaultClient) defaultClient = this;
@@ -274,6 +322,27 @@ export class FulcrumOps implements TraceSink {
     return this.options.agent ?? this.boundAgent;
   }
 
+  /** @internal */
+  holdTrace(trace: Trace): void {
+    this.heldTraces.add(trace);
+  }
+
+  /** @internal */
+  releaseTrace(trace: Trace): void {
+    this.heldTraces.delete(trace);
+  }
+
+  /**
+   * Report every closed trace that is still waiting on a deferred span.
+   *
+   * Only for the way out: once the process or the client is going away, a
+   * stream that has not finished is not going to, and the run is worth more
+   * with a cut-short span than not at all.
+   */
+  private releaseHeldTraces(): void {
+    for (const trace of Array.from(this.heldTraces)) this.safely('trace:release', () => void trace.release());
+  }
+
   // -------------------------------------------------------------------------
   // Tracing
   // -------------------------------------------------------------------------
@@ -322,6 +391,15 @@ export class FulcrumOps implements TraceSink {
   trace<T>(name: string, body: TracedBody<T>): T;
   trace<T>(options: TraceOptions, body: TracedBody<T>): T;
   trace<T>(nameOrOptions: string | TraceOptions, body: TracedBody<T>): T {
+    // Span-only options get here from JavaScript, or from an options object
+    // TypeScript could not check. A trace has nowhere to put them, so rather
+    // than drop them the run is opened with the typed span that is its body —
+    // the same shape `traced()` gives a typed call. `body` still gets the trace.
+    if (typeof nameOrOptions === 'object' && isTypedStep(nameOrOptions)) {
+      const span = this.startRootSpan(nameOrOptions, 'trace');
+      const owner = span.ownerTrace;
+      if (owner) return this.runInSpan(span, () => body(owner));
+    }
     const trace = this.startTrace(nameOrOptions);
     return this.context.run({ trace }, () => this.runUnit(trace, body));
   }
@@ -346,13 +424,46 @@ export class FulcrumOps implements TraceSink {
     const activeTrace = this.currentTrace();
     if (activeTrace) return activeTrace.startSpan(options);
 
-    const implicit = this.startTrace({ name: options.name ?? 'span', agent: options.agent });
-    const span = implicit.startSpan(options);
+    return this.startRootSpan(options as RootSpanOptions);
+  }
+
+  /**
+   * Open a span together with the trace that exists to hold it.
+   *
+   * That trace is the run. It is the row Live Runs lists, what a thread groups
+   * and what a tag filter matches; the span is a step inside it. So what the
+   * caller said about the work — input, metadata, tags, start time, thread —
+   * goes on the trace as well as the span. This is the path every call through
+   * `wrapOpenAI` / `wrapAnthropic` takes when nobody opened a trace first, and
+   * a trace given only a name made each of those a blank row with the prompt
+   * one click down.
+   */
+  private startRootSpan(options: RootSpanOptions, idNames: 'trace' | 'span' = 'span'): Span {
+    const implicit = this.startTrace({
+      // A caller-supplied id names whichever unit the caller asked for.
+      id: idNames === 'trace' ? options.id : undefined,
+      name: options.name ?? 'span',
+      agent: options.agent,
+      input: options.input,
+      metadata: options.metadata,
+      tags: options.tags,
+      startTime: options.startTime,
+      threadId: options.threadId,
+      sampled: options.sampled,
+    });
+    // `parent` is what the caller asked to be ignored by asking for a root.
+    const span = implicit.startSpan({
+      ...options,
+      id: idNames === 'span' ? options.id : undefined,
+      parent: undefined,
+    });
     // The implicit trace closes with its only span, so the run is complete.
+    // It adopts rather than being handed `endOptions`: an output or a failure
+    // set on the span before `end()` belongs on the run just as much.
     const originalEnd = span.end.bind(span);
     span.end = (endOptions: EndOptions = {}) => {
       originalEnd(endOptions);
-      implicit.end({ output: endOptions.output, error: endOptions.error, endTime: endOptions.endTime });
+      implicit.adopt(span).end({ endTime: endOptions.endTime });
       return span;
     };
     return span;
@@ -362,9 +473,20 @@ export class FulcrumOps implements TraceSink {
   span<T>(name: string, body: SpanBody<T>): T;
   span<T>(options: SpanOptions, body: SpanBody<T>): T;
   span<T>(nameOrOptions: string | SpanOptions, body: SpanBody<T>): T {
-    const span = this.startSpan(nameOrOptions);
-    const active = this.context.active();
-    const trace = active?.trace ?? this.currentTrace();
+    return this.runInSpan(this.startSpan(nameOrOptions), body);
+  }
+
+  /**
+   * Put a span in scope for the length of `body`, with the trace it belongs to.
+   *
+   * The span's own trace, not merely whichever is in scope: at the root that
+   * is the trace `startRootSpan` opened, and leaving it out of the context is
+   * what made `currentTrace()` come back empty inside a root span — so a
+   * `traced()` helper called from there opened a run of its own instead of
+   * nesting, and one call graph reported as N disconnected runs.
+   */
+  private runInSpan<T>(span: Span, body: SpanBody<T>): T {
+    const trace = span.ownerTrace ?? this.currentTrace();
     return this.context.run({ trace, span }, () => this.runUnit(span, body));
   }
 
@@ -374,10 +496,7 @@ export class FulcrumOps implements TraceSink {
    * The wrapper keeps the original's arity and name, so it can be dropped in
    * where the original was without anything downstream noticing.
    */
-  traced<A extends unknown[], R>(
-    fn: (...args: A) => R,
-    options: (TraceOptions & { asSpan?: boolean }) | string = {},
-  ): (...args: A) => R {
+  traced<A extends unknown[], R>(fn: (...args: A) => R, options: TracedOptions | string = {}): (...args: A) => R {
     const settings = typeof options === 'string' ? { name: options } : { ...options };
     const client = this;
     // `fn.name` is `''` for an anonymous function expression, and `??` would
@@ -394,9 +513,16 @@ export class FulcrumOps implements TraceSink {
       const body = () => fn.apply(this, args) as R;
       // A nested `traced` function becomes a span of the trace above it, which
       // is what makes decorating a whole call graph produce one tree.
-      const nestUnderCurrent = settings.asSpan ?? client.currentTrace() !== undefined;
-      return nestUnderCurrent
-        ? client.span(unitOptions as SpanOptions, body)
+      const inScope = client.currentSpan() !== undefined || client.currentTrace() !== undefined;
+      if (settings.asSpan ?? inScope) return client.span(unitOptions as SpanOptions, body);
+      // A run of its own. A trace has no type, model or token counters — only
+      // a span does — so `traced(callModel, { type: 'llm' })` recorded as a
+      // bare trace is a run with a name, a duration and an empty step list: no
+      // model, no tokens, no cost. Given any of those options the run is
+      // opened with the typed span that is its whole body, which also gives
+      // `currentSpan()` something to `setModel()` and `setUsage()` on.
+      return isTypedStep(settings)
+        ? client.runInSpan(client.startRootSpan(unitOptions, 'trace'), body)
         : client.trace(unitOptions as TraceOptions, body);
     };
 
@@ -470,7 +596,9 @@ export class FulcrumOps implements TraceSink {
     if (category) payload.category_name = category;
     const reason = clampText(score.reason, MAX_SCORE_REASON_LENGTH);
     if (reason) payload.reason = reason;
-    payload.source = clampText(score.source, MAX_SCORE_SOURCE_LENGTH) ?? 'sdk';
+    // Lower-cased for the same reason as a score attached in place: see
+    // `normaliseScore`.
+    payload.source = clampText(score.source, MAX_SCORE_SOURCE_LENGTH)?.toLowerCase() ?? 'sdk';
     const agent = clampText(score.agent ?? this.defaultAgent(), MAX_AGENT_LENGTH);
     if (agent) payload.agent = agent;
     this.queue.enqueue('scores', payload);
@@ -513,9 +641,9 @@ export class FulcrumOps implements TraceSink {
   private currentIds(traceId?: string, spanId?: string): { trace_id?: string; span_id?: string } {
     const out: { trace_id?: string; span_id?: string } = {};
     const span = this.currentSpan();
-    // A span opened with no trace in scope gets an implicit trace that never
-    // enters the context, so the span's own `traceId` is the only way to
-    // attribute the event to a run rather than leaving it orphaned.
+    // A span in scope normally brings its trace with it (see `runInSpan`). The
+    // span's own `traceId` is the fallback for one that did not, so the event
+    // is attributed to a run rather than left orphaned.
     const resolvedTrace = traceId ?? this.currentTrace()?.id ?? span?.traceId;
     const resolvedSpan = spanId ?? span?.id;
     if (resolvedTrace) out.trace_id = resolvedTrace;
@@ -636,8 +764,56 @@ export class FulcrumOps implements TraceSink {
    */
   async config(options: ConfigOptions = {}): Promise<IngestConfig | undefined> {
     if (!this.options.enabled) return undefined;
+    // The constructor's background attempt is one short try. A caller who is
+    // waiting is owed the full retry policy, so that attempt is allowed to
+    // finish and is then not the last word.
+    if (this.bootstrapping) await this.bootstrapping;
+    return this.fetchConfig(options);
+  }
+
+  /**
+   * Read the bootstrap document with nobody waiting for it.
+   *
+   * The transport's retry loop sleeps on a timer that holds the event loop
+   * open, which is right when a caller is awaiting the send and wrong here: a
+   * cron job that finished in a second would sit for four thirty-second
+   * attempts on an unreachable control plane, kept alive by a fetch it never
+   * asked for. So each background attempt is a single short request, and the
+   * waits between attempts are on timers that do not hold the process — a
+   * long-running agent still gets every retry (and with them the workspace's
+   * redaction rules), and a finished one exits.
+   */
+  private bootstrapInBackground(attempt: number): void {
+    this.bootstrapTimer = undefined;
+    if (this.closed || this.cachedConfig) return;
+    const last = attempt >= this.options.retry.maxAttempts;
+
+    const settled: Promise<void> = this.fetchConfig(
+      {},
+      { timeoutMs: Math.min(this.options.timeoutMs, BOOTSTRAP_TIMEOUT_MS), maxAttempts: 0, quiet: true },
+    )
+      .then(
+        () => undefined,
+        (thrown: unknown) => {
+          const error = toFulcrumError(thrown, 'Could not fetch the SDK configuration.');
+          if (last || !error.retryable || this.closed) {
+            this.report('config', error);
+            return;
+          }
+          const delay = backoffDelay(attempt, this.options.retry.backoffMs, this.options.retry.maxBackoffMs, error.retryAfterSeconds);
+          this.bootstrapTimer = setTimeout(() => this.bootstrapInBackground(attempt + 1), delay);
+          unrefTimer(this.bootstrapTimer);
+        },
+      )
+      .finally(() => {
+        if (this.bootstrapping === settled) this.bootstrapping = undefined;
+      });
+    this.bootstrapping = settled;
+  }
+
+  private fetchConfig(options: ConfigOptions, how: ConfigFetch = {}): Promise<IngestConfig | undefined> {
     if (!options.refresh && this.cachedConfig && Date.now() < this.configExpiresAt) {
-      return this.cachedConfig;
+      return Promise.resolve(this.cachedConfig);
     }
     if (this.configInFlight) return this.configInFlight;
 
@@ -651,6 +827,8 @@ export class FulcrumOps implements TraceSink {
           path: '/ingest/config',
           headers,
           allowNotModified: true,
+          timeoutMs: how.timeoutMs,
+          maxAttempts: how.maxAttempts,
         });
 
         if (response.status === 304 && this.cachedConfig) {
@@ -668,7 +846,7 @@ export class FulcrumOps implements TraceSink {
         return config;
       } catch (thrown) {
         const error = toFulcrumError(thrown, 'Could not fetch the SDK configuration.');
-        this.report('config', error);
+        if (!how.quiet) this.report('config', error);
         // Retry sooner than the document's own lifetime would allow, but not on
         // every trace — a control plane that is down should not be hammered.
         this.configExpiresAt = Date.now() + 30_000;
@@ -699,8 +877,14 @@ export class FulcrumOps implements TraceSink {
     if (config.capture_output === false) this.effectiveCaptureOutput = false;
     if (config.agent_bound && config.agent_name) this.boundAgent = config.agent_name;
 
+    // `batch_max_spans` is a budget of *spans per request*, summed across the
+    // traces in it — not a ceiling on how many traces go in one. It is handed to
+    // the queue as what it is, so a request is cut where the server would have
+    // refused it; `maxItems` stays the caller's.
     this.queue.reconfigure({
-      maxItems: Math.min(this.options.batch.maxItems, Math.max(1, config.batch_max_spans)),
+      maxSpans: Number.isFinite(config.batch_max_spans)
+        ? Math.min(this.options.batch.maxSpans, Math.max(1, Math.trunc(config.batch_max_spans)))
+        : this.options.batch.maxSpans,
       maxBytes: Math.min(this.options.batch.maxBytes, Math.max(1_024, config.batch_max_bytes)),
       flushIntervalMs: Math.min(this.options.batch.flushIntervalMs, Math.max(50, config.flush_interval_seconds * 1000)),
       maxQueueSize: Math.min(this.options.batch.maxQueueSize, Math.max(1, config.max_queue_size)),
@@ -762,7 +946,11 @@ export class FulcrumOps implements TraceSink {
    */
   async close(): Promise<void> {
     if (this.closed) return;
+    // Before `closed` is set: a released trace still has to be enqueued.
+    this.releaseHeldTraces();
     this.closed = true;
+    if (this.bootstrapTimer !== undefined) clearTimeout(this.bootstrapTimer);
+    this.bootstrapTimer = undefined;
     for (const unregister of this.unregisterExitHooks.splice(0)) unregister();
     try {
       await this.queue.close();
@@ -780,10 +968,12 @@ export class FulcrumOps implements TraceSink {
   /**
    * Flush what is queued when the host is going away.
    *
-   * On Node that is `beforeExit`, which still allows an await — deliberately
-   * not `SIGINT`/`SIGTERM`, because installing a handler for those stops the
-   * default "terminate now" behaviour the host expects, and a telemetry library
-   * has no business changing how an application responds to a kill signal.
+   * On Node that is two events. `beforeExit` is a process running out of work,
+   * and still allows an await. `SIGTERM` / `SIGINT` is a process being told to
+   * stop — every container deploy — and never reaches `beforeExit`; the hook
+   * for it flushes within a short grace and then hands the signal back, so how
+   * the application responds to being killed is unchanged. See
+   * `onTerminationSignal` for how that is kept true.
    *
    * In a browser it is `pagehide`, where nothing can be awaited at all; the
    * flush goes out with `keepalive` so the host finishes it after the document
@@ -792,11 +982,19 @@ export class FulcrumOps implements TraceSink {
   private installExitHooks(): void {
     this.unregisterExitHooks.push(
       onProcessExit(() => {
+        this.releaseHeldTraces();
         void this.flush();
       }),
     );
     this.unregisterExitHooks.push(
+      onTerminationSignal(() => {
+        this.releaseHeldTraces();
+        return this.flush();
+      }),
+    );
+    this.unregisterExitHooks.push(
       onPageHide(() => {
+        this.releaseHeldTraces();
         void this.queue.flush({ keepalive: true }).catch(() => undefined);
       }),
     );
@@ -847,7 +1045,7 @@ function isThenable(value: unknown): value is PromiseLike<unknown> {
  */
 export function traced<A extends unknown[], R>(
   fn: (...args: A) => R,
-  options: (TraceOptions & { asSpan?: boolean; client?: FulcrumOps }) | string = {},
+  options: (TracedOptions & { client?: FulcrumOps }) | string = {},
 ): (...args: A) => R {
   const { client: explicit, ...settings } =
     typeof options === 'string' ? { client: undefined, name: options } : { ...options };

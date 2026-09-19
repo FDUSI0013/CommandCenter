@@ -48,7 +48,7 @@ from .serialize import to_json_safe, to_payload
 if TYPE_CHECKING:  # pragma: no cover
     from .client import FulcrumOps
 
-__all__ = ["Span", "Trace", "SPAN_TYPES"]
+__all__ = ["Span", "Trace", "NoopSpan", "NOOP_SPAN", "SPAN_TYPES"]
 
 #: The span classes the telemetry engine models separately.
 SPAN_TYPES = ("general", "llm", "tool", "guardrail")
@@ -381,10 +381,16 @@ class Span(_Recordable):
                 self.trace.input = self.input
             if self.trace.output is None:
                 self.trace.output = self.output
-            # This span opened the trace implicitly, so it also has to take the
-            # trace's context tokens back down — going through ``__exit__``
-            # rather than ``end()`` is what does that.
-            self.trace.__exit__(None, error, None)
+            # ``self.error``, not just the argument: the provider wrappers mark
+            # a failure with ``record_exception()`` and then call ``end()``
+            # bare, and a model call that raised would otherwise list as a run
+            # that completed.
+            #
+            # Through ``__exit__`` rather than ``end()`` so that, when this span
+            # was entered as a context manager and took the trace into the
+            # context with it, the trace's tokens come back down too. A span
+            # that was never entered has none, and this is then just ``end()``.
+            self.trace.__exit__(None, self.error, None)
         return self
 
     def to_payload(self, *, include_trace_id: bool) -> Dict[str, Any]:
@@ -412,6 +418,15 @@ class Span(_Recordable):
     # -------------------------------------------------------- context manager
 
     def __enter__(self) -> "Span":
+        # A lone span carries its trace into the context here, not when it is
+        # created. ``with`` pairs this with ``__exit__`` in the same context, so
+        # whatever is attached is always detached. Attaching at creation had no
+        # such partner: a span opened in one context and closed in another -- a
+        # provider call awaited under ``asyncio.gather``, a stream drained by a
+        # thread pool -- left its finished trace current in the first one, and
+        # every later span there was appended to a run already sent.
+        if self._owns_trace and self.trace is not None and not self.trace._ended:
+            self.trace.__enter__()
         self._span_token = _context.attach_span(self)
         return self
 
@@ -429,6 +444,53 @@ class Span(_Recordable):
 
     def __repr__(self) -> str:  # pragma: no cover - diagnostics only
         return "Span(name={0!r}, type={1!r}, id={2!r})".format(self.name, self.type, self.id)
+
+
+class NoopSpan:
+    """What ``fulcrum_ops.current_span()`` answers when no span is open.
+
+    The body of a traced function reports what only it knows with
+    ``fulcrum_ops.current_span().set_usage(...)``. With reporting switched off —
+    no API key on a laptop, a run that was not sampled in, a function called
+    from outside anything traced — there is no span, and ``None`` there turns
+    the SDK being *off* into an ``AttributeError`` in the customer's agent.
+    Every recording method is accepted and discarded instead. It is falsy, so
+    ``if span:`` still tells the two apart.
+    """
+
+    __slots__ = ()
+
+    id = None
+    trace = None
+    trace_id = None
+
+    def __bool__(self) -> bool:
+        return False
+
+    def _discard(self, *args: Any, **kwargs: Any) -> "NoopSpan":
+        return self
+
+    set_input = set_output = set_metadata = add_tags = log = score = _discard
+    record_exception = set_model = set_usage = set_cost = end = _discard
+
+    def __enter__(self) -> "NoopSpan":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+        return False
+
+    async def __aenter__(self) -> "NoopSpan":
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+        return False
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostics only
+        return "NoopSpan()"
+
+
+#: There is only ever a need for one.
+NOOP_SPAN = NoopSpan()
 
 
 class Trace(_Recordable):
@@ -454,6 +516,18 @@ class Trace(_Recordable):
         self._trace_token: Any = None
         self._span_token: Any = None
 
+    def set_thread_id(self, thread_id: Optional[str]) -> "Trace":
+        """File this run under a conversation.
+
+        The Sessions, Conversation State and Memory views are built from
+        threads, and a thread exists only for runs that name one. The payload is
+        not built until the trace ends, so this can be called at any point while
+        the run is open — typically once the code has parsed whatever carries
+        the conversation id.
+        """
+        self.thread_id = None if thread_id is None else str(thread_id)
+        return self
+
     # ----------------------------------------------------------------- spans
 
     def span(
@@ -469,12 +543,20 @@ class Trace(_Recordable):
         provider: Optional[str] = None,
     ) -> Span:
         """Open a child span. Its parent is the innermost open span, unless one is named."""
+        if parent is None:
+            # Only a span of *this* trace. The context may hold a span from
+            # another run -- this trace was built without being entered, or the
+            # caller is inside somebody else's -- and a parent id that points
+            # into a different trace is a step the console can never place.
+            ambient = _context.current_span()
+            if ambient is not None and ambient.trace is self:
+                parent = ambient
         return Span(
             self._client,
             name,
             trace=self,
             trace_id=self.id,
-            parent=parent if parent is not None else _context.current_span(),
+            parent=parent,
             type=type,
             input=input,
             metadata=metadata,
@@ -485,7 +567,14 @@ class Trace(_Recordable):
         )
 
     def _add_span(self, span: Span) -> None:
-        if len(self.spans) < MAX_SPANS_PER_TRACE:
+        if self._ended:
+            # The trace has already been built and queued, so appending now
+            # would add the span to a list nobody reads again. It happens
+            # legitimately -- a handler that returns a streamed completion
+            # closes its trace long before the stream is drained -- so the span
+            # goes out on its own, carrying the id of the trace it belongs to.
+            self._client._report_span(span)
+        elif len(self.spans) < MAX_SPANS_PER_TRACE:
             self.spans.append(span)
         else:
             # Past the contract's ceiling the whole trace would be refused, so

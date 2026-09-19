@@ -127,10 +127,11 @@ async def test_all(principal: CurrentPrincipal, session: Db, request: Request) -
     summary="Sync every connection",
 )
 async def sync_all(principal: CurrentPrincipal, session: Db, request: Request) -> ActionResult:
-    """Record a sync against every connected, enabled tile.
+    """Sync every connected, enabled tile, probing their endpoints concurrently.
 
     Disconnected tiles are skipped: there is nothing to synchronise through a
-    link that is down. Requires the operator role.
+    link that is down. `ok` is false when any tile warned or did not answer.
+    Requires the operator role.
     """
     outcomes, summary = await service.sync_all(session, principal, request=request)
     if not summary.requested:
@@ -138,8 +139,10 @@ async def sync_all(principal: CurrentPrincipal, session: Db, request: Request) -
             message="No connections to sync.", data={"summary": summary.model_dump(mode="json")}
         )
     return ActionResult(
+        ok=not (summary.warned or summary.failed),
         message=(
-            f"{summary.succeeded} connection(s) synchronised, {summary.skipped} skipped."
+            f"{summary.succeeded} connection(s) synchronised, {summary.warned} with a "
+            f"warning, {summary.failed} unreachable, {summary.skipped} skipped."
         ),
         data={
             "summary": summary.model_dump(mode="json"),
@@ -259,8 +262,9 @@ async def delete_connection(
 ) -> None:
     """Remove an integration and its activity feed.
 
-    Refused with 412 while agents are still linked to it. The audit trail
-    survives the deletion. Requires the admin role.
+    Refused with 412 only when this is the last connection of its kind and
+    agents still run on that platform; a duplicate can always be removed. The
+    audit trail survives the deletion. Requires the admin role.
     """
     await service.delete_connection(session, principal, connection_id, request=request)
 
@@ -330,17 +334,28 @@ async def test_connection(
 async def sync_connection(
     principal: CurrentPrincipal, session: Db, connection_id: str, request: Request
 ) -> ActionResult:
-    """Record a completed sync against one integration.
+    """Reconcile one integration and record what was found.
 
-    Bumps today's sync counter, stamps `last_sync_at` and appends the feed row.
+    Counts the agents registered on this platform and, when an endpoint is
+    configured, re-probes it; the feed row carries both. `ok` is true only for a
+    clean sync: an endpoint answering 4xx/5xx is recorded with a warning, and
+    one that does not answer means nothing was synchronised — the tile goes
+    Disconnected and neither `last_sync_at` nor today's counter moves.
     Refused with 412 while the connection is disconnected or disabled.
     Requires the operator role.
     """
     outcome: ConnectionSyncOutcome = await service.sync_connection(
         session, principal, connection_id, request=request
     )
+    if not outcome.synced:
+        message = f"{outcome.name} was not synchronised: {outcome.detail}."
+    elif outcome.status is ActivityStatus.SUCCESS:
+        message = f"{outcome.name} synchronised: {outcome.detail}."
+    else:
+        message = f"{outcome.name} synchronised with a warning: {outcome.detail}."
     return ActionResult(
-        message=f"{outcome.name} synchronised.",
+        ok=outcome.synced and outcome.status is ActivityStatus.SUCCESS,
+        message=message,
         entity_id=outcome.connection_id,
         data=outcome.model_dump(mode="json"),
     )

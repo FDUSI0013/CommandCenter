@@ -15,6 +15,7 @@ from .client import (
     EngineNotFound,
     EngineTimeout,
     EngineUnavailable,
+    deadline,
 )
 
 __all__ = [
@@ -24,6 +25,7 @@ __all__ = [
     "EngineNotFound",
     "EngineTimeout",
     "EngineUnavailable",
+    "deadline",
     "get_engine_client",
     "set_engine_client",
 ]

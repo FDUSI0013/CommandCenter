@@ -100,26 +100,77 @@
     const root = document.getElementById('modal-root');
     const overlay = elem(`<div class="modal-overlay"></div>`);
     const foot = (cfg.footer||[]).map((b,i)=>`<button class="btn ${b.cls||''}" data-mbtn="${i}">${b.icon?ICONS[b.icon]:''}${esc(b.label)}</button>`).join('');
-    const modal = elem(`<div class="modal ${cfg.wide?'wide':''}">
+    const modal = elem(`<div class="modal ${cfg.wide?'wide':''}" role="dialog" aria-modal="true" tabindex="-1">
       <div class="modal-head">${cfg.icon?`<span style="color:var(--purple-bright);display:inline-flex;width:17px">${ICONS[cfg.icon]}</span>`:''}<div class="modal-title">${esc(cfg.title)}</div>
-        <button class="icon-btn" style="margin-left:auto" data-mclose>${ICONS.x}</button></div>
+        <button class="icon-btn" style="margin-left:auto" data-mclose aria-label="Close">${ICONS.x}</button></div>
       <div class="modal-body">${cfg.body||''}</div>
       ${foot?`<div class="modal-foot">${foot}</div>`:''}
     </div>`);
     overlay.appendChild(modal);
+    // Focus goes back where it came from, so a keyboard user is not dropped at
+    // the top of the page each time a dialog closes.
+    const opener = document.activeElement;
     root.appendChild(overlay);
-    const close = ()=> overlay.remove();
+    const close = ()=>{
+      if(!overlay.isConnected) return;
+      overlay.remove();
+      if(opener && opener.isConnected && typeof opener.focus === 'function') opener.focus();
+    };
+    // Escape closes the topmost dialog; the one document listener below finds it here.
+    overlay.__close = close;
     overlay.addEventListener('click', e=>{ if(e.target===overlay) close(); });
     modal.querySelector('[data-mclose]').addEventListener('click', close);
+
+    /* A footer action that returns a promise is a request in flight. The
+       buttons used to stay live while it ran, so with the API taking seconds to
+       answer a second click was a second POST: a duplicate configuration, a
+       second secret rotation, a success toast chased by a 409. The footer is
+       held until the action settles — a handler that returns early (a failed
+       validation) settles at once and hands the buttons straight back. */
+    let busy = false;
     (cfg.footer||[]).forEach((b,i)=>{
-      modal.querySelector(`[data-mbtn="${i}"]`).addEventListener('click', ()=>{
-        if(b.onClick) b.onClick(close, modal);
-        if(b.close !== false && !b.onClick) close();
+      const btn = modal.querySelector(`[data-mbtn="${i}"]`);
+      btn.addEventListener('click', ()=>{
+        if(busy) return;
+        if(!b.onClick){ if(b.close !== false) close(); return; }
+        const pending = b.onClick(close, modal);
+        if(!pending || typeof pending.then !== 'function') return;
+        busy = true;
+        const held = Array.from(modal.querySelectorAll('.modal-foot .btn')).filter(x=>!x.disabled);
+        held.forEach(x=>{ x.disabled = true; });
+        btn.classList.add('loading');
+        const release = ()=>{
+          busy = false;
+          btn.classList.remove('loading');
+          held.forEach(x=>{ x.disabled = false; });
+        };
+        pending.then(release, release);
       });
     });
     if(cfg.onOpen) cfg.onOpen(modal, close);
+    // Land the keyboard in the dialog: on its first field when it has one,
+    // otherwise on the dialog itself — never on a button, where a stray Enter
+    // would confirm a destructive action. A screen that placed focus itself in
+    // onOpen keeps it.
+    if(overlay.isConnected && !modal.contains(document.activeElement)){
+      const field = Array.from(modal.querySelectorAll('.modal-body input, .modal-body select, .modal-body textarea'))
+        .find(f=>!f.disabled && f.type !== 'hidden' && f.offsetParent !== null);
+      (field || modal).focus({ preventScroll: true });
+    }
     return { close, el: modal };
   }
+  /** Close every open dialog — the session ended, or the app is re-gating. */
+  function closeAllModals(){
+    document.querySelectorAll('#modal-root .modal-overlay').forEach(o=>{ if(o.__close) o.__close(); else o.remove(); });
+  }
+  document.addEventListener('keydown', e=>{
+    if(e.key !== 'Escape' || e.defaultPrevented || e.isComposing) return;
+    // An open menu is the innermost layer, then the topmost dialog.
+    if(activeMenu){ closeMenu(); return; }
+    const overlays = document.querySelectorAll('#modal-root .modal-overlay');
+    const top = overlays[overlays.length - 1];
+    if(top && top.__close){ e.preventDefault(); top.__close(); }
+  });
   function confirmModal(cfg){
     openModal({
       title: cfg.title, icon: cfg.icon || 'alert',
@@ -241,6 +292,8 @@
 
     /* One in-flight request at a time wins: a slow page-1 response must never
        overwrite the page-2 rows the user is already looking at. */
+    // The order the server last accepted — what a rejected sort falls back to.
+    let goodSort = { key: null, dir: 1 };
     async function load(){
       if(!server) { render(); return; }
       const ticket = ++state.seq;
@@ -251,11 +304,35 @@
         if(ticket !== state.seq) return;
         state.rows = (page && page.items) || [];
         state.total = page && page.total != null ? page.total : state.rows.length;
+        // The page asked for no longer exists: the last row of the last page
+        // was just approved, acknowledged or deleted. The server answers with
+        // no items and the true total, which used to render as "No records
+        // match your filters" above a footer still counting them. Ask again
+        // for the page that is now the last one.
+        const pages = Math.max(1, Math.ceil(state.total/state.pageSize));
+        if(!state.rows.length && state.total > 0 && state.page > pages){
+          state.page = pages;
+          return load();
+        }
         state.loading = false;
+        goodSort = { key: state.sortKey, dir: state.sortDir };
         render();
         if(cfg.onLoad) cfg.onLoad(state.rows, page);
       } catch (err) {
         if(ticket !== state.seq) return;
+        // Every header is clickable, but each endpoint orders by its own list
+        // of keys and answers 422 with that list for any other. That left an
+        // error block whose "Try again" re-sent the same sort. Put the order
+        // back to the last one the server took (none, if this was it) and say
+        // why the click did nothing.
+        const sortable = err && err.isValidation && err.details && err.details.sortable;
+        if(Array.isArray(sortable) && state.sortKey){
+          const col = cfg.columns.find(c=>c.key === state.sortKey);
+          const previous = goodSort.key !== state.sortKey ? goodSort : { key: null, dir: 1 };
+          state.sortKey = previous.key; state.sortDir = previous.dir;
+          toast('warn', `Cannot sort by ${col ? col.label : 'that column'}`, 'The server does not order this list by that column.');
+          return load();
+        }
         state.loading = false;
         state.error = err;
         state.rows = [];
@@ -265,8 +342,26 @@
 
     let searchTimer = null;
     function changed(resetPage){
+      // Whatever asks now supersedes a search still waiting out its debounce;
+      // the query it typed is already in state, so this load carries it.
+      clearTimeout(searchTimer); searchTimer = null;
       if(resetPage !== false) state.page = 1;
       if(server) load(); else render();
+    }
+    /* Typing must not fire a request per keystroke. Both search boxes come
+       through here — the filter bar's and the page-head box every screen wires
+       to search() — because on Live Runs one keystroke was a run list, a KPI
+       summary and a stream reconnect, each fanning out to every project. */
+    function searchChanged(q){
+      if(q === state.query) return;
+      state.query = q;
+      if(!server){ changed(); return; }
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(()=>{
+        searchTimer = null;
+        // The screen may have been left while the timer ran.
+        if(wrap.isConnected) changed();
+      }, 300);
     }
     const wrap = elem(`<div class="card pad-0"><div class="tbl-wrap" style="max-height:${cfg.maxHeight||'none'}"><table class="tbl"><thead></thead><tbody></tbody></table></div><div class="tbl-foot"></div></div>`);
     const thead = wrap.querySelector('thead'), tbody = wrap.querySelector('tbody'), foot = wrap.querySelector('.tbl-foot');
@@ -283,12 +378,7 @@
         });
       });
       const si = filterBar.querySelector('[data-tsearch]');
-      if(si) si.addEventListener('input', ()=>{
-        state.query = si.value;
-        // Typing must not fire a request per keystroke.
-        if(server){ clearTimeout(searchTimer); searchTimer = setTimeout(changed, 250); }
-        else changed();
-      });
+      if(si) si.addEventListener('input', ()=>searchChanged(si.value));
       filterBar.querySelector('.clear-filters').addEventListener('click', ()=>{
         state.filters = {}; state.query = '';
         filterBar.querySelectorAll('select').forEach(s=>s.value='');
@@ -357,6 +447,9 @@
       const pageRows = server ? rows : rows.slice(start, start + state.pageSize);
       const span = cfg.columns.length + 2;
 
+      // Skeletons only stand in for an empty table; a reload over rows already
+      // on screen dims them instead, so a slow sort or page is not a dead click.
+      tbody.parentNode.classList.toggle('is-stale', state.loading && pageRows.length > 0);
       if(state.loading && !pageRows.length){
         tbody.innerHTML = `<tr><td colspan="${span}"><div class="tbl-loading">${
           Array.from({length: Math.min(state.pageSize, 6)}, ()=>`<div class="skeleton-row"></div>`).join('')
@@ -462,7 +555,13 @@
         render();
         return true;
       },
-      search(q){ state.query = q; changed(); },
+      search(q){
+        // Two boxes, one query: the filter bar's box must not sit empty while
+        // the page-head box is narrowing the table.
+        const si = filterBar && filterBar.querySelector('[data-tsearch]');
+        if(si && si.value !== q) si.value = q;
+        searchChanged(q);
+      },
       getFiltered,
       selectFirst(){
         const rows = getFiltered();
@@ -530,6 +629,6 @@
   }
 
   window.C = { elem, badge, statusText, riskBadge, avatarHtml, ownerCell, entityCell, platformCell,
-    kpiCard, kpiRow, kpiSkeleton, miniKpi, toast, openModal, confirmModal, openMenu, closeMenu,
+    kpiCard, kpiRow, kpiSkeleton, miniKpi, toast, openModal, closeAllModals, confirmModal, openMenu, closeMenu,
     pageHead, searchBox, tabBar, inspSection, kv, dataTable, screenError };
 })();

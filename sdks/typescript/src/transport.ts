@@ -46,11 +46,17 @@ const RETRYABLE_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
  * Wait between retry attempts, holding the event loop open.
  *
  * Deliberately *not* unref'd, unlike the queue's idle flush timer. This sleep
- * only ever runs inside a send the caller is already waiting on, and an unref'd
- * timer here lets Node exit mid-backoff: a short-lived script that awaits
- * `flush()` would return from neither the flush nor the retry, and the batch
- * would be lost without a word — in precisely the transient-failure case the
- * retries exist to survive. `maxBackoffMs` bounds how long this can hold.
+ * runs inside a send somebody is waiting on — an awaited `flush()` or
+ * `config()`, or a timed flush that the exit hook's own flush queues up behind
+ * — and an unref'd timer here lets Node exit mid-backoff: a short-lived script
+ * that awaits `flush()` would return from neither the flush nor the retry, and
+ * the batch would be lost without a word — in precisely the transient-failure
+ * case the retries exist to survive. `maxBackoffMs` bounds how long this can
+ * hold.
+ *
+ * The one send nobody waits on is the constructor's bootstrap fetch, which is
+ * why it does not retry through here: see `bootstrapInBackground` in the
+ * client.
  */
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => {

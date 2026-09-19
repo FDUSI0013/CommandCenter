@@ -255,6 +255,20 @@ class PlatformUsageRow(BaseModel):
     color: str
 
 
+class MetricsOverview(BaseModel):
+    """The KPI row and both breakdowns, measured once.
+
+    The three are different views of one measurement -- the current window's
+    per-agent rollup -- so a screen that wants all of them asks here and the
+    store is asked once, rather than once per panel. The breakdowns arrive
+    whole (they are a handful of rows), in the order the donuts draw them.
+    """
+
+    summary: MetricsSummary
+    models: list[ModelUsageRow] = Field(default_factory=list)
+    platforms: list[PlatformUsageRow] = Field(default_factory=list)
+
+
 # ---------------------------------------------------------------------------
 # Export
 # ---------------------------------------------------------------------------

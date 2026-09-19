@@ -160,7 +160,7 @@ describe('wrapOpenAI', () => {
 });
 
 describe('wrapAnthropic', () => {
-  it('carries Anthropic’s own token key names through and derives the total', async () => {
+  it('records Anthropic’s token counters under the names the console charts, and derives the total', async () => {
     await withStub(async (stub, baseUrl) => {
       const client = await FulcrumOps.create({ apiKey: 'k', baseUrl, bootstrap: false, setAsDefault: false });
       const anthropic = {
@@ -185,7 +185,7 @@ describe('wrapAnthropic', () => {
       assert.equal(span.type, 'llm');
       assert.equal(span.provider, 'anthropic');
       assert.equal(span.model, 'claude-sonnet-4-5');
-      assert.deepEqual(span.usage, { input_tokens: 200, output_tokens: 50, total_tokens: 250 });
+      assert.deepEqual(span.usage, { prompt_tokens: 200, completion_tokens: 50, total_tokens: 250 });
       assert.equal((span.output as Record<string, unknown>).text, 'Hello there.');
     });
   });
@@ -214,7 +214,7 @@ describe('wrapAnthropic', () => {
       await client.close();
 
       const span = spansOfSoleTrace(stub)[0]!;
-      assert.deepEqual(span.usage, { input_tokens: 90, output_tokens: 12, total_tokens: 102 });
+      assert.deepEqual(span.usage, { prompt_tokens: 90, completion_tokens: 12, total_tokens: 102 });
       assert.deepEqual(span.output, { events: 4, text: 'Hi there' });
     });
   });

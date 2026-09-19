@@ -88,6 +88,7 @@ policy evaluation, guardrail checks, entitlement gate and quota accounting.
 
 ```bash
 scripts/check-branding.sh                              # no vendor strings ship
+scripts/check-config.sh                                # deploy config parses: XML, compose, Caddyfile, shell
 apps/control-plane/.venv/Scripts/python.exe -m pytest  # the suite, against an engine double
 apps/control-plane/.venv/Scripts/python.exe -m ruff check apps/control-plane/src
 apps/control-plane/.venv/Scripts/python.exe apps/control-plane/scripts/check_contract.py
@@ -97,7 +98,9 @@ deploy/verify-no-egress.sh                             # on a deployed host
 ## Deploying
 
 `deploy/README.md` has the runbook: host sizing, first deployment, the edge
-proxy, upgrades, backups and what to look at when something is wrong.
+proxy, upgrades (including two one-time steps for a host deployed before
+2026-09-18), the host's cron jobs, backups and what to look at when something is
+wrong.
 
 ## Licensing
 
