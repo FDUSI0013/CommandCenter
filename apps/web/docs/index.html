@@ -361,8 +361,9 @@ once and never rebuilt.</p>
 
 <p>Extras: <code>openai</code>, <code>anthropic</code>, <code>langchain</code>, <code>dev</code>.
 None of the provider packages is a hard dependency — the wrappers import lazily.
-The built wheel is also kept under <code>sdks/python/dist/</code> for an air-gapped
-<code>pip install ./fulcrum_ops-1.0.0-py3-none-any.whl</code>.</p>
+For an air-gapped install, download the wheel the index points at and install
+the file directly:
+<code>pip install ./fulcrum_ops-1.0.1-py3-none-any.whl</code>.</p>
 
 <h3>Two ways to configure</h3>
 
