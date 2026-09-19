@@ -58,11 +58,11 @@ cd \$ROOT/deploy
 TAG=\$(grep -oP '^APP_TAG=\K.*' .env || echo local)
 IMAGE=fulcrum-ops/control-plane
 
-echo "[1/7] fetch + verify release \$SHA"
+echo "[1/8] fetch + verify release \$SHA"
 curl -fsSL "\$URL" -o /tmp/release-\$SHA.tgz
 echo "\$DIGEST  /tmp/release-\$SHA.tgz" | sha256sum -c - >/dev/null
 
-echo "[2/7] keep a way back: image tag 'rollback' + archive of the files being replaced"
+echo "[2/8] keep a way back: image tag 'rollback' + archive of the files being replaced"
 mkdir -p \$ROOT/releases
 docker tag \$IMAGE:\$TAG \$IMAGE:rollback
 tar czf \$ROOT/releases/before-\$SHA-\$STAMP.tgz -C \$ROOT --exclude=deploy/.env apps deploy
@@ -75,13 +75,13 @@ restore() {
   exit 1
 }
 
-echo "[3/7] unpack (deploy/.env is not in a release and is left alone)"
+echo "[3/8] unpack (deploy/.env is not in a release and is left alone)"
 tar xzf /tmp/release-\$SHA.tgz -C \$ROOT
 
-echo "[4/7] build the control plane"
+echo "[4/8] build the control plane"
 docker compose build control-plane > \$ROOT/releases/build-\$SHA.log 2>&1 || { tail -30 \$ROOT/releases/build-\$SHA.log; restore "image build failed"; }
 
-echo "[5/7] recreate control-plane (only)"
+echo "[5/8] recreate control-plane (only)"
 docker compose up -d --no-deps control-plane
 ok=0
 for i in \$(seq 1 80); do
@@ -98,11 +98,38 @@ done
 [ "\$bad" = "0" ] || restore "\$bad of 12 follow-up health probes failed"
 echo "      healthy: \$(cat /tmp/health.json)"
 
-echo "[6/7] recreate the two stateless sidecars"
+echo "[6/8] recreate the two stateless sidecars"
 docker compose up -d --no-deps metric-runner safety-scanner
 
-echo "[7/7] publish the console"
+echo "[7/8] publish the console"
 bash publish-console.sh ../apps/web /srv/fulcrum-ops | tail -2
+
+echo "[8/8] the edge, only if its configuration actually changed"
+# Caddy terminates TLS for the whole site, so a bad file here takes everything
+# down, not just the thing being changed. It is validated before it is
+# installed, reloaded rather than restarted (graceful: existing connections
+# finish), and put back if the site stops answering afterwards.
+if ! cmp -s Caddyfile /etc/caddy/Caddyfile; then
+  cp /etc/caddy/Caddyfile \$ROOT/releases/Caddyfile-before-\$SHA-\$STAMP
+  set -a; . /etc/default/caddy 2>/dev/null || true; set +a
+  if ! caddy validate --config Caddyfile --adapter caddyfile >/dev/null 2>&1; then
+    echo "      REFUSED: the new Caddyfile does not validate; the edge is untouched"
+  else
+    cp Caddyfile /etc/caddy/Caddyfile
+    systemctl reload caddy
+    sleep 2
+    edge=\$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 https://127.0.0.1/health --resolve "\$(hostname -f):443:127.0.0.1" || true)
+    if [ "\$edge" = "200" ] || [ "\$edge" = "503" ]; then
+      echo "      edge reloaded (answers \$edge)"
+    else
+      cp \$ROOT/releases/Caddyfile-before-\$SHA-\$STAMP /etc/caddy/Caddyfile
+      systemctl reload caddy
+      echo "      edge did not answer after the reload (\$edge); previous Caddyfile restored"
+    fi
+  fi
+else
+  echo "      unchanged"
+fi
 
 echo "DEPLOYED \$SHA  (previous image kept as \$IMAGE:rollback; files in releases/before-\$SHA-\$STAMP.tgz)"
 REMOTE_EOF
