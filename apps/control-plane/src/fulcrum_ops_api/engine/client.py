@@ -22,9 +22,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import datetime as dt
+import functools
 import json
 import logging
 import random
+import ssl
 import uuid
 from collections.abc import AsyncIterator, Mapping, Sequence
 from typing import Any, Final
@@ -57,6 +59,28 @@ HEALTH_PATH: Final[str] = "/is-alive/ping"
 #: Only these verbs are safe to replay. POST creates traces, spans, comments
 #: and experiment items -- replaying one duplicates customer telemetry.
 IDEMPOTENT_METHODS: Final[frozenset[str]] = frozenset({"GET", "PUT", "DELETE"})
+
+@functools.lru_cache(maxsize=1)
+def _shared_ssl_context() -> ssl.SSLContext:
+    """One TLS context for every client this process builds.
+
+    ``httpx.AsyncClient()`` builds one eagerly in its constructor, and building
+    one means loading a CA bundle from disk: just under a second on a developer
+    machine behind a corporate trust store, and not free anywhere.
+
+    That cost is invisible at start-up and expensive in exactly one place --
+    ``_recycle_pool``, which builds a fresh client ON THE REQUEST PATH when the
+    pool has filled. It is synchronous, so it stalls the whole worker's event
+    loop, and it fires at the moment the worker is already in trouble. Measured
+    here: a full pool answered in 1.17 s against a 0.2 s pool timeout, and 0.95 s
+    of that was building the replacement client.
+
+    An SSLContext is designed to be shared between clients, and this one is
+    never even used in production -- the engine is reached over plain HTTP on a
+    private network. Building it once means a recycle costs nothing.
+    """
+    return httpx.create_ssl_context()
+
 
 _BACKOFF_BASE_SECONDS: Final[float] = 0.25
 _BACKOFF_CAP_SECONDS: Final[float] = 4.0
@@ -348,6 +372,7 @@ class EngineClient:
             ),
             transport=self._transport,
             follow_redirects=False,
+            verify=_shared_ssl_context(),
         )
 
     # -- lifecycle ---------------------------------------------------------

@@ -113,3 +113,32 @@ async def test_the_health_probe_is_bounded(upstream: str) -> None:
         assert asyncio.get_running_loop().time() - started < 1.5
     finally:
         await client.aclose()
+
+
+async def test_rebuilding_the_pool_does_not_stall_the_event_loop() -> None:
+    """``_recycle_pool`` builds a replacement client on the REQUEST PATH, and it
+    is synchronous -- so whatever it costs, the whole worker pays, at the moment
+    the worker is already in trouble.
+
+    ``httpx.AsyncClient()`` builds a TLS context in its constructor, which means
+    reading a CA bundle off disk: 0.95 s on the machine this was found on, which
+    turned a 0.2 s pool timeout into a 1.17 s answer. The client passes one
+    shared context instead. This pins that, because the symptom of losing it is
+    a latency regression on a path nobody exercises until production is on fire.
+    """
+    client = EngineClient(base_url="http://127.0.0.1:1", retries=0, max_connections=2)
+    try:
+        client._build_http_client()  # warm whatever is warmable
+
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        for _ in range(5):
+            client._build_http_client()
+        each = (loop.time() - started) / 5
+
+        assert each < 0.05, (
+            f"rebuilding the pool costs {each * 1000:.0f} ms of blocked event loop; "
+            "it should be free -- has the shared TLS context been dropped?"
+        )
+    finally:
+        await client.aclose()
