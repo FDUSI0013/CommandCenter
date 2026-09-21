@@ -30,8 +30,13 @@ serves its own matching build at `/pypi/simple`.
 
 ## 60-second quickstart
 
-**1. Get an API key.** Keys are minted per workspace and shown exactly once —
-the control plane stores only a digest and cannot show it again.
+**1. Get an API key.** In the console, open **Workspace Settings → API Keys**,
+create a key and bind it to the agent that will report with it. Keys are minted
+per workspace and shown exactly once — the control plane stores only a digest
+and cannot show it again, so copy it before closing the dialog.
+
+An operator with a shell on the control plane's host can mint one there instead,
+which is how the first key of a brand-new deployment is made:
 
 ```bash
 fulcrum-ops-api issue-key \
@@ -50,7 +55,7 @@ that already exists or the rows come back rejected.
 
 ```bash
 export FULCRUM_OPS_API_KEY=fo_live_…
-export FULCRUM_OPS_BASE_URL=https://controlplane.example.com/api/v1
+export FULCRUM_OPS_BASE_URL=https://controlplane.fdprod.net/api/v1
 ```
 
 `FULCRUM_OPS_BASE_URL` has no useful default. Left out, the SDK falls back to

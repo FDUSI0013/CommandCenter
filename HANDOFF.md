@@ -16,6 +16,16 @@ Work from evidence. Do not trust this document over what you observe.
 > and the 2026-09-18 audit (branch `fix/audit-2026-09-18`) is the current list
 > of what is open.
 
+> **State on 2026-09-21.** Production runs `e25193b`, at database revision
+> `a41c6b58d902`. `main` contains it -- the audit branch `fix/audit-2026-09-18`
+> is merged -- and the commits on `main` after it change only tests and
+> documentation, so the running code is `main`'s. Verified live after the deploy: 175 read operations with 0
+> failures and 0 slow, all 10 containers healthy; full suite 1315 passed. What
+> remains needs a decision rather than code: the prompt-injection guardrail needs
+> the scanner's privately distributed model (an HF token plus two model settings
+> on `safety-scanner`), and items 8–11 below are new features. The old demo
+> instance `i-04727f2dde4e32493` is STOPPED, not terminated.
+
 ## The product
 
 Fulcrum Ops governs AI agents. Teams register agents, connect them with an SDK
@@ -256,8 +266,8 @@ bug-fix release is the wrong place to change the schema. Each is written out
 below with what it is for, because the reason a column is wanted is the part
 that gets lost.
 
-**Items 1–7 and 12 are written as three revisions** on top of `51168850ae0f`, in
-this order:
+**Items 1–7 and 12 shipped on 2026-09-21** (release `e25193b`), as three
+revisions on top of `51168850ae0f`, in this order:
 
 | revision | what |
 | --- | --- |
@@ -310,29 +320,29 @@ revision, each with the data repair it needs.
 
 **Correctness, in rough order of how much it matters**
 
-1. **(written, `7b2e4c9a10d3`)** `configuration_versions`: a partial unique index on `(configuration_id)` where
+1. **(shipped 2026-09-21, `7b2e4c9a10d3`)** `configuration_versions`: a partial unique index on `(configuration_id)` where
    `is_current`, plus a repair pass keeping the row whose `version` matches
    `configurations.current_version`. Two current versions is a state the service
    now prevents but the table still permits.
-2. **(written, `7b2e4c9a10d3`)** `seat_assignments`: unique on `(license_id, user_id)` where `released_at IS
+2. **(shipped 2026-09-21, `7b2e4c9a10d3`)** `seat_assignments`: unique on `(license_id, user_id)` where `released_at IS
    NULL`. The row lock closes the race today; the index is what makes a double
    seat impossible rather than merely unlikely.
-3. **(written, `7b2e4c9a10d3`)** `backlog_items`: partial unique on `issue_id` where the item is open, after
+3. **(shipped 2026-09-21, `7b2e4c9a10d3`)** `backlog_items`: partial unique on `issue_id` where the item is open, after
    de-duplicating. Backs the one-item-per-issue rule the service already keeps.
-4. **(written, `7b2e4c9a10d3`)** `alerts`: partial unique on `(workspace_id, dedupe_key)` where the alert is
+4. **(shipped 2026-09-21, `7b2e4c9a10d3`)** `alerts`: partial unique on `(workspace_id, dedupe_key)` where the alert is
    unresolved. `raise_alert` already absorbs the `IntegrityError` onto the twin,
    so nothing in the service changes once the index exists — two simultaneous
    raises of one condition simply stop producing two alerts.
-5. **(written, `a41c6b58d902`)** `policies` data repair: `UPDATE policies SET enforcement = rules->'action'->>'mode'`
+5. **(shipped 2026-09-21, `a41c6b58d902`)** `policies` data repair: `UPDATE policies SET enforcement = rules->'action'->>'mode'`
    where the two disagree. Sets the column to what ingest has really been
    enforcing; changes no behaviour, but until it runs the `?enforcement=` filter
    and the Policy Center's column can disagree with the rule that actually fires.
 
 **Performance**
 
-6. **(written, `7b2e4c9a10d3`)** `policy_violations (policy_id, occurred_at)` — serves the 30-day rollup the
+6. **(shipped 2026-09-21, `7b2e4c9a10d3`)** `policy_violations (policy_id, occurred_at)` — serves the 30-day rollup the
    scheduler now recomputes and the inspector's Violations tab.
-7. **(written, `7b2e4c9a10d3`)** `audit_events (workspace_id, entity_id, occurred_at)` — the existing
+7. **(shipped 2026-09-21, `7b2e4c9a10d3`)** `audit_events (workspace_id, entity_id, occurred_at)` — the existing
    `(entity_type, entity_id)` index cannot serve the entity-history filter behind
    Agent Detail and the connector and policy inspectors. Build it
    `CONCURRENTLY` on a deployment where it has grown large — on this one it is
@@ -353,7 +363,7 @@ revision, each with the data repair it needs.
     still show its live judged count instead of zero during Scoring.
 11. `api_key_usage_daily`: real per-key metering, one upserted row per key per
     day, replacing the estimate the key usage modal shows now.
-12. **(written, `8f3d1c07a2be`)** `users.credentials_changed_at`: stamped when a
+12. **(shipped 2026-09-21, `8f3d1c07a2be`)** `users.credentials_changed_at`: stamped when a
     password is *rotated* — by its owner or by an admin reset, but not by the
     re-hash a sign-in may perform — and compared against the token's `iat` in
     `_principal_from_session`, which already has the user row loaded. Changing a
