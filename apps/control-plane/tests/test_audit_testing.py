@@ -391,18 +391,52 @@ async def test_progress_served_by_another_worker_reads_the_run_row(
 
     # A worker that does not own the run is a process with no live counters.
     service.runner._state.pop(run_id)
+    progress_url = f"/api/v1/testing/suites/{suite_id}/runs/{run_id}/progress"
+
+    # What such a worker serves is the run ROW, which the owning supervisor
+    # rewrites once per poll -- so the row trails the owner's in-memory phase by
+    # up to one poll. wait_for_phase above saw the owner reach Scoring; a read
+    # taken that same instant from the row can still say "Registering cases",
+    # and on a loaded machine it did. Wait for the row to catch up: what this
+    # test is about is WHERE the answer comes from, not how fast it is written.
+    for _ in range(100):
+        caught_up = (await admin_client.get(progress_url)).json()
+        if caught_up["phase"] == "Scoring" and caught_up["scored_cases"] == 2:
+            break
+        await asyncio.sleep(0.1)
+
+    # The owning supervisor is still scoring, and it reads the engine on every
+    # poll -- so counting engine calls around one progress read also counts
+    # whichever of ITS polls lands in between, and on a loaded machine one did.
+    # Park it at a gate first: its next poll waits here instead of reaching the
+    # engine, and once it is waiting nothing else is in flight. The count then
+    # covers the progress read and nothing else. Released right after, so the
+    # cancel below still finds a live supervisor.
+    gate, parked = asyncio.Event(), asyncio.Event()
+    read_cases = service._read_cases
+
+    async def held(*args, **kwargs):
+        parked.set()
+        await gate.wait()
+        return await read_cases(*args, **kwargs)
+
+    monkeypatch.setattr(service, "_read_cases", held)
+    await asyncio.wait_for(parked.wait(), timeout=30)
+
     experiment_reads = len(
         [call for call in engine.calls if call.method == "GET" and "/experiments/" in call.path]
     )
-    elsewhere = (
-        await admin_client.get(f"/api/v1/testing/suites/{suite_id}/runs/{run_id}/progress")
-    ).json()
-    assert elsewhere["phase"] == "Scoring", elsewhere
-    assert (elsewhere["scored_cases"], elsewhere["passed"], elsewhere["failed"]) == (2, 1, 1)
-    assert elsewhere["processed_cases"] == 3
+    # Bounded: a progress path that reached for the engine through the same
+    # helper would now wait on the gate for ever instead of failing.
+    elsewhere = (await asyncio.wait_for(admin_client.get(progress_url), timeout=10)).json()
     assert experiment_reads == len(
         [call for call in engine.calls if call.method == "GET" and "/experiments/" in call.path]
     ), "a progress read must not cost an engine call"
+    gate.set()
+
+    assert elsewhere["phase"] == "Scoring", elsewhere
+    assert (elsewhere["scored_cases"], elsewhere["passed"], elsewhere["failed"]) == (2, 1, 1)
+    assert elsewhere["processed_cases"] == 3
 
     # ...and a cancel served there still reaches the supervisor: it reads the
     # row at its next poll.

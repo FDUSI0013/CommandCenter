@@ -934,7 +934,12 @@ async def test_an_open_progress_stream_holds_no_database_connection(
     try:
         token = session_token(admin, workspace, Role.ADMIN)
         async with ProgressStream(app, token, deployment_id) as stream:
-            first = await stream.snapshot()
+            # The first frame needs a fresh connection and one query. That is
+            # milliseconds on an idle machine and has taken over five seconds on
+            # a saturated one, which failed this test for a reason unrelated to
+            # what it checks. The claim here is about connections HELD while the
+            # stream is open, not about how soon it opens.
+            first = await stream.snapshot(within=30.0)
             await asyncio.sleep(0.3)  # the poll's own short session has come and gone
             assert stream.status == 200
             assert first["awaiting_approval"] is True
