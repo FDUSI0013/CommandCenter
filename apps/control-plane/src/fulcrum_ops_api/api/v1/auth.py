@@ -228,6 +228,10 @@ async def change_password(
     The current password is always required, so a stolen cookie cannot be
     turned into permanent account control. API-key callers are refused: a key
     is not a person and has no password.
+
+    Every OTHER session on the account ends here -- that is usually the reason
+    for the change. This device keeps working because the cookie installed
+    below is minted after the change is stamped.
     """
     token, expires_at = await service.change_password(
         session,
@@ -238,7 +242,7 @@ async def change_password(
     )
     _set_session_cookie(response, token)
     return ActionResult(
-        message="Password changed. This device stays signed in.",
+        message="Password changed. This device stays signed in; other devices were signed out.",
         entity_id=principal.user_id,
         data={"session_expires_at": expires_at.isoformat()},
     )

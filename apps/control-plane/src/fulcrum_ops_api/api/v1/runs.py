@@ -14,6 +14,7 @@ is the stream's framing, which is an HTTP concern.
 from __future__ import annotations
 
 import datetime as dt
+import time
 from collections.abc import AsyncIterator
 from typing import Annotated
 
@@ -43,7 +44,7 @@ from ...schemas.runs import (
 from ...services import agents as agents_service
 from ...services import runs as service
 from ..common import ListParams, Page, list_params, to_csv
-from ..deps import CurrentPrincipal, Db
+from ..deps import CurrentPrincipal, Db, session_revoked
 
 router = APIRouter(prefix="/runs", tags=["Runs"])
 
@@ -242,9 +243,29 @@ async def stream_runs(
 
     async def frames() -> AsyncIterator[ServerSentEvent]:
         yield frame("open")
+        # The caller was authenticated once, before the first frame. This stream
+        # then holds that decision for up to half an hour, so it re-asks -- not
+        # per frame, which would put a query behind every run, but on a timer.
+        # Without it, changing a password ends every other session except the
+        # one already watching Live Runs, which is the one an attacker would
+        # have open.
+        #
+        # What this guarantees precisely: NO RUN IS DELIVERED more than
+        # STREAM_RECHECK_SECONDS after the session ended. It is not "the
+        # connection closes within 30 seconds" -- the check sits in the loop
+        # body, and a workspace reporting nothing never enters it, so a quiet
+        # stream can stay open until it ages out. That is the right shape for
+        # the risk: an idle stream is handing over nothing, and the first row it
+        # would hand over is the one this refuses.
+        next_recheck = time.monotonic() + service.STREAM_RECHECK_SECONDS
         async for run in service.stream_runs(principal, slot, filters=filters):
             if await request.is_disconnected():
                 return
+            now = time.monotonic()
+            if now >= next_recheck:
+                next_recheck = now + service.STREAM_RECHECK_SECONDS
+                if await session_revoked(principal):
+                    return
             yield frame("run", run)
 
     return EventSourceResponse(

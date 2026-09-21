@@ -152,7 +152,10 @@ documentation bug — fix it, regenerate both formats, and republish.
 
 Two such bugs were found by the 2026-09-18 audit. **Both are fixed in the master
 as of 2026-09-19**, and `build-docx.js` has been re-run, so the .docx and the
-served copy (`apps/web/docs/index.html`) carry the correction too. What the
+console's copy in the repository (`apps/web/docs/index.html`) carry the
+correction too. That file is what `deploy/publish-console.sh` puts on the host,
+which means it is ahead of what the site serves until the next deploy — check
+https://controlplane.fdprod.net/docs/ rather than assuming. What the
 guide now says, matching the SDK and `sdks/python/README.md`:
 
 - **`report_issue()`** ("Scores and feedback"). It is delivered as negative
@@ -212,7 +215,11 @@ the first — production has only ever run one tenant.
 
 ### 6. Finish the loose ends
 
-- The SDK ships as a local wheel; put it on a private index.
+- ~~The SDK ships as a local wheel; put it on a private index.~~ **Done.**
+  The control plane serves its own PEP 503 index at `/pypi/simple`, which is
+  now the documented install route:
+  `pip install --extra-index-url https://controlplane.fdprod.net/pypi/simple fulcrum-ops`.
+  The wheel lives in `apps/web/pypi/` and is published with the console.
 - Seats are purchased but unassigned on the current licence.
 - Connection traffic has never been seen populated — it needs a connection whose
   kind matches a registered agent's platform.
@@ -238,48 +245,98 @@ report it plainly rather than working around it.
 Finish by telling me: what you tested and how, what you fixed, what is still
 broken, and what you would do next.
 
-## Deferred: the schema changes this branch deliberately did not make
+## The schema changes: what is written, and what is left
 
 The audit pass of 2026-09-18/19 fixed 229 findings across 34 file owners working
-in parallel. Seventeen of the fixes they proposed need a database migration, and
-none was made: concurrent owners writing concurrent Alembic revisions fork the
-revision chain, and a bug-fix release is the wrong place to change the schema.
-Each is written out below with what it is for, because the reason a column is
-wanted is the part that gets lost.
+in parallel. Thirteen of the fixes they proposed looked like they needed a
+database migration — twelve turned out to, and item 13 was withdrawn on
+inspection (its entry says why). None was made during that pass: concurrent
+owners writing concurrent Alembic revisions fork the revision chain, and a
+bug-fix release is the wrong place to change the schema. Each is written out
+below with what it is for, because the reason a column is wanted is the part
+that gets lost.
 
-They are independent of one another. Take them one at a time, each as its own
-revision, each with the data repair it needs — several of the indexes below are
-unique and will refuse to build until existing duplicates are resolved, which is
-itself the evidence that the constraint was missing.
+**Items 1–7 and 12 are written as three revisions** on top of `51168850ae0f`, in
+this order:
+
+| revision | what |
+| --- | --- |
+| `7b2e4c9a10d3` | items 1–4 (the four partial unique indexes, each with its repair) and 6–7 (the two read indexes) |
+| `8f3d1c07a2be` | item 12, `users.credentials_changed_at` |
+| `a41c6b58d902` | item 5, the `policies.enforcement` repair |
+
+Check the deployed state before trusting this paragraph — a document says what
+was true when it was written, and the host says what is true now:
+
+```
+aws ssm send-command --instance-ids i-02c888d6ca6f07a6b --document-name AWS-RunShellScript   --parameters 'commands=["cd /opt/fulcrum/deploy && docker compose exec -T control-plane alembic current"]'
+```
+
+Each was rehearsed against the production database before being proposed for a
+release — rendered with `alembic upgrade 51168850ae0f:head --sql`, wrapped in
+`BEGIN … ROLLBACK` by hand (the rendered SQL ends in `COMMIT;`, so running it
+unaltered would apply it), run on the host, and read back. Every repair matched
+**zero rows**: production has no duplicates and no policy disagreeing with its
+own rule body, so the indexes go on clean. `scripts/` has no runner for this; the
+procedure is written out in the header of `deploy/ship.sh`.
+
+Each repair keeps the row the service that owns that table would have returned —
+`_current_version` for configurations, `_planning_item` for the backlog,
+`_live_alert` for alerts, the reassign path's `ORDER BY assigned_at ASC` for
+seats — and the two denormalised counters that shadow those tables
+(`configurations.current_version`, `tenant_licenses.seats_assigned`) are brought
+along in the same revision. A repair that picked a defensible row rather than
+*that* row would silently change what the product serves, which is not a repair.
+
+None of the three is built `CONCURRENTLY`. `policy_violations` (114k rows) and
+`audit_events` (18k) are small enough that the ordinary lock is milliseconds,
+and `CONCURRENTLY` cannot run inside the transaction Alembic wraps a revision
+in. On a deployment where these have reached millions of rows, build them by
+hand first and let the revision find them already present.
+
+**Rolling any of them back means running `downgrade()`, not just putting the
+previous image back.** The control plane migrates itself at start, from scripts
+baked into its own image, so an image that predates a revision cannot resolve the
+revision the database reports: it exits 255 before uvicorn and
+`restart: unless-stopped` turns that into a crash loop. `deploy/ship.sh`'s
+`restore()` handles it — it downgrades to the revision recorded before the
+deploy while the new image is still the tagged one, and refuses to swap the image
+at all if that downgrade fails. Any revision added here needs a `downgrade()`
+that actually works.
+
+**Items 8–11 are still open**, and item 13 was withdrawn (see its entry). They
+are independent of one another. Take them one at a time, each as its own
+revision, each with the data repair it needs.
 
 **Correctness, in rough order of how much it matters**
 
-1. `configuration_versions`: a partial unique index on `(configuration_id)` where
+1. **(written, `7b2e4c9a10d3`)** `configuration_versions`: a partial unique index on `(configuration_id)` where
    `is_current`, plus a repair pass keeping the row whose `version` matches
    `configurations.current_version`. Two current versions is a state the service
    now prevents but the table still permits.
-2. `seat_assignments`: unique on `(license_id, user_id)` where `released_at IS
+2. **(written, `7b2e4c9a10d3`)** `seat_assignments`: unique on `(license_id, user_id)` where `released_at IS
    NULL`. The row lock closes the race today; the index is what makes a double
    seat impossible rather than merely unlikely.
-3. `backlog_items`: partial unique on `issue_id` where the item is open, after
+3. **(written, `7b2e4c9a10d3`)** `backlog_items`: partial unique on `issue_id` where the item is open, after
    de-duplicating. Backs the one-item-per-issue rule the service already keeps.
-4. `alerts`: partial unique on `(workspace_id, dedupe_key)` where the alert is
+4. **(written, `7b2e4c9a10d3`)** `alerts`: partial unique on `(workspace_id, dedupe_key)` where the alert is
    unresolved. `raise_alert` already absorbs the `IntegrityError` onto the twin,
    so nothing in the service changes once the index exists — two simultaneous
    raises of one condition simply stop producing two alerts.
-5. `policies` data repair: `UPDATE policies SET enforcement = rules->'action'->>'mode'`
+5. **(written, `a41c6b58d902`)** `policies` data repair: `UPDATE policies SET enforcement = rules->'action'->>'mode'`
    where the two disagree. Sets the column to what ingest has really been
    enforcing; changes no behaviour, but until it runs the `?enforcement=` filter
    and the Policy Center's column can disagree with the rule that actually fires.
 
 **Performance**
 
-6. `policy_violations (policy_id, occurred_at)` — serves the 30-day rollup the
+6. **(written, `7b2e4c9a10d3`)** `policy_violations (policy_id, occurred_at)` — serves the 30-day rollup the
    scheduler now recomputes and the inspector's Violations tab.
-7. `audit_events (workspace_id, entity_id, occurred_at)` — the existing
+7. **(written, `7b2e4c9a10d3`)** `audit_events (workspace_id, entity_id, occurred_at)` — the existing
    `(entity_type, entity_id)` index cannot serve the entity-history filter behind
    Agent Detail and the connector and policy inspectors. Build it
-   `CONCURRENTLY`: this is the table that grows fastest.
+   `CONCURRENTLY` on a deployment where it has grown large — on this one it is
+   18k rows and `7b2e4c9a10d3` builds it inline, for the reason given above.
 
 **New capability, each a small feature rather than a fix**
 
@@ -296,11 +353,25 @@ itself the evidence that the constraint was missing.
     still show its live judged count instead of zero during Scoring.
 11. `api_key_usage_daily`: real per-key metering, one upserted row per key per
     day, replacing the estimate the key usage modal shows now.
-12. `users.credentials_changed_at`: stamp it on every password change and carry
-    it as a session claim, so changing a password invalidates sessions issued
-    before it. Today it does not.
-13. `connections.status_detail`: hold the last probe diagnostic in its own column
-    instead of deriving it back out of the operator's note.
+12. **(written, `8f3d1c07a2be`)** `users.credentials_changed_at`: stamped when a
+    password is *rotated* — by its owner or by an admin reset, but not by the
+    re-hash a sign-in may perform — and compared against the token's `iat` in
+    `_principal_from_session`, which already has the user row loaded. Changing a
+    password now ends every other session on the account; the caller doing the
+    changing keeps working because `change_password` re-issues its cookie after
+    the stamp. `iat` was widened from whole seconds to a float in the same
+    change: at second resolution a token minted in the same second as the change
+    could not be told from one minted just after it, and would have survived for
+    the rest of its life.
+13. ~~`connections.status_detail`~~ **— withdrawn, and the reason is worth
+    keeping.** The defect was that the probe wrote its diagnostic over whatever
+    the operator had written in `note`. The audit fix stopped that and now
+    derives the diagnostic from the newest probe-bearing row of the activity
+    feed (`services/connections._attach_status_detail`) — one indexed statement
+    for a whole page, set as a plain instance attribute that cannot be written
+    back. A column would save that one query and buy a write path that can go
+    stale; the feed is already the record. Re-open this only if the extra
+    statement shows up in a profile.
 
 **Not a migration, and already done on this branch**: `SecretAccessAction.REVOKE`
 (the column is a plain string) — the vault was writing `revoke` rows that

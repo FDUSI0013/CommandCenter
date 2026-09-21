@@ -258,6 +258,10 @@ class PolicyViolation(Base, PrimaryKeyMixin, TimestampMixin, WorkspaceScopedMixi
     __table_args__ = (
         Index("ix_policy_violations_workspace_occurred", "workspace_id", "occurred_at"),
         Index("ix_policy_violations_agent", "agent_id", "occurred_at"),
+        # The 30-day rollup the scheduler recomputes counts per policy over a
+        # window, and the inspector's Violations tab reads the same shape.
+        # policy_id alone means scanning every row a busy policy ever wrote.
+        Index("ix_policy_violations_policy_occurred", "policy_id", "occurred_at"),
     )
 
     policy_id: Mapped[str] = mapped_column(
@@ -377,6 +381,9 @@ class AuditEvent(Base, PrimaryKeyMixin, WorkspaceScopedMixin):
         Index("ix_audit_events_workspace_occurred", "workspace_id", "occurred_at"),
         # ...and every entity detail screen shows "history for this record".
         Index("ix_audit_events_entity", "entity_type", "entity_id"),
+        # That history is always asked for within one workspace and newest
+        # first, which neither index above can serve on its own.
+        Index("ix_audit_events_ws_entity_time", "workspace_id", "entity_id", "occurred_at"),
     )
 
     occurred_at: Mapped[dt.datetime] = mapped_column(

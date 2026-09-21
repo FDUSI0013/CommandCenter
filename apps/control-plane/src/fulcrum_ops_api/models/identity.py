@@ -79,6 +79,15 @@ class User(Base, PrimaryKeyMixin, TimestampMixin):
     last_login_at: Mapped[dt.datetime | None] = mapped_column(UtcDateTime, nullable=True)
     failed_login_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     locked_until: Mapped[dt.datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    # When the password last CHANGED -- not when it was last re-hashed, and not
+    # when the account was created. A session token issued before this moment is
+    # refused, which is what makes changing a password end the sessions someone
+    # else may be holding. Null means "never changed since this column existed",
+    # which refuses nothing: an account that has not rotated its credential has
+    # no sessions to invalidate.
+    credentials_changed_at: Mapped[dt.datetime | None] = mapped_column(
+        UtcDateTime, nullable=True
+    )
 
     memberships: Mapped[list[Membership]] = relationship(
         back_populates="user", cascade="all, delete-orphan"

@@ -27,6 +27,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -424,6 +425,15 @@ class BacklogItem(Base, PrimaryKeyMixin, TimestampMixin, ActorMixin, WorkspaceSc
     __table_args__ = (
         Index("ix_backlog_items_workspace_status", "workspace_id", "status"),
         Index("ix_backlog_items_workspace_priority", "workspace_id", "priority"),
+        # An issue is planned once. Closed work does not count, so the same
+        # issue can be raised again later.
+        Index(
+            "uq_backlog_items_open_issue",
+            "issue_id",
+            unique=True,
+            sqlite_where=text("issue_id IS NOT NULL AND status <> 'Done'"),
+            postgresql_where=text("issue_id IS NOT NULL AND status <> 'Done'"),
+        ),
     )
 
     issue_id: Mapped[str | None] = mapped_column(

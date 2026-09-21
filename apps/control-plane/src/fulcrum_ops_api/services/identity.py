@@ -621,6 +621,10 @@ async def login(
     user.locked_until = None
     user.last_login_at = _now()
     if needs_rehash(user.password_hash):
+        # The same password, stored under current parameters. Deliberately does
+        # NOT stamp credentials_changed_at: nothing was rotated, and stamping
+        # here would invalidate every other session of a person who merely
+        # signed in.
         user.password_hash = await off_loop(hash_password, password)
 
     token, expires_at = issue_session(user=user, workspace=workspace, role=role)
@@ -784,6 +788,11 @@ async def change_password(
     user.password_hash = await off_loop(hash_password, new_password)
     user.failed_login_count = 0
     user.locked_until = None
+    # Ends every session issued before now -- including the ones on someone
+    # else's machine, which is the reason a person changes a password they think
+    # is known. This caller keeps working because the token returned below is
+    # minted after the stamp.
+    user.credentials_changed_at = _now()
 
     workspace = await session.get(Workspace, principal.workspace_id)
     if workspace is None:
@@ -1480,6 +1489,10 @@ async def update_member(
         user.password_hash = await off_loop(hash_password, changes["password"])
         user.failed_login_count = 0
         user.locked_until = None
+        # A reset is how an admin takes an account back, so it has to end the
+        # sessions that account already has; unlike the self-service path there
+        # is nobody here to re-issue a token to.
+        user.credentials_changed_at = _now()
 
     await audit.record(
         session,

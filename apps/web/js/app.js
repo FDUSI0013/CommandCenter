@@ -265,10 +265,15 @@
 
     // A 401 from anywhere at any time means the session ended; re-gate rather
     // than letting screens render half-loaded against a dead session.
-    API.onUnauthorized(()=>{
+    //
+    // The reason comes from the server when it has one. A session can end
+    // because it aged out OR because the password changed on another device --
+    // and telling someone their session "expired" when their password was just
+    // changed under them hides the one fact they most need to see.
+    API.onUnauthorized((detail)=>{
       if(!Store.session.isAuthenticated) return;
       Store.session.clear();
-      gate('Your session expired. Sign in to continue.');
+      gate(detail || 'Your session expired. Sign in to continue.');
     });
 
     try {

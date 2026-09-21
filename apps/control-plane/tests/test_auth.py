@@ -609,3 +609,111 @@ async def test_a_session_for_a_revoked_membership_is_refused(client, db, factory
     response = await client.get("/api/v1/auth/status")
     assert response.status_code == 403
     assert error_code(response) == "permission_denied"
+
+
+# ---------------------------------------------------------------------------
+# A password change ends the sessions the old password opened
+# ---------------------------------------------------------------------------
+
+
+def _other_device(app, user, workspace, role) -> httpx.AsyncClient:
+    """A second caller holding its own session for the same account."""
+    return httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url=APP_BASE_URL,
+        headers={"Authorization": f"Bearer {session_token(user, workspace, role)}"},
+    )
+
+
+async def test_changing_a_password_ends_the_sessions_it_replaced(
+    app, client, signed_up, workspace
+):
+    """The reason people change a password they believe is known.
+
+    Session tokens are signed and self-contained -- there is nothing to delete
+    server side -- so what ends them is ``users.credentials_changed_at`` and the
+    ``iat`` comparison in ``_principal_from_session``.
+    """
+    async with _other_device(app, signed_up, workspace, Role.ADMIN) as elsewhere:
+        assert (await elsewhere.get("/api/v1/auth/status")).status_code == 204
+
+        await client.post(
+            "/api/v1/auth/login", json={"email": signed_up.email, "password": PASSWORD}
+        )
+        changed = await client.post(
+            "/api/v1/auth/change-password",
+            json={"current_password": PASSWORD, "new_password": "Tr0ubadour-Stapler!"},
+        )
+        assert changed.status_code == 200, changed.text
+
+        refused = await elsewhere.get("/api/v1/auth/status")
+        assert refused.status_code == 401, refused.text
+        assert error_code(refused) == "unauthenticated"
+
+
+async def test_changing_your_own_password_keeps_this_device_signed_in(client, signed_up):
+    """The cookie the change installs is minted after the stamp, so the person
+    doing the changing is not thrown out by their own action."""
+    await client.post(
+        "/api/v1/auth/login", json={"email": signed_up.email, "password": PASSWORD}
+    )
+    before = client.cookies.get(SESSION_COOKIE)
+
+    changed = await client.post(
+        "/api/v1/auth/change-password",
+        json={"current_password": PASSWORD, "new_password": "Tr0ubadour-Stapler!"},
+    )
+    assert changed.status_code == 200, changed.text
+    assert client.cookies.get(SESSION_COOKIE) != before, "a fresh token was installed"
+
+    assert (await client.get("/api/v1/auth/status")).status_code == 204
+    assert (await client.get("/api/v1/auth/session")).status_code == 200
+
+
+async def test_an_admin_reset_ends_the_members_sessions(app, as_role, factory, workspace):
+    """Resetting a password is how an admin takes an account back; unlike the
+    self-service path there is nobody here to hand a fresh token to."""
+    member = await factory.user(
+        workspace, email="locked-out@northwind.test", role=Role.MEMBER, password=PASSWORD
+    )
+    async with _other_device(app, member, workspace, Role.MEMBER) as theirs:
+        assert (await theirs.get("/api/v1/auth/status")).status_code == 204
+
+        async with as_role(Role.ADMIN) as admin:
+            reset = await admin.patch(
+                f"/api/v1/workspaces/users/{member.id}",
+                json={"password": "Adm1n-Issued-Reset!"},
+            )
+            assert reset.status_code == 200, reset.text
+
+        after = await theirs.get("/api/v1/auth/status")
+        assert after.status_code == 401, after.text
+
+
+async def test_signing_in_does_not_end_the_accounts_other_sessions(
+    app, client, db, signed_up, workspace
+):
+    """A sign-in may re-hash the stored password under current parameters. That
+    is not a rotation, and stamping it would sign the person out everywhere
+    every time they logged in."""
+    async with _other_device(app, signed_up, workspace, Role.ADMIN) as elsewhere:
+        assert (await elsewhere.get("/api/v1/auth/status")).status_code == 204
+
+        await client.post(
+            "/api/v1/auth/login", json={"email": signed_up.email, "password": PASSWORD}
+        )
+
+        assert (await db.get(User, signed_up.id)).credentials_changed_at is None
+        assert (await elsewhere.get("/api/v1/auth/status")).status_code == 204
+
+
+async def test_an_account_that_never_changed_its_password_keeps_its_session(
+    client, db, factory, workspace
+):
+    """Null means "nothing to invalidate", not "invalidate everything" -- which
+    is every account that existed before the column did."""
+    user = await factory.user(workspace, email="untouched@northwind.test", role=Role.ADMIN)
+    authorise(client, user, workspace, Role.ADMIN)
+
+    assert (await db.get(User, user.id)).credentials_changed_at is None
+    assert (await client.get("/api/v1/auth/status")).status_code == 204

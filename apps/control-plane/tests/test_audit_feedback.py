@@ -14,7 +14,9 @@ import asyncio
 import datetime as dt
 import time
 
-from sqlalchemy import select
+import pytest
+from sqlalchemy import select, text
+from sqlalchemy.exc import IntegrityError
 
 from fulcrum_ops_api.models.governance import AuditEvent
 from fulcrum_ops_api.models.quality import BacklogItem, FeedbackIssue, FeedbackItem
@@ -209,9 +211,18 @@ async def test_add_to_backlog_from_two_reports_of_one_issue_makes_one_item(
 
 
 async def test_an_issue_that_already_has_two_items_still_answers_409(
-    admin_client, factory, workspace
+    admin_client, db, factory, workspace
 ):
-    """Workspaces that forked an issue before the check existed must not 500."""
+    """Workspaces that forked an issue before the check existed must not 500.
+
+    Revision 7b2e4c9a10d3 added `uq_backlog_items_open_issue`, so the fork can
+    no longer be written -- which is the point of the index, and is asserted on
+    its own below. This test is about the rows an older deployment already has:
+    the index stops new ones, it does not visit the ones that exist. Lifting it
+    for the rest of the test is how that legacy pair is put back within reach,
+    and each test owns its own database.
+    """
+    await db.execute(text("DROP INDEX uq_backlog_items_open_issue"))
     issue, _rows = await _issue_with_reports(admin_client, factory, workspace)
     older = await factory.add(
         BacklogItem(workspace_id=workspace.id, issue_id=issue["id"], title="Fix totals")
@@ -227,6 +238,23 @@ async def test_an_issue_that_already_has_two_items_still_answers_409(
     # The issue row names the same item the conflict does, not an arbitrary one.
     read = await admin_client.get(f"{FEEDBACK}/issues/{issue['id']}")
     assert read.json()["backlog_item_id"] == older.id
+
+
+async def test_a_second_open_item_for_one_issue_can_no_longer_be_written(
+    admin_client, db, factory, workspace
+):
+    """The index, not the service, is what makes the fork unwritable."""
+    issue, _rows = await _issue_with_reports(admin_client, factory, workspace)
+    await factory.add(
+        BacklogItem(workspace_id=workspace.id, issue_id=issue["id"], title="Fix totals")
+    )
+
+    with pytest.raises(IntegrityError):
+        await factory.add(
+            BacklogItem(
+                workspace_id=workspace.id, issue_id=issue["id"], title="Fix totals (again)"
+            )
+        )
 
 
 async def test_a_reopened_issue_can_be_planned_again_after_its_fix_shipped(

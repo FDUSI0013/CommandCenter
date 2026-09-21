@@ -271,6 +271,16 @@ control plane is the enforcer.</p>
 httpOnly cookie, so several people, and the same person on several devices, can be signed in at
 once without interfering with each other.</p>
 
+<p>With one deliberate exception: <strong>changing a password ends every other session on that
+account</strong>, wherever it is open, and so does an administrator resetting it. That is usually the
+reason someone changes a password, so it is not treated as a side effect. The device doing the
+changing stays signed in; the others are asked to sign in again the next time they call. A
+deployment-progress tab left streaming closes within half a minute. A Live Runs tab closes on the
+next run it would have shown you — so a workspace where nothing is running may hold the connection
+open, delivering nothing, until it ages out. An API key is unaffected — it is not a
+session and has no password — so a key that should also be withdrawn has to be revoked under
+<strong>Workspace Settings</strong>.</p>
+
 <p>Agents never use a password. They authenticate with an API key, issued under
 <strong>Workspace Settings</strong>.</p>
 
@@ -1273,7 +1283,9 @@ trail: total calls, ingest records, a per-operation breakdown and active days.
 <p>Workspace membership. KPI row: members, privileged, never signed in, added in the last 30 days.</p>
 <p><strong>Add Member</strong> takes a name, email, role, job title, team and an optional initial
 password shown in clear so you can hand it over. <strong>Change Role</strong> records an optional
-reason on the audit trail. <strong>Set Password</strong> gives sign-in to an account that has none.
+reason on the audit trail. <strong>Set Password</strong> sets or replaces the credential on an account — use it to give
+sign-in to an account that has none, or to take one back. Either way it signs that account out
+everywhere; the new password is shown in clear so you can hand it over.
 <strong>Remove From Workspace</strong> revokes access without deleting the person.</p>
 <p>Two rules the server enforces: only an owner may grant the owner role, and you cannot remove your
 own membership. An email the platform already knows is <em>joined</em> to this workspace rather than

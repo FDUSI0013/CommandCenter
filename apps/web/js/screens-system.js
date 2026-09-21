@@ -2519,7 +2519,7 @@
               <input class="input" id="pwConfirm" type="password" autocomplete="new-password"></div>
             <div class="small st-red" id="pwErr"></div>
             <button class="btn primary mt" id="pwSave">${ICONS.key}Change Password</button>
-            <div class="small faint mt">This device stays signed in. The current password is always asked for, so an open session alone cannot take the account over.</div>
+            <div class="small faint mt">This device stays signed in; every other device is signed out. The current password is always asked for, so an open session alone cannot take the account over.</div>
           </div>
         </div>`;
 
@@ -2570,7 +2570,7 @@
           btn.disabled = true;
           try {
             const res = await Store.mutate(() => API.auth.changePassword({ current_password, new_password }), { event:'profile:changed' });
-            toast('success','Password changed', res.message || 'This device stays signed in.');
+            toast('success','Password changed', res.message || 'This device stays signed in; other devices were signed out.');
             ['#pwCurrent','#pwNew','#pwConfirm'].forEach(id => { const f = body.querySelector(id); if(f) f.value = ''; });
           } catch (err) {
             // A wrong current password and a weak new one both come back as the server worded them.
@@ -2806,7 +2806,7 @@
             body:`<div class="form-row"><label>NEW PASSWORD</label>
                 <input class="input" id="usPw" type="text" placeholder="At least 12 characters">
                 <div class="small faint" style="margin-top:4px">Shown in clear so you can pass it on. It replaces
-                  any existing password for ${esc(r.email)}.</div></div>`,
+                  any existing password for ${esc(r.email)}, and signs that account out everywhere.</div></div>`,
             footer:[
               { label:'Cancel' },
               { label:'Set Password', cls:'primary', onClick: async (close, modal) => {
@@ -2815,7 +2815,7 @@
                   try {
                     await Store.mutate(() => API.auth.users.update(r.id, { password }), { event:'members:changed' });
                     close();
-                    toast('success','Password set', `${r.full_name} can sign in with it now.`);
+                    toast('success','Password set', `${r.full_name} can sign in with it now; their other sessions ended.`);
                     refreshAll();
                   } catch (err) {
                     // Too short (422), a shared account or your own (403): each message says what to do.

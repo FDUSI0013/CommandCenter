@@ -16,7 +16,8 @@ from __future__ import annotations
 import asyncio
 
 import pytest
-from sqlalchemy import select, update
+from sqlalchemy import select, text, update
+from sqlalchemy.exc import IntegrityError
 
 from conftest import error_code
 from engine_double import EngineDouble
@@ -358,7 +359,18 @@ async def test_activation_is_refused_on_an_archived_configuration_and_below_oper
 
 
 async def two_current_revisions(admin_client, db, factory, workspace) -> Configuration:
-    """The state two racing activations leave behind: both rows carry the flag."""
+    """The state two racing activations used to leave behind: both rows carry
+    the flag.
+
+    Revision 7b2e4c9a10d3 added a partial unique index that now refuses it, so
+    the state cannot be created any more -- which is the point of the index, and
+    is asserted on its own below. What the two tests after this one are about is
+    the rows an older deployment already wrote: the index stops new ones, it does
+    not visit the ones that exist. Lifting it for the rest of the test is how
+    that legacy row is put back within reach. Each test owns its own database,
+    so nothing else sees the index go.
+    """
+    await db.execute(text("DROP INDEX uq_configuration_versions_current"))
     configuration = await factory.configuration(
         workspace, name="Router settings", current_version="v1.0.0", payload=model_body()
     )
@@ -376,6 +388,30 @@ async def two_current_revisions(admin_client, db, factory, workspace) -> Configu
         .values(is_current=True, status=ConfigurationStatus.ACTIVE.value)
     )
     return configuration
+
+
+async def test_two_current_revisions_can_no_longer_be_written(
+    admin_client, db, factory, workspace
+):
+    """The index, not the service, is what makes the race unwinnable."""
+    configuration = await factory.configuration(
+        workspace, name="Router settings", current_version="v1.0.0", payload=model_body()
+    )
+    bumped = await admin_client.post(
+        f"/api/v1/configurations/{configuration.id}/versions",
+        json={"version": "v1.1.0", "payload": model_body(temperature=0.9)},
+    )
+    assert bumped.status_code == 201, bumped.text
+
+    with pytest.raises(IntegrityError):
+        await db.execute(
+            update(ConfigurationVersion)
+            .where(
+                ConfigurationVersion.configuration_id == configuration.id,
+                ConfigurationVersion.version == "v1.0.0",
+            )
+            .values(is_current=True)
+        )
 
 
 async def test_a_configuration_with_two_current_revisions_still_answers(

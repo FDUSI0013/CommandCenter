@@ -26,6 +26,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -209,10 +210,20 @@ class SeatAssignment(Base, PrimaryKeyMixin, TimestampMixin):
     __tablename__ = "seat_assignments"
     __table_args__ = (
         # A user may hold the same seat again after release, so the timestamp is
-        # part of the key. NOTE: "one *active* seat per user" cannot be a
-        # portable partial unique index across SQLite and Postgres — the seat
-        # service enforces it inside the assignment transaction.
+        # part of the key.
         UniqueConstraint("license_id", "user_id", "assigned_at"),
+        # And may hold only one at a time. The service enforces this inside the
+        # assignment transaction; the index is what makes two concurrent
+        # assignments impossible rather than merely unlikely. (Both engines
+        # honour a partial unique index -- SQLite has since 3.8.)
+        Index(
+            "uq_seat_assignments_active",
+            "license_id",
+            "user_id",
+            unique=True,
+            sqlite_where=text("released_at IS NULL"),
+            postgresql_where=text("released_at IS NULL"),
+        ),
         Index("ix_seat_assignments_license_released_at", "license_id", "released_at"),
     )
 

@@ -89,15 +89,29 @@
     }
     clearTimeout(timer);
 
-    if (res.status === 401 && onUnauthorized) onUnauthorized();
+    // A 401 carries a reason worth repeating: a session can end because it aged
+    // out or because the password changed on another device, and the re-gate
+    // message is the only place the person is told which. The body is read here
+    // and reused below -- a Response body can only be read once.
+    // (`body` above is the REQUEST body; this is the answer.)
+    let answered;
+    let alreadyRead = false;
+    if (res.status === 401) {
+      answered = await safeJson(res);
+      alreadyRead = true;
+      if (onUnauthorized) onUnauthorized(answered && answered.error && answered.error.message);
+    }
 
     if (raw) {
-      if (!res.ok) throw new ApiError(res.status, await safeJson(res), res.headers.get('X-Request-Id'));
+      if (!res.ok) {
+        throw new ApiError(
+          res.status, alreadyRead ? answered : await safeJson(res), res.headers.get('X-Request-Id'));
+      }
       return res;
     }
     if (res.status === 204) return null;
 
-    const payload = await safeJson(res);
+    const payload = alreadyRead ? answered : await safeJson(res);
     if (!res.ok) throw new ApiError(res.status, payload, res.headers.get('X-Request-Id'));
     return payload;
   }

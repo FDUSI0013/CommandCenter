@@ -40,7 +40,7 @@ from ...schemas.deployments import (
 )
 from ...services import deployments as deployments_service
 from ..common import ActionResult, ListParams, Page, list_params, to_csv
-from ..deps import CurrentPrincipal, Db, Principal
+from ..deps import CurrentPrincipal, Db, Principal, session_revoked
 
 environments_router = APIRouter(prefix="/environments", tags=["Environments"])
 deployments_router = APIRouter(prefix="/deployments", tags=["Deployments"])
@@ -72,6 +72,21 @@ DEPLOYMENT_CSV_COLUMNS: list[tuple[str, str]] = [
 
 # Comment frame sent when a stream has been quiet, so proxies keep it open.
 STREAM_HEARTBEAT_SECONDS = 15.0
+
+#: How often an open stream re-asks whether its caller's session still stands.
+#: One small indexed read per interval per stream, against a decision that was
+#: otherwise made once and held for the life of the connection. Deliberately far
+#: longer than the heartbeat: the cost of being wrong for half a minute is one
+#: pipeline snapshot, and the cost of being wrong for a quarter of an hour is
+#: the whole point of the check.
+#:
+#: Unlike the runs stream, this one yields on EVERY poll whether anything moved
+#: or not, so the check really does fire on the timer and the connection closes
+#: within one interval of the session ending.
+#:
+#: Kept equal to ``services.runs.STREAM_RECHECK_SECONDS`` by hand rather than
+#: imported: the two streams are unrelated and either may want its own number.
+STREAM_RECHECK_SECONDS = 30.0
 
 
 # --------------------------------------------------------------------------- #
@@ -477,10 +492,19 @@ async def stream_deployment(
     async def frames() -> AsyncIterator[str]:
         previous: dict | None = None
         last_sent = time.monotonic()
+        # Re-ask whether this caller is still allowed to watch. See the same
+        # comment in api/v1/runs.py: the caller was authenticated once, a
+        # quarter of an hour ago at worst, and a password change since then must
+        # close this stream too.
+        next_recheck = time.monotonic() + STREAM_RECHECK_SECONDS
         async for payload in deployments_service.stream_progress(principal, deployment_id):
             if await request.is_disconnected():
                 return
             now = time.monotonic()
+            if now >= next_recheck:
+                next_recheck = now + STREAM_RECHECK_SECONDS
+                if await session_revoked(principal):
+                    return
             if payload != previous:
                 previous = payload
                 last_sent = now

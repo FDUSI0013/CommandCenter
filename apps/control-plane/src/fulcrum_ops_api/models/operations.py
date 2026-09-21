@@ -29,6 +29,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -414,6 +415,18 @@ class Alert(Base, PrimaryKeyMixin, TimestampMixin, WorkspaceScopedMixin):
             "ix_alerts_source_entity_type_source_entity_id",
             "source_entity_type",
             "source_entity_id",
+        ),
+        # The dedupe rule this table's docstring describes, made true. Two
+        # simultaneous raises of one condition both passed the lookup and both
+        # inserted; raise_alert already absorbs the IntegrityError onto the
+        # twin, so this index is the whole fix.
+        Index(
+            "uq_alerts_open_dedupe",
+            "workspace_id",
+            "dedupe_key",
+            unique=True,
+            sqlite_where=text("dedupe_key IS NOT NULL AND status <> 'Resolved'"),
+            postgresql_where=text("dedupe_key IS NOT NULL AND status <> 'Resolved'"),
         ),
     )
 

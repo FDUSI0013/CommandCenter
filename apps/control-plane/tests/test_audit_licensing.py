@@ -23,7 +23,9 @@ from __future__ import annotations
 import contextlib
 import datetime as dt
 
-from sqlalchemy import event, select, update
+import pytest
+from sqlalchemy import event, select, text, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from fulcrum_ops_api.models.governance import AuditEvent
@@ -510,6 +512,16 @@ async def test_the_locked_lookup_is_for_update_where_rows_can_be_locked():
 async def test_a_user_left_holding_two_active_seats_can_still_be_managed(
     owner_client, db, factory, workspace, member, admin
 ):
+    """What an older deployment already has on disk, and must still be able to
+    manage.
+
+    Revision 7b2e4c9a10d3 added `uq_seat_assignments_active`, so the race can no
+    longer be lost -- asserted on its own below. The index stops new duplicates;
+    it does not visit the ones already written, which is what this test is
+    about. Lifting it for the rest of the test is how that pair is put back
+    within reach, and each test owns its own database.
+    """
+    await db.execute(text("DROP INDEX uq_seat_assignments_active"))
     held = await factory.license(workspace, seats_purchased=5)
     # What two assignments racing past the unlocked check left behind.
     now = _now()
@@ -544,6 +556,52 @@ async def test_a_user_left_holding_two_active_seats_can_still_be_managed(
     assert [seat.user_id for seat in active] == [admin.id], "the duplicate was not cleared"
     stored = await db.get(TenantLicense, held.id)
     assert stored.seats_assigned == 1
+
+
+async def test_a_second_active_seat_for_one_user_can_no_longer_be_written(
+    factory, workspace, member
+):
+    """The row lock closes the race at run time; the index is what makes losing
+    it impossible. A released seat is outside the predicate, so the same user
+    may still hold the same licence again later."""
+    held = await factory.license(workspace, seats_purchased=5)
+    now = _now()
+    await factory.add(
+        SeatAssignment(
+            license_id=held.id, user_id=member.id, assigned_at=now, role="member"
+        )
+    )
+
+    with pytest.raises(IntegrityError):
+        await factory.add(
+            SeatAssignment(
+                license_id=held.id,
+                user_id=member.id,
+                assigned_at=now + dt.timedelta(seconds=1),
+                role="member",
+            )
+        )
+
+
+async def test_a_released_seat_does_not_block_taking_one_again(factory, workspace, member):
+    held = await factory.license(workspace, seats_purchased=5)
+    now = _now()
+    await factory.add(
+        SeatAssignment(
+            license_id=held.id,
+            user_id=member.id,
+            assigned_at=now - dt.timedelta(days=1),
+            released_at=now - dt.timedelta(hours=1),
+            role="member",
+        )
+    )
+
+    again = await factory.add(
+        SeatAssignment(
+            license_id=held.id, user_id=member.id, assigned_at=now, role="member"
+        )
+    )
+    assert again.released_at is None
 
 
 async def test_a_plan_whose_bullets_cannot_all_be_keys_still_resolves(owner_client, db):

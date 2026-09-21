@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
+import logging
 from typing import Annotated
 
 from fastapi import Depends, Header, Request
@@ -30,8 +31,10 @@ from ..core.security import (
     parse_api_key,
 )
 from ..db.base import stamp
-from ..db.session import get_session
+from ..db.session import get_session, get_sessionmaker
 from ..models.identity import ApiKey, Membership, Role, User, Workspace
+
+log = logging.getLogger(__name__)
 
 SESSION_COOKIE = "fo_session"
 API_KEY_HEADER = "X-Fulcrum-Api-Key"
@@ -53,6 +56,12 @@ class Principal:
     api_key_id: str | None = None
     api_key_agent_id: str | None = None
     scopes: tuple[str, ...] = ()
+    #: The session token's ``iat``, carried so work that outlives its request can
+    #: re-check it. Every ordinary request is authenticated once and answered in
+    #: milliseconds, but a server-sent-event stream holds one Principal for up to
+    #: half an hour; without this it could not tell that the password behind that
+    #: token had since changed. None for an API key, which has no session.
+    token_issued_at: float | None = None
 
     @property
     def actor(self) -> str:
@@ -239,6 +248,16 @@ async def _principal_from_session(
 
     if user is None or not user.is_active:
         raise Unauthenticated("This account is no longer active.")
+    # A token minted before the password changed is no longer proof of anything:
+    # whoever held the old credential could have minted it. Both sides carry
+    # sub-second precision, so the comparison is exact rather than "some time
+    # that second" -- and the token the change itself re-issues is minted after
+    # the stamp, which is what keeps that caller signed in.
+    changed = user.credentials_changed_at
+    if changed is not None and claims.get("iat", 0) < changed.timestamp():
+        raise Unauthenticated(
+            "Your password changed, so this session ended. Sign in again."
+        )
     if workspace is None and workspace_override:
         raise PermissionDenied("Unknown workspace.")
     if workspace is None or membership is None:
@@ -255,7 +274,67 @@ async def _principal_from_session(
         user_id=user.id,
         email=user.email,
         display_name=user.full_name,
+        token_issued_at=claims.get("iat"),
     )
+
+
+async def session_revoked(principal: Principal) -> bool:
+    """Has this caller's session ended since it was authenticated?
+
+    For long-lived work that holds one Principal across many minutes -- the two
+    server-sent-event streams, which run for up to half an hour and fifteen
+    minutes respectively. An ordinary request never needs this: it is
+    authenticated and answered before anything could change.
+
+    It re-reads the three things that can end a session while it is open:
+
+    * the account was deactivated,
+    * the password was changed out from under a token minted before it,
+    * the membership that put this caller in this workspace was removed.
+
+    The third matters more than it looks. ``remove_member`` deletes the
+    membership and leaves ``is_active`` alone -- correctly, because the account
+    may belong to other workspaces -- so a removed person's ordinary requests
+    start answering 403 while a stream opened a minute earlier would go on
+    handing them this workspace's runs. Removal is exactly the instruction
+    "stop showing them our data".
+
+    A role CHANGE is not checked. Both streams carry one workspace's own rows
+    and expose nothing that a lower role could not already read, so a demotion
+    mid-stream discloses nothing the moment before it did not.
+
+    Opens its own short-lived session, because the request's was committed and
+    handed back before the stream started. Answers False on any database
+    trouble: a stream is not the place to decide that an unreachable database
+    means the caller is an impostor. That is one recheck interval of grace, not
+    an open door -- the next interval asks again.
+    """
+    if principal.kind != "user" or principal.user_id is None:
+        return False
+    try:
+        async with get_sessionmaker()() as session:
+            row = (
+                await session.execute(
+                    select(User, Membership)
+                    .select_from(User)
+                    .outerjoin(
+                        Membership,
+                        and_(
+                            Membership.user_id == User.id,
+                            Membership.workspace_id == principal.workspace_id,
+                        ),
+                    )
+                    .where(User.id == principal.user_id)
+                )
+            ).first()
+            user, membership = row if row is not None else (None, None)
+            if user is None or not user.is_active or membership is None:
+                return True
+            changed = user.credentials_changed_at
+            return changed is not None and (principal.token_issued_at or 0) < changed.timestamp()
+    except Exception:  # noqa: BLE001 -- see the docstring: never fail closed here
+        log.warning("could not re-check a streaming session; leaving it open", exc_info=True)
+        return False
 
 
 async def get_principal(
@@ -285,7 +364,12 @@ async def get_principal(
 
     token = bearer or request.cookies.get(SESSION_COOKIE) or ""
     if not token:
-        raise Unauthenticated()
+        # The commonest 401 by far: the cookie aged out or was cleared, so the
+        # browser sends nothing. The console shows this sentence on its sign-in
+        # gate, so it has to read like one -- the generic
+        # "Valid credentials are required." is an API answer, not something to
+        # put in front of a person who was working a moment ago.
+        raise Unauthenticated("Your session has ended. Sign in to continue.")
 
     principal = await _principal_from_session(token, session, x_fulcrum_workspace)
     request.state.principal = principal

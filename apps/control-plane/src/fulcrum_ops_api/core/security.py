@@ -159,7 +159,13 @@ def issue_session_token(
         "sub": user_id,
         "ws": workspace_id,
         "role": role,
-        "iat": int(now.timestamp()),
+        # Sub-second, deliberately. `iat` is compared against
+        # `users.credentials_changed_at` to end the sessions a password change
+        # replaces, and at whole-second resolution a token minted in the same
+        # second as the change cannot be told from one minted just after it --
+        # so it would survive the change for the rest of its life. Nothing else
+        # reads this claim, and NumericDate permits a fractional part.
+        "iat": now.timestamp(),
         "exp": int((now + dt.timedelta(minutes=ttl)).timestamp()),
         "iss": settings.service_name,
     }

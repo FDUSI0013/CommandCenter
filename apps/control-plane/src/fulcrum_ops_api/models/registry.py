@@ -24,6 +24,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -628,6 +629,16 @@ class ConfigurationVersion(Base, PrimaryKeyMixin, TimestampMixin, WorkspaceScope
             unique=True,
         ),
         Index("ix_configuration_versions_config_current", "configuration_id", "is_current"),
+        # Exactly one revision may be current. The service has always intended
+        # this; nothing stopped a second one, and a configuration with two
+        # current rows cannot be rolled back or re-imported (both 500).
+        Index(
+            "uq_configuration_versions_current",
+            "configuration_id",
+            unique=True,
+            sqlite_where=text("is_current"),
+            postgresql_where=text("is_current"),
+        ),
     )
 
     configuration_id: Mapped[str] = mapped_column(

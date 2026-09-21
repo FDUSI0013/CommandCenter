@@ -274,6 +274,11 @@ async def update_member(
     `POST /auth/change-password`, which asks for the current one. Deactivation
     is refused for the last owner and for yourself. Only an owner may modify
     another owner. Requires the admin role.
+
+    Setting a password here ENDS that account's existing sessions, everywhere,
+    including any open stream -- the point of a reset is to take the account
+    back. Nothing is re-issued: the member signs in again with the password you
+    were shown.
     """
     row = await service.update_member(session, principal, user_id, payload, request=request)
     return MemberRead.model_validate(row)

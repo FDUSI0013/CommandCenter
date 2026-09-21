@@ -148,6 +148,13 @@ STREAM_POLL_SECONDS: Final[float] = 3.0
 STREAM_OVERLAP_SECONDS: Final[float] = 30.0
 STREAM_HEARTBEAT_SECONDS: Final[float] = 15.0
 STREAM_MAX_SECONDS: Final[float] = 30 * 60.0
+
+#: How often an open stream re-asks whether its caller's session still stands
+#: (api/v1/runs.py). The caller is authenticated once, before the first frame,
+#: and that decision would otherwise hold for the whole STREAM_MAX_SECONDS
+#: above. One small indexed read per interval per stream buys the difference
+#: between "ends in thirty seconds" and "ends in half an hour".
+STREAM_RECHECK_SECONDS: Final[float] = 30.0
 STREAM_SCAN_BUDGET: Final[int] = 200
 STREAM_SEEN_IDS: Final[int] = 2_000
 

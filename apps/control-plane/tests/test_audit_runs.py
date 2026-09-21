@@ -806,6 +806,11 @@ class _LiveStream:
             "server": ("control-plane.test", 80),
         }
         self.status: int | None = None
+        #: Set when the response body ends -- the server closed the stream
+        #: rather than the test hanging up. A test that expects a stream to
+        #: close can then assert something POSITIVE instead of waiting for a
+        #: frame that never comes, which a slow machine also satisfies.
+        self.ended = asyncio.Event()
         self._frames: asyncio.Queue[str] = asyncio.Queue()
         self._hang_up = asyncio.Event()
         self._asked = False
@@ -821,8 +826,11 @@ class _LiveStream:
     async def _send(self, message: dict) -> None:
         if message["type"] == "http.response.start":
             self.status = message["status"]
-        elif message["type"] == "http.response.body" and message.get("body"):
-            await self._frames.put(message["body"].decode())
+        elif message["type"] == "http.response.body":
+            if message.get("body"):
+                await self._frames.put(message["body"].decode())
+            if not message.get("more_body", False):
+                self.ended.set()
 
     async def __aenter__(self) -> _LiveStream:
         self._task = asyncio.ensure_future(self._app(self._scope, self._receive, self._send))
@@ -921,3 +929,120 @@ async def test_a_stream_over_a_quiet_workspace_asks_the_store_nothing_per_projec
 
     assert engine.calls_to("/v1/private/projects"), "the poll ran"
     assert engine.calls_to("/traces/search") == []
+
+
+# ---------------------------------------------------------------------------
+# A stream is not a way to outlive the session that opened it
+# ---------------------------------------------------------------------------
+
+
+async def test_a_stream_stops_delivering_once_its_session_has_been_ended(
+    app, admin, workspace, db, factory, engine, monkeypatch
+):
+    """Live Runs is the landing screen, so a stolen cookie is usually already
+    watching it. Changing the password 401s every ordinary request at once; the
+    stream used to be the exception, and kept handing over every new run -- with
+    the prompt and response text in it -- for up to half an hour.
+
+    The re-check is on a timer rather than per frame, so it is forced here: what
+    is being proved is that the stream closes on it, not how often it fires.
+    """
+    from sqlalchemy import update
+
+    from conftest import session_token
+    from fulcrum_ops_api.models.identity import Role, User
+    from fulcrum_ops_api.services import runs as service
+
+    monkeypatch.setattr(service, "STREAM_RECHECK_SECONDS", 0.0)
+    agent = await factory.provisioned_agent(workspace, engine, name="Support Bot")
+
+    async with _LiveStream(app, session_token(admin, workspace, Role.ADMIN)) as stream:
+        await stream.frame("open")
+        engine.add_trace(project_name=agent.engine_project_name, name="before")
+        assert '"agent":"Support Bot"' in await stream.frame("run"), "the stream is live"
+
+        # What change_password does, a moment later and from another device.
+        await db.execute(
+            update(User)
+            .where(User.id == admin.id)
+            .values(credentials_changed_at=_utcnow() + dt.timedelta(seconds=1))
+        )
+        engine.add_trace(project_name=agent.engine_project_name, name="after")
+
+        # The stream CLOSES -- asserted positively. "no further frame arrived"
+        # would also be satisfied by a machine too busy to produce one.
+        await asyncio.wait_for(stream.ended.wait(), timeout=10)
+        assert stream._frames.empty(), "the run reported after the change was handed over"
+
+
+async def test_an_api_key_stream_is_not_disturbed_by_the_session_check(
+    app, workspace, db, factory, engine, admin
+):
+    """A key has no session to end, and must not be closed by a rule about one."""
+    from fulcrum_ops_api.api.deps import Principal, session_revoked
+    from fulcrum_ops_api.models.identity import Role
+
+    key_caller = Principal(
+        workspace_id=workspace.id,
+        workspace_slug=workspace.slug,
+        engine_workspace=workspace.engine_workspace,
+        role=Role.OPERATOR,
+        kind="api_key",
+        api_key_id="key-1",
+    )
+    assert await session_revoked(key_caller) is False
+
+
+async def test_session_revoked_answers_the_four_states_it_exists_for(
+    app, workspace, db, factory, admin
+):
+    from sqlalchemy import delete, update
+
+    from fulcrum_ops_api.api.deps import Principal, session_revoked
+    from fulcrum_ops_api.models.identity import Role, User
+
+    def caller(user, issued_at):
+        return Principal(
+            workspace_id=workspace.id,
+            workspace_slug=workspace.slug,
+            engine_workspace=workspace.engine_workspace,
+            role=Role.ADMIN,
+            kind="user",
+            user_id=user.id,
+            token_issued_at=issued_at,
+        )
+
+    now = _utcnow()
+    live = caller(admin, now.timestamp())
+
+    # 1. Nothing has happened.
+    assert await session_revoked(live) is False
+
+    # 2. The password changed after this token was minted.
+    await db.execute(
+        update(User)
+        .where(User.id == admin.id)
+        .values(credentials_changed_at=now + dt.timedelta(seconds=30))
+    )
+    assert await session_revoked(live) is True
+    # A token minted after the change is not caught by it.
+    later = caller(admin, (now + dt.timedelta(minutes=1)).timestamp())
+    assert await session_revoked(later) is False
+
+    # 3. The account was deactivated.
+    await db.execute(
+        update(User)
+        .where(User.id == admin.id)
+        .values(credentials_changed_at=None, is_active=False)
+    )
+    assert await session_revoked(live) is True
+    await db.execute(update(User).where(User.id == admin.id).values(is_active=True))
+    assert await session_revoked(live) is False
+
+    # 4. The membership that put them in this workspace was removed. This is the
+    # one `remove_member` actually does -- it deletes the membership and leaves
+    # the account active, because the account may belong to other workspaces.
+    from fulcrum_ops_api.models.identity import Membership
+
+    await db.execute(delete(Membership).where(Membership.user_id == admin.id))
+    assert await session_revoked(live) is True
