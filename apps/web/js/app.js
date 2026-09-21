@@ -115,7 +115,7 @@
     APP.route = SCREENS[route] ? route : 'live-runs';
     APP.param = param || null;
     APP.currentTitle = screen.title;
-    document.title = screen.title + ' — Fulcrum Ops';
+    document.title = screen.title + ' — AI Command Center';
     renderNav();
     const main = document.getElementById('main');
     main.innerHTML = '';
@@ -162,7 +162,7 @@
       { sep:true },
       { label:'Sign Out', icon:'logout', danger:true, onClick:()=>C.confirmModal({
           title:'Sign Out', confirmLabel:'Sign Out',
-          msg:'Sign out of Fulcrum Ops? Your session will be closed on this device.',
+          msg:'Sign out of AI Command Center? Your session will be closed on this device.',
           onConfirm: signOut }) },
     );
     C.openMenu(anchor, items);

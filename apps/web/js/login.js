@@ -36,7 +36,7 @@
           <div class="auth-brand">
             <div class="auth-mark">${ICONS.bolt.replace('currentColor', '#fff')}</div>
             <div>
-              <div class="auth-name">Fulcrum Ops</div>
+              <div class="auth-name">AI Command Center</div>
               <div class="auth-tag">AI Agent Control Plane</div>
             </div>
           </div>

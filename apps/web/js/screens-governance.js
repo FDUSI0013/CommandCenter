@@ -1123,7 +1123,7 @@
         const m = a.metrics || {};
         const crumb = main.querySelector('.crumbs .cur');
         if(crumb) crumb.textContent = a.name || agentId;
-        document.title = (a.name || 'Agent Detail') + ' — Fulcrum Ops';
+        document.title = (a.name || 'Agent Detail') + ' — AI Command Center';
 
         document.getElementById('adHead').innerHTML = `
           <div class="page-head">
