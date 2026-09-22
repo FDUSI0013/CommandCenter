@@ -1,13 +1,13 @@
-# Deploying Fulcrum Ops
+# Deploying FD AI Command Center
 
 One host runs everything. The edge proxy terminates TLS and is the only thing
-listening publicly; the control plane sits behind it on loopback; the telemetry
+listening publicly; the API server sits behind it on loopback; the telemetry
 engine and its four datastores are on a private compose network with no
 published ports at all.
 
 ```
               :443
-  internet ──────────▶ Caddy ──▶ 127.0.0.1:8080  control plane ──┐
+  internet ──────────▶ Caddy ──▶ 127.0.0.1:8080  API server ─────┐
                         │                                        │  private network
                         └─ /  console static files               ▼
                                                           telemetry engine
@@ -15,7 +15,7 @@ published ports at all.
                                                    ├── analytics DB (ClickHouse + keeper)
                                                    ├── cache / queues (Redis)
                                                    └── blob store (MinIO)
-                                            control plane ── app DB (Postgres)
+                                               API server ── app DB (Postgres)
 ```
 
 ## Sizing the host
@@ -26,7 +26,7 @@ The compose file caps every service, and those caps add up:
 |---|---:|---:|---:|
 | analytics DB (ClickHouse) | 5.0 GB | none | 1024 |
 | telemetry engine (JVM) | 4.0 GB | none | 1024 |
-| control plane | 3.0 GB | none | **2048** |
+| API server | 3.0 GB | none | **2048** |
 | safety scanner | 3.0 GB | 2.0 cores | 512 |
 | metric runner | 2.5 GB | 1.5 cores | 256 |
 | app DB (Postgres) | 1.5 GB | none | **2048** |
@@ -41,7 +41,7 @@ Add the operating system, Docker and Caddy and the floor is about **24 GB**.
 Three of those numbers were learned the hard way, and the compose file says why
 next to each: the **metric runner** pre-forks four ~310 MB executors (it used to
 get 900 MB for five, and the kernel killed and re-forked the fifth ~450 times an
-hour at a full core); the **control plane** runs four workers at ~240 MB each
+hour at a full core); the **API server** runs four workers at ~240 MB each
 (they sat at 870 MB of a 1 GB cap); the **keeper**'s JVM is told its heap
 (`-Xmx512m`) because the image's default of 1000 MB is more than its container
 is allowed.
@@ -93,7 +93,8 @@ sudo install -m 0644 -o root -g root deploy/cron.d/fulcrum-ops      /etc/cron.d/
 sudo install -m 0644 -o root -g root deploy/logrotate.d/fulcrum-ops /etc/logrotate.d/fulcrum-ops
 ```
 
-Then remove `FULCRUM_OPS_BOOTSTRAP_*` from `.env` and restart the control plane.
+Then remove `FULCRUM_OPS_BOOTSTRAP_*` from `.env` and restart the API server
+(`docker compose restart control-plane`).
 
 `ENGINE_TAG` has no default: compose refuses to start until `.env` names the
 engine build to run. `deploy/mirror-images.sh` ends by printing the two lines to
@@ -104,7 +105,7 @@ repository); `ENFORCE_IMMUTABLE=1` locks them.
 ## The edge
 
 `Caddyfile` goes to `/etc/caddy/Caddyfile` on the host. It serves the console's
-static files, proxies `/api/*` and `/health` to the control plane, and proxies
+static files, proxies `/api/*` and `/health` to the API server, and proxies
 `/v1/traces` for agents that report over OpenTelemetry. It sets HSTS, a strict
 CSP, `X-Frame-Options: DENY` and disables buffering on the streaming routes —
 without `flush_interval -1` the live run stream would arrive in chunks minutes
@@ -113,10 +114,10 @@ apart.
 Three settings on every proxy block are there because of how this stack fails,
 and the file explains each where it is set:
 
-- **A 30-second retry window** (`lb_try_duration`). The control plane is one
+- **A 30-second retry window** (`lb_try_duration`). The API server is one
   container; while it restarts nothing listens on 8080. A request that arrives
   in that gap is held and re-dialled instead of being answered 502 — so a deploy
-  no longer shows the console "cannot reach the control plane" or refuses an
+  no longer shows the console "cannot reach the server" or refuses an
   agent's ingest batch. Only a failed dial is retried for a POST, so nothing is
   delivered twice.
 - **`response_header_timeout 150s`**, replacing a 24-hour read timeout on every
@@ -124,8 +125,8 @@ and the file explains each where it is set:
   run is allowed 135 s), and it means a request into a wedged worker ends in a
   504 rather than being held for a day. The two event streams keep a
   `read_timeout` of their own — it is per read, and they heartbeat every 15 s.
-- **`keepalive 60s`**, paired with `--timeout-keep-alive 75` on the control
-  plane. The side that reuses idle connections has to give them up first, or a
+- **`keepalive 60s`**, paired with `--timeout-keep-alive 75` on the API
+  server. The side that reuses idle connections has to give them up first, or a
   POST is eventually sent down a socket the server has just closed.
 
 A 10 MB `request_body` ceiling sits just above the API's own 8 MiB ingest limit,
@@ -162,11 +163,11 @@ docker compose pull                  # or: engine/build.sh && deploy/mirror-imag
 docker compose up -d control-plane   # migrations run in the container's CMD
 ```
 
-The control plane runs `alembic upgrade head` before it starts serving, so a
+The API server runs `alembic upgrade head` before it starts serving, so a
 restart never serves against an older schema. Roll back by deploying the
 previous `APP_TAG`; roll the schema back only with a deliberate down-revision.
 
-The control-plane image is built on the host, and `pyproject.toml` gives lower
+The API server's image is built on the host, and `pyproject.toml` gives lower
 bounds only — so a rebuild installs whatever is newest that day unless
 `deploy/constraints.txt` pins it. That file ships without pins and says how to
 record them from the running, verified image (`pip freeze` inside the
@@ -174,9 +175,9 @@ container). Do that once after a deploy you are satisfied with, and commit it.
 The build copies `deploy/constraints.txt`, so ship `deploy/` together with
 `apps/control-plane` — without it the build stops at that `COPY`.
 
-The control plane waits for its database to be healthy and for the engine merely
+The API server waits for its database to be healthy and for the engine merely
 to have *started*: `up -d control-plane` works while the engine is unhealthy,
-which is exactly when a control-plane fix is most likely to be needed.
+which is exactly when a server fix is most likely to be needed.
 
 ### One-time steps for a host deployed before 2026-09-18
 
@@ -235,14 +236,14 @@ once a minute, it restarts what Docker calls unhealthy.
 - It runs **on the host**, deliberately. The usual alternative is a third-party
   image with the Docker socket mounted into it, which is root on this host for a
   container we did not build.
-- It touches only containers labelled `fulcrum.autoheal=true`: the control
-  plane, the engine, the metric runner and the safety scanner. The datastores
+- It touches only containers labelled `fulcrum.autoheal=true`: the API
+  server, the engine, the metric runner and the safety scanner. The datastores
   are left out — one that is unhealthy is usually recovering, and restarting it
   mid-recovery makes things worse.
 - It restarts a container **at most once every ten minutes**. If the restart did
   not cure it, it says so in the log and leaves it for a person, rather than
   restarting it every minute and burying the evidence.
-- For that to be safe, the control plane's container healthcheck is a *liveness*
+- For that to be safe, the API server's container healthcheck is a *liveness*
   probe: it passes on any answer from `/health`, including the 503 that means
   "the engine is down". Restarting the API cannot mend the engine; it would only
   take login and the governance screens down with it, in a loop. `/health`
@@ -269,7 +270,7 @@ DRY_RUN=1 bash /opt/fulcrum/deploy/autoheal.sh      # says what it would restart
 The `PATH` line matters: cron's own is `/usr/bin:/bin`, the AWS CLI lives in
 `/usr/local/bin`, and that is how a backup can "succeed" every night without a
 copy ever leaving the host. The weekly `builder prune` is there because the
-control plane is built on the host and nothing else ever removes the build cache
+API server's image is built on the host and nothing else ever removes the build cache
 (22 GB of it by September 2026).
 
 ## Backups
@@ -324,7 +325,7 @@ cat /opt/fulcrum/backups/BACKUP_FAILED        # present only if the last backup 
 ```
 
 A service whose process is killed *inside* its container — the metric runner's
-executors, a control-plane worker — is replaced by its own supervisor, and
+executors, an API server worker — is replaced by its own supervisor, and
 Docker's restart count never moves. `docker stats` sitting at a container's
 memory limit, and `dmesg | grep -i 'killed process'`, are how that shows up.
 

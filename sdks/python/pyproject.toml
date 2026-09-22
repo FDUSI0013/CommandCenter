@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "fulcrum-ops"
-version = "1.0.1"
-description = "Report agent traces, spans, feedback scores and governance events to the Fulcrum Ops control plane."
+version = "1.0.2"
+description = "Report agent traces, spans, feedback scores and governance events to FD AI Command Center."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "Proprietary" }

@@ -1,4 +1,4 @@
-/* Fulcrum Ops — utilities: formatting, CSV export, SVG charts */
+/* FD AI Command Center — utilities: formatting, CSV export, SVG charts */
 (function(){
   'use strict';
 

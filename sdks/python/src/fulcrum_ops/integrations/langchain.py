@@ -206,7 +206,7 @@ def _summarise(value: Any) -> Any:
 
 
 class FulcrumOpsCallbackHandler:
-    """Report a LangChain run to Fulcrum Ops as a trace with nested spans.
+    """Report a LangChain run to FD AI Command Center as a trace with nested spans.
 
     ::
 

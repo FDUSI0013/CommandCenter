@@ -86,7 +86,7 @@ STAGE_BUILD, STAGE_TESTS, STAGE_SECURITY_SCAN, STAGE_APPROVAL, STAGE_DEPLOY = (
     DEFAULT_PIPELINE_STAGES
 )
 
-# How long each stage occupies the pipeline. The control plane records the run;
+# How long each stage occupies the pipeline. The server records the run;
 # the platform agent that performs the work reports back through the same rows,
 # and these are the budgets the runner allows a stage before it moves on.
 STAGE_RUNTIME_SECONDS: dict[str, float] = {
@@ -2353,7 +2353,7 @@ async def recover_orphaned_pipelines(*, grace_seconds: float = ORPHAN_GRACE_SECO
     touched -- the approvals queue settles those.
 
     The interrupted stage is put back to Pending and the pipeline is resumed
-    rather than failed: the stages are the control plane's own and repeatable,
+    rather than failed: the stages are the server's own and repeatable,
     and a restart of this service is not a reason to fail somebody's release.
     """
     now = _now()

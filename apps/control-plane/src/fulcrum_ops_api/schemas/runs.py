@@ -1,6 +1,6 @@
 """Wire contracts for Live Runs and Replay Studio.
 
-A *run* is one agent execution. The control plane does not store runs: they
+A *run* is one agent execution. The platform does not store runs: they
 live in the telemetry engine as traces, and this module is the vocabulary we
 map them into — the sixteen columns of the Live Runs table, the inspector's
 seven sections, the execution-trace span tree, and the ordered step list the
@@ -385,11 +385,13 @@ class SparkPoint(BaseModel):
 
 
 class SparkKpi(BaseModel):
-    """One of the four sparkline mini-KPIs under the KPI row."""
+    """One of the sparkline mini-KPIs under the KPI row."""
 
     label: str
-    value: float
-    unit: str = Field(description="'tokens', 'usd', 'percent' or 'runs'")
+    value: float | None = Field(
+        description="Null when there was nothing to measure it over, such as a rate of no runs"
+    )
+    unit: str = Field(description="'tokens', 'usd', 'percent', 'runs' or 'violations'")
     series: list[SparkPoint] = Field(default_factory=list)
 
 
@@ -422,16 +424,85 @@ class ScanInfo(BaseModel):
     )
 
 
+class ModelSlice(BaseModel):
+    """One model's share of the window's runs: a slice of the LLMs Used panel.
+
+    Folded in the same pass as ``total_runs``, so the slices of one summary
+    always add up to it -- runs, and the tokens and cost beside them.
+    """
+
+    model: str | None = Field(
+        None,
+        description=(
+            "The run's Model column: the model recorded on the run, else the "
+            "agent's registered model. Null when neither names one"
+        ),
+    )
+    runs: int
+    tokens: int = 0
+    cost: float = 0.0
+    runs_model_from_agent: int = Field(
+        0,
+        description=(
+            "Of `runs`, those that recorded no model and are counted under the model "
+            "their agent is registered with. Always 0 for the null model"
+        ),
+    )
+
+
+class ViolationCountScope(BaseModel):
+    """What Policy Violations and Human Escalations were counted from.
+
+    Both are counts of the violation records the Policy Center lists, not of
+    runs: one record per breach, written by the enforcement path when it
+    decided. They are read from those records directly -- not from the capped
+    telemetry scan -- so they are complete whatever ``scan`` says, and their
+    change against the previous window is always a measured one.
+    """
+
+    window_start: dt.datetime
+    window_end: dt.datetime
+    previous_window_start: dt.datetime = Field(
+        description="The previous window runs from here up to `window_start`"
+    )
+    agent_id: str | None = Field(
+        None,
+        description=(
+            "The one agent whose records were counted. Null: every record in the "
+            "workspace, as the Policy Center counts them"
+        ),
+    )
+    escalating_actions: list[str] = Field(
+        default_factory=list,
+        description="Enforcement actions Human Escalations counts, as Agent Detail does",
+    )
+    filters_not_applied: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Filters in the request that do not narrow these counts. A violation "
+            "record names its agent, not the run's tenant, source, status, risk, "
+            "verdict or text"
+        ),
+    )
+
+
 class RunsSummary(BaseModel):
-    """The four KPI cards and the four sparkline mini-KPIs on Live Runs.
+    """The KPI cards, the LLMs Used panel and the sparkline mini-KPIs on Live Runs.
 
     Every card is computed over the selected window and compared with the
     window immediately before it, so "vs last 24h" is a measured change.
 
-    Both windows are read under the same cap, and each reports what it was
-    computed from (``scan``, ``previous_scan``). When either was capped the two
-    are not comparable: ``comparable`` is false and every ``*_delta_*`` field is
-    null, so the console draws no arrow rather than a trend that did not happen.
+    The run figures are folded from a capped telemetry scan. Both windows are
+    read under the same cap, and each reports what it was computed from
+    (``scan``, ``previous_scan``). When either was capped the two are not
+    comparable: ``comparable`` is false and every run-based ``*_delta_*`` field
+    is null, so the console draws no arrow rather than a trend that did not
+    happen.
+
+    Policy Violations and Human Escalations are not run figures. They count the
+    violation records the Policy Center counts (see ``violations_scope``), one
+    indexed count per request, so they are exact under any cap and their
+    deltas are always measured.
     """
 
     time_range: TimeRange
@@ -447,29 +518,61 @@ class RunsSummary(BaseModel):
     avg_latency_previous_seconds: float | None = None
     avg_latency_delta_seconds: float | None = None
 
-    policy_violations: int = 0
+    policy_violations: int = Field(
+        0,
+        description=(
+            "Violation records in the window for the agents in view -- the records "
+            "the Policy Center counts -- not runs with a non-Allowed verdict"
+        ),
+    )
     policy_violations_previous: int = 0
-    policy_violations_delta_percent: float | None = None
+    policy_violations_delta_percent: float | None = Field(
+        None, description="Null only when the previous window had none to compare with"
+    )
+
+    human_escalations_previous: int = 0
+    human_escalations_delta_percent: float | None = None
+
+    models: list[ModelSlice] = Field(
+        default_factory=list,
+        description=(
+            "Runs in the window by model, most runs first and the unrecorded "
+            "(null) model last. Folded with `total_runs`: the runs add up to it"
+        ),
+    )
 
     tokens_used: SparkKpi
     estimated_cost: SparkKpi
     fallback_rate: SparkKpi
-    human_escalations: SparkKpi
+    human_escalations: SparkKpi = Field(
+        description=(
+            "Violation records in the window whose action put a human in the loop "
+            "(`violations_scope.escalating_actions`), bucketed like the others"
+        )
+    )
+    agent_handoffs: SparkKpi = Field(
+        description=(
+            "Runs the agent itself reported as escalated to a person, from the "
+            "run's own metadata. Folded from the scan, like the other run figures"
+        )
+    )
 
     tenants: list[str] = Field(
         default_factory=list, description="Options for the Tenant filter, from the window"
     )
     scan: ScanInfo
     previous_scan: ScanInfo | None = Field(
-        None, description="What the `*_previous` figures were computed from"
+        None, description="What the run figures' `*_previous` values were computed from"
     )
     comparable: bool = Field(
         True,
         description=(
-            "False when either window hit the scan cap. The deltas are then null: "
-            "a capped window is 'the most recent N runs', which cannot be subtracted"
+            "False when either window hit the scan cap. The run-based deltas are "
+            "then null: a capped window is 'the most recent N runs', which cannot "
+            "be subtracted. The violation and escalation deltas are unaffected"
         ),
     )
+    violations_scope: ViolationCountScope
 
 
 # ---------------------------------------------------------------------------

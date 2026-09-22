@@ -1,12 +1,17 @@
-/* Fulcrum Ops — app shell: navigation, routing, session, boot */
+/* FD AI Command Center — app shell: navigation, routing, session, boot */
 (function(){
   'use strict';
+
+  // The product's name, exactly as it is shown: in tab titles and wherever the
+  // shell names the product in a sentence. Never shortened.
+  const PRODUCT = 'FD AI Command Center';
 
   const NAV = [
     { label:'PLATFORM', items:[
       ['live-runs','Live Runs','activity'],
       ['replay','Replay Studio','replay'],
       ['metrics','Metrics','chart'],
+      ['llm-usage','LLM Usage','cpu'],
     ]},
     { label:'AGENT GOVERNANCE', items:[
       ['connections','Hosting & Deployment','plug'],
@@ -47,7 +52,7 @@
       const map = { 'Connection Center':'connections','Hosting & Deployment':'connections','Quota, Cost & Capacity':'quota','Policy Center':'policies',
         'Secrets & Credentials':'secrets','Testing & Regression':'testing','Testing & Regression Suite':'testing','RAG & Knowledge Governance':'knowledge',
         'Deployment & Environment':'deployments','Environments & Releases':'deployments','Live Runs':'live-runs','Agent Registry':'agents','Approvals & Audit':'approvals',
-        'Guardrails':'guardrails','Metrics':'metrics','Evaluations':'evaluations','Configuration Center':'configurations',
+        'Guardrails':'guardrails','Metrics':'metrics','LLM Usage':'llm-usage','Evaluations':'evaluations','Configuration Center':'configurations',
         'Prompt Studio':'prompts','Prompt Manager':'prompts','Connector & MCP Governance':'connectors',
         'Memory & State Management':'memory','Feedback & Quality Loop':'feedback','Exports':'exports',
         'Licensing & Entitlements':'licensing' };
@@ -115,7 +120,7 @@
     APP.route = SCREENS[route] ? route : 'live-runs';
     APP.param = param || null;
     APP.currentTitle = screen.title;
-    document.title = screen.title + ' — AI Command Center';
+    document.title = screen.title + ' — ' + PRODUCT;
     renderNav();
     const main = document.getElementById('main');
     main.innerHTML = '';
@@ -162,7 +167,7 @@
       { sep:true },
       { label:'Sign Out', icon:'logout', danger:true, onClick:()=>C.confirmModal({
           title:'Sign Out', confirmLabel:'Sign Out',
-          msg:'Sign out of AI Command Center? Your session will be closed on this device.',
+          msg:'Sign out of ' + PRODUCT + '? Your session will be closed on this device.',
           onConfirm: signOut }) },
     );
     C.openMenu(anchor, items);
@@ -212,6 +217,8 @@
     // The next sign-in renders the same route afresh, so nothing here is lost.
     teardownScreen();
     C.closeAllModals();
+    // The tab must not go on naming the screen the sign-in form now covers.
+    document.title = PRODUCT;
     document.getElementById('main').innerHTML = '';
     document.getElementById('app').style.display = 'none';
     AUTH.show({
@@ -259,7 +266,6 @@
   }
 
   async function boot(){
-    document.getElementById('brandIcon').innerHTML = ICONS.bolt.replace('currentColor','#fff');
     document.getElementById('userCaret').innerHTML = ICONS.chevDown;
     document.getElementById('userCard').addEventListener('click', (e)=>userMenu(e.currentTarget));
 
@@ -284,7 +290,7 @@
       else {
         document.getElementById('main').innerHTML =
           `<div class="screen-error">${ICONS.alert}
-             <div class="se-title">Cannot reach the control plane</div>
+             <div class="se-title">Cannot reach the server</div>
              <div>${U.esc((err && err.message) || 'The API did not respond.')}</div>
              <button class="btn" id="retryBoot" style="margin-top:12px">Try again</button>
            </div>`;

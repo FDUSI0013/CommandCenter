@@ -75,7 +75,7 @@ PROBE_DEADLINE_SECONDS = 10.0
 #: Redirects are followed by hand so that each hop is vetted like the first; a
 #: real endpoint is an http->https bounce and perhaps a trailing slash away.
 PROBE_MAX_REDIRECTS = 3
-PROBE_USER_AGENT = "Fulcrum-Ops-Control-Plane/1.0 (connector reachability probe)"
+PROBE_USER_AGENT = "FD-AI-Command-Center/1.0 (connector reachability probe)"
 
 #: Two clocks are never perfectly aligned and clients round timestamps when they
 #: echo them back, so an optimistic check tolerates a second of drift.
@@ -963,7 +963,7 @@ async def probe_addresses(url: httpx.URL, *, redirected: bool = False) -> list[s
     """The literal addresses a probe of ``url`` may connect to.
 
     The probe is a request this process makes on a member's say-so to a URL an
-    operator typed, and the control plane sits on the same network as the
+    operator typed, and the server sits on the same network as the
     telemetry engine, the analytics store and the blob store - none of them
     published, some of them unauthenticated *because* they are unpublished. So
     the host is resolved here, once, and refused if **any** answer is not a

@@ -552,10 +552,10 @@ export class Trace extends Unit {
       if (this.spans.length > 0) wire.spans = this.spans.map((span) => span.toWire());
       return wire;
     }
-    // The control plane reads a run's model off the spans nested in its trace,
+    // The server reads a run's model off the spans nested in its trace,
     // and a streamed trace arrives with none — so Live Runs would show the
     // model the agent was registered with, or nothing, instead of the one that
-    // ran. The trace says it itself, by the rule the control plane would have
+    // ran. The trace says it itself, by the rule the server would have
     // applied, unless the caller's own metadata already names one.
     const model = this.modelThatRan();
     if (model && !wire.metadata?.model) wire.metadata = { ...(wire.metadata ?? {}), model };

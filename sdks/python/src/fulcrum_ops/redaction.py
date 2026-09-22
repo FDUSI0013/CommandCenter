@@ -1,6 +1,6 @@
 """Local redaction — the rules from ``GET /ingest/config``, applied at source.
 
-The control plane can mask content after it arrives, but by then the content has
+The server can mask content after it arrives, but by then the content has
 already crossed the network and been written to a request log. So every
 guardrail set to *Mask*, plus any rule an operator wrote into the workspace
 settings, is shipped down to the SDK and applied here, before the payload leaves

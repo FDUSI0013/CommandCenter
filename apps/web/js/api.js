@@ -1,6 +1,6 @@
-/* Fulcrum Ops — API client.
+/* FD AI Command Center — API client.
  *
- * Single place the console talks to the control plane. Everything else in the
+ * Single place the console talks to the server. Everything else in the
  * app calls API.<domain>.<verb>(); nothing else constructs a URL or a header.
  *
  * Conventions this mirrors from the server:
@@ -85,7 +85,7 @@
       if (err.name === 'AbortError') {
         throw new ApiError(0, { error: { code: 'timeout', message: 'The request timed out.' } });
       }
-      throw new ApiError(0, { error: { code: 'network', message: 'Cannot reach the control plane.' } });
+      throw new ApiError(0, { error: { code: 'network', message: 'Cannot reach the server.' } });
     }
     clearTimeout(timer);
 
@@ -318,6 +318,10 @@
       flag: (id, body) => post(`/runs/${encodeURIComponent(id)}/flag`, body || {}),
       stream: (opts) => stream('/runs/stream', opts),
       export: (params) => download('/runs/export', params),
+    },
+    // LLM Usage: one request answers the whole screen.
+    llmUsage: {
+      get: (params) => get('/llm-usage', params),
     },
     metrics: {
       summary: (params) => get('/metrics/summary', params),

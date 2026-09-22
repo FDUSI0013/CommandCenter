@@ -1,4 +1,4 @@
-# Fulcrum Ops — Analysis
+# FD AI Command Center — Analysis
 
 _Prepared 2026-08-18. Covers: current AWS hosting, the demo frontend's full feature
 inventory, the telemetry engine's capabilities, and the feature→backend mapping._
@@ -23,7 +23,7 @@ inventory, the telemetry engine's capabilities, and the feature→backend mappin
 **Account context (us-east-1):** 20 EC2 instances (14 running), 11 S3 buckets, **no RDS**,
 no ECS/EKS in use for this workload. Five Elastic IPs, all attached.
 
-**Conclusion:** the control plane is a pure static site. The host is 1/16th the size needed to
+**Conclusion:** the application is a pure static site. The host is 1/16th the size needed to
 run a real backend — the engine stack alone needs 8–16 GB RAM. **A new instance is required.**
 
 ---
@@ -125,7 +125,7 @@ paths are already vendor-neutral. Highlights:
 
 **Auth:** `authentication.enabled` defaults to **false** in self-hosted mode → the engine trusts
 its caller and resolves everything from a workspace header. That is exactly what we want: the
-engine runs on a private network and **our** control plane is the sole identity authority.
+engine runs on a private network and **our** server is the sole identity authority.
 
 ---
 
@@ -179,7 +179,7 @@ Section 4 does require that redistributed *source or binaries* retain the licenc
 copyright notices and any `NOTICE` content. The clean way to satisfy both the requirement
 ("nothing vendor-branded anywhere in the product") and the licence is:
 
-- product surfaces — UI, SDK, API, docs, package names, env vars — carry **only Fulcrum Ops branding**;
+- product surfaces — UI, SDK, API, docs, package names, env vars — carry **only FD AI Command Center branding**;
 - a `THIRD_PARTY_LICENSES.md` in the repo (not shipped to users, not rendered in the app) retains
   the upstream licence text.
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fulcrum Ops — branding gate.
+# FD AI Command Center — branding gate.
 #
 # The telemetry engine underneath this product is a white-labelled third-party
 # component. Nothing a customer can see may name it: not the console, not the

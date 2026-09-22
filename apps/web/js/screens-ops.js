@@ -1,4 +1,4 @@
-/* Fulcrum Ops — OPERATIONS screens: Quota Cost & Capacity, Memory & State, Deployment & Environment
+/* FD AI Command Center — OPERATIONS screens: Quota Cost & Capacity, Memory & State, Deployment & Environment
  *
  * Cost and capacity come from measured usage, memory from the stores and the
  * live sessions behind them, deployments from a pipeline the server actually

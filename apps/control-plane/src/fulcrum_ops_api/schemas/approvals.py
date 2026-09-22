@@ -100,7 +100,7 @@ class ApprovalWorkflowStep(BaseModel):
 class FollowOnAction(BaseModel):
     """The action the caller must now perform, lifted from an approved payload.
 
-    The control plane never executes an agent's action itself; approving a
+    The server never executes an agent's action itself; approving a
     request hands the replayable payload back so the caller — the agent runtime
     or the operator's tooling — can carry it out under the approval it just won.
     """

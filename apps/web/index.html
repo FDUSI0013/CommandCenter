@@ -3,8 +3,13 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>AI Command Center</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%236D4AEF'/%3E%3Cpath d='M17.5 5L9 18h6l-1.5 9L22 14h-6l1.5-9z' fill='white'/%3E%3C/svg%3E">
+<title>FD AI Command Center</title>
+<meta name="application-name" content="FD AI Command Center">
+<meta name="apple-mobile-web-app-title" content="FD AI Command Center">
+<meta name="theme-color" content="#2A0854">
+<link rel="icon" type="image/png" sizes="32x32" href="img/favicon-32.png">
+<link rel="icon" type="image/png" sizes="64x64" href="img/favicon-64.png">
+<link rel="apple-touch-icon" sizes="180x180" href="img/apple-touch-icon.png">
 <link rel="stylesheet" href="css/app.css">
 </head>
 <body>
@@ -12,12 +17,16 @@
 
   <!-- ============ SIDEBAR ============ -->
   <aside class="sidebar" id="sidebar">
+    <!-- The brand plate is the logo's own ground colour, so the logo's built-in
+         margin disappears into it; css/app.css (.brand) explains the offsets.
+         The "FD" of the name is drawn in the logo's letterforms (.fd-mark) and
+         still reads and copies as the text "FD". -->
     <div class="brand" id="brand">
-      <div class="brand-icon" id="brandIcon"></div>
-      <div>
-        <div class="brand-name">AI Command Center</div>
+      <div class="brand-top">
+        <img class="brand-logo" src="img/fd-ryze-logo.png" width="326" height="88" alt="FD RYZE">
         <div class="brand-status"><span class="dot pulse"></span>LIVE</div>
       </div>
+      <div class="brand-name"><span class="fd-mark"><span>FD</span></span> AI Command Center</div>
     </div>
     <nav class="nav" id="nav"></nav>
     <!-- Empty and hidden until /auth/me answers: the shell must never show a
@@ -58,6 +67,7 @@
 <script src="js/screens-ops.js"></script>
 <script src="js/screens-quality.js"></script>
 <script src="js/screens-system.js"></script>
+<script src="js/screens-llm.js"></script>
 <script src="js/app.js"></script>
 </body>
 </html>

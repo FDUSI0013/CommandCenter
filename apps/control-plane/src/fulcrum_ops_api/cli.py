@@ -1,4 +1,4 @@
-"""Operator command line for the Fulcrum Ops control plane.
+"""Operator command line for the FD AI Command Center server.
 
 Installed as ``fulcrum-ops-api``. Five commands cover everything that has to
 happen outside a request: standing a new deployment up, running the server,
@@ -34,7 +34,7 @@ from .services import identity as service
 
 app = typer.Typer(
     name="fulcrum-ops-api",
-    help="Operate the Fulcrum Ops control plane.",
+    help="Operate the FD AI Command Center server.",
     no_args_is_help=True,
     add_completion=False,
 )
@@ -135,7 +135,7 @@ def _print_key(token: str, *, name: str) -> None:
 def bootstrap(
     workspace_name: Annotated[
         str, typer.Option("--workspace", help="Display name of the first workspace")
-    ] = "Fulcrum Ops",
+    ] = "FD AI Command Center",
     slug: Annotated[
         str | None, typer.Option("--slug", help="URL slug; derived from the name when omitted")
     ] = None,

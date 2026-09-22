@@ -5,7 +5,7 @@
  *
  * 1. **Enqueueing is synchronous and cannot fail.** A `trace()` that finishes
  *    hands its payload over and returns. No promise, no throw, no await.
- * 2. **The queue is bounded.** If the control plane is unreachable for an hour,
+ * 2. **The queue is bounded.** If the server is unreachable for an hour,
  *    an agent under load must not accumulate an hour of traces in memory. Past
  *    `maxQueueSize` the *oldest* items are dropped, because in an outage the
  *    freshest telemetry is the telemetry worth having.

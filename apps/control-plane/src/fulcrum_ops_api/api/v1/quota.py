@@ -420,7 +420,7 @@ async def report_capacity(
     here with the thresholds the rest of the screen uses, so they are not
     accepted. A reading dated in the future, or older than the thirty days of
     history the screen shows, is refused with 422; so is one filed under a pool
-    the platform reports about itself (`Control Plane Memory`, `Host Memory`,
+    the platform reports about itself (`Platform Memory`, `Host Memory`,
     `Platform Disk`, `Host CPU`). Requires the operator role (an API key needs
     the `admin` scope).
     """

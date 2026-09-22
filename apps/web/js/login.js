@@ -1,6 +1,6 @@
-/* Fulcrum Ops — sign-in.
+/* FD AI Command Center — sign-in.
  *
- * The console is a single page behind one gate: until the control plane
+ * The console is a single page behind one gate: until the server
  * recognises the caller, nothing else is rendered and no data is fetched. The
  * gate paints over the whole app rather than routing to a separate page, so a
  * session that expires mid-session can re-authenticate in place and land the
@@ -34,11 +34,8 @@
       <div class="auth-shell">
         <form class="auth-card" autocomplete="on">
           <div class="auth-brand">
-            <div class="auth-mark">${ICONS.bolt.replace('currentColor', '#fff')}</div>
-            <div>
-              <div class="auth-name">AI Command Center</div>
-              <div class="auth-tag">AI Agent Control Plane</div>
-            </div>
+            <img class="brand-logo" src="img/fd-ryze-logo.png" width="326" height="88" alt="FD RYZE">
+            <h1 class="auth-name"><span class="fd-mark"><span>FD</span></span> AI Command Center</h1>
           </div>
 
           ${cfg && cfg.reason ? `<div class="auth-note">${U.esc(cfg.reason)}</div>` : ''}

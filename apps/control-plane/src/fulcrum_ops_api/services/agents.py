@@ -1,6 +1,6 @@
 """Agent Registry and Agent Detail business logic.
 
-An agent row is the control plane's half of a 1:1 pairing with a telemetry
+An agent row is the platform's half of a 1:1 pairing with a telemetry
 project. Registering an agent therefore does two things that must both succeed:
 it inserts the governed row, and it ensures the project the agent's runs will
 land in exists. The project is ensured *first* — if telemetry cannot be
@@ -29,15 +29,17 @@ set, which is still not a number.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import datetime as dt
 import difflib
-from collections.abc import Awaitable, Mapping, Sequence
+from collections.abc import Awaitable, Collection, Mapping, Sequence
 from typing import Any, Final, TypeVar
 
 from fastapi import Request
 from sqlalchemy import Select, and_, case, delete, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.elements import ColumnElement
 
 from ..api.common import ListParams, apply_filters, apply_search, apply_sort, paginate
 from ..api.deps import Principal
@@ -402,6 +404,175 @@ def _metrics_of(agent: Agent) -> AgentMetrics | None:
         return None
 
 
+# ---------------------------------------------------------------------------
+# Governance counts: one definition for every screen that shows one
+# ---------------------------------------------------------------------------
+#
+# "Policy violations" are the rows of ``policy_violations`` recorded for the
+# workspace inside the window: every row, whatever enforcement fired, resolved
+# or not, and whatever agent it names -- an agent since deleted from the
+# registry included, because its rows are still in the table. "Human
+# escalations" are those rows whose ``action_taken`` put a person in the loop,
+# :data:`ESCALATING_ACTIONS`. The Policy Center's cards, its per-policy columns
+# and its violations feed, the Agent Registry's card and rows, Agent Detail and
+# Live Runs all select with the predicates below, so no two of them can
+# disagree about the same window.
+
+#: The window, in days, the registry, Agent Detail and the Policy Center count
+#: over. Live Runs counts the same rows over whichever window it has selected.
+GOVERNANCE_WINDOW_DAYS: Final[int] = STATS_WINDOW_DAYS
+
+#: Enforcement outcomes that put a human in the loop: what "Human Escalations"
+#: counts out of the window's violations, on every screen that shows it.
+ESCALATING_ACTIONS: Final[tuple[str, ...]] = (
+    PolicyEnforcement.ESCALATE.value,
+    PolicyEnforcement.REQUIRE_APPROVAL.value,
+)
+
+
+def governance_window_start(
+    days: int = GOVERNANCE_WINDOW_DAYS, *, now: dt.datetime | None = None
+) -> dt.datetime:
+    """The first instant of a trailing window of ``days`` ending ``now``."""
+    return (now or _now()) - dt.timedelta(days=days)
+
+
+def violations_in_window(
+    workspace_id: str, start: dt.datetime, end: dt.datetime | None = None
+) -> tuple[ColumnElement[bool], ...]:
+    """WHERE clauses selecting the workspace's violation rows in the window.
+
+    This *is* the definition of "policy violations": nothing narrows it by
+    agent, policy state, severity or resolution. A caller asking a narrower
+    question (one agent, one policy) adds its own clause beside these.
+
+    With ``end`` the window is ``[start, end)``: half-open, so a window and the
+    one before it share no record. Without it the window closes at *now*,
+    inclusively. A record stamped in the future -- a reporting host whose clock
+    runs ahead, or a local time sent as UTC -- is not in "the last 30 days",
+    and Live Runs, which always passes its own end, does not count it; left
+    open here, the Policy Center and the registry would have counted it and
+    disagreed with Live Runs until its timestamp came round.
+    """
+    return (
+        PolicyViolation.workspace_id == workspace_id,
+        PolicyViolation.occurred_at >= start,
+        (
+            PolicyViolation.occurred_at < end
+            if end is not None
+            else PolicyViolation.occurred_at <= _now()
+        ),
+    )
+
+
+def is_human_escalation() -> ColumnElement[bool]:
+    """The clause that picks the human escalations out of a set of violations."""
+    return PolicyViolation.action_taken.in_(ESCALATING_ACTIONS)
+
+
+def _count_if(condition: ColumnElement[bool]) -> Any:
+    return func.coalesce(func.sum(case((condition, 1), else_=0)), 0)
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class ViolationCounts:
+    """Violations in a window, and how many of them were blocked or escalated."""
+
+    violations: int = 0
+    blocked: int = 0
+    escalations: int = 0
+
+
+async def violation_counts(
+    session: AsyncSession,
+    workspace_id: str,
+    start: dt.datetime,
+    end: dt.datetime | None = None,
+) -> ViolationCounts:
+    """The workspace's violations in ``[start, end)``, in one statement."""
+    violations, blocked, escalations = (
+        await session.execute(
+            select(
+                func.count(PolicyViolation.id),
+                _count_if(PolicyViolation.action_taken == PolicyEnforcement.BLOCK.value),
+                _count_if(is_human_escalation()),
+            ).where(*violations_in_window(workspace_id, start, end))
+        )
+    ).one()
+    return ViolationCounts(int(violations or 0), int(blocked or 0), int(escalations or 0))
+
+
+async def violation_counts_by_policy(
+    session: AsyncSession,
+    workspace_id: str,
+    policy_ids: Collection[str],
+    start: dt.datetime,
+) -> dict[str, ViolationCounts]:
+    """Per-policy violations since ``start`` for the policies named, counted live.
+
+    A policy with none is absent from the answer; read it as zero. One grouped
+    statement over the page's ids, answered from
+    ``ix_policy_violations_policy_occurred``.
+    """
+    if not policy_ids:
+        return {}
+    rows = (
+        await session.execute(
+            select(
+                PolicyViolation.policy_id,
+                func.count(PolicyViolation.id),
+                _count_if(PolicyViolation.action_taken == PolicyEnforcement.BLOCK.value),
+                _count_if(is_human_escalation()),
+            )
+            .where(
+                *violations_in_window(workspace_id, start),
+                PolicyViolation.policy_id.in_(sorted(set(policy_ids))),
+            )
+            .group_by(PolicyViolation.policy_id)
+        )
+    ).all()
+    return {
+        policy_id: ViolationCounts(int(count or 0), int(blocked or 0), int(escalated or 0))
+        for policy_id, count, blocked, escalated in rows
+    }
+
+
+async def _violation_counts_by_agent(
+    session: AsyncSession, agents: Sequence[Agent]
+) -> dict[str, ViolationCounts]:
+    """Per-agent violations in the governance window, for the rows of one page.
+
+    The registry row used to carry whatever the agent's cache held from the
+    last time somebody opened its detail page -- days old, or never written --
+    beside a KPI card counted a moment ago.
+    """
+    if not agents:
+        return {}
+    start = governance_window_start()
+    counts: dict[str, ViolationCounts] = {}
+    for workspace_id in {agent.workspace_id for agent in agents}:
+        stmt = (
+            select(
+                PolicyViolation.agent_id,
+                func.count(PolicyViolation.id),
+                _count_if(PolicyViolation.action_taken == PolicyEnforcement.BLOCK.value),
+                _count_if(is_human_escalation()),
+            )
+            .where(*violations_in_window(workspace_id, start))
+            .group_by(PolicyViolation.agent_id)
+        )
+        named = [agent.id for agent in agents if agent.workspace_id == workspace_id]
+        if len(named) <= _MAX_NAMED_AGENTS:
+            stmt = stmt.where(PolicyViolation.agent_id.in_(named))
+        else:
+            stmt = stmt.where(PolicyViolation.agent_id.is_not(None))
+        for agent_id, count, blocked, escalated in (await session.execute(stmt)).all():
+            counts[agent_id] = ViolationCounts(
+                int(count or 0), int(blocked or 0), int(escalated or 0)
+            )
+    return counts
+
+
 #: Enforcement outcomes that only record a match. Everything else intervened in
 #: a run, which is what makes an otherwise Allowed agent read as Warned.
 PASSIVE_ACTIONS: Final[tuple[str, ...]] = (
@@ -439,7 +610,7 @@ async def _strongest_enforcement(
     """Agent id -> the strongest enforcement recorded against it in the window."""
     if not agents:
         return {}
-    window_start = _now() - dt.timedelta(days=STATS_WINDOW_DAYS)
+    window_start = governance_window_start()
     stmt = (
         select(PolicyViolation.agent_id, PolicyViolation.action_taken)
         .where(
@@ -485,11 +656,28 @@ def _policy_status_of(agent: Agent, strongest: str | None) -> PolicyStatus:
 async def read_agents(
     session: AsyncSession, agents: Sequence[Agent]
 ) -> list[AgentRead]:
-    """Shape rows for the table: owner names and policy verdicts, one statement each."""
+    """Shape rows for the table: owner names and policy verdicts, one statement each.
+
+    A row whose metrics were cached carries its governance counts as counted
+    now, not as cached: the cache is written when the agent's page is opened,
+    and a row saying 3 violations beside a KPI card that has since counted 5
+    is the disagreement this module exists to prevent. A row with no cache
+    stays ``metrics: null`` -- "not measured" -- as before.
+    """
     labels = await _owner_labels(session, {a.owner_user_id or "" for a in agents})
     enforced = await _strongest_enforcement(session, agents)
+    cached = {agent.id: _metrics_of(agent) for agent in agents}
+    counted = await _violation_counts_by_agent(
+        session, [agent for agent in agents if cached[agent.id] is not None]
+    )
     reads: list[AgentRead] = []
     for agent in agents:
+        metrics = cached[agent.id]
+        if metrics is not None:
+            counts = counted.get(agent.id, ViolationCounts())
+            metrics = metrics.model_copy(
+                update={"violations_30d": counts.violations, "escalations_30d": counts.escalations}
+            )
         name, email = labels.get(agent.owner_user_id or "", (None, None))
         reads.append(
             AgentRead(
@@ -521,7 +709,7 @@ async def read_agents(
                 engine_project_id=agent.engine_project_id,
                 engine_project_name=agent.engine_project_name,
                 is_provisioned=agent.is_provisioned,
-                metrics=_metrics_of(agent),
+                metrics=metrics,
                 created_at=agent.created_at,
                 updated_at=agent.updated_at,
                 created_by=agent.created_by,
@@ -578,7 +766,7 @@ async def _list_stmt(
         # The filter selects what the column *shows* (see ``_policy_status_of``):
         # Warned is derived for an Allowed agent policy has stepped in on, so
         # those rows belong under Warned and not under Allowed.
-        tripped = _tripped_policy(_now() - dt.timedelta(days=STATS_WINDOW_DAYS))
+        tripped = _tripped_policy(governance_window_start())
         allowed = Agent.policy_status == PolicyStatus.ALLOWED.value
         if policy_status is PolicyStatus.ALLOWED:
             stmt = stmt.where(allowed, ~tripped)
@@ -669,11 +857,14 @@ async def summarise(session: AsyncSession, principal: Principal) -> AgentsSummar
 
     Policy Violations counts breaches recorded against this workspace in the
     last 30 days, and is compared with the 30 days before that; the two windows
-    are the only honest way to render the card's delta.
+    are the only honest way to render the card's delta. Both are counted with
+    :func:`violations_in_window`, the definition the Policy Center's cards and
+    feed and Live Runs use, so the card counts every violation row of the
+    workspace -- including those of agents since deleted from the registry.
     """
     now = _now()
-    window_start = now - dt.timedelta(days=30)
-    previous_start = now - dt.timedelta(days=60)
+    window_start = governance_window_start(now=now)
+    previous_start = governance_window_start(2 * GOVERNANCE_WINDOW_DAYS, now=now)
     workspace = Agent.workspace_id == principal.workspace_id
 
     def _count_where(condition: Any) -> Any:
@@ -699,32 +890,10 @@ async def summarise(session: AsyncSession, principal: Principal) -> AgentsSummar
         )
     ).one()
 
-    violations = (
-        await session.execute(
-            select(
-                func.coalesce(
-                    func.sum(case((PolicyViolation.occurred_at >= window_start, 1), else_=0)),
-                    0,
-                ).label("current"),
-                func.coalesce(
-                    func.sum(
-                        case(
-                            (
-                                (PolicyViolation.occurred_at >= previous_start)
-                                & (PolicyViolation.occurred_at < window_start),
-                                1,
-                            ),
-                            else_=0,
-                        )
-                    ),
-                    0,
-                ).label("previous"),
-            ).where(
-                PolicyViolation.workspace_id == principal.workspace_id,
-                PolicyViolation.occurred_at >= previous_start,
-            )
-        )
-    ).one()
+    current = await violation_counts(session, principal.workspace_id, window_start)
+    previous = await violation_counts(
+        session, principal.workspace_id, previous_start, window_start
+    )
 
     grouped = (
         await session.execute(
@@ -755,8 +924,8 @@ async def summarise(session: AsyncSession, principal: Principal) -> AgentsSummar
         active_percent=round(active / total * 100, 1) if total else 0.0,
         high_risk=int(totals.high_risk or 0),
         high_risk_added_30d=int(totals.high_risk_added or 0),
-        policy_violations_30d=int(violations.current or 0),
-        policy_violations_previous_30d=int(violations.previous or 0),
+        policy_violations_30d=current.violations,
+        policy_violations_previous_30d=previous.violations,
         pending_approval=int(totals.pending_approval or 0),
         inactive=inactive,
         inactive_percent=round(inactive / total * 100, 1) if total else 0.0,
@@ -883,6 +1052,15 @@ async def _policy_bindings(
             .order_by(Policy.name.asc())
         )
     ).all()
+    # The policy's own count over the window, counted now -- the figure the
+    # Policy Center's row for the same policy shows -- not the rollup column,
+    # which the scheduler rewrites every few minutes.
+    counted = await violation_counts_by_policy(
+        session,
+        principal.workspace_id,
+        [policy.id for policy, _ in rows],
+        governance_window_start(),
+    )
     return [
         AgentPolicyBindingRead(
             binding_id=binding.id if binding is not None else None,
@@ -898,7 +1076,7 @@ async def _policy_bindings(
             # equal is the rule body's mode and not the column beside it.
             enforcement=enforced_mode(policy.rules, policy.enforcement),
             version=policy.version,
-            violations_30d=policy.violations_30d,
+            violations_30d=counted.get(policy.id, ViolationCounts()).violations,
             bound_at=binding.bound_at if binding is not None else None,
             bound_by=binding.bound_by if binding is not None else None,
         )
@@ -1067,37 +1245,24 @@ def _configuration(agent: Agent, owner_name: str | None, tools: list[str]) -> Ag
     )
 
 
-#: Enforcement outcomes that put a human in the loop: what "Escalations (30d)"
-#: counts out of the window's violations.
-ESCALATING_ACTIONS: Final[tuple[str, ...]] = (
-    PolicyEnforcement.ESCALATE.value,
-    PolicyEnforcement.REQUIRE_APPROVAL.value,
-)
-
-
 async def _governance_counts(
     session: AsyncSession, principal: Principal, agent_id: str, window_start: dt.datetime
 ) -> tuple[int, int]:
     """Violations, and how many of them escalated, recorded against one agent.
 
-    Counted from our own violation rows -- the same rows the Policy Center and
-    the registry's KPI card count -- so the agent's page cannot disagree with
-    them. One statement, answered from ``ix_policy_violations_agent``.
+    Counted with :func:`violations_in_window` and :func:`is_human_escalation`
+    -- the definition the Policy Center, the registry's KPI card and Live Runs
+    count with -- narrowed to this agent, so the agent's page cannot disagree
+    with them. One statement, answered from ``ix_policy_violations_agent``.
     """
     violations, escalations = (
         await session.execute(
             select(
                 func.count(PolicyViolation.id),
-                func.coalesce(
-                    func.sum(
-                        case((PolicyViolation.action_taken.in_(ESCALATING_ACTIONS), 1), else_=0)
-                    ),
-                    0,
-                ),
+                _count_if(is_human_escalation()),
             ).where(
-                PolicyViolation.workspace_id == principal.workspace_id,
+                *violations_in_window(principal.workspace_id, window_start),
                 PolicyViolation.agent_id == agent_id,
-                PolicyViolation.occurred_at >= window_start,
             )
         )
     ).one()
@@ -1201,7 +1366,8 @@ async def get_detail(
     """
     agent = await get_agent(session, principal, agent_id)
     window_end = _now()
-    window_start = window_end - dt.timedelta(days=STATS_WINDOW_DAYS)
+    # One window for the run figures and the governance counts beside them.
+    window_start = governance_window_start(STATS_WINDOW_DAYS, now=window_end)
 
     connectors = await _linked_connectors(session, principal, agent.id)
     policies = await _policy_bindings(session, principal, agent)

@@ -1,8 +1,8 @@
-/* Fulcrum Ops — QUALITY screens: Evaluations, Guardrails, Testing & Regression,
+/* FD AI Command Center — QUALITY screens: Evaluations, Guardrails, Testing & Regression,
  * Feedback & Quality Loop.
  *
  * Every score, verdict, cluster and count on these screens is read from the
- * control plane, which reads the telemetry engine behind it. Nothing is scored
+ * server, which reads the telemetry engine behind it. Nothing is scored
  * in the browser: when a judgement has not been made yet the cell shows "—",
  * and when the engine cannot answer the screen says so and offers a retry.
  */
@@ -353,7 +353,7 @@
 
       /**
        * The Dataset filter offers the datasets this workspace's evaluations
-       * name — read from the control plane's own rows. The engine's dataset
+       * name — read from the server's own rows. The engine's dataset
        * list is the wrong source for a filter: it is paged (the first 25 only),
        * costs a store read, and offers datasets no evaluation here has used.
        */

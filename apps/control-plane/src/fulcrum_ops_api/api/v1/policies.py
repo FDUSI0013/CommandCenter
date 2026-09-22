@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
+from collections.abc import Mapping
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Query, Request, Response, status
 from fastapi.responses import StreamingResponse
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from ...models.governance import (
     Policy,
@@ -39,8 +41,9 @@ from ...schemas.policies import (
     enforced_mode,
 )
 from ...services import policies as service
+from ...services.agents import ViolationCounts
 from ..common import ListParams, Page, list_params, to_csv
-from ..deps import CurrentPrincipal, Db
+from ..deps import CurrentPrincipal, Db, Principal
 
 router = APIRouter(prefix="/policies", tags=["Policies"])
 
@@ -61,6 +64,7 @@ EXPORT_COLUMNS: list[tuple[str, str]] = [
     ("applies_envs", "Environments In Scope"),
     ("violations_30d", "Violations (30d)"),
     ("blocked_30d", "Blocked (30d)"),
+    ("escalations_30d", "Human Escalations (30d)"),
     ("requests_30d", "Requests (30d)"),
     ("approved_pct", "Approved %"),
     ("last_triggered_at", "Last Triggered"),
@@ -114,10 +118,35 @@ Filters = Annotated[PolicyFilters, Depends(policy_filters)]
 Params = Annotated[ListParams, Depends(list_params)]
 
 
-def _csv_row(policy: Policy) -> dict[str, Any]:
+def _counted(policy: Policy, counts: Mapping[str, ViolationCounts]) -> dict[str, int]:
+    """The windowed figures for one policy, as counted a moment ago."""
+    counted = counts.get(policy.id) or ViolationCounts()
+    return {
+        "violations_30d": counted.violations,
+        "blocked_30d": counted.blocked,
+        "escalations_30d": counted.escalations,
+    }
+
+
+def _read(policy: Policy, counts: Mapping[str, ViolationCounts]) -> PolicyRead:
+    """A policy with its violation figures counted live, not read from the rollup.
+
+    The row is not written to: the counts go onto the response only, so reading
+    a policy never moves the ``updated_at`` an open edit form is holding.
+    """
+    return PolicyRead.model_validate(policy).model_copy(update=_counted(policy, counts))
+
+
+async def _read_one(session: AsyncSession, principal: Principal, policy: Policy) -> PolicyRead:
+    return _read(policy, await service.window_counts(session, principal, [policy]))
+
+
+def _csv_row(policy: Policy, counts: Mapping[str, ViolationCounts]) -> dict[str, Any]:
     row: dict[str, Any] = {key: getattr(policy, key, None) for key, _ in EXPORT_COLUMNS}
-    # The file says what the table says: the mode the rule body enforces.
+    # The file says what the table says: the mode the rule body enforces, and
+    # the violation figures as counted now.
     row["enforcement"] = enforced_mode(policy.rules, policy.enforcement)
+    row.update(_counted(policy, counts))
     for key in ("last_triggered_at", "updated_at"):
         value = row.get(key)
         if isinstance(value, dt.datetime):
@@ -125,11 +154,17 @@ def _csv_row(policy: Policy) -> dict[str, Any]:
     return row
 
 
-def _action_response(
-    policy: Policy, message: str, *, agents_affected: int = 0, bound_agents: int = 0
+async def _action_response(
+    session: AsyncSession,
+    principal: Principal,
+    policy: Policy,
+    message: str,
+    *,
+    agents_affected: int = 0,
+    bound_agents: int = 0,
 ) -> PolicyActionResponse:
     return PolicyActionResponse(
-        policy=PolicyRead.model_validate(policy),
+        policy=await _read_one(session, principal, policy),
         message=message,
         agents_affected=agents_affected,
         bound_agents=bound_agents,
@@ -152,7 +187,9 @@ async def list_policies(
 
     Supports free-text search over name, description, category, scope label and
     version, sorting by any table column, and the Status, Category, Scope and
-    Risk Level dropdowns.
+    Risk Level dropdowns. ``violations_30d``, ``blocked_30d`` and
+    ``escalations_30d`` are counted when the page is read, over the same
+    30-day window and records as the summary cards.
     """
     rows, total = await service.list_policies(
         session,
@@ -165,7 +202,10 @@ async def list_policies(
         enforcement=filters.enforcement,
         owner_user_id=filters.owner_user_id,
     )
-    return Page[PolicyRead].build(rows, total, params.page, params.page_size)
+    counts = await service.window_counts(session, principal, rows)
+    return Page[PolicyRead].build(
+        [_read(policy, counts) for policy in rows], total, params.page, params.page_size
+    )
 
 
 @router.get("/summary", response_model=PolicySummary, summary="Policy KPI summary")
@@ -174,7 +214,12 @@ async def policy_summary(
     session: Db,
     window_days: Annotated[int, Query(ge=1, le=365, description="Rolling window.")] = 30,
 ) -> PolicySummary:
-    """The KPI cards above the table: totals by status and the windowed violation numbers."""
+    """The KPI cards above the table: totals by status and the windowed violation numbers.
+
+    The windowed numbers count every violation record of the workspace in the
+    window, the records Live Runs and the Agent Registry count too. Human
+    Escalations are those enforced as Escalate or Require Approval.
+    """
     return await service.summary(session, principal, window_days=window_days)
 
 
@@ -206,7 +251,10 @@ async def list_violations(
     """Every breach recorded by the enforcement path, newest first.
 
     Each row carries the policy and agent names so the feed renders without a
-    second round trip. Pass ``policy_id`` for the inspector's Violations tab.
+    second round trip; ``agent_name`` is null for a row whose agent has since
+    been deleted from the registry, and the row is listed all the same. Pass
+    ``policy_id`` for the inspector's Violations tab, and ``window_days=30`` for
+    the total the summary cards and the policy's ``violations_30d`` report.
     """
     rows, total = await service.list_violations(
         session,
@@ -249,7 +297,8 @@ async def export_policies(
         enforcement=filters.enforcement,
         owner_user_id=filters.owner_user_id,
     )
-    body = to_csv([_csv_row(policy) for policy in rows], EXPORT_COLUMNS)
+    counts = await service.window_counts(session, principal, rows)
+    body = to_csv([_csv_row(policy, counts) for policy in rows], EXPORT_COLUMNS)
     filename = f"policies-{dt.datetime.now(dt.UTC):%Y%m%d}.csv"
     return StreamingResponse(
         iter([body]),
@@ -280,7 +329,7 @@ async def create_policy(
     draft; it enforces nothing until somebody has reviewed and activated it.
     """
     policy = await service.create_policy(session, principal, body, request=request)
-    return PolicyRead.model_validate(policy)
+    return await _read_one(session, principal, policy)
 
 
 @router.post(
@@ -314,7 +363,7 @@ async def get_policy(
 ) -> PolicyRead:
     """One policy, including its full rule body and reach counters."""
     policy = await service.get_policy(session, principal, policy_id)
-    return PolicyRead.model_validate(policy)
+    return await _read_one(session, principal, policy)
 
 
 @router.patch("/{policy_id}", response_model=PolicyRead, summary="Update a policy")
@@ -336,7 +385,7 @@ async def update_policy(
     change both to different values and the request is refused with 422.
     """
     policy = await service.update_policy(session, principal, policy_id, body, request=request)
-    return PolicyRead.model_validate(policy)
+    return await _read_one(session, principal, policy)
 
 
 @router.delete(
@@ -376,7 +425,9 @@ async def activate_policy(
     policy, affected, bound = await service.activate_policy(
         session, principal, policy_id, request=request
     )
-    return _action_response(
+    return await _action_response(
+        session,
+        principal,
         policy,
         f"{policy.name} is now enforced across {affected} agent(s).",
         agents_affected=affected,
@@ -409,7 +460,9 @@ async def deactivate_policy(
         reason=body.reason if body else None,
         request=request,
     )
-    return _action_response(
+    return await _action_response(
+        session,
+        principal,
         policy,
         f"{policy.name} is no longer enforced; {affected} agent(s) affected.",
         agents_affected=affected,
@@ -439,7 +492,9 @@ async def clone_policy(
         name=body.name if body else None,
         request=request,
     )
-    return _action_response(policy, f"{policy.name} created as an inactive draft.")
+    return await _action_response(
+        session, principal, policy, f"{policy.name} created as an inactive draft."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -486,7 +541,9 @@ async def bind_agent(
     policy, affected, bound, created = await service.bind_agent(
         session, principal, policy_id, agent_id, request=request
     )
-    return _action_response(
+    return await _action_response(
+        session,
+        principal,
         policy,
         f"{policy.name} is now bound to this agent."
         if created
@@ -515,7 +572,9 @@ async def unbind_agent(
     policy, affected, bound, removed = await service.unbind_agent(
         session, principal, policy_id, agent_id, request=request
     )
-    return _action_response(
+    return await _action_response(
+        session,
+        principal,
         policy,
         f"{policy.name} is no longer bound to this agent."
         if removed

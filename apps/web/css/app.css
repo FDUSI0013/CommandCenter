@@ -1,8 +1,11 @@
 /* ================================================================
-   Fulcrum Ops — AI Agent Control Plane
+   FD AI Command Center
    Design system — light theme
    ================================================================ */
 :root{
+  /* The FD RYZE logo's ground (img/fd-ryze-logo.png is drawn on exactly this
+     colour), used wherever the logo sits so its margins vanish into the plate. */
+  --brand-ink:#2A0854;
   --bg:#F2F4F9;
   --panel:#FFFFFF;
   --panel-2:#F6F8FB;
@@ -12,6 +15,9 @@
   --text:#1B2436;
   --text-dim:#5A6478;
   --text-faint:#8E97AB;
+  /* Named by a few rules below (sign-in foot, error text, workspace slug) but
+     never defined, so they fell back to full-strength text. */
+  --muted:var(--text-dim);
   --purple:#6D4AEF;
   --purple-bright:#5B36D6;
   --purple-dim:rgba(109,74,239,0.10);
@@ -65,18 +71,66 @@ button{font-family:inherit;}
   border-right:1px solid var(--border);
   display:flex;flex-direction:column;
   flex-shrink:0;
-  padding:18px 12px 14px;
+  padding:12px 12px 14px;
 }
-.brand{display:flex;align-items:center;gap:10px;padding:0 8px 16px;}
-.brand-icon{
-  width:34px;height:34px;border-radius:9px;flex-shrink:0;
-  background:linear-gradient(135deg,#7B58FF,#5B3FE0);
-  display:flex;align-items:center;justify-content:center;
-  box-shadow:0 4px 14px rgba(109,74,239,0.35);
+
+/* ---- brand: the FD RYZE logo and the product name ------------------------
+   img/fd-ryze-logo.png is 326x88 px: white lettering on a solid #2A0854
+   ground, the lettering inside x 46..314, y 26..71 (the "FD" caps are
+   y 33..70). Every place the logo appears is a plate of that same ground, so
+   the image may hang its built-in margin out past the plate's padding and be
+   clipped there without a seam. .brand-logo's negative margins are those pixel
+   offsets scaled to the rendered height (--logo-h / 88): the "F" lands flush
+   with the text below it, and the image's layout box is exactly as tall as its
+   lettering, so the spacing around it is the spacing written here.
+   The PNG must carry NO colour profile (no iCCP/cHRM/gAMA chunk). The file as
+   first exported was tagged Display P3, so browsers converted its ground to
+   about rgb(46,5,88) and a lighter box showed round the lettering on the
+   #2A0854 plate. Untagged, its pixels are read as sRGB and match exactly. */
+.brand-logo{
+  display:block;flex-shrink:0;width:auto;height:var(--logo-h,40px);
+  margin:calc(var(--logo-h,40px) * -26 / 88) 0 calc(var(--logo-h,40px) * -16 / 88) calc(var(--logo-h,40px) * -46 / 88);
 }
-.brand-icon svg{width:18px;height:18px;}
-.brand-name{font-weight:700;font-size:14.5px;letter-spacing:.01em;}
-.brand-status{font-size:10px;color:var(--green);display:flex;align-items:center;gap:5px;margin-top:1px;font-weight:700;letter-spacing:.12em;}
+/* The "FD" of "FD AI Command Center", drawn in the logo's own letterforms:
+   img/fd-mark.png (the two letters cut from the logo, 73x38) masks a box of
+   currentColor sized to the cap height of the surrounding text and sitting on
+   its baseline (an inline-block with overflow:hidden takes its bottom edge as
+   its baseline). The real text "FD" stays inside, transparent, so the name is
+   read aloud, selected and copied as "FD AI Command Center". */
+.fd-mark{
+  display:inline-block;vertical-align:baseline;overflow:hidden;
+  height:.71em;width:calc(.71em * 73 / 38);
+  background-color:currentColor;
+  -webkit-mask-image:url(../img/fd-mark.png);mask-image:url(../img/fd-mark.png);
+  -webkit-mask-size:contain;mask-size:contain;
+  -webkit-mask-repeat:no-repeat;mask-repeat:no-repeat;
+  -webkit-mask-position:left bottom;mask-position:left bottom;
+}
+.fd-mark > span{color:transparent;white-space:nowrap;}
+/* Selecting the name must not paint the hidden letters in the highlight text
+   colour on top of the drawn ones. */
+.fd-mark > span::selection{color:transparent;}
+@media (forced-colors:active){.fd-mark{forced-color-adjust:none;background-color:CanvasText;}}
+
+/* Sidebar plate, 209px wide inside the 234px sidebar (1px border, 12px
+   padding each side): logo and LIVE on one row (lettering 122px, status 36px,
+   181px available), the product name on its own row below (153px at 13.5px
+   bold in Segoe UI, of 181px available; nowrap, with an ellipsis as the guard
+   should a wider fallback face ever run out of room). */
+.brand{
+  --logo-h:40px;
+  flex-shrink:0;overflow:hidden;
+  margin:0 0 12px;padding:14px 14px 13px;
+  background:var(--brand-ink);color:#fff;border-radius:12px;
+  box-shadow:0 6px 18px rgba(42,8,84,.20);
+}
+.brand-top{display:flex;align-items:center;justify-content:space-between;gap:8px;}
+.brand-name{margin-top:10px;font-weight:700;font-size:13.5px;line-height:1.25;letter-spacing:.01em;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.brand-status{font-size:10px;color:#4ADE80;display:flex;align-items:center;gap:5px;flex-shrink:0;font-weight:700;letter-spacing:.12em;}
+.brand-status .dot{background:#4ADE80;}
+.brand-status .dot.pulse{animation-name:pulse-live;}
+@keyframes pulse-live{0%{box-shadow:0 0 0 0 rgba(74,222,128,.45);}70%{box-shadow:0 0 0 6px rgba(74,222,128,0);}100%{box-shadow:0 0 0 0 rgba(74,222,128,0);}}
 .dot{width:6px;height:6px;border-radius:50%;background:var(--green);display:inline-block;flex-shrink:0;}
 .dot.pulse{animation:pulse 2.2s infinite;}
 @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(22,163,74,.4);}70%{box-shadow:0 0 0 6px rgba(22,163,74,0);}100%{box-shadow:0 0 0 0 rgba(22,163,74,0);}}
@@ -633,16 +687,26 @@ tr.flash-in td{animation:rowIn 1.4s;}
 
 /* ---- sign-in gate -------------------------------------------------------- */
 #auth-root{position:fixed;inset:0;z-index:400;}
+/* Centred when the card fits, scrollable from its top when it does not: the
+   card's auto margins do the centring and fall to zero rather than going
+   negative, so on a short window (a phone on its side, a zoomed laptop) the
+   branded header is never pushed above the top edge where nothing can reach it. */
 .auth-shell{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;padding:24px;
+  overflow-y:auto;
   background:radial-gradient(1100px 620px at 18% -10%,rgba(109,74,239,.16),transparent 60%),var(--bg);}
 .auth-card{width:100%;max-width:392px;background:var(--panel);border:1px solid var(--border);border-radius:16px;
+  margin:auto;
   padding:30px 28px 24px;box-shadow:0 20px 60px rgba(20,24,40,.14);display:flex;flex-direction:column;gap:16px;}
-.auth-brand{display:flex;align-items:center;gap:11px;margin-bottom:4px;}
-.auth-mark{width:34px;height:34px;border-radius:9px;background:var(--purple);display:flex;align-items:center;
-  justify-content:center;box-shadow:0 4px 14px rgba(109,74,239,.32);}
-.auth-mark svg{width:17px;height:17px;}
-.auth-name{font-weight:700;font-size:15px;color:var(--text);letter-spacing:-.2px;}
-.auth-tag{font-size:11.5px;color:var(--muted);}
+/* The card's header is a brand plate (see .brand-logo above) laid over the
+   card's own top border: the negative margins are the card's padding plus its
+   1px border, and the radius is the card's outer radius, so the dark header
+   meets the card edge exactly and the logo's "F" lines up with the fields. */
+.auth-brand{
+  --logo-h:48px;
+  margin:-31px -29px 8px;padding:27px 29px 24px;
+  background:var(--brand-ink);color:#fff;border-radius:16px 16px 0 0;
+}
+.auth-name{margin:12px 0 0;font-weight:700;font-size:18px;line-height:1.25;letter-spacing:.005em;color:#fff;}
 .auth-note{font-size:12.5px;color:#B45309;background:var(--amber-dim);border:1px solid rgba(180,83,9,.18);
   border-radius:8px;padding:9px 11px;}
 .auth-field{display:flex;flex-direction:column;gap:6px;}

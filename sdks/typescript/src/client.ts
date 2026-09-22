@@ -8,7 +8,7 @@
  *
  * Concretely: `trace(name, fn)` returns exactly what `fn` returned, throws
  * exactly what `fn` threw, and swallows everything that goes wrong in the SDK
- * itself. A missing API key, an unreachable control plane, a full queue, a
+ * itself. A missing API key, an unreachable server, a full queue, a
  * serialisation failure on an exotic argument — none of them reach the caller
  * except through `onError`.
  *
@@ -826,7 +826,7 @@ export class FulcrumOps implements TraceSink {
    * The transport's retry loop sleeps on a timer that holds the event loop
    * open, which is right when a caller is awaiting the send and wrong here: a
    * cron job that finished in a second would sit for four thirty-second
-   * attempts on an unreachable control plane, kept alive by a fetch it never
+   * attempts on an unreachable server, kept alive by a fetch it never
    * asked for. So each background attempt is a single short request, and the
    * waits between attempts are on timers that do not hold the process — a
    * long-running agent still gets every retry (and with them the workspace's
@@ -897,7 +897,7 @@ export class FulcrumOps implements TraceSink {
         const error = toFulcrumError(thrown, 'Could not fetch the SDK configuration.');
         if (!how.quiet) this.report('config', error);
         // Retry sooner than the document's own lifetime would allow, but not on
-        // every trace — a control plane that is down should not be hammered.
+        // every trace — a server that is down should not be hammered.
         this.configExpiresAt = Date.now() + 30_000;
         if (this.cachedConfig) return this.cachedConfig;
         throw error;

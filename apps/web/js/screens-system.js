@@ -1,7 +1,7 @@
-/* Fulcrum Ops — SYSTEM screens: Alerts, Exports, Licensing & Entitlements,
+/* FD AI Command Center — SYSTEM screens: Alerts, Exports, Licensing & Entitlements,
  * and Workspace Settings (profile + API access tokens).
  *
- * Everything on these three screens is read from the control plane. An alert
+ * Everything on these three screens is read from the server. An alert
  * exists because something raised it, an export row exists because a file was
  * generated, a seat exists because somebody was given one. Nothing here is
  * simulated: when the workspace has no data the screen says so, and when a call
@@ -1016,7 +1016,7 @@
           try { const list = await API.exports.datasets(); datasets = Array.isArray(list) ? list : []; } catch (_) { datasets = []; }
         }
         if(!datasets.length){
-          toast('error','No datasets available','The control plane did not offer any exportable dataset.');
+          toast('error','No datasets available','The server did not offer any exportable dataset.');
           return;
         }
         openModal({

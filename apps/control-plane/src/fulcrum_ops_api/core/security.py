@@ -1,7 +1,7 @@
 """Password hashing, API-key minting/verification, session tokens, and the
 symmetric envelope used for secret material at rest.
 
-No third-party auth service is involved: the control plane is the identity
+No third-party auth service is involved: the server is the identity
 authority for both browser sessions and SDK API keys.
 """
 

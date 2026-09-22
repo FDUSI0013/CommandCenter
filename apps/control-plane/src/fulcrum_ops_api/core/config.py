@@ -1,4 +1,4 @@
-"""Runtime configuration for the Fulcrum Ops control plane API.
+"""Runtime configuration for the FD AI Command Center server.
 
 Every setting is overridable by environment variable. Nothing in this file may
 reference an upstream vendor: the observability engine is addressed only through
@@ -262,7 +262,7 @@ class Settings(BaseSettings):
     # refuses to call a private, loopback or link-local address -- from inside
     # the container network those are the unpublished services beside it and
     # the instance metadata endpoint. Turn this on only where the connectors
-    # being governed really do live on the control plane's own network.
+    # being governed really do live on the server's own network.
     connector_probe_allow_private: bool = False
 
     # ---- audit trail: hash-chain verification -------------------------------

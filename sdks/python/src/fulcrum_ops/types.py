@@ -6,7 +6,7 @@ are the boundary types: everything above them is ordinary Python, and the
 conversion happens in :mod:`fulcrum_ops.trace` so a contract change lands in one
 place.
 
-Nothing in the SDK validates against these at runtime — the control plane is the
+Nothing in the SDK validates against these at runtime — the server is the
 authority, and a client-side schema that drifts from it is worse than none. They
 exist so a type checker can catch a misspelled key, and so a reader can see the
 whole contract without opening the OpenAPI document.
@@ -115,7 +115,7 @@ class FeedbackScoreIn(TypedDict, total=False):
 class SpanIn(TypedDict, total=False):
     """One unit of work inside a trace.
 
-    ``id`` is optional on the wire: when it is omitted the control plane mints a
+    ``id`` is optional on the wire: when it is omitted the server mints a
     time-ordered one. This SDK always supplies its own, which is what makes a
     retry after a network timeout idempotent rather than a duplicate row.
     """

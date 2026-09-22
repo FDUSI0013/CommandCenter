@@ -1,6 +1,6 @@
-# Fulcrum Ops — make it fully functional and bulletproof
+# FD AI Command Center — make it fully functional and bulletproof
 
-You are taking over a working but unfinished AI agent control plane. It is live,
+You are taking over a working but unfinished AI agent governance console. It is live,
 it has real telemetry flowing, and roughly half its screens have never been
 exercised with real data. Your job is to finish it: verify what exists, use it
 as a real user would, find what breaks, and fix it.
@@ -28,12 +28,24 @@ Work from evidence. Do not trust this document over what you observe.
 
 ## The product
 
-Fulcrum Ops governs AI agents. Teams register agents, connect them with an SDK
+FD AI Command Center governs AI agents. Teams register agents, connect them with an SDK
 or over OpenTelemetry, and the platform records every run and enforces policy,
 guardrails, entitlement and quota **at ingest**, before telemetry is stored.
 
-Twenty-four console screens over one FastAPI control plane, with a white-labelled
+Twenty-five console screens over one FastAPI server, with a white-labelled
 Apache-2.0 telemetry engine behind a private adapter.
+
+**Naming.** The product is called **FD AI Command Center** (renamed 2026-09-22) —
+never shortened to "AI Command Center" or "Command Center". Where prose means the
+backend service rather than the product, it says "the server" or "the platform".
+The earlier name survives only in technical identifiers that running agents and
+integrations depend on, and those are deliberately unchanged while the owner
+decides: the pip package `fulcrum-ops`, the Python modules `fulcrum_ops` and
+`fulcrum_ops_api`, `FULCRUM_OPS_*` environment variables, `X-Fulcrum-*` headers,
+the `fulcrum-ops-api` CLI, cookie and localStorage key names, the host name
+`controlplane.fdprod.net`, the `apps/control-plane` directory and compose service,
+image names and file names. Do not rename any of them as a side effect of other
+work.
 
 **The governing principle, which you must not violate:** nothing in the console
 is simulated. If a number is on screen a service computed it. If a service
@@ -47,7 +59,7 @@ itself instead.
 | Thing | Location |
 |---|---|
 | Source | `C:\Users\FDUSI0013\fulcrum-ops\` — a git repository; `origin` is AWS CodeCommit `fulcrum-ops` (us-east-1). History starts 2026-08-24 |
-| Control plane | `apps/control-plane` (FastAPI, Python 3.12, venv at `.venv`) |
+| Server (API) | `apps/control-plane` (FastAPI, Python 3.12, venv at `.venv`) |
 | Console | `apps/web` (vanilla JS, no build step) |
 | SDKs | `sdks/python`, `sdks/typescript` |
 | Docs | `docs/user-guide.html` (master) + `Fulcrum-Ops-Operator-Manual.docx` |
@@ -226,7 +238,7 @@ the first — production has only ever run one tenant.
 ### 6. Finish the loose ends
 
 - ~~The SDK ships as a local wheel; put it on a private index.~~ **Done.**
-  The control plane serves its own PEP 503 index at `/pypi/simple`, which is
+  The server serves its own PEP 503 index at `/pypi/simple`, which is
   now the documented install route:
   `pip install --extra-index-url https://controlplane.fdprod.net/pypi/simple fulcrum-ops`.
   The wheel lives in `apps/web/pypi/` and is published with the console.
@@ -305,7 +317,7 @@ in. On a deployment where these have reached millions of rows, build them by
 hand first and let the revision find them already present.
 
 **Rolling any of them back means running `downgrade()`, not just putting the
-previous image back.** The control plane migrates itself at start, from scripts
+previous image back.** The API server migrates itself at start, from scripts
 baked into its own image, so an image that predates a revision cannot resolve the
 revision the database reports: it exits 255 before uvicorn and
 `restart: unless-stopped` turns that into a crash loop. `deploy/ship.sh`'s
@@ -354,7 +366,7 @@ revision, each with the data repair it needs.
    runtime instead of parking a run and hoping something picks it up.
 9. `pending_runs` (or `triggered_runs`): a real work queue for console-issued
    runs. Today a runtime polls `GET /runs?status=Running` every few seconds and
-   the control plane answers by scanning telemetry — the single most expensive
+   the server answers by scanning telemetry — the single most expensive
    repeated query in production. An indexed table replaces a scan with a lookup,
    and lets ingest merge the trigger's own metadata into the reported trace.
    (The 2026-09-19 work made the scan much cheaper and made an abandoned request

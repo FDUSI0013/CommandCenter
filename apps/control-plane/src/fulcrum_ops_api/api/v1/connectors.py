@@ -300,7 +300,7 @@ async def test_connector(
     a malformed endpoint is ``Unreachable`` with a message saying so, and an
     endpoint on a private, loopback or link-local address - or one that
     redirects to such an address - is ``Warning`` with ``ok: false`` and no
-    ``http_status`` or ``latency_ms``, because the control plane does not call
+    ``http_status`` or ``latency_ms``, because the server does not call
     into its own network on a connector's behalf and so measured nothing.
     """
     return await connectors_service.test_connector(

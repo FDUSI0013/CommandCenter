@@ -45,6 +45,7 @@ from typing import Any, Final
 from fastapi import Request
 from sqlalchemy import Select, func, or_, select
 from sqlalchemy import delete as sa_delete
+from sqlalchemy import update as sa_update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -2389,7 +2390,7 @@ async def record_capacity(
     # reads whether a pass is due from the newest reading under those names, in
     # any workspace -- so one tenant's cron job posting "Platform Disk" every few
     # minutes would stop the platform recording its readings for every tenant.
-    reserved = {name.casefold() for name in PLATFORM_POOLS}
+    reserved = {name.casefold() for name in (*PLATFORM_POOLS, *LEGACY_PLATFORM_POOLS)}
     records: list[CapacityRecord] = []
     for position, reading in enumerate(payload.readings):
         if reading.name.casefold() in reserved:
@@ -2429,7 +2430,7 @@ async def record_capacity(
 
 @dataclasses.dataclass(frozen=True)
 class PlatformReading:
-    """One thing the control plane measured about the machine it runs on."""
+    """One thing the server measured about the machine it runs on."""
 
     name: str
     resource_type: str
@@ -2440,7 +2441,7 @@ class PlatformReading:
 
 #: The pools the platform reports about itself. The names are fixed: they are
 #: how the sweep recognises its own readings when it asks whether one is due.
-PLATFORM_MEMORY: Final[str] = "Control Plane Memory"
+PLATFORM_MEMORY: Final[str] = "Platform Memory"
 PLATFORM_HOST_MEMORY: Final[str] = "Host Memory"
 PLATFORM_DISK: Final[str] = "Platform Disk"
 PLATFORM_CPU: Final[str] = "Host CPU"
@@ -2450,6 +2451,12 @@ PLATFORM_POOLS: Final[tuple[str, ...]] = (
     PLATFORM_DISK,
     PLATFORM_CPU,
 )
+#: Names a platform pool was recorded under before the product was renamed,
+#: mapped to the pool's current name. Rows under an old name are moved by the
+#: capacity sweep, so a pool's history carries on under one name instead of the
+#: screen showing a second, frozen pool until the old readings expire. The old
+#: names stay reserved: a reporter's rows filed under one would be moved too.
+LEGACY_PLATFORM_POOLS: Final[dict[str, str]] = {"Control Plane Memory": PLATFORM_MEMORY}
 
 _GIB: Final[float] = float(1024**3)
 #: A cgroup with no memory limit reports a number this large, or the word "max".
@@ -2616,6 +2623,19 @@ async def run_capacity_sweep(*, force: bool = False) -> dict[str, int]:
         ]
         session.add_all(records)
         counts["capacity_recorded"] = len(records)
+
+        # Readings still filed under a pool's former name join its current one.
+        renamed = 0
+        for old_name, new_name in LEGACY_PLATFORM_POOLS.items():
+            moved = await session.execute(
+                sa_update(CapacityRecord)
+                .where(CapacityRecord.name == old_name)
+                .values(name=new_name)
+                .execution_options(synchronize_session=False)
+            )
+            renamed += moved.rowcount or 0
+        if renamed:
+            counts["capacity_renamed"] = renamed
 
         # Readings past the history window are never shown again; whoever
         # reported them, keeping them only makes every read of the table slower.

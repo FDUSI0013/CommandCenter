@@ -1,4 +1,4 @@
-/* Fulcrum Ops — shared UI components */
+/* FD AI Command Center — shared UI components */
 (function(){
   'use strict';
   const { esc, fmtFull, initials, avColor } = U;

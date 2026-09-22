@@ -1,4 +1,6 @@
-<title>Fulcrum Ops Operator Manual</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FD AI Command Center — Operator Manual</title>
 <style>
   :root{
     --ink:#0E1417; --ink-2:#3A474D; --ink-3:#63737A;
@@ -45,6 +47,22 @@
   }
   .brand{font-family:var(--sans);font-weight:700;font-size:15px;letter-spacing:-.01em;margin:0 0 2px}
   .brand span{color:var(--accent)}
+  /* The "FD" of the product name is set in the Fulcrum Digital letterforms: a
+     tight-cropped mark whose glyphs fill the image top to bottom, so an image as
+     tall as the font's cap height (0.698em in IBM Plex Sans) sitting on the
+     baseline lines up with the capitals beside it. The inline pixel sizes on
+     each <img> are for the Word copy, which is built without this stylesheet;
+     !important lets the page override them. The mark is brand purple, which
+     vanishes on the dark theme, so there it is drawn in the heading ink. */
+  .fd-glyph{height:.698em!important;width:auto!important;vertical-align:baseline;margin-right:.06em}
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]) .fd-glyph{filter:brightness(0) invert(.92)}
+  }
+  :root[data-theme="dark"] .fd-glyph{filter:brightness(0) invert(.92)}
+  .masthead{margin:0 0 30px}
+  .masthead-logo{display:block;height:44px!important;width:auto!important;border-radius:7px}
+  .subtitle{font-family:var(--sans);font-weight:500;font-size:21px;line-height:1.3;color:var(--ink-2);
+    margin:-4px 0 22px;letter-spacing:-.01em}
   .brand-sub{font-family:var(--mono);font-size:10.5px;text-transform:uppercase;letter-spacing:.11em;color:var(--ink-3);margin:0 0 22px}
   .toc-group{font-family:var(--mono);font-size:10.5px;text-transform:uppercase;letter-spacing:.11em;
     color:var(--ink-3);margin:22px 0 7px;padding-bottom:5px;border-bottom:1px solid var(--rule)}
@@ -72,6 +90,8 @@
   pre{background:var(--code-bg);border:1px solid var(--rule);border-radius:9px;
       padding:16px 18px;overflow-x:auto;margin:0 0 18px;box-shadow:var(--shadow)}
   pre code{background:none;border:0;padding:0;font-size:13.2px;line-height:1.62;color:var(--ink)}
+  /* A long identifier in running text may break rather than push a phone-width page sideways. */
+  :not(pre)>code{overflow-wrap:anywhere}
   .lede{font-size:19.5px;line-height:1.55;color:var(--ink-2);margin-bottom:26px}
   .eyebrow{font-family:var(--mono);font-size:11px;text-transform:uppercase;letter-spacing:.12em;
     color:var(--accent);margin:0 0 9px}
@@ -115,13 +135,14 @@
 
 <div class="shell">
 <nav class="toc">
-  <p class="brand">Fulcrum <span>Ops</span></p>
+  <p class="brand"><img class="fd-glyph" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEkAAAAmCAYAAACI0bZTAAABQUlEQVR42u2aUQ6DIAyG67KHnWWXWHeH3Qc42erJ3AsmhAylRaKhbWIQH4h+acvf4vR8fBAAvnCOTYXnywFrUzbOyT3L7jCuYTau5uMYahe6gT7z8VoAwBmkOmC7sLRDSmE5g9QAyiBVgDJIFaAMUhkUSnWSj6LsSh+Tv88r00ooXNut4pMLSaxaOxptzEPywV4gRhEASEu4hQiJBN6kKicFTimSljTaEjdJwk7j7haYYee4ifvVKdmeAQp7tUr8QS/5vuAuaeHW4smaFTcZpANNMyQ0SAcB0lSWNEkZ86QKTzqrVXKmRnJMSPMIrRKuB3EFsaqc5IB/Uu1HP8FNvccJO5RhBEjIPOIW1akjQELo1ymwsgS2uxRWluyEGRmkbUBB0/9JXHFbbOsapIL3GKQK79EMiQSnJUNCoj/zpprzB92oQbQIdbTAAAAAAElFTkSuQmCC" alt="FD" style="height:10px;width:auto"> AI Command Center</p>
   <p class="brand-sub">Operator Manual</p>
   <p style="margin:-14px 0 22px"><a href="/" style="font-size:12.5px">← Back to the console</a></p>
 
   <div class="toc-group">Start here</div>
   <a href="#what">What this is</a>
   <a href="#concepts">Core concepts</a>
+  <a href="#counts">Violations and escalations</a>
   <a href="#signin">Signing in and roles</a>
   <a href="#firstagent">Connect your first agent</a>
 
@@ -145,6 +166,7 @@
   <a href="#live-runs">Live Runs</a>
   <a href="#replay">Replay Studio</a>
   <a href="#metrics">Metrics</a>
+  <a href="#llm-usage">LLM Usage</a>
 
   <div class="toc-group">Agent governance</div>
   <a href="#connections">Hosting &amp; Deployment</a>
@@ -184,15 +206,20 @@
 
 <main><div class="wrap">
 
+<header class="masthead">
+  <img class="masthead-logo" src="data:image/png;base64,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" alt="FD RYZE" width="163" height="44" style="height:44px;width:auto">
+</header>
 <p class="eyebrow">Operator manual</p>
-<h1>Running agents you did not write</h1>
-<p class="lede">Fulcrum Ops is an AI agent control plane. Teams register the agents they run, connect
-them with an SDK or over OpenTelemetry, and then govern them: what they may call, what they cost,
-what they were asked, what they answered, and what has to be approved before they act.</p>
+<h1><img class="fd-glyph" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEkAAAAmCAYAAACI0bZTAAABQUlEQVR42u2aUQ6DIAyG67KHnWWXWHeH3Qc42erJ3AsmhAylRaKhbWIQH4h+acvf4vR8fBAAvnCOTYXnywFrUzbOyT3L7jCuYTau5uMYahe6gT7z8VoAwBmkOmC7sLRDSmE5g9QAyiBVgDJIFaAMUhkUSnWSj6LsSh+Tv88r00ooXNut4pMLSaxaOxptzEPywV4gRhEASEu4hQiJBN6kKicFTimSljTaEjdJwk7j7haYYee4ifvVKdmeAQp7tUr8QS/5vuAuaeHW4smaFTcZpANNMyQ0SAcB0lSWNEkZ86QKTzqrVXKmRnJMSPMIrRKuB3EFsaqc5IB/Uu1HP8FNvccJO5RhBEjIPOIW1akjQELo1ymwsgS2uxRWluyEGRmkbUBB0/9JXHFbbOsapIL3GKQK79EMiQSnJUNCoj/zpprzB92oQbQIdbTAAAAAAElFTkSuQmCC" alt="FD" style="height:21px;width:auto"> AI Command Center</h1>
+<p class="subtitle">Running agents you did not write</p>
+<p class="lede">FD AI Command Center is an AI agent governance console. Teams register the agents
+they run, connect them with an SDK or over OpenTelemetry, and then govern them: what they may call,
+what they cost, what they were asked, what they answered, and what has to be approved before they
+act.</p>
 
 <h2 id="what">What this is</h2>
 
-<p>The product is twenty-four screens over one API, split down the middle by a deliberate
+<p>The product is twenty-five screens over one API, split down the middle by a deliberate
 architectural line.</p>
 
 <p><strong>Governance is yours.</strong> Agents, connections, connectors, policies, approvals, the
@@ -201,7 +228,7 @@ with role checks and an append-only, hash-chained audit trail.</p>
 
 <p><strong>Telemetry belongs to the engine.</strong> Runs, traces, spans, feedback scores, prompts,
 datasets, experiments and costs live in a private telemetry engine reached through one adapter. It
-is not addressable from outside; the control plane in front of it is the sole identity authority,
+is not addressable from outside; the server in front of it is the sole identity authority,
 and one workspace maps to one project namespace inside it.</p>
 
 <p>That line matters when something breaks. If the engine is unreachable, telemetry screens fail
@@ -218,7 +245,7 @@ working. You will never see a fabricated zero standing in for a number nobody me
 <h3>How the pieces fit</h3>
 
 <pre><code>   an agent  --SDK or OTLP--&gt;  +------------------+
-                              |  control plane   |  the only public surface
+                              |    the server    |  the only public surface
    the console -------------&gt;  |  (FastAPI)       |  identity . tenancy . governance
                               +--------+---------+
                                        |  private network, no published port
@@ -234,10 +261,10 @@ working. You will never see a fabricated zero standing in for a number nobody me
 <table>
 <thead><tr><th>Term</th><th>What it means here</th></tr></thead>
 <tbody>
-<tr><td><strong>Workspace</strong></td><td>A tenant. Every query filters on it, so another workspace row is indistinguishable from a row that does not exist. One person can belong to many workspaces: identity is global, access is per-workspace.</td></tr>
+<tr><td><strong>Workspace</strong></td><td>A tenant. Every query filters on it, so another workspace's row is indistinguishable from a row that does not exist. One person can belong to many workspaces: identity is global, access is per-workspace.</td></tr>
 <tr><td><strong>Agent</strong></td><td>A registered thing that runs. Registration creates its private namespace in the telemetry engine, so an unregistered agent has nowhere to report and is invisible to every telemetry read.</td></tr>
 <tr><td><strong>Run</strong></td><td>One execution: a question in, an answer out. A row on Live Runs. Internally a <em>trace</em>.</td></tr>
-<tr><td><strong>Span</strong></td><td>One timed step inside a run, typed <code>general</code>, <code>llm</code>, <code>tool</code> or <code>guardrail</code>. Spans nest, and the nesting is the agent real decision path.</td></tr>
+<tr><td><strong>Span</strong></td><td>One timed step inside a run, typed <code>general</code>, <code>llm</code>, <code>tool</code> or <code>guardrail</code>. Spans nest, and the nesting is the agent's real decision path.</td></tr>
 <tr><td><strong>Connector</strong></td><td>Something an agent is permitted to call: an MCP server, an API, a database, a vector store, a custom tool. Registered by a human and granted to agents, never auto-discovered from traffic.</td></tr>
 <tr><td><strong>Policy</strong></td><td>A rule evaluated on the way in, before telemetry is stored. Scoped Global, Environment, Agent or Connector, enforced as Block, Require Approval, Escalate, Mask, Route, Throttle, Warn or Log Only.</td></tr>
 <tr><td><strong>Guardrail</strong></td><td>A runtime safety filter: prompt injection, PII, toxicity, hallucination, secrets. Produces events you read on the Guardrails screen.</td></tr>
@@ -261,7 +288,39 @@ because it explains why things get refused.</p>
 </ol>
 
 <p>An agent therefore cannot opt out of governance by lying to the SDK. The SDK is a reporter; the
-control plane is the enforcer.</p>
+server is the enforcer.</p>
+
+<h3 id="counts">Violations, escalations and hand-offs: one definition everywhere</h3>
+
+<p>Three figures appear on more than one screen. Each has exactly one definition, and every screen
+that shows it counts the same records for its own window and scope.</p>
+
+<div class="scroll">
+<table>
+<thead><tr><th>Figure</th><th>What it counts</th><th>Where you see it</th></tr></thead>
+<tbody>
+<tr><td><strong>Policy violations</strong></td><td>Violation events recorded by the enforcement path at ingest (step 5 above): one for each policy an item matched, and one for each violation an agent reported itself with <code>log_policy_violation()</code> (Python) or <code>policyViolation()</code> (TypeScript). These are the records the Policy Center counts, whatever the enforcement, including those of agents since removed from the registry.</td><td>Live Runs, Policy Center, Agent Registry, Agent Detail</td></tr>
+<tr><td><strong>Human escalations</strong></td><td>Those violations whose recorded enforcement was <code>Escalate</code> or <code>Require Approval</code>: the ones that put a person in the loop. A subset of policy violations, never more than them.</td><td>Live Runs, Policy Center, Agent Detail</td></tr>
+<tr><td><strong>Agent hand-offs</strong></td><td>Runs the agent itself reported as escalated to a human. A statement the agent made in its own telemetry, not a policy outcome, so it is counted separately and never added to human escalations.</td><td>Live Runs</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note">
+  <p class="note-t">Same records, different windows</p>
+  <p>Live Runs counts over the window selected in its Time Range filter &mdash; the last hour, 6 hours
+  or 24 hours. The Policy Center counts over 30 days. Both read the same violation records, so the
+  numbers agree when the windows do; a Live Runs figure smaller than the Policy Center's is the
+  shorter window, not a missing record. The Agent Registry's Policy Violations card counts the whole
+  workspace over 30 days, and Agent Detail shows one agent's figures over 30 days.</p>
+  <p>Two things that sound similar are not these figures. The Approvals &amp; Audit screen's
+  <strong>Escalated Requests (30d)</strong> count is approval requests an approver has passed to a senior
+  reviewer: a status of a request in the queue, not a count of violations. The Metrics chart's
+  <code>escalations</code> line, by contrast, is Human Escalations exactly as defined above, narrowed by the agent filter like every other line. LLM Usage shows, per model,
+  only the violation records it can tie to one of that model's runs, so its per-model counts add up
+  to less than the window's total whenever a record names no stored run (see
+  <a href="#llm-usage">LLM Usage</a>).</p>
+</div>
 
 <h2 id="signin">Signing in and roles</h2>
 
@@ -333,7 +392,7 @@ the rest of your fleet.</p>
 <h3>3. Point your agent at the platform</h3>
 
 <pre><code>export FULCRUM_OPS_API_KEY=fo_live_...
-export FULCRUM_OPS_BASE_URL=https://your-control-plane/api/v1
+export FULCRUM_OPS_BASE_URL=https://your-server/api/v1
 export FULCRUM_OPS_WORKSPACE=your-workspace-slug</code></pre>
 
 <h3>4. Instrument and run</h3>
@@ -354,10 +413,10 @@ fulcrum_ops.flush()</code></pre>
 
 <h2 id="sdk-install">The Python SDK: install and configure</h2>
 
-<p>The package is <code>fulcrum-ops</code> (import name <code>fulcrum_ops</code>). It needs Python
+<p>The SDK package is <code>fulcrum-ops</code> (import name <code>fulcrum_ops</code>). It needs Python
 3.9 or newer and has exactly one runtime dependency, <code>httpx</code>.</p>
 
-<p>The control plane serves it: the SDK is its client, versioned with the API it
+<p>The server serves it: the SDK is its client, versioned with the API it
 speaks to, and anything that can report telemetry can already reach the host. No
 credentials and no extra login &mdash; just point pip at the index alongside your
 usual one, so the SDK's single dependency (<code>httpx</code>) still resolves normally:</p>
@@ -373,7 +432,7 @@ once and never rebuilt.</p>
 None of the provider packages is a hard dependency — the wrappers import lazily.
 For an air-gapped install, download the wheel the index points at and install
 the file directly:
-<code>pip install ./fulcrum_ops-1.0.1-py3-none-any.whl</code>.</p>
+<code>pip install ./fulcrum_ops-1.0.2-py3-none-any.whl</code>.</p>
 
 <h3>Two ways to configure</h3>
 
@@ -774,14 +833,14 @@ await fulcrum.close();</code></pre>
 
 <h2 id="otlp">OpenTelemetry, with no SDK at all</h2>
 
-<p>An agent already emitting OpenTelemetry needs no Fulcrum code. Point the exporter at the control
-plane and it lands in the same pipeline, with identical policy, guardrail, entitlement and quota
+<p>An agent already emitting OpenTelemetry needs no SDK code. Point the exporter at the server and
+it lands in the same pipeline, with identical policy, guardrail, entitlement and quota
 treatment.</p>
 
 <pre><code>from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 
 OTLPSpanExporter(
-    endpoint="https://your-control-plane/v1/traces",
+    endpoint="https://your-server/v1/traces",
     headers={"X-Fulcrum-Api-Key": "fo_live_..."},
 )
 # resource attribute service.name  ->  matched to the registered agent
@@ -833,8 +892,38 @@ tree.</p>
 <p class="route">#/live-runs &middot; every role can read</p>
 <p>Real-time observability of agent executions across every connected platform. This is the screen
 you leave open.</p>
-<p><strong>KPI row:</strong> total runs, success rate, average latency, policy violations, tokens
-used, estimated cost, fallback rate, human escalations.</p>
+<p><strong>The window.</strong> Every figure on the screen answers the window chosen in the Time Range
+filter: the last hour, the last 6 hours or the last 24 hours (the default). Each card compares it
+with the window of equal length immediately before.</p>
+<p><strong>KPI row:</strong> Total Runs, Success Rate, Avg Latency, Policy Violations and the
+<strong>LLMs Used</strong> panel. Beneath them, smaller trend tiles for tokens used, estimated cost,
+fallback rate, human escalations and agent hand-offs. Policy violations, human escalations and agent
+hand-offs mean exactly what <a href="#counts">Core concepts</a> defines, for this window.</p>
+<p><strong>Success Rate</strong> is successful runs (Completed or Warned) over finished runs.
+A run still in flight counts toward Total Runs but not toward the rate &mdash; it has neither
+succeeded nor failed yet &mdash; so a window whose runs are all still running shows a dash rather
+than 100%. LLM Usage uses the same definition, so the two agree over the same window.</p>
+<p><strong>Which filters the cards answer.</strong> The run figures follow the Time Range, Tenant and
+Source filters. Policy Violations and Human Escalations follow the Time Range only: they count every
+violation record in the workspace for the window, because a violation record names its agent, not
+the run's tenant or source. When a Tenant or Source filter is set, a note beneath the cards says that
+it does not narrow those two. The Status, Risk, Policy and search filters narrow the table, not the
+cards.</p>
+<p><strong>LLMs Used</strong> is a donut of the runs in the window by model &mdash; the same runs the
+Total Runs card counts, so its slices add up to that card. Each run is counted under the model shown
+in its Model column: the model the run recorded or, when it recorded none, the model its agent is
+registered with. The five most-used models get a slice each and any others share an
+<strong>Other</strong> slice. A run whose model is known neither way is not dropped: it forms a grey
+<strong>Model not recorded</strong> slice. Hover a legend entry for its runs, tokens and cost; click the
+panel to open <a href="#llm-usage">LLM Usage</a> for the full breakdown. LLM Usage opens on its own
+window (24 hours, 7 days or 30 days), so its counts match the panel when both show the last 24
+hours.</p>
+<p><strong>When the window is capped.</strong> A busy window is read newest-first up to a scan limit.
+When that limit is reached a note beneath the cards says how many runs were read and from when the
+window was read whole. The run figures &mdash; the donut included, which says so itself &mdash; are
+then a floor for the window rather than a complete count, and their trend deltas are withheld.
+Policy Violations and Human Escalations are counted from the violation records rather than from the
+runs read, so they stay complete and keep their trend.</p>
 <p><strong>Live stream:</strong> a server-sent event connection pushes new runs as they arrive,
 reconnecting with exponential backoff up to 30 seconds if the connection drops. The LIVE badge in
 the header tells you the stream is attached.</p>
@@ -876,11 +965,16 @@ execution.</p>
 90d), each KPI measured twice — once over the window, once over the window immediately before it —
 so a delta compares equal spans of time.</p>
 <p><strong>Six KPI cards:</strong> total runs, success rate, p50 latency, p90 latency, tokens, cost.</p>
-<p><strong>Eight series</strong> you can overlay on shared axes: <code>runs</code>,
+<p><strong>Eight series</strong> on the API you can overlay on shared axes: <code>runs</code>,
 <code>success_rate</code>, <code>latency_p50</code>, <code>latency_p90</code>, <code>tokens</code>,
-<code>cost</code>, <code>violations</code>, <code>escalations</code>. The first six come from the
-telemetry engine; violations and escalations come from your own governance tables, and they land on
-the same bucket grid so one chart can carry both.</p>
+<code>cost</code>, <code>violations</code>, <code>escalations</code>; the screen's charts draw runs
+and cost. The first six come from the telemetry engine; the last two are read from your own
+governance tables and land on the same bucket grid so one chart can carry both.
+<code>violations</code> buckets the policy violation records defined under
+<a href="#counts">Core concepts</a>. <code>escalations</code> buckets approval requests escalated to a
+senior reviewer, by when each request was raised &mdash; the Approvals screen's Escalated status,
+not the human escalations Live Runs and the Policy Center count. Both are counted for the whole
+workspace: the agent filter below does not narrow them.</p>
 <p><strong>Breakdowns:</strong> per-model usage (runs, tokens, cost, share) and per-platform runs.
 Export the whole daily table as CSV.</p>
 <p><strong>Per-agent metrics.</strong> The agent picker beside the window control narrows every
@@ -896,6 +990,69 @@ and <code>/export</code>, so you can compare a few agents in one call. Agent Reg
   than interpolated — a neighbouring percentile is a different number and showing it under this
   name would be a lie.</p>
 </div>
+</div>
+
+<div class="screen">
+<h3 id="llm-usage">LLM Usage</h3>
+<p class="route">#/llm-usage &middot; Platform group &middot; every role can read</p>
+<p>Which models your agents use, how much, and which of them give the best results. Reached from the
+sidebar, or by clicking the LLMs Used panel on Live Runs.</p>
+<p><strong>The window.</strong> A window selector sets the period every figure on the screen
+answers: the last 24 hours, 7 days or 30 days. It is the screen's own, not Live Runs', so the LLMs
+Used panel and this screen count the same runs when both show the last 24 hours.</p>
+<p><strong>How a run is attributed.</strong> The unit is the run &mdash; one agent execution, one row
+of Live Runs &mdash; not the LLM call. Each run is counted once, under the model its Live Runs Model
+column shows: the model the run recorded or, when it recorded none, the model its agent is registered
+with. A run that called two models is counted under the one it recorded. Runs whose model is known
+neither way form a <strong>Model not recorded</strong> row rather than being left out, so the shares
+add up to all the runs read. A run attributed from the registration is the agent's configured model,
+not a record of what ran; the per-agent breakdown sets the two side by side.</p>
+<p><strong>What is used, and how much.</strong> One row per model: runs and share of the window,
+input and output tokens, cost and cost per run, the providers recorded on its runs, and the agents
+using it. Tokens and cost are a dash for a model none of whose runs recorded them. This is where an
+unexpected model &mdash; a deployment alias nobody meant to ship, an expensive model on a cheap task
+&mdash; shows up.</p>
+<p><strong>Which give the best results.</strong> Leaders are named one measure at a time, never as a
+blended score, and only among models with enough evidence: at least 20 runs on the measure, or 10
+ratings for feedback. Runs with no known model are never ranked.</p>
+<ul>
+<li><strong>Success rate</strong> &mdash; successful runs (Completed or Warned) over finished runs
+(Completed, Warned or Failed). Runs still running are left out; the sample is the finished runs.</li>
+<li><strong>Feedback rating</strong> &mdash; the mean 1&ndash;5 rating of the Feedback &amp; Quality
+Loop records that name one of the model's runs. A model nobody rated shows a dash, not a zero.</li>
+<li><strong>Cost per successful run</strong> &mdash; the cost of all the model's finished runs,
+failures included, divided by the runs that succeeded, so a cheap model that fails often is not
+flattered. A model whose recorded cost is $0 is not ranked: the store records zero when it holds no
+price for a model, and "free" would win every time.</li>
+<li><strong>Median latency</strong> &mdash; the p50 of the model's run durations, computed from the
+runs themselves, which one slow outlier cannot move.</li>
+</ul>
+<p>Each leader is shown with its sample &mdash; the finished, successful or timed runs, or the ratings,
+behind the figure &mdash; and models tied on the same value are named with it. When no model has the
+minimum sample, that measure has no leader and says so rather than naming one. Read the sample before
+acting on a ranking.</p>
+<p><strong>Per-agent breakdown.</strong> One row per agent and model: runs, the model's share of that
+agent's runs, success rate, tokens and cost, beside the model the agent is registered with. An agent
+running on something other than its registered model stands out, and you can see whether a model's
+results hold across agents or come from one of them.</p>
+<p><strong>Violations and guardrail events per model.</strong> A violation record or guardrail event
+is counted against a model only when its trace id is one of that model's runs. A record for an item
+that was blocked before it was stored, or for a run outside the rows read, names no run here, so the
+per-model counts can add up to less than the window's total for the same scope. Both are reported;
+for violations and human escalations the window's total is the figure Live Runs and the Policy
+Center count, over this screen's window.</p>
+<div class="note">
+  <p class="note-t">Nothing here is a composite</p>
+  <p>There is no single "best model" number, because success, feedback, cost and speed trade against
+  each other differently for every workload, and any weighting would be a choice the screen made for
+  you. Each measure stands on its own with the evidence behind it. The figures come from the same
+  capped scan Live Runs reads. When a window holds more runs than one scan reads, the screen says so:
+  the per-model figures then describe the newest runs of the window rather than all of them, and the
+  platform's uncapped count of runs in the window says what share of it they cover.</p>
+</div>
+<p>On the API: <code>GET /api/v1/llm-usage</code> with <code>window</code> (<code>24h</code>,
+<code>7d</code> or <code>30d</code>; <code>7d</code> when omitted), an optional repeatable
+<code>agent_id</code> and an optional <code>environment</code>.</p>
 </div>
 
 <h2 id="connections">Agent governance</h2>
@@ -939,12 +1096,16 @@ MCP Governance, which is where tools reached through them are governed. On the A
 <p>Every AI agent across your organisation, and the front door for registering new ones.</p>
 <p><strong>New Agent</strong> requires a name and takes platform, environment, agent type
 (Pro-code, Low-code, Copilot), risk level, description and an owner. Registration is what creates
-the agent telemetry namespace, so nothing can report until this exists.</p>
+the agent's telemetry namespace, so nothing can report until this exists.</p>
 <p><strong>Lifecycle:</strong> agents start <code>Pending Review</code> and move to
 <code>Active</code> or <code>Inactive</code>. Only listed transitions are allowed; anything else is
 refused with a 409. An inactive agent cannot ingest.</p>
 <p><strong>Row actions:</strong> activate, deactivate (with a reason), clone, run, export the
-configuration manifest, and delete.</p>
+configuration manifest, and delete. <strong>Edit Agent</strong> also sets the model the agent is
+registered with; a run that records no model of its own is counted under it on Live Runs and LLM
+Usage.</p>
+<p>The <strong>Policy Violations</strong> card counts the workspace's policy violations over the last
+30 days, as defined under <a href="#counts">Core concepts</a>, against the 30 days before.</p>
 </div>
 
 <div class="screen">
@@ -952,7 +1113,9 @@ configuration manifest, and delete.</p>
 <p class="route">#/agent/&lt;id&gt; &middot; click any agent</p>
 <p>Nine tabs covering everything known about one agent:</p>
 <p><strong>Overview</strong> — status, owner, risk, environment, and its run statistics for the
-window. <strong>Runs</strong> — its executions, the Live Runs table scoped to this agent.
+window; its Violations (30d) and Human Escalations (30d) are the policy violations and human
+escalations defined under <a href="#counts">Core concepts</a>, for this agent.
+<strong>Runs</strong> — its executions, the Live Runs table scoped to this agent.
 <strong>Model &amp; Prompt</strong> — the model it is configured with and its system prompt.
 <strong>Tools &amp; Connectors</strong> — what it is granted permission to call.
 <strong>Security &amp; Access</strong> — access scope and controls.
@@ -1011,6 +1174,18 @@ status. Optionally supply a <code>rules</code> JSON object; omit it and the serv
 <p><strong>Actions:</strong> activate, deactivate (with a reason), clone, import and export a policy
 bundle as JSON. A <strong>Violations</strong> view lists what each policy has actually caught, which
 is the honest test of whether a rule is doing anything.</p>
+<p><strong>KPI rows.</strong> The first row describes the policies themselves: Total Policies, Active
+Policies, Warning and Pending Review. The second counts over the last 30 days: <strong>Policy
+Violations (30d)</strong>, <strong>Human Escalations (30d)</strong>, <strong>Blocked Actions
+(30d)</strong> (violations enforced as Block) and <strong>Policies Violated (30d)</strong>. The
+violations and escalations are exactly those defined under <a href="#counts">Core concepts</a>
+&mdash; the same records Live Runs counts, including those of agents since removed from the registry
+&mdash; and the table's Violations (30d) column counts the same records per policy, so its rows add
+up to the cards.</p>
+<p><strong>Why Live Runs shows fewer.</strong> Live Runs shows at most 24 hours, so its Policy
+Violations and Human Escalations are lower whenever anything fired earlier in the month; the two
+agree when the windows do. On the API, <code>GET /api/v1/policies/summary?window_days=1</code> counts
+the last 24 hours, the window Live Runs opens on.</p>
 <p>Policies reach an agent either by explicit binding or by scope match, and per-agent or per-tag
 exceptions remove specific agents from a rule that would otherwise cover them.</p>
 </div>
@@ -1057,7 +1232,7 @@ change can be traced to the exact wording that caused it.</p>
 returning the answer, the provider's own token counts and the round-trip latency — so a wording
 change can be judged on output, cost and speed together. Optionally override the model, add a
 system message, or cap output tokens.</p>
-<p>This is the one place the control plane calls a model itself, so it is <strong>off unless
+<p>This is the one place the server calls a model itself, so it is <strong>off unless
 configured</strong>. Set <code>FULCRUM_OPS_PROMPT_STUDIO_ENDPOINT</code> and
 <code>FULCRUM_OPS_PROMPT_STUDIO_API_KEY</code> (plus optionally
 <code>_MODEL</code>, <code>_API_VERSION</code>, <code>_MAX_OUTPUT_TOKENS</code>) and restart.
@@ -1324,7 +1499,7 @@ file download. Authentication is either the session cookie or
 <code>Authorization: Bearer fo_...</code>; ingest endpoints accept only API keys and refuse a
 browser session with a 403.</p>
 
-<pre><code>curl -s https://your-control-plane/api/v1/runs?page_size=5 \
+<pre><code>curl -s https://your-server/api/v1/runs?page_size=5 \
   -H "Authorization: Bearer fo_live_..."</code></pre>
 
 <h2 id="troubleshooting">Troubleshooting</h2>
@@ -1337,6 +1512,8 @@ browser session with a 403.</p>
 <tr><td>Everything is silently not reported</td><td>No <code>FULCRUM_OPS_API_KEY</code>. The SDK disables itself by design and your functions still run. Check <code>/health</code> on your agent or print <code>client.enabled</code>.</td></tr>
 <tr><td>Cost shows <code>$0.00</code> but tokens are right</td><td>The price table is keyed on <em>model plus provider</em>. Report the real model (not a deployment alias) and the provider vocabulary the table uses — <code>azure</code> for Azure-served OpenAI models, not <code>azure-openai</code>. On a hand-written span that is yours to set; <code>track_openai</code> detects it from the client, and a Foundry agent that names no model needs <code>model=</code> on the wrapper.</td></tr>
 <tr><td>A telemetry screen shows <code>telemetry_unavailable</code></td><td>The engine is unreachable. Governance screens keep working. Check the engine container and <code>/health</code>, which reports <code>"telemetry": false</code> when the adapter cannot reach it.</td></tr>
+<tr><td>Live Runs and the Policy Center show different violation counts</td><td>Different windows over the same records. Live Runs counts its Time Range (1, 6 or 24 hours); the Policy Center counts 30 days. To compare like with like, ask the API for the Policy Center's figures over one day (<code>GET /api/v1/policies/summary?window_days=1</code>) and set Live Runs to the last 24 hours. The Tenant and Source filters do not narrow the violation cards on Live Runs. Human escalations are a subset of those violations; agent hand-offs are runs the agent itself flagged, and are counted separately. See <a href="#counts">Core concepts</a>.</td></tr>
+<tr><td>LLMs Used shows a large grey Model not recorded slice</td><td>Those runs arrived without a model, and their agents are registered without one. Report the model with <code>set_model()</code> on the <code>llm</code> span, or use a provider wrapper, which fills it in; failing that, set the agent's model with <strong>Edit Agent</strong> in the Agent Registry. Runs already stored without a model are then shown under the registered one too, because that attribution is made when a run is read, not when it is stored.</td></tr>
 <tr><td>A number is a dash</td><td>Not an error. It means nothing was measured for that window. Zero would be a claim the platform is not entitled to make.</td></tr>
 <tr><td>Guardrail event rejected as malformed</td><td><code>matched</code> must be a mapping of label to count, not a list. <code>action_taken</code> must be <code>Warn</code>, <code>Block</code>, <code>Mask</code> or <code>Log</code> (casing and variants like <code>Warned</code> are normalised; there is no <code>Passed</code>).</td></tr>
 <tr><td>Batch returned 200 but rows are missing</td><td>Ingest is partial-success. Individual items can be refused by policy, guardrail, entitlement or quota while the batch succeeds. The per-item verdicts say which.</td></tr>
@@ -1350,7 +1527,7 @@ browser session with a 403.</p>
 
 <h3>Health checks worth knowing</h3>
 
-<pre><code>curl https://your-control-plane/health
+<pre><code>curl https://your-server/health
 # {"status":"ok","telemetry":true,...}   telemetry:false means the engine is down
 
 python -c "import fulcrum_ops; print(fulcrum_ops.get_client().stats())"
@@ -1364,7 +1541,7 @@ python -c "import fulcrum_ops; print(fulcrum_ops.get_client().stats())"
 </div>
 
 <footer>
-  <p><strong>Fulcrum Ops Operator Manual.</strong> Twenty-four screens, two SDKs, one API. Written
+  <p><strong>FD AI Command Center &mdash; Operator Manual.</strong> Twenty-five screens, two SDKs, one API. Written
   against the running product — every field, action, enum and endpoint named here exists in the
   code that serves it.</p>
 </footer>

@@ -1,4 +1,4 @@
-# Wiring a console screen to the control plane
+# Wiring a console screen to the server
 
 The console was built against an in-memory dataset. Every screen is being moved
 onto the live API. This is the shared contract for doing that, so twenty-three

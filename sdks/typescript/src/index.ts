@@ -1,6 +1,6 @@
 /**
- * `@fulcrum-ops/sdk` — report agent telemetry and governance events to the
- * Fulcrum Ops control plane.
+ * `@fulcrum-ops/sdk` — report agent telemetry and governance events to
+ * FD AI Command Center.
  *
  * ```ts
  * import { FulcrumOps } from '@fulcrum-ops/sdk';

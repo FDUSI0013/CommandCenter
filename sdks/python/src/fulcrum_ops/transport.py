@@ -57,7 +57,7 @@ def backoff_delay(
     """Exponential backoff with full jitter.
 
     Full jitter rather than a fixed multiplier because the failure mode that
-    matters is a fleet of agent processes losing the control plane at the same
+    matters is a fleet of agent processes losing the server at the same
     instant and then retrying in lockstep. Spreading each attempt uniformly
     across its window is what stops the recovery from being a second outage.
 
@@ -112,7 +112,7 @@ class Transport:
                     import httpx
                 except ImportError as exc:  # pragma: no cover - declared dependency
                     raise FulcrumOpsError(
-                        "httpx is required to talk to the control plane. "
+                        "httpx is required to talk to the FD AI Command Center server. "
                         "Install it with: pip install httpx"
                     ) from exc
                 self._client = httpx.Client(
@@ -180,7 +180,9 @@ class Transport:
                     timeout=timeout if timeout is not None else self._options.timeout_seconds,
                 )
         except Exception as exc:
-            raise to_fulcrum_error(exc, "The request to the control plane failed.") from exc
+            raise to_fulcrum_error(
+                exc, "The request to the FD AI Command Center server failed."
+            ) from exc
 
         return Response(raw.status_code, _decode(raw), raw.headers)
 
@@ -206,7 +208,7 @@ class Transport:
         target = urljoin(url, str(location))
         if (urlsplit(target).hostname or "").lower() != (urlsplit(url).hostname or "").lower():
             logger.warning(
-                "fulcrum-ops: the control plane at %s redirects to another host (%s); not "
+                "fulcrum-ops: the server at %s redirects to another host (%s); not "
                 "following it with the API key. Set base_url to the address it should use.",
                 url,
                 target,

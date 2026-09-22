@@ -636,7 +636,10 @@ async def test_the_rollup_refresh_fills_the_columns_the_table_sorts_and_shows(
     await factory.agent(workspace, environment="Staging")
 
     before = await admin_client.get(f"{POLICIES}/{noisy.id}")
-    assert (before.json()["violations_30d"], before.json()["applies_agents"]) == (0, 0)
+    # The windowed violation figures are counted when the policy is read, so
+    # they are right before any sweep; the reach counters still wait for one.
+    assert (before.json()["violations_30d"], before.json()["blocked_30d"]) == (3, 2)
+    assert before.json()["applies_agents"] == 0
 
     async with db.session() as session:
         refreshed = await service.refresh_rollups(session, workspace_id=workspace.id)

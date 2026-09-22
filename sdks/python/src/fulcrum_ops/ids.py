@@ -1,6 +1,6 @@
 """Client-minted identifiers.
 
-The control plane will mint an id for any item that arrives without one, but the
+The server will mint an id for any item that arrives without one, but the
 SDK always supplies its own, for two reasons: a retry after a network timeout
 carries the same id and is therefore idempotent rather than a duplicate row, and
 a caller can hold the trace id — to attach a score to it later — before the
@@ -64,7 +64,7 @@ def adoptable_id(value: object) -> Optional[str]:
     "Is a UUID" is not the test. The store addresses a run by a *version 7*
     UUID and nothing else, and its refusal is not confined to the run that
     earned it: one ``uuid.uuid4()`` on a trace costs every trace sent in the
-    same request. The control plane's own check stops at the UUID shape, so
+    same request. The server's own check stops at the UUID shape, so
     this is the last place the difference still belongs to one run. The
     canonical spelling is returned because that is the one the run is stored
     and linked under.

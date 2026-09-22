@@ -85,7 +85,7 @@ class ConfigurationError(FulcrumOpsError):
 
 
 class ApiError(FulcrumOpsError):
-    """A non-2xx response from the control plane."""
+    """A non-2xx response from the FD AI Command Center server."""
 
     default_code = "api_error"
 
@@ -147,14 +147,14 @@ class RateLimitError(ApiError):
 
 
 class ServerError(ApiError):
-    """5xx from the control plane."""
+    """5xx from the server."""
 
     default_code = "server_error"
     default_retryable = True
 
 
 class TelemetryUnavailableError(ServerError):
-    """503 ``telemetry_unavailable`` — the control plane is up, its store is not.
+    """503 ``telemetry_unavailable`` — the server is up, its store is not.
 
     Its own class because it is the one server failure a customer will actually
     see during a staged rollout, and "your telemetry engine is not reachable"
@@ -249,7 +249,7 @@ def error_from_response(
 ) -> ApiError:
     """Build the right exception from a failed response.
 
-    The control plane returns one envelope for every deliberate failure —
+    The server returns one envelope for every deliberate failure —
     ``{"error": {"code", "message", "details", "request_id"}}`` — so the message
     a developer sees is the sentence the server wrote for a person, not a
     generic "request failed".

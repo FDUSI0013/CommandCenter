@@ -379,14 +379,26 @@ class PolicyRead(BaseModel):
     last_evaluated_at: dt.datetime | None = None
     last_triggered_at: dt.datetime | None = None
 
-    # Rollups recomputed in bulk by ``services.policies.refresh_rollups`` on the
-    # scheduler's clock. They are shown as stored and never recomputed per
-    # request, which is why the KPI endpoint queries the violation table
-    # directly instead of summing these columns. ``last_evaluated_at`` and
-    # ``applies_tools`` have no producer: render the first as "—" when null and
-    # do not present the second as a measured count.
-    violations_30d: int = 0
-    blocked_30d: int = 0
+    # The windowed violation figures are counted from ``policy_violations`` when
+    # the policy is read (``services.policies.window_counts``), with the same
+    # definition as the KPI cards, so a page's rows add up to the cards. The
+    # remaining counters are rollups recomputed in bulk by
+    # ``services.policies.refresh_rollups`` on the scheduler's clock.
+    # ``last_evaluated_at`` and ``applies_tools`` have no producer: render the
+    # first as "—" when null and do not present the second as a measured count.
+    violations_30d: int = Field(
+        0, description="Violations of this policy in the last 30 days, counted when read."
+    )
+    blocked_30d: int = Field(
+        0, description="Of those, the ones enforced as Block, counted when read."
+    )
+    escalations_30d: int = Field(
+        0,
+        description=(
+            "Of those, the human escalations (enforced as Escalate or Require Approval), "
+            "counted when read."
+        ),
+    )
     requests_30d: int = 0
     approved_pct: int = 0
     applies_agents: int = 0
@@ -575,7 +587,10 @@ class PolicySummary(BaseModel):
     """The KPI cards above the Policy Center table.
 
     Every number is a SQL aggregate: the status counts come from ``policies``,
-    the windowed numbers from ``policy_violations``.
+    the windowed numbers from ``policy_violations``. The windowed numbers count
+    every violation record of the workspace in the window -- the same records
+    the Agent Registry's card and Live Runs count, including those naming an
+    agent since deleted from the registry.
     """
 
     total: int
@@ -590,4 +605,15 @@ class PolicySummary(BaseModel):
         description="Distinct policies with at least one breach in the window."
     )
     violations_30d: int = Field(description="Violation events in the window.")
+    human_escalations_30d: int = Field(
+        0,
+        description=(
+            "Violations in the window whose enforcement put a person in the loop: "
+            "those enforced as one of ``escalating_actions``."
+        ),
+    )
+    escalating_actions: list[str] = Field(
+        default_factory=list,
+        description="The enforcement outcomes counted as human escalations.",
+    )
     window_days: int

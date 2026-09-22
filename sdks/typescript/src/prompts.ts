@@ -1,7 +1,7 @@
 /**
  * Fetching prompts from the Prompt Manager, with a cache.
  *
- * An agent that pulls its system prompt from the control plane gets versioning,
+ * An agent that pulls its system prompt from the server gets versioning,
  * review and rollback for free — but it also gets a network round trip on a
  * path that used to be a string literal. So every lookup is cached, and the
  * cache is the point rather than an optimisation.
@@ -19,7 +19,7 @@ import { NotFoundError } from './errors.js';
 import type { Transport } from './transport.js';
 import type { Page, PromptRead, PromptStatus, PromptVersionDetail } from './types.js';
 
-/** Mustache-style placeholder, which is what the control plane's templates use. */
+/** Mustache-style placeholder, which is what the server's templates use. */
 const VARIABLE_PATTERN = /\{\{\s*([A-Za-z_][A-Za-z0-9_.]*)\s*\}\}/g;
 
 /** A prompt, resolved and ready to render. */

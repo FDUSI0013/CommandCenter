@@ -2,9 +2,9 @@
 
 Everything the SDK does passes through here: tracing, feedback, prompts,
 datasets, the bootstrap configuration, and the queue that carries all of it to
-the control plane. The client is deliberately the only object with a network
-connection, so there is exactly one place where "what happens when the control
-plane is down" has to be answered.
+the server. The client is deliberately the only object with a network
+connection, so there is exactly one place where "what happens when the server
+is down" has to be answered.
 
 The answer is always the same. Reporting is best-effort and never raises into
 the caller; the calls a developer explicitly makes and waits for —
@@ -62,14 +62,14 @@ __all__ = ["FulcrumOps", "configure", "get_client", "set_default_client", "shutd
 
 logger = logging.getLogger("fulcrum_ops")
 
-#: The feedback source an agent-raised issue is filed under. The control plane
+#: The feedback source an agent-raised issue is filed under. The server
 #: reads ``source`` through a closed list and files anything else as end-user
 #: feedback, which an agent judging its own answer is not; of the sources it
 #: knows, this is the one that says the verdict is about an agent response.
 ISSUE_SOURCE = "Agent Response Rating"
 
 #: How long the configuration document is trusted when it does not say. The
-#: control plane sends ``refresh_after_seconds``; the floor keeps a document that
+#: server sends ``refresh_after_seconds``; the floor keeps a document that
 #: says ``0`` from turning every flush interval into a request.
 CONFIG_DEFAULT_REFRESH_SECONDS = 300.0
 CONFIG_MIN_REFRESH_SECONDS = 30.0
@@ -78,7 +78,7 @@ CONFIG_RETRY_DELAYS = (5.0, 30.0, 60.0, 120.0, 300.0)
 #: How long the first send waits for the start-up read, so that a run which ends
 #: in the process's first moments is not posted before the workspace's redaction
 #: rules have had a chance to arrive. Waited on the worker thread, never on the
-#: caller's, and bounded: a control plane that is down must not hold telemetry
+#: caller's, and bounded: a server that is down must not hold telemetry
 #: back for ever on the strength of rules nobody can fetch.
 BOOTSTRAP_GRACE_SECONDS = 5.0
 
@@ -93,7 +93,7 @@ _warned_no_key = False
 
 
 class FulcrumOps:
-    """Report agent telemetry and governance events to the Fulcrum Ops control plane.
+    """Report agent telemetry and governance events to FD AI Command Center.
 
     ::
 
@@ -191,16 +191,16 @@ class FulcrumOps:
             # against some other service that happens to own the port), and
             # neither outcome mentions that the address was never chosen.
             logger.warning(
-                "fulcrum-ops: an API key is set but no control plane address is. Telemetry, "
+                "fulcrum-ops: an API key is set but no server address is. Telemetry, "
                 "and the key with it, will be sent to the built-in default %s. Set "
-                "FULCRUM_OPS_BASE_URL (or pass base_url=) to your control plane, e.g. "
-                "https://controlplane.example.com.",
+                "FULCRUM_OPS_BASE_URL (or pass base_url=) to your FD AI Command Center "
+                "server, e.g. https://your-server.example.com.",
                 self._options.base_url,
             )
 
         self._flusher.start()
         if self._options.bootstrap:
-            # Fire-and-forget: start-up must not block on the control plane. A
+            # Fire-and-forget: start-up must not block on the server. A
             # document that arrives a moment late still applies — to payloads
             # not built yet, and to rows already queued, which are put through
             # the new rules before they are sent.
@@ -568,11 +568,11 @@ class FulcrumOps:
         guardrail, policy and feedback events — and refuses the whole row for
         any other kind or any field it does not know, so an ``issue.reported``
         event with a ``title`` was queued, answered ``True`` here, and then
-        thrown away by the control plane at flush. An agent complaining about
+        thrown away by the server at flush. An agent complaining about
         its own answer *is* feedback, so that is the kind it goes out as, and
         the Feedback inbox is where it lands. The title leads the body, because
         the body is what that screen lists; the structured copy rides in
-        ``detail``, which the control plane stores verbatim, so nobody has to
+        ``detail``, which the server stores verbatim, so nobody has to
         parse the severity back out of prose.
         """
         cleaned = clamp_text(title, MAX_ISSUE_TITLE_LENGTH)
@@ -792,7 +792,7 @@ class FulcrumOps:
         """Keep the configuration current. Runs on the flusher thread, each time it wakes.
 
         The document used to be read exactly once, at start-up, with no second
-        try. A process that started while the control plane was restarting ran
+        try. A process that started while the server was restarting ran
         for the rest of its life with no redaction rules at all, and a Mask
         guardrail or a lower sampling rate set in the console reached no agent
         until somebody redeployed it. The document says how long it is good for
@@ -805,7 +805,7 @@ class FulcrumOps:
         if not self._bootstrapped.is_set() and not self._grace_spent:
             # Once. The grace is for the run that ends in the process's first
             # moments; a start-up read that is still hanging after it -- a
-            # control plane that accepts the connection and then says nothing
+            # server that accepts the connection and then says nothing
             # for thirty seconds -- must not cost every flush in that window
             # another five.
             self._grace_spent = True
@@ -835,7 +835,7 @@ class FulcrumOps:
         self._config_due = time.monotonic() + delay
         if self._config_failures == 1:
             # Once per outage. The retries that follow are routine, and a
-            # warning every minute for as long as the control plane is away
+            # warning every minute for as long as the server is away
             # would teach people to filter this logger out.
             self._handle_error(
                 to_fulcrum_error(exc, "Could not read the SDK configuration."), "config"
@@ -947,7 +947,7 @@ class FulcrumOps:
 
         Payloads are built, and redacted, on the caller's thread when a run
         ends — which can be before the start-up read has answered, or while the
-        control plane was unreachable and the queue was holding rows for it.
+        server was unreachable and the queue was holding rows for it.
         Those rows went out carrying whatever the *server's* rules would have
         removed. Called by the flusher for every row just before it is sent.
         """
@@ -1031,7 +1031,7 @@ class FulcrumOps:
 
         Worth exporting to the customer's own metrics: ``dropped_overflow``
         rising means the queue ceiling is too low for the traffic, and
-        ``rejected`` rising means the control plane is refusing rows for a
+        ``rejected`` rising means the server is refusing rows for a
         reason worth reading.
         """
         snapshot = self._flusher.snapshot()
@@ -1169,6 +1169,6 @@ def _register_atexit() -> None:
         return
     _atexit_registered = True
     # Bounded on purpose. A process on its way out must not hang waiting for a
-    # control plane that is not answering; two seconds is enough to drain a
+    # server that is not answering; two seconds is enough to drain a
     # healthy queue and short enough that nobody notices when it is not.
     atexit.register(lambda: shutdown(timeout=2.0))

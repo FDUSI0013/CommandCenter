@@ -1,4 +1,4 @@
-# Fulcrum Ops control plane — pinned dependency versions for the image build.
+# FD AI Command Center server — pinned dependency versions for the image build.
 #
 # Every dependency in apps/control-plane/pyproject.toml is a lower bound
 # (fastapi>=0.115, uvicorn>=0.32, ...), so an image rebuilt next month is not the

@@ -356,7 +356,7 @@ async def list_documents(
 ) -> Page[KnowledgeDocumentRead]:
     """The documents agents actually retrieved from this source in the window.
 
-    The control plane does not index the corpus, so this lists what retrieval
+    The server does not index the corpus, so this lists what retrieval
     telemetry observed — with the chunks seen per document, the last retrieval
     time and which agents read it — rather than a directory listing. A source
     nothing has retrieved from answers with an empty page.

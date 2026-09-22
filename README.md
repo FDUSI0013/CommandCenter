@@ -1,24 +1,25 @@
-# Fulcrum Ops
+# FD AI Command Center
 
-An AI agent control plane. Teams register the agents they run, connect them with
+An AI agent governance console. Teams register the agents they run, connect them with
 an SDK or over OpenTelemetry, and then govern them: what they may call, what they
 cost, what they were asked, what they answered, and what has to be approved
 before they act.
 
-The console is twenty-three screens over one API. Nothing in it is simulated —
+The console is twenty-five screens over one API. Nothing in it is simulated —
 if a number is on screen, a service computed it, and if a service cannot answer,
 the screen says so instead of showing a zero.
 
 ## What is here
 
 ```
-apps/control-plane   FastAPI service — identity, tenancy, governance, the public API
+apps/control-plane   the server: FastAPI — identity, tenancy, governance, the public API
 apps/web             the console: vanilla JS, no build step, served from the API or the edge
-sdks/python          fulcrum-ops — decorators, provider wrappers, batching reporter
-sdks/typescript      @fulcrum-ops/sdk — the same surface for Node and the browser
+sdks/python          the Python SDK (package fulcrum-ops) — decorators, provider wrappers, batching reporter
+sdks/typescript      the TypeScript SDK (@fulcrum-ops/sdk) — the same surface for Node and the browser
 engine/              build tooling for the private telemetry engine (source is fetched, never committed)
 deploy/              compose stack, edge proxy config, image mirroring, egress verification
-docs/                the analysis this was built from, and the console wiring contract
+docs/                the operator manual (user-guide.html is the master), the analysis this was
+                     built from, and the console wiring contract
 scripts/             repository gates, including the branding check
 ```
 
@@ -26,7 +27,7 @@ scripts/             repository gates, including the branding check
 
 ```
    an agent ──SDK or OTLP──▶ ┌──────────────────┐
-                             │  control plane   │  the only public surface
+                             │    the server    │  the only public surface
    the console ─────────────▶│  (FastAPI)       │  identity · tenancy · governance
                              └────────┬─────────┘
                                       │ private network, no published port
@@ -44,7 +45,7 @@ services we own, with role checks and an append-only, hash-chained audit trail.
 **Telemetry is the engine's.** Runs, traces, spans, feedback scores, prompts,
 datasets, experiments, guardrails and costs live in a private engine reached only
 through one adapter. It runs with its own authentication disabled because it is
-not addressable from outside; the control plane in front of it is the sole
+not addressable from outside; the server in front of it is the sole
 identity authority, and one workspace maps to one project namespace inside it.
 
 When the engine is unreachable, telemetry endpoints fail closed with

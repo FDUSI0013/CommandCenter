@@ -1,7 +1,7 @@
-/* Fulcrum Ops — PLATFORM screens: Live Runs, Replay Studio, Metrics
+/* FD AI Command Center — PLATFORM screens: Live Runs, Replay Studio, Metrics
  *
- * Everything here is telemetry: it comes from the control plane's run and
- * metric endpoints, which read the engine behind them. Nothing on these screens
+ * Everything here is telemetry: it comes from the platform's run and metric
+ * endpoints, which read the engine behind them. Nothing on these screens
  * is generated in the browser. When the telemetry backend cannot answer, the
  * screen says so rather than showing a zero.
  */
@@ -87,6 +87,122 @@
     return parts.map((p, i) => label(p[0], i === 0) + p[1]).join('');
   }
 
+  /* ---------------- the LLMs Used panel ----------------
+     Sits in the KPI row beside Total Runs. The server folds `models` in the
+     same pass as total_runs, so the slices always add up to the Total Runs
+     card: the donut is that number, split by model. The five biggest named
+     models get a slice each, the rest share "Other", and runs that name no
+     model at all -- not on the run, not on the agent -- are a grey "Not
+     recorded" slice rather than being dropped or spread across the others. */
+  const MODEL_COLORS = ['purple','blue','green','amber','cyan'];
+  const MODEL_SHOWN = 5;
+  /* 672px is the narrowest the four cards stay on one row (.kpi-row's 158px
+     minimum each, three 12px gaps). With the panel's 340px that puts the panel
+     beside the cards from a 1366px-wide window up; narrower than that it takes
+     the full width below them, and its legend spreads into more columns. */
+  const KPI_BASIS = 'flex:2 1 672px;min-width:0;margin-bottom:0';
+  const LLM_PANEL_BASIS = 'flex:1 1 340px;min-width:0';
+
+  /** The four cards and the panel, side by side; they wrap on a narrow screen. */
+  function kpiArea(cardsHtml, panelHtml){
+    return `<div style="display:flex;flex-wrap:wrap;gap:12px;margin-bottom:16px">
+      <div class="kpi-row" style="${KPI_BASIS}">${cardsHtml}</div>${panelHtml}</div>`;
+  }
+
+  function kpiAreaSkeleton(labels){
+    const card = (label, style) => `<div class="kpi-card card-loading" ${style ? `style="${style}"` : ''}>
+      <div class="kpi-top"><div class="kpi-label">${esc(label)}</div></div><div class="kpi-value">&nbsp;</div></div>`;
+    return kpiArea(labels.map(l => card(l)).join(''), card('LLMs Used', LLM_PANEL_BASIS));
+  }
+
+  /** Top five named models, then Other, then Model not recorded; empty slices dropped. */
+  function modelSlices(models){
+    const named = models.filter(m => m.model != null).sort((a, b) => b.runs - a.runs);
+    const unnamed = models.filter(m => m.model == null);
+    const sum = (rows, key) => rows.reduce((total, row) => total + (row[key] || 0), 0);
+    const slices = named.slice(0, MODEL_SHOWN).map((m, i) => ({
+      label: m.model, runs: m.runs, tokens: m.tokens, cost: m.cost,
+      fromAgent: m.runs_model_from_agent || 0, color: MODEL_COLORS[i] }));
+    const rest = named.slice(MODEL_SHOWN);
+    if(rest.length) slices.push({
+      label: 'Other', runs: sum(rest, 'runs'), tokens: sum(rest, 'tokens'), cost: sum(rest, 'cost'),
+      fromAgent: sum(rest, 'runs_model_from_agent'), color: 'pink', members: rest.map(m => m.model) });
+    if(unnamed.length) slices.push({
+      label: 'Model not recorded', runs: sum(unnamed, 'runs'), tokens: sum(unnamed, 'tokens'),
+      cost: sum(unnamed, 'cost'), color: 'gray', unrecorded: true });
+    return slices.filter(s => s.runs > 0);
+  }
+
+  /** The summary's time_range, as the short suffix the governance screens put on a count. */
+  const WINDOW_SHORT = { 'Last hour':'1h', 'Last 6 hours':'6h', 'Last 24 hours':'24h' };
+
+  /* The run filters a violation record cannot answer, as the summary names
+     them in violations_scope.filters_not_applied: [filter label, what it is of a run]. */
+  const FILTER_NAMES = { tenant:['Tenant','tenant'], source:['Source','source'], status:['Status','status'],
+    risk:['Risk','risk'], policy:['Policy','policy verdict'], q:['search','text'] };
+  function listOf(items){
+    return items.length < 2 ? items.join('') : items.slice(0, -1).join(', ') + ' and ' + items[items.length - 1];
+  }
+
+  function sharePct(part, whole){
+    if(!whole) return '—';
+    const p = part / whole * 100;
+    return (p >= 10 || p === 0 ? p.toFixed(0) : p < 0.1 ? '<0.1' : p.toFixed(1)) + '%';
+  }
+
+  function llmPanel(s){
+    const slices = modelSlices(s.models || []);
+    // The slices are folded with total_runs and add up to it; summing them
+    // rather than trusting the field keeps the percentages honest either way.
+    const total = slices.reduce((t, x) => t + x.runs, 0);
+    const scan = s.scan || {};
+    const capped = scan.truncated
+      // runs_scanned is what was read, before the Tenant and Source filters:
+      // the donut can hold fewer, so this names the read, not the donut.
+      ? `Read from the most recent ${fmtFull(scan.runs_scanned)} runs — the window was capped, so these are a floor.` : null;
+    const share = (x) => `${fmtFull(x.runs)} run${x.runs === 1 ? '' : 's'} (${sharePct(x.runs, total)})`;
+    const hint = (x) => [
+      `${x.label}: ${share(x)}`,
+      `${fmtFull(x.tokens)} tokens`, fmtMoney(x.cost, 2),
+      x.members ? `models: ${x.members.join(', ')}` : null,
+      // The Model column's rule: a run that names no model is counted under the
+      // one its agent is registered with. Say how many, rather than let a
+      // registration read as something every one of these runs reported.
+      x.fromAgent ? `${fmtFull(x.fromAgent)} of these named no model and are counted under their agent's registered model` : null,
+      x.unrecorded ? 'neither the run nor its agent names a model' : null,
+    ].filter(Boolean).join(' · ');
+    /* As many 150px columns as the panel has room for: one beside the cards
+       on a laptop screen, two on a wide one, more when the panel sits on its
+       own row. Filled row by row, so the ranking reads left to right. */
+    const legend = slices.length
+      ? `<div class="legend" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:3px 14px;margin-top:8px">${
+          slices.map(x => `<div class="legend-item" style="font-size:11.5px;gap:6px;min-width:0" title="${esc(hint(x))}">
+            <span class="sw" style="background:${U.cc(x.color)}"></span>
+            <span class="lg-label" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0${x.unrecorded ? ';color:var(--text-dim)' : ''}">${esc(x.label)}</span>
+            <span class="lg-val">${esc(fmtNum(x.runs))}</span>
+            <span class="lg-pct" style="width:auto;min-width:30px">${esc(sharePct(x.runs, total))}</span></div>`).join('')}</div>`
+      : `<div class="faint small" style="margin-top:10px">No runs in this window.</div>`;
+    // The accessible name carries the figures too: a screen reader otherwise
+    // hears "link" and none of what the donut and its legend show.
+    const spoken = `LLMs used in this window: ${slices.length
+      ? slices.map(x => `${x.label}, ${share(x)}`).join('; ') : 'no runs'}.${
+      capped ? ' ' + capped : ''} Open LLM Usage.`;
+    return `<div class="kpi-card" data-nav="llm-usage" data-llm-panel role="link" tabindex="0"
+        aria-label="${esc(spoken)}" title="Open LLM Usage"
+        style="${LLM_PANEL_BASIS};display:flex;align-items:center;gap:14px;cursor:pointer">
+        ${donut({ segments: slices.map(x => ({ value: x.runs, color: x.color, label: x.label })),
+                  size: 72, thickness: 10,
+                  centerVal: `<span style="font-size:15px">${esc(fmtNum(total))}</span>`,
+                  centerLabel: total === 1 ? 'run' : 'runs' })}
+        <div style="flex:1;min-width:0">
+          <div class="kpi-top" style="align-items:center">
+            <div class="kpi-label">LLMs Used</div>
+            <span class="link" style="font-size:11px">LLM Usage ${ICONS.arrowRight}</span></div>
+          ${legend}
+          ${capped ? `<div class="kpi-sub" style="margin-top:6px">${esc(capped)}</div>` : ''}
+        </div></div>`;
+  }
+
   /* ================= LIVE RUNS ================= */
   SCREENS['live-runs'] = {
     title:'Live Runs',
@@ -96,6 +212,7 @@
       // still resolves into these closures; every path that would start new
       // work (a summary, a stream, an inspector read) checks this first.
       let disposed = false;
+      const SUMMARY_LABELS = ['Total Runs','Success Rate','Avg Latency','Policy Violations'];
 
       main.innerHTML = `
         ${pageHead({ title:'Live Runs', sub:'Real-time observability of agent executions across every connected platform.',
@@ -104,7 +221,7 @@
             <button class="btn" id="lrExport">${ICONS.download}Export</button>
             <button class="btn orange" id="btnRun">${ICONS.play}Run</button>` })}
         <div class="chip-row" id="lrChips"></div>
-        <div id="lrKpis">${kpiSkeleton(['Total Runs','Success Rate','Avg Latency','Policy Violations'])}</div>
+        <div id="lrKpis">${kpiAreaSkeleton(SUMMARY_LABELS)}</div>
         <div class="mini-kpi-row" id="lrMini"></div>
         <div id="lrScanNote"></div>
         <div class="with-inspector" id="lrLayout">
@@ -152,7 +269,6 @@
          The server memoises a summary for the same 20 s, so asking sooner
          would only be handed the same numbers. */
       const SUMMARY_REFRESH_MS = 20000;
-      const SUMMARY_LABELS = ['Total Runs','Success Rate','Avg Latency','Policy Violations'];
       let summaryKey = null;      // the filters the cards on screen (or on their way) answer
       let summaryAt = 0;          // when the last answer, good or bad, arrived
       let summarySeq = 0, summaryInflight = false, summaryDirty = false, summaryTimer = null;
@@ -174,7 +290,7 @@
         // Numbers for other filters must not sit under the new ones while the
         // request runs. A refresh of the same filters keeps its cards.
         if(key !== summaryKey){
-          host.innerHTML = kpiSkeleton(SUMMARY_LABELS);
+          host.innerHTML = kpiAreaSkeleton(SUMMARY_LABELS);
           if(mini) mini.innerHTML = '';
         }
         summaryKey = key;
@@ -221,10 +337,23 @@
         const mini = document.getElementById('lrMini');
         const note = document.getElementById('lrScanNote');
         const scan = s.scan || {};
+        const vscope = s.violations_scope || {};
         // When either window hit the scan cap the server withholds every delta
-        // (they arrive null); say why the trend line is missing.
+        // folded from the scan (they arrive null); say why the trend is missing.
         const withheld = s.comparable === false ? 'trend withheld — a window was capped' : null;
-        host.innerHTML = kpiRow([
+        /* Policy Violations is NOT folded from the scan. It counts the violation
+           records the Policy Center counts — every one in the window for the
+           agents in view — so it is complete under any cap and its trend is
+           never withheld. It used to count runs whose verdict was not Allowed,
+           which disagreed with the Policy Center; the Policy column in the
+           table still shows each run's own verdict.
+           The Policy Center counts the same records over 30 days and says so
+           in its labels ("Policy Violations (30d)"); these name their own
+           window the same way, so two different windows are never read as two
+           different answers to one question. */
+        const span = WINDOW_SHORT[s.time_range] || null;
+        const windowed = (label) => span ? `${label} (${span})` : label;
+        const cards = [
           { label:'Total Runs', value:fmtFull(s.total_runs), icon:'activity', color:'purple',
             delta: s.total_runs_delta_percent == null ? null : Math.abs(s.total_runs_delta_percent).toFixed(1)+'%',
             dir: deltaDir(s.total_runs_delta_percent), good: s.total_runs_delta_percent >= 0, vs:'vs previous period', sub: withheld },
@@ -234,30 +363,56 @@
           { label:'Avg Latency', value: secs(s.avg_latency_seconds), icon:'clock', color:'amber',
             delta: s.avg_latency_delta_seconds == null ? null : Math.abs(s.avg_latency_delta_seconds).toFixed(2)+'s',
             dir: deltaDir(s.avg_latency_delta_seconds), good: s.avg_latency_delta_seconds <= 0, vs:'vs previous period', sub: withheld },
-          { label:'Policy Violations', value:fmtFull(s.policy_violations), icon:'shield', color:'red',
+          { label:windowed('Policy Violations'), value:fmtFull(s.policy_violations), icon:'shield', color:'red',
             delta: s.policy_violations_delta_percent == null ? null : Math.abs(s.policy_violations_delta_percent).toFixed(1)+'%',
-            dir: deltaDir(s.policy_violations_delta_percent), good: s.policy_violations_delta_percent <= 0, vs:'vs previous period', sub: withheld },
-        ]);
+            dir: deltaDir(s.policy_violations_delta_percent), good: s.policy_violations_delta_percent <= 0, vs:'vs previous period',
+            sub: s.policy_violations_previous === 0 && s.policy_violations > 0
+              ? 'none in the previous period' : 'recorded violations, as in Policy Center' },
+        ];
+        host.innerHTML = kpiArea(cards.map(kpiCard).join(''), llmPanel(s));
+        const panel = host.querySelector('[data-llm-panel]');
+        // The click is the app's own [data-nav] handler; the keyboard needs this.
+        if(panel) panel.addEventListener('keydown', e => {
+          if(e.key === 'Enter' || e.key === ' '){ e.preventDefault(); APP.go('llm-usage'); }
+        });
+
         /* A capped scan holds each agent's NEWEST runs, so the window is read
            whole only from `covered_from` on. A bucket before that is not a
            measurement — drawing it made a busy morning look like a flat line
-           of zeros — so it is not drawn. sparkline() needs two points. */
+           of zeros — so it is not drawn. sparkline() needs two points.
+           Human Escalations is the exception: it is counted from the violation
+           records, not the scan, so every one of its buckets was measured.
+           Agent Hand-offs is the agent's own "I passed this to a person" flag
+           on the run, which Human Escalations used to count. */
         const from = scan.truncated && scan.covered_from ? ts(scan.covered_from) : null;
-        if(mini) mini.innerHTML = [s.tokens_used, s.estimated_cost, s.fallback_rate, s.human_escalations]
-          .filter(Boolean)
-          .map((k, i) => {
-            const points = (k.series || []).filter(p => from == null || ts(p.at) >= from).map(p => p.value);
+        const counted = s.human_escalations;
+        if(mini) mini.innerHTML = [
+          [s.tokens_used, 'green'], [s.estimated_cost, 'orange'], [s.fallback_rate, 'orange'],
+          [s.human_escalations, 'purple'], [s.agent_handoffs, 'amber'],
+        ]
+          .filter(([k]) => Boolean(k))
+          .map(([k, color]) => {
+            const points = (k.series || [])
+              .filter(p => k === counted || from == null || ts(p.at) >= from).map(p => p.value);
             return miniKpi({
-              label: k.label,
+              label: k === counted ? windowed(k.label) : k.label,
               value: formatSpark(k),
-              spark: points.length >= 2 ? points : null,
-              color: ['green','orange','orange','purple'][i],
+              // A figure that was not measured (a rate over no runs) prints a
+              // dash; a flat line under it would read as a measured zero.
+              spark: k.value != null && points.length >= 2 ? points : null,
+              color,
             });
           }).join('');
-        if(note) note.innerHTML = scan.truncated
-          ? `<div class="scan-note">${ICONS.info} Showing the most recent ${fmtFull(scan.runs_scanned)} runs across ${fmtFull(scan.agents_scanned)} of ${fmtFull(scan.agents_total)} agents — the window was capped, so totals below are a floor, not a complete count.${
-              from == null ? '' : ` The figures are complete from ${esc(U.fmtDateTime(from))} onwards; before that the window was only partly read, and the trend lines start there.`}</div>`
-          : '';
+
+        const notes = [];
+        if(scan.truncated) notes.push(`Showing the most recent ${fmtFull(scan.runs_scanned)} runs across ${fmtFull(scan.agents_scanned)} of ${fmtFull(scan.agents_total)} agents — the window was capped, so the run figures above are a floor, not a complete count.${
+          from == null ? '' : ` They are complete from ${esc(U.fmtDateTime(from))} onwards; before that the window was only partly read, and the trend lines start there.`
+        } Policy Violations and Human Escalations are counted from the violation records, not the runs read, and are complete.`);
+        const unapplied = vscope.filters_not_applied || [];
+        if(unapplied.length) notes.push(`Policy Violations and Human Escalations count every violation recorded against the agents in view. The ${
+          esc(listOf(unapplied.map(f => (FILTER_NAMES[f] || [f])[0])))} filter${unapplied.length === 1 ? ' does' : 's do'} not narrow them — a violation record names its agent, not the run’s ${
+          esc(listOf(unapplied.map(f => (FILTER_NAMES[f] || [f, f])[1])))}.`);
+        if(note) note.innerHTML = notes.map(n => `<div class="scan-note">${ICONS.info} ${n}</div>`).join('');
       }
 
       /* The Tenant filter's options are workspace-specific and ride on the
@@ -472,7 +627,9 @@
           ${inspSection('Errors & Fallbacks','alert', kv([
             ['Retry Count', String(err.retry_count == null ? 0 : err.retry_count)],
             ['Fallback Used', err.fallback_used ? 'Yes' : 'No'],
-            ['Escalated', err.escalated ? '<span class="st-amber">Yes</span>' : 'No'],
+            // The run's own flag -- what the Agent Hand-offs figure counts, not
+            // the Human Escalations one, which counts violation records.
+            ['Agent Hand-off', err.escalated ? '<span class="st-amber">Yes</span>' : 'No'],
             ...(err.message ? [['Message', esc(err.message)]] : []),
           ]))}
           ${(r.feedback_scores||[]).length ? inspSection('Feedback Scores','star',
@@ -1057,11 +1214,23 @@
 
       /** The models table over rows already in hand: sorting and paging it asks
        *  the server nothing. Rows arrive heaviest token consumer first. */
+      /* This table groups each agent's runs under the model the agent is
+         REGISTERED with -- the per-agent rollup the cards above are measured
+         from. Live Runs and LLM Usage group by the model each run RECORDED. The
+         two agree whenever agents run the model they are registered with, and
+         differ when one does not; so the column says which it is, and points to
+         the screen that answers the other question. */
       function paintModels(host, rows){
         host.innerHTML = '';
+        const note = document.createElement('div');
+        note.className = 'small muted';
+        note.style.margin = '0 0 8px';
+        note.innerHTML = 'Runs grouped by each agent\u2019s <b>registered</b> model. '
+          + 'For the model each run actually recorded, see <a href="#/llm-usage">LLM Usage</a>.';
+        host.appendChild(note);
         const table = dataTable({
           columns: [
-            { key:'model', label:'Model', render:r=>`<b>${esc(r.model)}</b>` },
+            { key:'model', label:'Registered Model', render:r=>`<b>${esc(r.model)}</b>` },
             { key:'agent_count', label:'Agents', align:'right', cls:'num', render:r=>fmtFull(r.agent_count) },
             { key:'runs', label:'Runs', align:'right', cls:'num', render:r=>fmtFull(r.runs) },
             { key:'tokens', label:'Tokens', align:'right', cls:'num', render:r=>r.tokens_display || dash },

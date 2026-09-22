@@ -1,7 +1,8 @@
-# fulcrum-ops
+# FD AI Command Center — Python SDK
 
-Report agent traces, spans, feedback scores and governance events to the
-Fulcrum Ops control plane.
+Report agent traces, spans, feedback scores and governance events to
+FD AI Command Center. The package is `fulcrum-ops`; its import name is
+`fulcrum_ops`.
 
 - **One dependency.** `httpx`, and nothing else.
 - **Never breaks your agent.** A telemetry failure is counted, logged and handed
@@ -15,15 +16,15 @@ Fulcrum Ops control plane.
 pip install --extra-index-url https://controlplane.fdprod.net/pypi/simple fulcrum-ops
 ```
 
-The package is served by the control plane it reports to, not by the public
+The package is served by the deployment it reports to, not by the public
 index: it is that deployment's client, versioned with the API it speaks to, and
 any agent that can report telemetry can already reach the host. `--extra-index-url`
 rather than `--index-url`, so the one dependency (`httpx`) still comes from
 wherever you normally get packages. To pin it for a project, put the same line in
 `requirements.txt` as `--extra-index-url https://controlplane.fdprod.net/pypi/simple`
-followed by `fulcrum-ops==1.0.1`.
+followed by `fulcrum-ops==1.0.2`.
 
-Replace the host if your control plane lives somewhere else; every deployment
+Replace the host if your server lives somewhere else; every deployment
 serves its own matching build at `/pypi/simple`.
 
 ---
@@ -32,10 +33,10 @@ serves its own matching build at `/pypi/simple`.
 
 **1. Get an API key.** In the console, open **Workspace Settings → API Keys**,
 create a key and bind it to the agent that will report with it. Keys are minted
-per workspace and shown exactly once — the control plane stores only a digest
+per workspace and shown exactly once — the server stores only a digest
 and cannot show it again, so copy it before closing the dialog.
 
-An operator with a shell on the control plane's host can mint one there instead,
+An operator with a shell on the server's host can mint one there instead,
 which is how the first key of a brand-new deployment is made:
 
 ```bash
@@ -59,7 +60,7 @@ export FULCRUM_OPS_BASE_URL=https://controlplane.fdprod.net/api/v1
 ```
 
 `FULCRUM_OPS_BASE_URL` has no useful default. Left out, the SDK falls back to
-`http://127.0.0.1:8080/api/v1` — a control plane running on your own machine —
+`http://127.0.0.1:8080/api/v1` — a server running on your own machine —
 and says so in one `WARNING` on the `fulcrum_ops` logger when the client is
 built, because a key with nowhere to go is a mistake: nothing reaches your
 console, and the key and your prompts are posted to whatever owns that port.
@@ -124,7 +125,7 @@ mistyped variable name does not pass for a quiet console; set
 purpose and silence it. `client.stats()["enabled"]` tells you which you got.
 
 `environment=` labels the runs this process reports, and it is where an agent
-the control plane has never seen is first filed. For an agent that is already
+the server has never seen is first filed. For an agent that is already
 registered, the environment set in the console is the one policies, quotas and
 guardrail scope go by.
 
@@ -478,7 +479,7 @@ experiment that stops at the first bad case tells you far less than one that
 finishes and shows you all four.
 
 `client.experiments.run(dataset, judge_model=...)` is the other half: it asks the
-control plane to evaluate the dataset server-side with a judge model, and hands
+platform to evaluate the dataset server-side with a judge model, and hands
 back an evaluation id.
 
 ---
@@ -498,15 +499,15 @@ Those in-request retries cover a blip of a few seconds. **An outage longer than
 that is waited out, not thrown away**: a batch that fails for a reason that can
 clear — no connection, a timeout, a 5xx, a 429 — goes back to the front of the
 queue, and the worker backs off (one flush interval, doubling to a minute, or
-whatever `Retry-After` said) before trying again. A deploy of the control plane
-costs you nothing. What *is* dropped: a batch the control plane refused for a
+whatever `Retry-After` said) before trying again. A deploy of the server
+costs you nothing. What *is* dropped: a batch the server refused for a
 reason retrying cannot change (a revoked key, a malformed body), a row that has
 been failing for ten minutes, whatever is still queued when the process closes
 during an outage, and anything past the queue ceiling.
 
 The queue is **bounded**. Past `max_queue_size` the *oldest* rows are dropped,
 because during an outage the freshest telemetry is the telemetry someone is
-waiting to look at, and an unbounded queue turns a control-plane outage into
+waiting to look at, and an unbounded queue turns a server outage into
 your own out-of-memory kill.
 
 ```python
@@ -522,13 +523,13 @@ client = FulcrumOps(
 ```
 
 - `client.flush(timeout=10)` — send everything queued, now. `True` means it was
-  all handed to the control plane. `False` means it was not — the wait timed
+  all handed to the server. `False` means it was not — the wait timed
   out, or a batch could not be delivered and was kept for later or dropped — and
   during an outage it comes back as soon as the attempt has failed, not after the
   whole timeout. It never raises.
 - `client.close()` — flush, stop the worker, release the pool. Idempotent.
 - An `atexit` hook flushes every live client with a two-second bound, so a
-  process on its way out never hangs on a control plane that is not answering.
+  process on its way out never hangs on a server that is not answering.
 
 Prefer an explicit `close()` in a short-lived process — a Lambda handler, a CLI,
 a test. Exit hooks are a safety net, not a guarantee: `os._exit()` and a fatal
@@ -560,7 +561,7 @@ queued. An `http_client` you injected is yours to make fork-safe.
  'retries': 1, 'errors': 0, 'pending': 0, 'last_error': None, 'enabled': True, ...}
 ```
 
-`requeued` rising with `pending` means the control plane is unreachable and rows
+`requeued` rising with `pending` means the server is unreachable and rows
 are waiting for it; `dropped_failed` and `dropped_overflow` are what was lost.
 
 A batch is answered with HTTP 200 even when individual rows are refused, so
@@ -690,7 +691,7 @@ is long gone by the time its `on_llm_end` fires.
 
 ---
 
-## Configuration from the control plane
+## Configuration from the server
 
 On start-up the SDK reads `GET /ingest/config` on a background thread and adopts
 what it says: sampling, batching, the flush interval, the queue ceiling and the
@@ -699,7 +700,7 @@ redaction rules. The fetch never blocks start-up.
 It is then **kept current**. The document says how long it is good for
 (`refresh_after_seconds`, five minutes as served) and the worker thread re-reads
 it when that is up, revalidated with an ETag so a refresh that finds nothing new
-is one `304`. A read that fails — the process started while the control plane was
+is one `304`. A read that fails — the process started while the server was
 restarting — is tried again after 5 s, 30 s, a minute and so on, and reported to
 `on_error` once per outage. So a guardrail switched to *Mask*, or a sampling rate
 lowered in the console, reaches a running agent within minutes, without a
@@ -726,7 +727,7 @@ sent, not that it is scrubbed on arrival. That holds for a run that finished
 before the rules arrived, too: a queued row remembers which rules it was built
 under and is put through the current ones just before it is sent, and the first
 send of a process waits (on the worker thread, for at most five seconds) for the
-start-up read. If the control plane cannot be reached at all there are no server
+start-up read. If the server cannot be reached at all there are no server
 rules to apply, and your own still are. Add your own on top:
 
 ```python
@@ -774,7 +775,7 @@ The calls whose whole purpose is to return a value do raise: `config()`,
 `get_prompt()` and the dataset helpers. There a failure *is* the answer, and
 swallowing it would hand a model an empty system prompt.
 
-`flush()` and `close()` never raise either, even when the control plane is
+`flush()` and `close()` never raise either, even when the server is
 unreachable. They are what ends up in a `finally` block and a shutdown hook, and
 a telemetry flush has no business turning a request that worked into a request
 that failed.
@@ -799,7 +800,7 @@ FulcrumOpsError
 
 Every error carries `code`, `status`, `request_id`, `details`, `retryable` and
 `retry_after_seconds`. `request_id` is the one to quote in a support ticket: it
-is echoed by the control plane on every deliberate failure.
+is echoed by the server on every deliberate failure.
 
 ---
 

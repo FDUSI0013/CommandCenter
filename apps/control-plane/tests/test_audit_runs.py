@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 from collections.abc import AsyncIterator
+from urllib.parse import urlsplit
 
 import httpx
 import pytest
@@ -297,11 +298,13 @@ async def test_a_capped_window_withholds_the_trend_and_says_why(
     assert body["previous_scan"]["truncated"] is True
     assert body["previous_scan"]["runs_scanned"] == 2000
     assert body["comparable"] is False
+    # Every delta folded from the scan is withheld. Policy violations are no
+    # longer among them: they are counted from the violation records, whole,
+    # and test_live_runs_governance_counts proves their delta survives a cap.
     for delta in (
         "total_runs_delta_percent",
         "success_rate_delta_points",
         "avg_latency_delta_seconds",
-        "policy_violations_delta_percent",
     ):
         assert body[delta] is None, delta
 
@@ -787,6 +790,7 @@ class _LiveStream:
 
     def __init__(self, app, token: str, query: str = "") -> None:
         self._app = app
+        host = urlsplit(APP_BASE_URL).hostname or "localhost"
         self._scope = {
             "type": "http",
             "asgi": {"version": "3.0"},
@@ -798,12 +802,12 @@ class _LiveStream:
             "query_string": query.encode(),
             "root_path": "",
             "headers": [
-                (b"host", b"control-plane.test"),
+                (b"host", host.encode()),
                 (b"accept", b"text/event-stream"),
                 (b"authorization", f"Bearer {token}".encode()),
             ],
             "client": ("127.0.0.1", 50000),
-            "server": ("control-plane.test", 80),
+            "server": (host, 80),
         }
         self.status: int | None = None
         #: Set when the response body ends -- the server closed the stream

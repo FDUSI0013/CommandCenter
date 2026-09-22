@@ -2,7 +2,7 @@
 
 The source registry is ours; the evidence about how well a source grounds is the
 telemetry engine's. A sync therefore does not crawl a corpus — this service owns
-no crawler and will not pretend to — it re-derives what the control plane can
+no crawler and will not pretend to — it re-derives what the server can
 actually know about an index from the retrieval telemetry the agents produced:
 which documents were retrieved, how many distinct chunks they came from, and
 what the feedback scores on those retrieval spans say about grounding quality.
@@ -1065,7 +1065,7 @@ async def list_documents(
 ) -> tuple[list[KnowledgeDocumentRead], int]:
     """The documents retrieval telemetry saw agents read from this source.
 
-    This is deliberately not "every document in the corpus": the control plane
+    This is deliberately not "every document in the corpus": the server
     does not index the corpus, so the only documents it can name are the ones it
     watched an agent retrieve. The modal says so, and an unretrieved corpus
     answers with an empty page rather than a fabricated file list.

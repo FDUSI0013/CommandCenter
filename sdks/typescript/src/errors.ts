@@ -83,7 +83,7 @@ export class RateLimitError extends ApiError {}
 /** 402 — the workspace has exhausted its entitlement for this resource. */
 export class QuotaExceededError extends ApiError {}
 
-/** 5xx, including the control plane's own `telemetry_unavailable`. */
+/** 5xx, including the server's own `telemetry_unavailable`. */
 export class ServerError extends ApiError {}
 
 /** The request never completed: DNS, TLS, connection reset, offline browser. */

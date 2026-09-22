@@ -1,6 +1,6 @@
 # Third-party licences
 
-Fulcrum Ops embeds a telemetry engine distributed under the **Apache License,
+FD AI Command Center embeds a telemetry engine distributed under the **Apache License,
 Version 2.0**. That licence permits commercial redistribution and rebranding; it
 grants no trademark rights, and it imposes no attribution requirement on a
 product's user interface. It does require that redistributed source or binaries
@@ -12,7 +12,7 @@ SDKs or any customer-facing artefact, and nothing in the product renders it.
 
 ## Embedded components
 
-| Component | Role in Fulcrum Ops | Licence |
+| Component | Role in FD AI Command Center | Licence |
 |---|---|---|
 | Telemetry engine (Java/Dropwizard) | Stores and queries traces, spans, threads, feedback scores, prompts, datasets, experiments, guardrail definitions and cost records. Runs on the private compose network as `telemetry-engine`; never publicly addressable. | Apache-2.0 |
 | Metric runner (Python) | Executes user-defined evaluation metrics in a sandbox. Runs as `metric-runner`. | Apache-2.0 |
@@ -32,7 +32,7 @@ service and not linked into our code), PostgreSQL (PostgreSQL Licence), Caddy
 
 ## Our own dependencies
 
-The control plane's Python dependencies and their licences are resolvable from
+The server's Python dependencies and their licences are resolvable from
 `apps/control-plane/pyproject.toml`; the SDKs declare theirs in their respective
 manifests. All are permissive (MIT, BSD, Apache-2.0, PSF).
 
@@ -40,7 +40,7 @@ manifests. All are permissive (MIT, BSD, Apache-2.0, PSF).
 
 Product surfaces — the console, the API contract, both SDKs, package names,
 environment variables, log output, container labels and image tags — carry only
-Fulcrum Ops naming. The upstream project's name appears in exactly two places,
+FD AI Command Center naming. The upstream project's name appears in exactly two places,
 both repository-only and neither shipped: this licence documentation, and the
 unmodified source under `engine/vendor/`, which is not committed and is fetched
 at build time. `scripts/check-branding.sh` enforces that boundary in CI.

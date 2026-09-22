@@ -4,7 +4,7 @@ Everything the Metrics screen shows is measured by the telemetry engine and
 reshaped here. Three rules hold throughout:
 
 * **Tenancy comes from our database, not from the engine.** The engine is a
-  single-tenant service behind this control plane, so the set of telemetry
+  single-tenant service behind this server, so the set of telemetry
   namespaces a request may read is derived from the ``agents`` rows of the
   caller's workspace. A project the workspace does not own is never asked for,
   which makes a cross-tenant read impossible rather than merely forbidden.
@@ -62,7 +62,7 @@ from ..engine import (
     get_engine_client,
 )
 from ..engine.client import deadline as engine_deadline
-from ..models.governance import ApprovalRequest, ApprovalStatus, PolicyViolation
+from ..models.governance import PolicyViolation
 from ..models.registry import Agent
 from ..schemas.metrics import (
     DEFAULT_INTERVAL,
@@ -80,6 +80,7 @@ from ..schemas.metrics import (
     SeriesMetric,
     TrendDirection,
 )
+from .agents import is_human_escalation, violations_in_window
 
 SOURCE_SCREEN: Final[str] = "Metrics"
 
@@ -1648,34 +1649,31 @@ async def _governance_points(
     metric: SeriesMetric,
     start: dt.datetime,
     end: dt.datetime,
+    agent_ids: Sequence[str] | None = None,
 ) -> list[tuple[dt.datetime, float]]:
-    """Violation and escalation timestamps out of our own governance tables.
+    """Violation and escalation timestamps, by the product-wide definitions.
 
-    Escalations are bucketed by the instant the request was raised: the row
-    records no separate escalation timestamp, and bucketing on ``updated_at``
-    would move a request every time a comment landed on it.
+    Both lines are drawn from the violation records, through the same clauses
+    the Policy Center, the registry, Agent Detail and Live Runs count with
+    (``services.agents.violations_in_window`` and ``is_human_escalation``), so
+    a point on this chart is a record those screens also count.
+
+    "Escalations" used to be approval requests in the Escalated state, bucketed
+    by when they were raised. That is the Approvals screen's own figure, and it
+    shared a name with Human Escalations everywhere else while counting
+    something different -- the chart and the cards beside it disagreed.
+
+    The agent filter narrows both lines, as it narrows every engine line on the
+    chart; so does a key bound to one agent.
     """
-    if metric is SeriesMetric.VIOLATIONS:
-        stmt = (
-            select(PolicyViolation.occurred_at)
-            .where(
-                PolicyViolation.workspace_id == principal.workspace_id,
-                PolicyViolation.occurred_at >= start,
-                PolicyViolation.occurred_at < end,
-            )
-            .limit(MAX_GOVERNANCE_ROWS)
-        )
-    else:
-        stmt = (
-            select(ApprovalRequest.requested_at)
-            .where(
-                ApprovalRequest.workspace_id == principal.workspace_id,
-                ApprovalRequest.status == ApprovalStatus.ESCALATED.value,
-                ApprovalRequest.requested_at >= start,
-                ApprovalRequest.requested_at < end,
-            )
-            .limit(MAX_GOVERNANCE_ROWS)
-        )
+    clauses = list(violations_in_window(principal.workspace_id, start, end))
+    if metric is SeriesMetric.ESCALATIONS:
+        clauses.append(is_human_escalation())
+    if agent_ids:
+        clauses.append(PolicyViolation.agent_id.in_(list(agent_ids)))
+    if principal.api_key_agent_id:
+        clauses.append(PolicyViolation.agent_id == principal.api_key_agent_id)
+    stmt = select(PolicyViolation.occurred_at).where(*clauses).limit(MAX_GOVERNANCE_ROWS)
     stamps = (await session.execute(stmt)).scalars().all()
     return [(stamp, 1.0) for stamp in stamps if stamp is not None]
 
@@ -1750,7 +1748,9 @@ async def series(
     governance: dict[SeriesMetric, list[float | None]] = {}
     for metric in metrics:
         if metric in GOVERNANCE_METRICS and metric not in governance:
-            points = await _governance_points(session, principal, metric, span.start, span.end)
+            points = await _governance_points(
+                session, principal, metric, span.start, span.end, agent_ids
+            )
             # A governance chart counts events, so an empty bucket is a
             # measured zero rather than an absent measurement.
             folded = fold_sum(points, starts, grid_interval)

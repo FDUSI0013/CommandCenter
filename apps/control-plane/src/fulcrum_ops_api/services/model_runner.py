@@ -1,4 +1,4 @@
-"""Calling a model from the control plane.
+"""Calling a model from the server.
 
 This is the one place the service talks to a model provider itself. Everywhere
 else it governs and records agents that do their own calling, so this module is
@@ -81,7 +81,7 @@ def requirement() -> str:
     return (
         "Running prompts is not configured on this deployment. Set "
         + " and ".join(missing)
-        + ", then restart the control plane."
+        + ", then restart the server."
     )
 
 

@@ -1,7 +1,8 @@
-# @fulcrum-ops/sdk
+# FD AI Command Center — TypeScript SDK
 
-Report agent traces, spans, feedback scores and governance events to the
-Fulcrum Ops control plane, from Node or the browser.
+Report agent traces, spans, feedback scores and governance events to
+FD AI Command Center, from Node or the browser. The package is
+`@fulcrum-ops/sdk`.
 
 - **Zero runtime dependencies.** Global `fetch`, nothing else.
 - **ESM and CJS**, with full type declarations.
@@ -18,7 +19,7 @@ npm install @fulcrum-ops/sdk
 ## 60-second quickstart
 
 **1. Get an API key.** Keys are minted per workspace and shown exactly once —
-the control plane stores only a SHA-256 digest and cannot show it again.
+the server stores only a SHA-256 digest and cannot show it again.
 
 ```bash
 fulcrum-ops-api issue-key \
@@ -37,7 +38,7 @@ exists or the rows come back rejected.
 
 ```bash
 export FULCRUM_OPS_API_KEY=fo_live_…
-export FULCRUM_OPS_BASE_URL=https://controlplane.example.com/api/v1
+export FULCRUM_OPS_BASE_URL=https://your-server.example.com/api/v1
 ```
 
 **3. Trace something.**
@@ -427,7 +428,7 @@ The two lookups you await for an answer — `config()` and `prompts.get()` — d
 reject, because there a failure is the answer: a prompt that cannot be fetched
 must not be silently replaced with an empty string.
 
-`flush()` and `close()` never reject, even when the control plane is
+`flush()` and `close()` never reject, even when the server is
 unreachable. They are the calls that end up in a `finally` block or a shutdown
 hook, and a telemetry flush has no business turning a request that worked into
 a request that failed. What went wrong still arrives at `onError`, and the

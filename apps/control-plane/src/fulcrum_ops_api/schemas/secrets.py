@@ -1,6 +1,6 @@
 """Wire contracts for Secrets & Credentials.
 
-One rule shapes this module: material leaves the control plane through exactly
+One rule shapes this module: material leaves the server through exactly
 one type, :class:`SecretRevealResult`, returned by exactly one endpoint, which
 is role-gated, justified, and written to two separate evidence trails. Every
 other response — list, detail, create, update, disable, enable — is a
@@ -110,7 +110,7 @@ class SecretRead(BaseModel):
     status: str
     #: Masked form only, e.g. "************a1c" — never the value itself.
     display_hint: str | None = None
-    #: True when the control plane holds encrypted material for this row; false
+    #: True when the server holds encrypted material for this row; false
     #: for entries that only point at an externally managed vault.
     has_material: bool = False
     rotation_period_days: int | None = None
@@ -403,7 +403,7 @@ class SecretRevealResult(BaseModel):
 
 
 class SecretRotateRequest(BaseModel):
-    """Rotate a credential. Omit ``value`` and the control plane mints one.
+    """Rotate a credential. Omit ``value`` and the server mints one.
 
     For a credential it only points at there is nothing to mint into: omitting
     ``value`` there records a rotation performed in the external vault.

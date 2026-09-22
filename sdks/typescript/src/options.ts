@@ -51,7 +51,7 @@ export interface RetryOptions {
 export interface FulcrumOpsOptions {
   /** API key. Falls back to `FULCRUM_OPS_API_KEY`. */
   apiKey?: string;
-  /** API root, e.g. `https://controlplane.example.com/api/v1`. Falls back to `FULCRUM_OPS_BASE_URL`. */
+  /** API root, e.g. `https://your-server.example.com/api/v1`. Falls back to `FULCRUM_OPS_BASE_URL`. */
   baseUrl?: string;
   /** Workspace slug, for keys that are not already scoped. Falls back to `FULCRUM_OPS_WORKSPACE`. */
   workspace?: string;
@@ -200,7 +200,7 @@ export function normaliseBaseUrl(raw: string): string {
     parsed = new URL(trimmed);
   } catch (cause) {
     throw new ConfigurationError(
-      `baseUrl is not a valid URL: ${raw}. Expected something like "https://controlplane.example.com/api/v1".`,
+      `baseUrl is not a valid URL: ${raw}. Expected something like "https://your-server.example.com/api/v1".`,
       { cause },
     );
   }

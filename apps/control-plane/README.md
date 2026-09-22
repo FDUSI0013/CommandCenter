@@ -1,6 +1,6 @@
-# Fulcrum Ops — control plane API
+# FD AI Command Center — server API
 
-The only publicly reachable component of Fulcrum Ops. It owns identity, tenancy,
+The only publicly reachable component of FD AI Command Center. It owns identity, tenancy,
 governance state and the public API contract. The telemetry engine it reads and
 writes sits on a private network and is never addressable from outside.
 

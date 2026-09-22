@@ -1,7 +1,7 @@
-/* Fulcrum Ops — client state.
+/* FD AI Command Center — client state.
  *
  * The console used to read a module-scope object of seeded rows. Every list now
- * comes from the control plane, and each table owns its own rows (dataTable in
+ * comes from the server, and each table owns its own rows (dataTable in
  * server mode), so the only state shared between screens is what lives here.
  * Nothing here fabricates a value.
  *

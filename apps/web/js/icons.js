@@ -1,4 +1,4 @@
-/* Fulcrum Ops — inline SVG icon set (feather-style, stroke-based) */
+/* FD AI Command Center — inline SVG icon set (feather-style, stroke-based) */
 (function(){
   const S = (paths, vb) => `<svg viewBox="${vb||'0 0 24 24'}" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${paths}</svg>`;
 

@@ -1,4 +1,4 @@
-"""Fulcrum Ops control plane — application factory.
+"""FD AI Command Center server — application factory.
 
 This service is the only publicly reachable component. It owns identity,
 tenancy, governance state and the public API contract; the telemetry engine it
@@ -14,6 +14,7 @@ import pathlib
 import re
 from collections.abc import Awaitable
 from contextlib import asynccontextmanager, suppress
+from typing import Any
 
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
@@ -49,10 +50,10 @@ log = logging.getLogger("fulcrum_ops")
 HEALTH_CHECK_SECONDS = 3.0
 
 DESCRIPTION = """
-The Fulcrum Ops control plane API.
+The FD AI Command Center API.
 
 Agents report telemetry through the ingest endpoints — directly, via the
-Fulcrum Ops SDKs, or over OpenTelemetry — and every governance surface in the
+FD AI Command Center SDKs, or over OpenTelemetry — and every governance surface in the
 console reads and writes through the same contract.
 
 Authenticate with an API key (`Authorization: Bearer fo_…`) for programmatic
@@ -91,7 +92,7 @@ async def lifespan(app: FastAPI):
     scheduler_task = scheduler.start()
 
     log.info(
-        "control plane ready (env=%s, db=%s)",
+        "server ready (env=%s, db=%s)",
         settings.environment,
         settings.database_url.split("://", 1)[0],
     )
@@ -108,7 +109,7 @@ async def lifespan(app: FastAPI):
 
 def create_app() -> FastAPI:
     app = FastAPI(
-        title="Fulcrum Ops API",
+        title="FD AI Command Center API",
         description=DESCRIPTION,
         version="1.0.0",
         docs_url="/api/docs",
@@ -179,7 +180,58 @@ def create_app() -> FastAPI:
     # behind the API and health routes rather than in front of them.
     _mount_console(app)
 
+    _use_readable_component_names(app)
     return app
+
+
+def _use_readable_component_names(app: FastAPI) -> None:
+    """Name the API document's colliding schemas after their area, not their module.
+
+    Two models with the same class name -- the governance and the registry
+    ``RiskLevel``, say -- cannot share a component name, so FastAPI qualifies
+    both with their full Python module path, and the API docs then list
+    ``<package>__models__governance__RiskLevel``. This renames each to its area
+    plus its class (``GovernanceRiskLevel``) and rewrites every reference to it,
+    once, when the document is first built. A name that would collide with an
+    existing component is left as FastAPI made it.
+    """
+    generate = app.openapi
+    prefix = f"{__package__}__"
+    ref_root = "#/components/schemas/"
+
+    def openapi() -> dict[str, Any]:
+        if app.openapi_schema is not None:
+            return app.openapi_schema
+        spec = generate()
+        schemas = spec.get("components", {}).get("schemas", {})
+        renames: dict[str, str] = {}
+        for name in [n for n in schemas if n.startswith(prefix)]:
+            parts = name[len(prefix):].split("__")
+            candidate = "".join(p.title().replace("_", "") for p in parts[-2:-1]) + parts[-1]
+            if candidate in schemas or candidate in renames.values():
+                continue
+            renames[name] = candidate
+        if not renames:
+            return spec
+        refs = {ref_root + old: ref_root + new for old, new in renames.items()}
+
+        def rewrite(node: Any) -> Any:
+            if isinstance(node, dict):
+                return {key: rewrite(value) for key, value in node.items()}
+            if isinstance(node, list):
+                return [rewrite(value) for value in node]
+            if isinstance(node, str):
+                return refs.get(node, node)
+            return node
+
+        spec = rewrite(spec)
+        spec["components"]["schemas"] = {
+            renames.get(name, name): body for name, body in spec["components"]["schemas"].items()
+        }
+        app.openapi_schema = spec
+        return spec
+
+    app.openapi = openapi  # type: ignore[method-assign]
 
 
 def _mount_console(app: FastAPI) -> None:

@@ -9,7 +9,7 @@ can see.
 
 Two ways to run one, and they are different tools:
 
-* :meth:`Experiments.run` asks the control plane to evaluate a dataset with a
+* :meth:`Experiments.run` asks the server to evaluate a dataset with a
   judge model. The work happens server-side; you get an evaluation id back.
 * :meth:`Experiments.evaluate` runs *your* function over the cases in *your*
   process, traces every case, and applies scorers you wrote in Python. Use it
@@ -223,7 +223,7 @@ class Experiments:
         name: Optional[str] = None,
         notes: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Ask the control plane to evaluate a dataset with a judge model."""
+        """Ask the server to evaluate a dataset with a judge model."""
         body: Dict[str, Any] = {"dataset": dataset, "judge_model": judge_model}
         if agent_id:
             body["agent_id"] = agent_id

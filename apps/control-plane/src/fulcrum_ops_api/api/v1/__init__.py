@@ -30,6 +30,7 @@ from . import (
     ingest,
     knowledge,
     licensing,
+    llm_usage,
     memory,
     metrics,
     policies,
@@ -50,6 +51,7 @@ router.include_router(workspaces.router)
 # -- platform ---------------------------------------------------------------
 router.include_router(runs.router)
 router.include_router(metrics.router)
+router.include_router(llm_usage.router)
 
 # -- agent governance -------------------------------------------------------
 router.include_router(connections.router)

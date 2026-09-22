@@ -1,6 +1,6 @@
 ---
 name: connect-agent
-description: Connect an existing AI agent to the Fulcrum Ops control plane using the SDK. Registers the agent, mints a bound ingest key, instruments the code with @trace and typed spans, wires the environment, and verifies a run actually lands before declaring success. Use when someone says "connect this agent", "instrument this agent", "add Fulcrum to this project", "onboard an agent", or points at an agent repo and wants it governed.
+description: Connect an existing AI agent to FD AI Command Center using its SDK. Registers the agent, mints a bound ingest key, instruments the code with @trace and typed spans, wires the environment, and verifies a run actually lands before declaring success. Use when someone says "connect this agent", "instrument this agent", "add FD AI Command Center to this project", "onboard an agent", or points at an agent repo and wants it governed.
 ---
 
 # Connect an existing agent
@@ -14,12 +14,12 @@ Establish these four facts. Ask only for what you cannot determine yourself.
 
 | Fact | How to get it |
 |---|---|
-| Control plane URL | Ask. Looks like `https://host/api/v1`. |
+| Server URL | Ask. Looks like `https://host/api/v1`. |
 | An admin session or key | Ask. Needed to register and mint. |
 | The agent's entry point | Read the code. The function that takes a request and returns an answer. |
 | Where it will run | Ask. Decides how the key is delivered. |
 
-Never invent the URL, and never proceed against a control plane you cannot
+Never invent the URL, and never proceed against a server you cannot
 reach — check `GET /health` first and stop if it does not answer.
 
 ## Step 1 — Read the agent before changing it
@@ -73,7 +73,8 @@ a secret manager, according to where the agent runs.
 
 ## Step 4 — Instrument
 
-Add the dependency (`fulcrum-ops` for Python, `@fulcrum-ops/sdk` for Node), then:
+Add the SDK dependency (package `fulcrum-ops` for Python, `@fulcrum-ops/sdk` for
+Node), then:
 
 ```python
 import fulcrum_ops

@@ -4,7 +4,7 @@ A memory store is our registry row: what kind of store it is, which environment
 it serves, who owns it, how long its contents may legally be kept. The records
 themselves are not ours — conversation and session stores are backed by the
 telemetry engine's trace threads, and every other store type is held by the
-backend named in ``backend``, which the control plane governs but does not
+backend named in ``backend``, which the server governs but does not
 address.
 
 That split is visible in this module: the *store* schemas are ordinary CRUD

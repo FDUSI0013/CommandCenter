@@ -1345,7 +1345,7 @@ async def update_retention(
 
 
 def _require_thread_backed(store: MemoryStore, action: str) -> None:
-    """Refuse operations the control plane cannot honestly perform.
+    """Refuse operations the server cannot honestly perform.
 
     Only conversation and session stores are held in the telemetry store. Every
     other type lives in the backend named on the row, which this service does
@@ -1357,7 +1357,7 @@ def _require_thread_backed(store: MemoryStore, action: str) -> None:
     backend = store.backend or "its own backend"
     raise PreconditionFailed(
         f"'{store.name}' is a {store.store_type} store; its records are held by "
-        f"{backend}, which the control plane governs but does not address. "
+        f"{backend}, which FD AI Command Center governs but does not address. "
         f"{action} it there and report the result with PATCH /memory/{store.id}.",
         details={"store_type": store.store_type, "backend": store.backend},
     )
@@ -1925,8 +1925,8 @@ async def purge_store(
     This is the real deletion, not a marker, so it is fenced on every side:
 
     * **Whose.** Only the agents bound to this store (:func:`_store_projects`)
-      are swept. A store no agent names is refused: it owns nothing the control
-      plane can identify, and "everything in the workspace" is not an answer.
+      are swept. A store no agent names is refused: it owns nothing the server
+      can identify, and "everything in the workspace" is not an answer.
     * **What.** Only conversation threads whose *last* activity is past the
       window, removed whole. Runs that belong to no thread are never touched.
     * **On whose word.** A real purge carries the store's name in ``confirm``.
@@ -1974,7 +1974,7 @@ async def purge_store(
         )
         raise PreconditionFailed(
             f"No provisioned agent names '{store.name}' as its memory policy, so the "
-            "control plane cannot tell which conversation records belong to it and "
+            "server cannot tell which conversation records belong to it and "
             "will not delete any. Set the memory policy of the agents that use this "
             f"store to its name, then run the purge again.{too_long}",
             details={"bound_agents": 0},
@@ -2189,7 +2189,7 @@ async def backup_store(
 
     What is recorded is the manifest: the retention policy and status a restore
     can put back, and how many conversation threads the store's agents held at
-    that moment. The threads are counted, not copied — the control plane has
+    that moment. The threads are counted, not copied — the server has
     nowhere to keep a second copy of them — and the response, the ledger row and
     the audit detail all say so, because the one thing a backup must never do is
     let someone purge on the strength of it.

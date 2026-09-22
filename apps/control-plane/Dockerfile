@@ -1,4 +1,4 @@
-# Fulcrum Ops control plane
+# FD AI Command Center server
 #
 # Build context is the REPOSITORY ROOT, not this directory: the image carries
 # both the API and the console's static files, and those live in sibling

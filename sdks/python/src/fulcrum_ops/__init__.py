@@ -1,5 +1,4 @@
-"""``fulcrum_ops`` — report agent telemetry and governance events to the Fulcrum
-Ops control plane.
+"""``fulcrum_ops`` — report agent telemetry and governance events to FD AI Command Center.
 
 ::
 
@@ -17,7 +16,7 @@ Ops control plane.
 
 The one promise this package makes, which every module in it is written to
 keep: **losing telemetry never breaks the caller's agent.** A missing API key,
-an unreachable control plane, a full queue, a value that will not serialise —
+an unreachable server, a full queue, a value that will not serialise —
 none of them reach the calling code. They are counted, logged, and handed to the
 ``on_error`` hook.
 

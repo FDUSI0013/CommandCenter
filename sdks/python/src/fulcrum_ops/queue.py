@@ -7,7 +7,7 @@ never break the customer's agent.** Everything else follows from it.
   deque and returns; the network happens on a worker thread.
 * The queue is bounded. Past ``max_queue_size`` the *oldest* items are dropped,
   because during an outage the newest telemetry is the telemetry someone is
-  waiting to look at, and an unbounded queue turns a control-plane outage into
+  waiting to look at, and an unbounded queue turns a server outage into
   the customer's own out-of-memory kill.
 * No failure escapes. Every send path funnels through :meth:`_send`, which
   converts anything raised into a counted, logged outcome.
@@ -18,7 +18,7 @@ never break the customer's agent.** Everything else follows from it.
   minutes, or the queue ceiling drops anything. The in-request retries cover a
   blip of a few seconds. A deploy takes longer than that.
 * Shutdown is best-effort but bounded. An ``atexit`` hook flushes, with a
-  timeout, so a process that is exiting does not hang on a control plane that is
+  timeout, so a process that is exiting does not hang on a server that is
   not answering.
 
 Batches are cut on three triggers — item count, byte budget, and the flush
@@ -55,12 +55,12 @@ __all__ = ["Flusher", "QueueItem", "KIND_ENDPOINTS"]
 logger = logging.getLogger("fulcrum_ops")
 
 #: How long a row may keep failing before it is given up on. Long enough to ride
-#: out a deploy or a proxy restart; short enough that a control plane which is
+#: out a deploy or a proxy restart; short enough that a server which is
 #: never coming back does not pin ten thousand rows in memory for the life of
 #: the process.
 REQUEUE_MAX_AGE_SECONDS = 600.0
 
-#: The longest the worker waits between attempts while the control plane is down.
+#: The longest the worker waits between attempts while the server is down.
 OUTAGE_MAX_BACKOFF_SECONDS = 60.0
 
 #: kind -> (path, envelope key, hard per-batch ceiling from the contract)
@@ -228,7 +228,7 @@ class Flusher:
             total = sum(len(q) for q in self._queues.values())
             if total >= self._options.max_queue_size:
                 # Shed from the front: the oldest row is the least useful one to
-                # keep when the control plane is unreachable.
+                # keep when the server is unreachable.
                 shed_from = max(self._queues.values(), key=len)
                 if shed_from:
                     dropped = shed_from.popleft()
@@ -257,16 +257,16 @@ class Flusher:
     def flush(self, timeout: Optional[float] = 10.0) -> bool:
         """Send everything queued and wait for it.
 
-        ``True`` means every row that was queued has been handed to the control
-        plane. ``False`` means it has not: the wait timed out, or a batch could
+        ``True`` means every row that was queued has been handed to the server.
+        ``False`` means it has not: the wait timed out, or a batch could
         not be delivered — it was put back for a later attempt, or dropped — so
         a caller that flushes before exiting can tell a clean hand-off from a
-        control plane that was not there. It used to answer ``True`` the moment
+        server that was not there. It used to answer ``True`` the moment
         the queue was empty, which a dropped batch also leaves it.
 
         During an outage it returns as soon as the attempt it asked for has
         failed, not after the full timeout: a handler that flushes per request
-        must not turn a control-plane restart into ten seconds on every call.
+        must not turn a server restart into ten seconds on every call.
 
         Callable from any thread, including from inside a traced function. When
         the worker was never started — a client that has only just been
@@ -332,7 +332,7 @@ class Flusher:
                     if held > 0:
                         # Backing off after a failed drain. A full queue does
                         # not shorten it: "ready" is a reason to send promptly,
-                        # not a reason to hammer a control plane that is down.
+                        # not a reason to hammer a server that is down.
                         self._cond.wait(timeout=held)
                     elif not self._ready_locked():
                         self._cond.wait(timeout=self._options.flush_interval_seconds)
@@ -409,7 +409,7 @@ class Flusher:
         continuously cannot keep this call from ever returning — the next cycle
         picks up whatever arrived meanwhile.
 
-        Stops at the first batch the control plane could not be reached for, and
+        Stops at the first batch the server could not be reached for, and
         answers ``False``. The other kinds go to the same host, so trying them
         would only spend another full retry cycle each to learn the same thing.
         """
@@ -478,7 +478,7 @@ class Flusher:
     def _send(self, kind: str, batch: List[QueueItem]) -> bool:
         """Post one batch. Never raises; failures are counted and logged.
 
-        ``False`` means the control plane could not be reached and the caller
+        ``False`` means the server could not be reached and the caller
         should stop sending for now; a batch that was *refused* is a delivered
         answer, and the next one may well be accepted.
         """
@@ -516,7 +516,7 @@ class Flusher:
         if response is None or error is not None:
             self._record_error(error, "ingest.{0}".format(kind))
             if error is None or error.retryable:
-                # Nothing was refused: the control plane was not there, or said
+                # Nothing was refused: the server was not there, or said
                 # to come back later. That clears on its own, and these rows
                 # are the ones somebody will be looking for when it does.
                 self._requeue(kind, batch, error)
@@ -655,7 +655,7 @@ class Flusher:
         for registered in body.get("auto_registered") or []:
             if isinstance(registered, dict):
                 logger.info(
-                    "fulcrum-ops: registered agent %r in the control plane",
+                    "fulcrum-ops: registered agent %r in FD AI Command Center",
                     registered.get("name") or registered.get("slug"),
                 )
 

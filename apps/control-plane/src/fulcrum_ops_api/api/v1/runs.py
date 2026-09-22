@@ -1,7 +1,7 @@
 """Live Runs and Replay Studio routes.
 
 Nine endpoints back two screens: the run table with its six filters and CSV
-export, the KPI row and its four sparklines, the row inspector, the Full
+export, the KPI row with its LLMs Used panel and sparklines, the row inspector, the Full
 Response and Execution Trace modals, the flag-for-review action, the live
 server-sent-events stream behind the LIVE pill, and the ordered step list the
 replay player scrubs through.
@@ -156,16 +156,28 @@ async def get_summary(
     filters: RunFiltersQuery,
     time_range: TimeRangeQuery = TimeRange.LAST_24_HOURS,
 ) -> RunsSummary:
-    """The four KPI cards and the four sparkline mini-KPIs.
+    """The KPI cards, the LLMs Used panel and the sparkline mini-KPIs.
 
-    The selected window and the window immediately before it are read
-    concurrently, so every "vs last 24h" delta is measured rather than modelled.
-    The response carries a `scan` block saying how much telemetry the numbers
-    were computed from, and a `previous_scan` block saying the same of the
-    earlier window. When either was capped, `comparable` is false and every
-    `*_delta_*` field is null: there is a figure for each window and no trend.
-    A capped `scan` also carries `covered_from`: the figures, and the sparkline
-    buckets, are measurements from that instant on and a floor before it.
+    **Run figures.** Total runs, success rate, latency, tokens, cost, fallback
+    rate, Agent Hand-offs (runs the agent itself escalated) and `models` (the
+    window's runs by model, which always add up to `total_runs`) are folded
+    from the telemetry. The selected window and the window immediately before
+    it are read concurrently, so every "vs previous period" delta is measured
+    rather than modelled. The response carries a `scan` block saying how much
+    telemetry the numbers were computed from, and a `previous_scan` block
+    saying the same of the earlier window. When either was capped, `comparable`
+    is false and every run-based `*_delta_*` field is null: there is a figure
+    for each window and no trend. A capped `scan` also carries `covered_from`:
+    the figures, and the sparkline buckets, are measurements from that instant
+    on and a floor before it.
+
+    **Policy Violations and Human Escalations** count the violation records
+    the Policy Center counts -- for these two windows, and every agent unless
+    the request is narrowed to one -- and Human Escalations is those whose
+    action was Escalate or Require Approval. They are counted rather than
+    scanned, so they are exact under any cap and their deltas always
+    measured. `violations_scope` states the windows, the agent and which of the
+    request's filters do not narrow them.
     """
     return await service.summarise(
         session, principal, filters=filters, time_range=time_range

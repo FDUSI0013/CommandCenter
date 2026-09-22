@@ -11,8 +11,8 @@ with a ``workspace_id`` filter. A trace whose project belongs to no agent in the
 caller's workspace answers 404, exactly as if it did not exist. There is no code
 path here that queries the engine without a project id from that set.
 
-**Why the filtered set is assembled here.** Tenant, risk and policy are control
-plane concepts carried on trace metadata by the ingest contract; the engine
+**Why the filtered set is assembled here.** Tenant, risk and policy are the
+platform's concepts, carried on trace metadata by the ingest contract; the engine
 indexes traces, not our vocabulary. So a request scans a bounded window of the
 workspace's projects through the engine's cursor search, maps the rows, and then
 filters, sorts and paginates in process. The scan is capped
@@ -40,7 +40,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Sequen
 from typing import Any, Final, TypeVar
 
 from fastapi import Request
-from sqlalchemy import Select, case, func, select
+from sqlalchemy import Select, and_, case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..api.common import ListParams
@@ -64,6 +64,7 @@ from ..engine import (
     get_engine_client,
 )
 from ..engine import deadline as engine_deadline
+from ..models.governance import PolicyViolation
 from ..models.identity import Role
 from ..models.registry import Agent, Platform, RiskLevel
 from ..schemas.runs import (
@@ -71,6 +72,7 @@ from ..schemas.runs import (
     PREVIEW_CHARS,
     SPAN_PREVIEW_CHARS,
     GuardrailVerdict,
+    ModelSlice,
     ReplaySession,
     ReplayStep,
     ReplayStepKind,
@@ -96,9 +98,15 @@ from ..schemas.runs import (
     TimeRange,
     ToolCall,
     TranscriptMessage,
+    ViolationCountScope,
     as_metadata,
 )
 from . import audit, telemetry_cache
+
+# What a policy violation and a human escalation are. The Policy Center, the
+# registry and Agent Detail select with these same predicates; Live Runs reads
+# them from there so no two screens can disagree about the same window.
+from .agents import ESCALATING_ACTIONS, is_human_escalation, violations_in_window
 
 # What Run Agent writes to ``metadata.source``. Read from where it is written, so
 # the writer and this reader cannot drift apart.
@@ -1001,8 +1009,10 @@ def _map_run(trace: dict[str, Any], agent: Agent, principal: Principal) -> RunRe
         agent=agent.name,
         agent_id=agent.id,
         status=_status_of(trace, meta, policy),
+        # The model the run recorded, else the one its agent is registered with.
+        # A blank name is no name: it falls through rather than being shown.
         model=(
-            str(meta.get("model")) if meta.get("model") else (agent.model or None)
+            str(meta.get("model") or "").strip() or (agent.model or "").strip() or None
         ),
         input_preview=_preview(_payload_text(trace.get("input")), PREVIEW_CHARS),
         tools=_tools_of(trace, meta),
@@ -1031,22 +1041,28 @@ class _Scanned:
 
     The flags are not table columns, so they do not belong on
     :class:`RunRead`; carrying them alongside means the summary counts real
-    fallbacks and real escalations without a second read per run.
+    fallbacks and real agent hand-offs without a second read per run.
     """
 
     run: RunRead
     retry_count: int
     fallback_used: bool
     escalated: bool
+    #: The run named its model itself. False when ``run.model`` came from the
+    #: agent's registration -- or when neither named one.
+    model_recorded: bool = False
 
 
 def _scan_run(trace: dict[str, Any], agent: Agent, principal: Principal) -> _Scanned:
-    retries, fallback, escalated = _error_flags(as_metadata(trace.get("metadata")))
+    meta = as_metadata(trace.get("metadata"))
+    retries, fallback, escalated = _error_flags(meta)
     return _Scanned(
         run=_map_run(trace, agent, principal),
         retry_count=retries,
         fallback_used=fallback,
         escalated=escalated,
+        # Read as _map_run reads it: a blank name is no name.
+        model_recorded=bool(str(meta.get("model") or "").strip()),
     )
 
 
@@ -1926,30 +1942,83 @@ async def get_replay(
 
 
 @dataclasses.dataclass
+class _ModelTally:
+    """One model's runs, tokens and cost within a window."""
+
+    runs: int = 0
+    tokens: int = 0
+    cost: float = 0.0
+    #: Of ``runs``, those that named no model and are counted under the model
+    #: their agent is registered with.
+    from_agent: int = 0
+
+
+@dataclasses.dataclass
 class _Aggregate:
-    """Counters folded over one window of runs."""
+    """Counters folded over one window of runs.
+
+    Policy violations are not among them. A run's verdict says how the run was
+    treated; the Policy Violations card counts the violation records the Policy
+    Center counts, which this fold cannot see (:func:`_violation_counts`).
+    """
 
     runs: int = 0
     failed: int = 0
+    #: Runs still in flight: counted in Total Runs, but neither a success nor a
+    #: failure yet, so they stay out of the success rate's denominator.
+    running: int = 0
     duration_total: float = 0.0
     duration_count: int = 0
     tokens: int = 0
     cost: float = 0.0
-    violations: int = 0
     fallbacks: int = 0
-    escalations: int = 0
+    #: Runs the agent itself reported as escalated to a person.
+    handoffs: int = 0
+    models: dict[str | None, _ModelTally] = dataclasses.field(default_factory=dict)
 
     @property
     def success_rate(self) -> float | None:
-        if not self.runs:
+        """Successful runs over FINISHED runs.
+
+        A run still in flight has not succeeded. It used to be counted as a
+        success -- (runs - failed) / runs -- so a busy window read higher than it
+        was, and LLM Usage, which divides by finished runs, disagreed with this
+        card over the very same runs. Both now use one definition: Completed
+        and Warned over Completed, Warned and Failed. A window whose runs are
+        all still running has no rate yet, and shows a dash.
+        """
+        finished = self.runs - self.running
+        if not finished:
             return None
-        return round((self.runs - self.failed) / self.runs * 100, 1)
+        return round((finished - self.failed) / finished * 100, 1)
 
     @property
     def avg_latency(self) -> float | None:
         if not self.duration_count:
             return None
         return round(self.duration_total / self.duration_count, 3)
+
+    def model_slices(self) -> list[ModelSlice]:
+        """The window's runs by model: most runs first, the unrecorded last.
+
+        Every run is tallied under exactly one model in :func:`_fold`, in the
+        same step that counts it into ``runs``, so the slices add up to the
+        total by construction -- never "most of it".
+        """
+        ordered = sorted(
+            self.models.items(),
+            key=lambda item: (item[0] is None, -item[1].runs, (item[0] or "").lower()),
+        )
+        return [
+            ModelSlice(
+                model=model,
+                runs=tally.runs,
+                tokens=tally.tokens,
+                cost=round(tally.cost, 6),
+                runs_model_from_agent=tally.from_agent,
+            )
+            for model, tally in ordered
+        ]
 
 
 def _fold(scanned: Iterable[_Scanned]) -> _Aggregate:
@@ -1960,16 +2029,40 @@ def _fold(scanned: Iterable[_Scanned]) -> _Aggregate:
         aggregate.runs += 1
         if run.status is RunStatus.FAILED:
             aggregate.failed += 1
+        elif run.status is RunStatus.RUNNING:
+            aggregate.running += 1
         if run.duration_seconds is not None:
             aggregate.duration_total += run.duration_seconds
             aggregate.duration_count += 1
         aggregate.tokens += run.tokens
         aggregate.cost += run.cost
-        if run.policy is not RunPolicy.ALLOWED:
-            aggregate.violations += 1
         aggregate.fallbacks += int(item.fallback_used)
-        aggregate.escalations += int(item.escalated)
+        aggregate.handoffs += int(item.escalated)
+        # The model the table's Model column shows for this run. A blank name
+        # is no name: it joins the runs that recorded none.
+        model = (run.model or "").strip() or None
+        tally = aggregate.models.get(model)
+        if tally is None:
+            tally = aggregate.models[model] = _ModelTally()
+        tally.runs += 1
+        tally.tokens += run.tokens
+        tally.cost += run.cost
+        if model is not None and not item.model_recorded:
+            tally.from_agent += 1
     return aggregate
+
+
+def _bucket_edges(since: dt.datetime, until: dt.datetime) -> list[dt.datetime]:
+    """The sparkline grid: :data:`SERIES_BUCKETS` equal buckets, ``until`` last.
+
+    Shared by the scan-based series and the counted ones, so a bucket means the
+    same stretch of time on every sparkline under the KPI row.
+    """
+    span = max((until - since).total_seconds(), 1.0)
+    width = span / SERIES_BUCKETS
+    return [
+        since + dt.timedelta(seconds=width * index) for index in range(SERIES_BUCKETS)
+    ] + [until]
 
 
 def _buckets(
@@ -1979,7 +2072,7 @@ def _buckets(
     span = max((until - since).total_seconds(), 1.0)
     width = span / SERIES_BUCKETS
     buckets: list[tuple[dt.datetime, list[_Scanned]]] = [
-        (since + dt.timedelta(seconds=width * index), []) for index in range(SERIES_BUCKETS)
+        (start, []) for start in _bucket_edges(since, until)[:SERIES_BUCKETS]
     ]
     for item in scanned:
         offset = (_as_utc(item.run.occurred_at) - since).total_seconds()
@@ -1994,6 +2087,144 @@ def _percent_delta(current: float, previous: float) -> float | None:
     return round((current - previous) / previous * 100, 1)
 
 
+# --------------------------------------------------------------------------- #
+# Policy Violations and Human Escalations
+# --------------------------------------------------------------------------- #
+
+
+def _filters_not_applied(filters: RunFilters) -> list[str]:
+    """The request's filters that a violation record cannot answer.
+
+    A record names the agent it was recorded against -- which the agent filter
+    narrows -- and nothing about the run's tenant, source, status, risk,
+    verdict or text. Those filters narrow the run figures and not these, and
+    the response says which ones were set rather than letting the two sit
+    under one set of dropdowns as though they answered the same question.
+    """
+    return [
+        name
+        for name, value in (
+            ("tenant", filters.tenant),
+            ("source", filters.source),
+            ("status", filters.status),
+            ("risk", filters.risk),
+            ("policy", filters.policy),
+            ("q", filters.q.strip() if filters.q else None),
+        )
+        if value
+    ]
+
+
+@dataclasses.dataclass(frozen=True)
+class _ViolationCounts:
+    """Policy Violations and Human Escalations for two windows."""
+
+    violations: int
+    violations_previous: int
+    escalations: int
+    escalations_previous: int
+    escalation_series: list[SparkPoint]
+
+
+async def _violation_counts(
+    session: AsyncSession,
+    principal: Principal,
+    filters: RunFilters,
+    *,
+    since: dt.datetime,
+    until: dt.datetime,
+    previous_since: dt.datetime,
+) -> _ViolationCounts:
+    """Policy Violations and Human Escalations, counted as the Policy Center counts.
+
+    The card used to count *runs* whose verdict was not Allowed, reading the
+    verdict off the run's metadata or its guardrail results. That mixed failed
+    guardrail checks in with enforcement decisions, could never see a run the
+    enforcement path stopped before it reported, and disagreed with the Policy
+    Center, which counts the violation records themselves. This counts those
+    records: the workspace's own, in the window, for the agents in view --
+    every agent unless the request is narrowed to one, by the agent filter or
+    by a key bound to one.
+
+    A human escalation is one of those records whose action put a person in
+    the loop (:data:`ESCALATING_ACTIONS`), the definition Agent Detail and the
+    registry count with.
+
+    Both come from the shared predicates in ``services.agents``, so "a
+    violation in the window" means here exactly what it means there: windows
+    are half-open, and the previous one ends where the current one starts, so
+    no record is counted in both. One statement answers both windows and the
+    sparkline's buckets, from ``ix_policy_violations_workspace_occurred``.
+    """
+    edges = _bucket_edges(since, until)
+    if not may_read_agent(principal, filters.agent_id):
+        # A key bound to one agent, asking about another: nothing is in view,
+        # exactly as the run figures beside these have nothing in them.
+        return _ViolationCounts(
+            violations=0,
+            violations_previous=0,
+            escalations=0,
+            escalations_previous=0,
+            escalation_series=[SparkPoint(at=edge, value=0.0) for edge in edges[:-1]],
+        )
+
+    workspace_id = principal.workspace_id
+    escalating = is_human_escalation()
+    current = and_(*violations_in_window(workspace_id, since, until))
+    previous = and_(*violations_in_window(workspace_id, previous_since, since))
+
+    def tally(condition: Any) -> Any:
+        return func.coalesce(func.sum(case((condition, 1), else_=0)), 0)
+
+    buckets = [
+        tally(and_(escalating, *violations_in_window(workspace_id, start, end)))
+        for start, end in zip(edges, edges[1:], strict=False)
+    ]
+    stmt = select(
+        tally(current),
+        tally(previous),
+        tally(and_(current, escalating)),
+        tally(and_(previous, escalating)),
+        *buckets,
+    ).where(*violations_in_window(workspace_id, previous_since, until))
+    scoped = filters.agent_id or principal.api_key_agent_id
+    if scoped:
+        # The narrower question adds its own clause beside the definition.
+        stmt = stmt.where(PolicyViolation.agent_id == scoped)
+
+    values = [int(value or 0) for value in (await session.execute(stmt)).one()]
+    return _ViolationCounts(
+        violations=values[0],
+        violations_previous=values[1],
+        escalations=values[2],
+        escalations_previous=values[3],
+        escalation_series=[
+            SparkPoint(at=edge, value=float(count))
+            for edge, count in zip(edges, values[4:], strict=False)
+        ],
+    )
+
+
+# --------------------------------------------------------------------------- #
+# The summary
+# --------------------------------------------------------------------------- #
+
+
+@dataclasses.dataclass(frozen=True)
+class _RunFigures:
+    """Everything the KPI row folds from the telemetry scan, and over which windows.
+
+    This, not the finished :class:`RunsSummary`, is what requests share: the
+    violation counts are added per request on the caller's own session.
+    ``fields`` is never mutated once built.
+    """
+
+    fields: dict[str, Any]
+    since: dt.datetime
+    until: dt.datetime
+    previous_since: dt.datetime
+
+
 async def summarise(
     session: AsyncSession,
     principal: Principal,
@@ -2001,14 +2232,19 @@ async def summarise(
     filters: RunFilters,
     time_range: TimeRange = TimeRange.LAST_24_HOURS,
 ) -> RunsSummary:
-    """The four KPI cards and the four sparkline mini-KPIs.
+    """The KPI cards, the LLMs Used panel and the sparkline mini-KPIs.
 
-    The selected window and the window immediately before it are scanned
-    concurrently, so every "vs last 24h" delta on the screen is a measured
-    change rather than a guess -- and when either scan hit its cap there is no
-    delta at all, because there is then nothing measured to subtract. Fallback
-    and escalation counts come from the same scan: they are recorded on the
-    run's metadata by the ingest contract.
+    Two sources, each read once:
+
+    * the run figures -- total runs, success rate, latency, tokens, cost,
+      fallbacks, agent hand-offs and the runs-by-model breakdown -- are folded
+      from scans of the selected window and the window immediately before it,
+      read concurrently. Every "vs previous period" delta is a measured change,
+      and when either scan hit its cap there is no delta at all, because there
+      is then nothing measured to subtract;
+    * Policy Violations and Human Escalations are the violation records the
+      Policy Center counts, for the same two windows (:func:`_violation_counts`).
+      They are counted, not scanned, so they are exact whatever the cap.
     """
     # The scope is resolved once, before the concurrency starts: the two scans
     # below share this request's session and it serves one operation at a time.
@@ -2025,8 +2261,47 @@ async def summarise(
         tuple(sorted(str(agent.id) for agent in scope.agents)),
         repr(filters),
     )
-    return await telemetry_cache.summaries.get(
+    figures: _RunFigures = await telemetry_cache.summaries.get(
         key, lambda: _summarise(scope, principal, filters=filters, time_range=time_range)
+    )
+
+    # Per request and after the scans: one indexed read on this request's own
+    # session, which the scans never touch. It is asked about the windows the
+    # run figures were folded over, so the whole row describes one window even
+    # when the run figures are a shared answer a few seconds old.
+    counts = await _violation_counts(
+        session,
+        principal,
+        filters,
+        since=figures.since,
+        until=figures.until,
+        previous_since=figures.previous_since,
+    )
+    return RunsSummary(
+        **figures.fields,
+        policy_violations=counts.violations,
+        policy_violations_previous=counts.violations_previous,
+        policy_violations_delta_percent=_percent_delta(
+            counts.violations, counts.violations_previous
+        ),
+        human_escalations=SparkKpi(
+            label="Human Escalations",
+            value=float(counts.escalations),
+            unit="violations",
+            series=counts.escalation_series,
+        ),
+        human_escalations_previous=counts.escalations_previous,
+        human_escalations_delta_percent=_percent_delta(
+            counts.escalations, counts.escalations_previous
+        ),
+        violations_scope=ViolationCountScope(
+            window_start=figures.since,
+            window_end=figures.until,
+            previous_window_start=figures.previous_since,
+            agent_id=filters.agent_id or principal.api_key_agent_id,
+            escalating_actions=list(ESCALATING_ACTIONS),
+            filters_not_applied=_filters_not_applied(filters),
+        ),
     )
 
 
@@ -2036,7 +2311,7 @@ async def _summarise(
     *,
     filters: RunFilters,
     time_range: TimeRange,
-) -> RunsSummary:
+) -> _RunFigures:
     since, until = window_for(time_range)
     previous_since, previous_until = window_for(time_range, end=since)
 
@@ -2087,14 +2362,16 @@ async def _summarise(
         )
         for at, rows in buckets
     ]
-    escalation_series = [
+    handoff_series = [
         SparkPoint(at=at, value=float(sum(1 for item in rows if item.escalated)))
         for at, rows in buckets
     ]
 
     tenants = sorted({item.run.tenant for item in current if item.run.tenant})
 
-    return RunsSummary(
+    # Every field the scan answers. Policy Violations and Human Escalations are
+    # not among them: they are counted per request by summarise().
+    fields: dict[str, Any] = dict(
         time_range=time_range,
         total_runs=now_agg.runs,
         total_runs_previous=was_agg.runs,
@@ -2119,11 +2396,7 @@ async def _summarise(
             and was_agg.avg_latency is not None
             else None
         ),
-        policy_violations=now_agg.violations,
-        policy_violations_previous=was_agg.violations,
-        policy_violations_delta_percent=(
-            _percent_delta(now_agg.violations, was_agg.violations) if comparable else None
-        ),
+        models=now_agg.model_slices(),
         tokens_used=SparkKpi(
             label="Tokens Used",
             value=float(now_agg.tokens),
@@ -2138,22 +2411,29 @@ async def _summarise(
         ),
         fallback_rate=SparkKpi(
             label="Fallback Rate",
+            # A rate over no runs was not measured; it is not 0%.
             value=(
-                round(now_agg.fallbacks / now_agg.runs * 100, 2) if now_agg.runs else 0.0
+                round(now_agg.fallbacks / now_agg.runs * 100, 2) if now_agg.runs else None
             ),
             unit="percent",
             series=fallback_series,
         ),
-        human_escalations=SparkKpi(
-            label="Human Escalations",
-            value=float(now_agg.escalations),
+        # What the card called Human Escalations until it was made to agree
+        # with the Policy Center: the runs the agent itself handed to a person,
+        # as its own metadata records. Still measured, under its own name.
+        agent_handoffs=SparkKpi(
+            label="Agent Hand-offs",
+            value=float(now_agg.handoffs),
             unit="runs",
-            series=escalation_series,
+            series=handoff_series,
         ),
         tenants=tenants,
         scan=info,
         previous_scan=previous_info,
         comparable=comparable,
+    )
+    return _RunFigures(
+        fields=fields, since=since, until=until, previous_since=previous_since
     )
 
 

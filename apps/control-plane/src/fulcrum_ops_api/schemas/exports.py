@@ -140,7 +140,7 @@ class ExportJobRead(BaseModel):
 class ExportJobCreate(BaseModel):
     """Request a new extract.
 
-    ``source_screen`` must name a dataset the control plane can actually read;
+    ``source_screen`` must name a dataset the server can actually read;
     the service rejects anything else and lists what is available, so the
     console never queues a job that cannot produce a file.
     """

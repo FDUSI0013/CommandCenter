@@ -1,7 +1,7 @@
 /**
  * Identifier minting.
  *
- * The control plane addresses traces and spans by UUID and refuses anything
+ * The server addresses traces and spans by UUID and refuses anything
  * else on its own result row, so ids are minted here rather than left to the
  * server. Two things follow from doing it client-side:
  *
@@ -58,7 +58,7 @@ const UUID_V7_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}
  * version 7 only, and its refusal is not confined to the item that earned it:
  * one `crypto.randomUUID()` (version 4) on a trace costs every trace sent in
  * the same request, and on a span it costs that request's spans while the
- * traces are still reported as accepted. The control plane's own check stops at
+ * traces are still reported as accepted. The server's own check stops at
  * the UUID shape, so this is the last place the difference can be caught while
  * it still belongs to one item. An id that fails is replaced by `newId()`.
  */

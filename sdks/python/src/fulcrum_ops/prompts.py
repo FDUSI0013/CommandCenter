@@ -1,6 +1,6 @@
 """Fetching prompts from the Prompt Manager, with a cache.
 
-An agent that pulls its system prompt from the control plane gets versioning,
+An agent that pulls its system prompt from the server gets versioning,
 review and rollback for free — but it also gets a network round trip on a path
 that used to be a string literal. So every lookup is cached, and the cache is
 the point rather than an optimisation.
@@ -30,7 +30,7 @@ from .transport import Transport
 
 __all__ = ["Prompt", "PromptCache", "render_template", "template_variables"]
 
-#: Mustache-style placeholder, which is what the control plane's templates use.
+#: Mustache-style placeholder, which is what the server's templates use.
 _VARIABLE_PATTERN = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_.]*)\s*\}\}")
 
 DEFAULT_TTL_SECONDS = 300.0

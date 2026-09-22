@@ -1,6 +1,6 @@
 """Wire contracts for the Agent Registry and the nine-tab Agent Detail screen.
 
-An agent is the control-plane half of a 1:1 pairing with a telemetry project:
+An agent is the governance half of a 1:1 pairing with a telemetry project:
 identity, ownership, risk and configuration live in our ``agents`` table, while
 every run counter and prompt version is read back from the telemetry engine at
 request time. That split is visible in the schemas below —

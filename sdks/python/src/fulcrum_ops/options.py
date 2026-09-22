@@ -128,12 +128,12 @@ def normalise_base_url(raw: str) -> str:
     if parts.scheme not in ("http", "https"):
         raise ConfigurationError(
             "base_url must be http or https; received {0!r}. Expected something like "
-            '"https://controlplane.example.com/api/v1".'.format(raw)
+            '"https://your-server.example.com/api/v1".'.format(raw)
         )
     if not parts.netloc:
         raise ConfigurationError(
             "base_url is missing a host: {0!r}. Expected something like "
-            '"https://controlplane.example.com/api/v1".'.format(raw)
+            '"https://your-server.example.com/api/v1".'.format(raw)
         )
 
     # Point a bare host at the versioned API root rather than at the web app.
@@ -149,7 +149,7 @@ class Options:
 
     api_key: Optional[str] = None
     base_url: str = DEFAULT_BASE_URL
-    #: True when nobody named a control plane and ``base_url`` is the fallback.
+    #: True when nobody named a server and ``base_url`` is the fallback.
     #: The client says so out loud: a key with nowhere to go is a mistake, and
     #: the fallback sends that key to whatever is listening on this machine.
     base_url_defaulted: bool = False

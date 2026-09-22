@@ -2558,7 +2558,7 @@ async def ingest_events(
     """Record governance events the SDK observed inside the customer's process.
 
     These do not belong in the telemetry store: a guardrail that fired, a policy
-    the SDK enforced locally and end-user feedback are all control-plane state,
+    the SDK enforced locally and end-user feedback are all governance state,
     and they land in the same tables the Guardrails, Policy Center and Feedback
     screens read. Every reference is resolved with one batched lookup, and an
     event naming a guardrail or policy this workspace does not have is rejected

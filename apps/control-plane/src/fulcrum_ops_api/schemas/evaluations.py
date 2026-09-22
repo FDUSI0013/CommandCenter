@@ -1,6 +1,6 @@
 """Wire contracts for the Evaluations screen.
 
-An evaluation is one judged scoring pass over a dataset: the control plane
+An evaluation is one judged scoring pass over a dataset: the server
 creates an experiment in the telemetry engine, links the cases an SDK experiment
 already ran to it, and reads the judged scores back. Four metrics have columns
 of their own — correctness, grounding, faithfulness and safety — because those
@@ -324,7 +324,7 @@ class EvaluationDetail(EvaluationRead):
         description=(
             "True when the telemetry store could not be read for the case breakdown. "
             "items is then empty because it is unknown, not because there are no cases; "
-            "every other field comes from the control plane's own database"
+            "every other field comes from the server's own database"
         ),
     )
     scored_items: int = Field(0, description="Cases that carry at least one judged score")

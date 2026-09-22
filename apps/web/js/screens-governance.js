@@ -1,11 +1,11 @@
-/* Fulcrum Ops — AGENT GOVERNANCE screens.
+/* FD AI Command Center — AGENT GOVERNANCE screens.
  *
  *   Connection Center · Agent Registry · Agent Detail ·
  *   Connector & MCP Governance · Policy Center · Approvals & Audit
  *
  * These are the screens that decide what an agent is allowed to do, so nothing
- * here may be approximated: every count, badge and row is what the control
- * plane returned for this workspace. A field the server did not send renders as
+ * here may be approximated: every count, badge and row is what the server
+ * returned for this workspace. A field the server did not send renders as
  * a dash, a call that failed says so and offers itself again, and an empty
  * table says the workspace is empty rather than filling itself in.
  */
@@ -187,7 +187,7 @@
       requireRole(document.getElementById('qaSync'), 'operator', 'Syncing connections');
       const hooks = document.getElementById('qaHooks');
       hooks.disabled = true;
-      hooks.title = 'The control plane does not expose a webhook registry yet, so there is nothing to manage here.';
+      hooks.title = 'The platform does not expose a webhook registry yet, so there is nothing to manage here.';
 
       /* ---- KPI cards + the health donut, both off /connections/summary ---- */
       function loadSummary(){
@@ -589,7 +589,7 @@
         searchTimer = setTimeout(loadGrid, 250);
       });
       document.getElementById('ccDonutMode').addEventListener('change', e=>{ donutMode = e.target.value; paintDonut(); });
-      document.getElementById('ccRefresh').addEventListener('click', ()=>{ reloadAll(); toast('info','Refreshing','Re-reading every connection from the control plane.'); });
+      document.getElementById('ccRefresh').addEventListener('click', ()=>{ reloadAll(); toast('info','Refreshing','Re-reading every connection from the server.'); });
 
       document.getElementById('qaHealth').addEventListener('click', ()=>APP.go('metrics'));
 
@@ -627,7 +627,7 @@
           title:'Add Connection', icon:'plus',
           body:`<div class="form-row"><label>CONNECTION TYPE</label><select class="filter-select w-100" id="ncType" style="height:34px">
               ${optionList(['Azure AI Foundry','Copilot Studio','M365 Copilot','Power Platform','Custom Agent','MCP Server','Vector Database','Microsoft Purview','Custom REST API'])}</select></div>
-            <div class="form-row"><label>DISPLAY NAME</label><input class="input" id="ncName" placeholder="e.g. Fulcrum-Foundry-EU"></div>
+            <div class="form-row"><label>DISPLAY NAME</label><input class="input" id="ncName" placeholder="e.g. FD-Foundry-EU"></div>
             <div class="form-row"><label>ENDPOINT / RESOURCE URI</label><input class="input" id="ncUri" placeholder="https://…"></div>
             <div class="form-row"><label>AUTHENTICATION</label><select class="filter-select w-100" id="ncAuth" style="height:34px">${optionList(AUTH_MODES)}</select></div>
             <div class="form-row"><label>ENVIRONMENT</label><select class="filter-select w-100" id="ncEnv" style="height:34px">${optionList(ENVIRONMENTS, 'Production')}</select></div>`,
@@ -723,7 +723,7 @@
           <button class="btn" id="agCols">${ICONS.columns}Columns</button>
           <button class="btn" id="agExport">${ICONS.download}Export</button>
           <button class="btn primary" id="agNew">${ICONS.plus}New Agent</button>`})}
-        <div id="agKpis">${kpiSkeleton(['Total Agents','Active Agents','High Risk Agents','Policy Violations','Pending Approval','Inactive Agents'])}</div>
+        <div id="agKpis">${kpiSkeleton(['Total Agents','Active Agents','High Risk Agents','Policy Violations (30d)','Pending Approval','Inactive Agents'])}</div>
         <div class="with-inspector" id="agLayout">
           <div id="agTableWrap"></div>
           <div class="inspector" id="agInspector"></div>
@@ -747,13 +747,18 @@
               {label:'High Risk Agents', value:num(s.high_risk), icon:'shield', color:'orange',
                 delta: s.high_risk_added_30d ? s.high_risk_added_30d + ' vs last 30 days' : null,
                 dir: deltaDir(s.high_risk_added_30d), good:false, sub: s.high_risk_added_30d ? null : 'No change in 30 days'},
-              {label:'Policy Violations', value:num(s.policy_violations_30d), icon:'alert', color:'red',
+              {label:'Policy Violations (30d)', value:num(s.policy_violations_30d), icon:'alert', color:'red',
                 delta: violationDelta ? Math.abs(violationDelta) + ' vs previous 30 days' : null,
                 dir: deltaDir(violationDelta), good: violationDelta <= 0,
                 sub: violationDelta ? null : 'Unchanged vs previous 30 days'},
               {label:'Pending Approval', value:num(s.pending_approval), sub:'Awaiting governance review', icon:'clock', color:'amber'},
               {label:'Inactive Agents', value:num(s.inactive), sub: pct(s.inactive_percent) + ' of total', icon:'xCircle', color:'gray'},
             ], 190);
+            // Which records the violation card counts, for whoever sets it beside another screen's.
+            const violationCard = host.querySelectorAll('.kpi-card')[3];
+            if(violationCard) violationCard.title = 'Every policy violation recorded in this workspace in the last 30 days, '
+              + 'including those of agents since removed from the registry: the same records the Policy Center\'s '
+              + 'Policy Violations (30d) card counts, and Live Runs counts for its selected window.';
             fillFilter(table, 5, (s.owners||[]).map(o=>o.name));
           })
           .catch(err => { host.innerHTML = ''; host.appendChild(screenError(err, loadSummary, 'the agent summary')); });
@@ -1123,7 +1128,7 @@
         const m = a.metrics || {};
         const crumb = main.querySelector('.crumbs .cur');
         if(crumb) crumb.textContent = a.name || agentId;
-        document.title = (a.name || 'Agent Detail') + ' — AI Command Center';
+        document.title = (a.name || 'Agent Detail') + ' — FD AI Command Center';
 
         document.getElementById('adHead').innerHTML = `
           <div class="page-head">
@@ -1199,7 +1204,7 @@
         openModal({
           title:'Run '+detail.agent.name, icon:'play',
           body:`<div class="form-row"><label>INPUT</label><input class="input" id="adRunInput" placeholder="What should the agent be asked?"></div>
-            <p class="small muted" style="margin:0">This records a run request and returns its run ID. The control plane does not call the agent: hand the run ID to the agent's runtime, which reports the run under it. Until it does, the request shows on Live Runs as Running.</p>`,
+            <p class="small muted" style="margin:0">This records a run request and returns its run ID. The platform does not call the agent: hand the run ID to the agent's runtime, which reports the run under it. Until it does, the request shows on Live Runs as Running.</p>`,
           footer:[{label:'Cancel'},{label:'Request Run', cls:'orange', onClick: async (close, modal)=>{
             const input = modal.querySelector('#adRunInput').value.trim();
             try {
@@ -1447,8 +1452,8 @@
                         <div class="small muted">${x[0]}</div><div style="font-size:17px;font-weight:700;margin-top:2px">${x[1]}</div></div>`).join('')}
                   </div>
                   <div class="faint small" style="margin-top:8px">${m.computed_at
-                    ? 'Computed ' + esc(rel(m.computed_at)) + ' from the telemetry engine.'
-                    : 'These counters have not been computed yet.'}</div></div>
+                    ? 'Run figures computed ' + esc(rel(m.computed_at)) + ' from the telemetry engine.'
+                    : 'The run figures have not been computed yet.'} Policy Violations are counted from this agent's violation records when the page opens.</div></div>
               </div>
               <div class="grid g2">
                 <div class="card">${inspSection('Agent Information','info', kv([
@@ -1470,8 +1475,8 @@
                   ['Policies Bound', `${activePolicies.length} active${detail.policies.length > activePolicies.length
                     ? ` <span class="faint">· ${detail.policies.length - activePolicies.length} not active</span>` : ''}`],
                   ['Policies Applied', num(a.policies_applied)],
-                  ['Violations (30d)', num(m.violations_30d)],
-                  ['Escalations (30d)', num(m.escalations_30d)],
+                  ['Violations (30d)', `<span title="This agent's policy violation records in the last 30 days: the records the Policy Center and Live Runs count, narrowed to this agent.">${num(m.violations_30d)}</span>`],
+                  ['Human Escalations (30d)', `<span title="Of those, the ones enforced as Escalate or Require Approval: the Policy Center's and Live Runs' definition.">${num(m.escalations_30d)}</span>`],
                   ['Human Review', a.policy_status === 'Approval Required' ? '<span class="st-amber">Required</span>' : 'Not required'],
                 ]))}
                 ${detail.policies.length ? `<div style="margin-top:6px">${detail.policies.slice(0,4).map(p=>
@@ -1787,7 +1792,7 @@
         if(!v) return '';
         if(typeof v.template === 'string') return v.template;
         if(!previewIsPartial(v)) return v.template_preview || '';
-        // Read-one-version is not served by every control plane build; without
+        // Read-one-version is not served by every server build; without
         // it the honest answer is "unknown", not the preview.
         if(typeof API.agents.version === 'function' && (v.commit || v.version)){
           const full = await API.agents.version(detail.agent.id, v.commit || v.version);
@@ -2787,7 +2792,8 @@
           <button class="btn" id="plExport">${ICONS.download}Export</button>
           <button class="btn primary" id="plNew">${ICONS.plus}Create Policy</button>`})}
         <div id="plTabs"></div>
-        <div id="plKpis">${kpiSkeleton(['Total Policies','Active Policies','Warning','Blocked Actions (30d)','Policies Violated (30d)','Pending Review'])}</div>
+        <div id="plKpis">${kpiSkeleton(['Total Policies','Active Policies','Warning','Pending Review'], 220)}
+          ${kpiSkeleton(['Policy Violations (30d)','Human Escalations (30d)','Blocked Actions (30d)','Policies Violated (30d)'], 220)}</div>
         <div class="with-inspector" id="plLayout">
           <div id="plTableWrap"></div>
           <div class="inspector" id="plInspector"></div>
@@ -2802,14 +2808,34 @@
         API.policies.summary()
           .then(s => {
             if(!document.getElementById('plKpis')) return;
+            const d = s.window_days;
+            // The server names what it counts as an escalation; say exactly that.
+            const escalating = (s.escalating_actions && s.escalating_actions.length)
+              ? s.escalating_actions.join(' or ') : 'Escalate or Require Approval';
+            const sameRecords = `Counted from this workspace's policy violation records, including those of agents `
+              + `since removed from the registry: the same records Live Runs counts for its selected window.`;
             host.innerHTML = kpiRow([
               {label:'Total Policies', value:num(s.total), sub:`${num(s.inactive)} inactive`, icon:'shield', color:'purple'},
               {label:'Active Policies', value:`<span class="st-green">${num(s.active)}</span>`, sub:s.active_pct + '% of total', icon:'checkCircle', color:'green'},
               {label:'Warning', value:`<span class="st-amber">${num(s.warning)}</span>`, sub:s.warning?'Enforcing with warnings':'None', icon:'alert', color:'amber'},
-              {label:`Blocked Actions (${s.window_days}d)`, value:num(s.blocked_actions_30d), sub:'Enforced as Block', icon:'xCircle', color:'red'},
-              {label:`Policies Violated (${s.window_days}d)`, value:num(s.policies_violated_30d), sub:`${num(s.violations_30d)} violation events`, icon:'flag', color:'orange'},
               {label:'Pending Review', value:num(s.pending_review), sub:s.pending_review?'Awaiting governance sign-off':'None', icon:'clock', color:'blue'},
-            ], 190);
+            ], 220) + kpiRow([
+              {label:`Policy Violations (${d}d)`, value:num(s.violations_30d), sub:'Violation events, every enforcement', icon:'alert', color:'red'},
+              {label:`Human Escalations (${d}d)`, value:num(s.human_escalations_30d), sub:`Enforced as ${escalating}`, icon:'users', color:'pink'},
+              {label:`Blocked Actions (${d}d)`, value:num(s.blocked_actions_30d), sub:'Enforced as Block', icon:'xCircle', color:'red'},
+              {label:`Policies Violated (${d}d)`, value:num(s.policies_violated_30d), sub:`of ${num(s.total)} policies`, icon:'flag', color:'orange'},
+            ], 220)
+            + `<div class="small faint" id="plKpiNote" style="margin:-8px 0 14px">Last ${d} days. ${esc(sameRecords)} `
+            + `Human Escalations are the violations enforced as ${esc(escalating)}. The table's Violations (${d}d) column counts the same records per policy, so its rows add up to these cards.</div>`;
+            /* The same sentence on the cards themselves, for whoever hovers rather than reads. */
+            const windowed = host.querySelectorAll('.kpi-row')[1];
+            const tips = [
+              `Every policy violation recorded in the last ${d} days. ${sameRecords}`,
+              `Violations in the last ${d} days enforced as ${escalating}. ${sameRecords}`,
+              `Violations in the last ${d} days enforced as Block. ${sameRecords}`,
+              `Distinct policies with at least one violation in the last ${d} days. ${sameRecords}`,
+            ];
+            if(windowed) windowed.querySelectorAll('.kpi-card').forEach((card, i)=>{ if(tips[i]) card.title = tips[i]; });
           })
           .catch(err => { host.innerHTML = ''; host.appendChild(screenError(err, loadSummary, 'the policy summary')); });
       }
@@ -2847,7 +2873,9 @@
           {key:'status', label:'Status', render:r=>statusText(r.status, r.status==='Active'?'green':r.status==='Warning'?'amber':r.status==='Inactive'?'gray':'purple')},
           {key:'enforcement', label:'Enforcement', render:r=>badge(r.enforcement, ENF_COLORS[r.enforcement]||'gray')},
           {key:'version', label:'Version', render:r=>`<span class="mono small">${esc(r.version)}</span>`},
-          {key:'violations_30d', label:'Violations (30d)', align:'right', cls:'num', render:r=>num(r.violations_30d)},
+          {key:'violations_30d', label:'Violations (30d)', align:'right', cls:'num', render:r=> r.violations_30d == null ? dash
+            : `<span title="${esc(`${fmtFull(r.violations_30d)} violation records in the last 30 days, counted when this page loaded${
+              r.escalations_30d ? `, ${fmtFull(r.escalations_30d)} of them human escalations` : ''}`)}">${num(r.violations_30d)}</span>`},
           {key:'updated_at', label:'Last Modified', render:r=>`<div class="dim nowrap">${rel(r.updated_at)}</div>
             <div class="cell-sub">${esc(r.updated_by || '—')}</div>`},
         ],
@@ -3238,9 +3266,10 @@
                 ['Requests Triggered', num(p.requests_30d)],
                 ['Approved', p.approved_pct == null ? dash : `<span class="st-green">${p.approved_pct}%</span>`],
                 ['Violations', `<span class="st-amber">${num(p.violations_30d)}</span>`],
+                ['Human Escalations', `<span title="Violations enforced as Escalate or Require Approval">${num(p.escalations_30d)}</span>`],
                 ['Blocked', `<span class="st-red">${num(p.blocked_30d)}</span>`],
                 ['Last Triggered', rel(p.last_triggered_at)],
-              ]))}
+              ]) + `<div class="small faint" style="margin-top:6px">Violations, escalations and blocks are counted from this policy's violation records when it is opened: the same records the cards above and Live Runs count.</div>`)}
               <div class="insp-section"><div class="insp-section-title">Quick Actions</div>
                 <div style="display:flex;flex-direction:column;gap:8px">
                   <button class="btn sm block" id="plEditBtn">${ICONS.edit}Edit Policy</button>
@@ -3292,18 +3321,29 @@
           else if(i === 3){
             bodyEl.innerHTML = inspSection('Violations','flag','<div class="card-loading" style="height:120px"></div>');
             const host = bodyEl.querySelector('.insp-section');
-            API.policies.violations({ policy_id: p.id, page_size: 6, sort:'-occurred_at' })
+            // The window the table's Violations (30d) column and the cards count,
+            // so the total here is that column's figure for this policy.
+            const VIOLATION_WINDOW_DAYS = 30;
+            API.policies.violations({ policy_id: p.id, page_size: 6, sort:'-occurred_at', window_days: VIOLATION_WINDOW_DAYS })
               .then(page => {
                 if(tab !== 3) return;
                 const rows = page.items || [];
-                host.innerHTML = `<div class="insp-section-title">${ICONS.flag}Violations (${page.total})</div>` + (rows.length
+                /* A row naming an agent deleted from the registry is still a
+                   violation and is counted like every other; it is labelled for
+                   what it is, and offers no link to a page that no longer exists. */
+                const who = v => v.agent_name ? esc(v.agent_name)
+                  : v.agent_id ? `Agent no longer registered <span class="mono faint" style="font-weight:400">${esc(v.agent_id.slice(0, 8))}</span>`
+                  : 'No agent recorded';
+                host.innerHTML = `<div class="insp-section-title">${ICONS.flag}Violations, last ${VIOLATION_WINDOW_DAYS} days (${num(page.total)})</div>`
+                  + `<div class="small faint" style="margin:-2px 0 8px">The same records the Violations (${VIOLATION_WINDOW_DAYS}d) column and the cards above count${
+                      page.total > rows.length ? `; the ${rows.length} most recent are shown` : ''}.</div>` + (rows.length
                   ? rows.map(v=>`<div style="border:1px solid var(--border-soft);border-radius:9px;padding:9px 11px;margin-bottom:8px;background:var(--panel-2)">
-                      <div class="flex between"><b style="font-size:12px">${esc(v.agent_name || 'Unattributed')}</b>${badge(v.severity)}</div>
-                      <div class="small dim" style="margin-top:3px">${esc(v.action_taken)} · ${esc(rel(v.occurred_at))}${
+                      <div class="flex between"><b style="font-size:12px">${who(v)}</b>${badge(v.severity)}</div>
+                      <div class="small dim" style="margin-top:3px">${esc(v.action_taken)} · ${rel(v.occurred_at)}${
                         v.resolved ? ' · <span class="st-green">resolved</span>' : ''}</div>
-                      ${v.agent_id?`<button class="link small" data-nav="agent/${esc(v.agent_id)}">View agent ${ICONS.arrowRight}</button>`:''}
+                      ${v.agent_id && v.agent_name ?`<button class="link small" data-nav="agent/${esc(v.agent_id)}">View agent ${ICONS.arrowRight}</button>`:''}
                     </div>`).join('')
-                  : '<div class="empty-state" style="padding:20px">'+ICONS.checkCircle+'<div class="es-title">No violations</div><div>This policy has not been breached.</div></div>');
+                  : `<div class="empty-state" style="padding:20px">${ICONS.checkCircle}<div class="es-title">No violations</div><div>This policy has not been breached in the last ${VIOLATION_WINDOW_DAYS} days.</div></div>`);
               })
               .catch(err => {
                 if(tab !== 3) return;
@@ -3364,7 +3404,7 @@
           actions:`${searchBox('apSearch','Search requests, agents, users, actions…')}
           <button class="btn" id="apExport">${ICONS.download}Export</button>
           <button class="btn primary" id="apNewRule">${ICONS.plus}New Approval Rule</button>`})}
-        <div id="apKpis">${kpiSkeleton(['Pending Approvals','Approved (30d)','Rejected (30d)','Escalated (30d)','Avg. Time to Approve','Approval SLA Met'])}</div>
+        <div id="apKpis">${kpiSkeleton(['Pending Approvals','Approved (30d)','Rejected (30d)','Escalated Requests (30d)','Avg. Time to Approve','Approval SLA Met'])}</div>
         <div id="apTabs"></div>
         <div class="with-inspector" id="apLayout">
           <div id="apTableWrap"></div>
@@ -3384,7 +3424,7 @@
               {label:'Pending Approvals', value:`<span class="st-amber">${num(s.pending)}</span>`, sub:s.pending?'Awaiting a decision':'Queue is clear', icon:'clock', color:'amber'},
               {label:'Approved (30d)', value:num(s.approved_30d), sub:'Decided in the last 30 days', icon:'checkCircle', color:'green'},
               {label:'Rejected (30d)', value:num(s.rejected_30d), sub:'Decided in the last 30 days', icon:'xCircle', color:'red'},
-              {label:'Escalated (30d)', value:num(s.escalated_30d), sub:'Currently with a senior reviewer', icon:'users', color:'orange'},
+              {label:'Escalated Requests (30d)', value:num(s.escalated_30d), sub:'Currently with a senior reviewer', icon:'users', color:'orange'},
               {label:'Avg. Time to Approve', value:`<span style="font-size:20px">${s.avg_time_to_approve_seconds == null ? '—' : esc(duration(s.avg_time_to_approve_seconds))}</span>`,
                 sub:s.avg_time_to_approve_seconds == null ? 'No approvals in the window' : 'Requested to approved', icon:'clock', color:'blue'},
               {label:'Approval SLA Met', value:s.sla_met_percent == null ? dash : pct(s.sla_met_percent, 0),
@@ -3783,7 +3823,7 @@
               toast(verb === 'approve' ? 'success' : verb === 'reject' ? 'error' : 'warn',
                 `Request ${res.request.status.toLowerCase()}`, res.message);
               if(res.follow_on) openModal({ title:'Follow-on Action', icon:'zap',
-                body:`<p style="margin-top:0">The approved payload names an action for the caller to carry out. The control plane does not execute it.</p>`
+                body:`<p style="margin-top:0">The approved payload names an action for the caller to carry out. The platform does not execute it.</p>`
                   + kv([['Action', esc(res.follow_on.action)], ['Target', esc(res.follow_on.target || '—')]])
                   + `<div class="quote" style="font-family:Consolas,monospace;font-size:11px;white-space:pre-wrap">${esc(JSON.stringify(res.follow_on.parameters, null, 2))}</div>`,
                 footer:[{label:'Close'}] });

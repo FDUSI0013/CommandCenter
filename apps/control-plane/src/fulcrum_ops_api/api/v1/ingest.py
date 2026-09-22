@@ -228,7 +228,7 @@ async def ingest_events(
 ) -> IngestBatchResult:
     """Record guardrail triggers, policy violations and end-user feedback.
 
-    These are control-plane state rather than telemetry: they land in the same
+    These are governance state rather than telemetry: they land in the same
     tables the Guardrails, Policy Center and Feedback & Quality Loop screens
     read. Send `ref` to make a retry idempotent — a repeat comes back as a
     duplicate instead of a second row.

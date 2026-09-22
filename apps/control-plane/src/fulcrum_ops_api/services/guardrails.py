@@ -1253,7 +1253,7 @@ PATTERNS = {patterns!r}
 
 
 class GuardrailScan(base_metric.BaseMetric):
-    """Pattern scan mirrored from the control plane guardrail {guardrail_name!r}."""
+    """Pattern scan mirrored from the FD AI Command Center guardrail {guardrail_name!r}."""
 
     def __init__(self, name: str = {metric_name!r}):
         self.name = name

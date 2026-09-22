@@ -39,6 +39,7 @@ from pydantic import (
 )
 
 from ..core.errors import ValidationFailed
+from ..models.governance import PolicyEnforcement
 
 # ---------------------------------------------------------------------------
 # Caps
@@ -62,7 +63,7 @@ MAX_SCORES_PER_ITEM: Final[int] = 25
 MAX_NAME_LENGTH: Final[int] = 200
 
 #: Longest excerpt kept on a guardrail event row. The full payload stays in the
-#: telemetry engine; the control plane keeps only enough to recognise the hit.
+#: telemetry engine; the server keeps only enough to recognise the hit.
 MAX_SAMPLE_LENGTH: Final[int] = 500
 
 #: Marker written in place of content a policy or guardrail ordered masked.
@@ -123,10 +124,16 @@ class RejectionCode(enum.StrEnum):
     DUPLICATE = "duplicate"
 
 
+#: The enforcement vocabulary, keyed by its lower-case spelling.
+_ENFORCEMENT_BY_KEY: Final[dict[str, str]] = {
+    member.value.lower(): member.value for member in PolicyEnforcement
+}
+
+
 class IngestEventKind(enum.StrEnum):
     """Governance events an SDK reports alongside its telemetry.
 
-    These are the occurrences the control plane owns rather than the telemetry
+    These are the occurrences the server owns rather than the telemetry
     engine: a guardrail that fired in the customer's own process, a policy the
     SDK enforced locally, and end-user feedback captured in the product.
     """
@@ -266,7 +273,7 @@ class ScoreIn(FeedbackScoreIn):
 class SpanIn(_TelemetryBase):
     """One unit of work inside a trace.
 
-    ``id`` is optional: when the SDK omits it the control plane mints a
+    ``id`` is optional: when the SDK omits it the server mints a
     time-ordered id. Supplying one makes a retry idempotent, which is what the
     SDKs do, so a network timeout never double-counts a span.
     """
@@ -441,6 +448,41 @@ class EventIn(BaseModel):
             and not self.body
         ):
             raise ValueError("feedback.submitted needs a rating or a body")
+        return self
+
+    @field_validator("occurred_at")
+    @classmethod
+    def _not_in_the_future(cls, value: dt.datetime | None) -> dt.datetime | None:
+        """An event cannot have happened after it arrived.
+
+        A reporting host whose clock runs ahead, or a local time sent as UTC,
+        used to store the event as given -- and every governance window runs up
+        to *now*, so the record was invisible on every screen until the clock
+        caught up with it. The arrival time is the truthful upper bound.
+        """
+        if value is None:
+            return None
+        aware = value if value.tzinfo is not None else value.replace(tzinfo=dt.UTC)
+        now = dt.datetime.now(dt.UTC)
+        return now if aware > now else aware
+
+    @model_validator(mode="after")
+    def _canonical_violation_action(self) -> EventIn:
+        """Spell a violation's action the way every screen matches it.
+
+        Whether a violation counts as a Block, or as a Human Escalation, is an
+        exact match on its action (``services.agents.ESCALATING_ACTIONS``). An
+        SDK that sent "escalate" or "require_approval" stored a row that counted
+        as a violation and never as either -- on every screen alike, so nothing
+        disagreed, and nothing was right. Case, spacing, hyphens and underscores
+        are folded onto the enforcement vocabulary; a value that is not one of
+        its words is kept exactly as sent rather than guessed at.
+        """
+        if self.kind is IngestEventKind.POLICY_VIOLATION and self.action_taken:
+            key = " ".join(self.action_taken.replace("_", " ").replace("-", " ").lower().split())
+            canonical = _ENFORCEMENT_BY_KEY.get(key)
+            if canonical is not None:
+                self.action_taken = canonical
         return self
 
 

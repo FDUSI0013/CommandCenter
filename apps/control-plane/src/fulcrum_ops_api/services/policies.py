@@ -16,14 +16,23 @@ Three rules hold throughout:
 * **Evidence.** Every state change writes an audit row in the same transaction
   as the change itself, so the two commit or roll back together.
 
-The rollup columns on ``policies`` (``violations_30d``, ``blocked_30d``,
-``requests_30d``, ``approved_pct``) are never computed per page load — counting
-a busy policy's violations for every row of every table render is too slow.
-They are recomputed in bulk by :func:`refresh_rollups`, which the platform
-scheduler calls on its own clock. The ``applies_*`` reach counters are refreshed
-on write, because a write is the one moment a new scope's reach is known, and
-again by the same sweep, because agents register themselves through ingest long
-after the policy that governs them was saved.
+Violation figures -- the KPI cards, each policy's "Violations (30d)" and
+"Blocked (30d)", the violations feed -- are counted from ``policy_violations``
+when they are asked for, with the one definition in
+:mod:`services.agents` (:func:`~.agents.violations_in_window`,
+:func:`~.agents.is_human_escalation`) that the Agent Registry, Agent Detail and
+Live Runs count with as well. For a page of policies that is one grouped
+statement over the page's ids (:func:`window_counts`), answered from an index.
+They used to be read from rollup columns the scheduler rewrote every five
+minutes, which is how a row could disagree with the cards above it.
+
+The remaining rollup columns on ``policies`` (``requests_30d``, ``approved_pct``,
+and the stored copies of ``violations_30d`` and ``blocked_30d``) are recomputed
+in bulk by :func:`refresh_rollups`, which the platform scheduler calls on its
+own clock. The ``applies_*`` reach counters are refreshed on write, because a
+write is the one moment a new scope's reach is known, and again by the same
+sweep, because agents register themselves through ingest long after the policy
+that governs them was saved.
 """
 
 from __future__ import annotations
@@ -31,7 +40,7 @@ from __future__ import annotations
 import copy
 import datetime as dt
 import re
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from typing import Any, Final
 
 from fastapi import Request
@@ -76,11 +85,21 @@ from ..schemas.policies import (
     is_resolvable_signal,
 )
 from . import audit
+from .agents import (
+    ESCALATING_ACTIONS,
+    GOVERNANCE_WINDOW_DAYS,
+    ViolationCounts,
+    governance_window_start,
+    is_human_escalation,
+    violation_counts_by_policy,
+    violations_in_window,
+)
 
 SOURCE_SCREEN: Final[str] = "Policy Center"
 ENTITY_TYPE: Final[str] = "policy"
 
-DEFAULT_WINDOW_DAYS: Final[int] = 30
+#: The Policy Center's window: the Agent Registry's and Agent Detail's as well.
+DEFAULT_WINDOW_DAYS: Final[int] = GOVERNANCE_WINDOW_DAYS
 
 #: Hard ceiling on an export so one click cannot pull an unbounded result set
 #: into memory. Well above any real workspace's policy count.
@@ -121,6 +140,7 @@ SORTABLE: Final[dict[str, InstrumentedAttribute]] = {
     "modified": Policy.updated_at,
     "updated_at": Policy.updated_at,
     "created_at": Policy.created_at,
+    # Placeholders: :func:`_sortable` swaps these for live counts per request.
     "violations_30d": Policy.violations_30d,
     "blocked_30d": Policy.blocked_30d,
     "last_triggered_at": Policy.last_triggered_at,
@@ -151,7 +171,37 @@ VIOLATION_SORTABLE: Final[dict[str, InstrumentedAttribute]] = {
 
 
 def _window_start(window_days: int) -> dt.datetime:
-    return dt.datetime.now(dt.UTC) - dt.timedelta(days=window_days)
+    return governance_window_start(window_days)
+
+
+def _live_count(workspace_id: str, start: dt.datetime, *extra: ColumnElement[bool]) -> Any:
+    """A policy's violations since ``start``, correlated to the row being sorted.
+
+    The same predicate :func:`window_counts` groups by, so sorting the table by
+    "Violations (30d)" orders it by exactly the figures the column prints.
+    """
+    return (
+        select(func.count(PolicyViolation.id))
+        .where(
+            *violations_in_window(workspace_id, start),
+            PolicyViolation.policy_id == Policy.id,
+            *extra,
+        )
+        .correlate(Policy)
+        .scalar_subquery()
+    )
+
+
+def _sortable(workspace_id: str) -> dict[str, Any]:
+    """The table's sort keys, with the windowed counts sorted by their live value."""
+    start = _window_start(DEFAULT_WINDOW_DAYS)
+    return {
+        **SORTABLE,
+        "violations_30d": _live_count(workspace_id, start),
+        "blocked_30d": _live_count(
+            workspace_id, start, PolicyViolation.action_taken == PolicyEnforcement.BLOCK.value
+        ),
+    }
 
 
 def _next_version(current: str | None) -> str:
@@ -490,7 +540,7 @@ async def _reach(
 
     Two aggregate statements, run on the write path and by
     :func:`refresh_rollups`. ``applies_tools`` is deliberately not computed:
-    there is no tool inventory in the control plane, so nothing can count it and
+    there is no tool inventory on the platform, so nothing can count it and
     the column keeps its default rather than being given an invented number.
 
     Given ``policy_id``, agents explicitly bound to that policy count as well as
@@ -645,7 +695,7 @@ def _filtered_stmt(
         # rendered label ("Finance Agents").
         stmt = stmt.where(or_(Policy.scope == scope, Policy.scope_label == scope))
     stmt = apply_search(stmt, params, SEARCHABLE)
-    return apply_sort(stmt, params, SORTABLE, Policy.updated_at)
+    return apply_sort(stmt, params, _sortable(principal.workspace_id), Policy.updated_at)
 
 
 # ---------------------------------------------------------------------------
@@ -726,7 +776,10 @@ async def list_violations(
 
     The names are resolved in two lookups over the ids on the page rather than
     by joining every row into Python, so the page cost does not grow with the
-    size of the violation table.
+    size of the violation table. A row naming an agent that has since been
+    deleted from the registry is listed like any other, with no agent name;
+    with ``window_days`` the total is the Policy Center's "violation events"
+    card for the same window, row for row.
     """
     stmt = (
         select(PolicyViolation)
@@ -748,7 +801,9 @@ async def list_violations(
     elif resolved is False:
         stmt = stmt.where(PolicyViolation.resolved_at.is_(None))
     if window_days:
-        stmt = stmt.where(PolicyViolation.occurred_at >= _window_start(window_days))
+        stmt = stmt.where(
+            *violations_in_window(principal.workspace_id, _window_start(window_days))
+        )
 
     stmt = apply_search(stmt, params, (PolicyViolation.trace_id, Policy.name, Agent.name))
     stmt = apply_sort(stmt, params, VIOLATION_SORTABLE, PolicyViolation.occurred_at)
@@ -805,6 +860,11 @@ async def summary(
     Status counts come from ``policies``; the windowed numbers come from
     ``policy_violations`` rather than from the cached rollups on ``policies``,
     because the cards must agree with the violation feed shown beside them.
+    They are selected with :func:`~.agents.violations_in_window` -- the
+    definition the Agent Registry's card and Live Runs use -- so every row
+    counts, including those naming an agent since deleted from the registry.
+    Human Escalations are the window's violations whose enforcement was one of
+    :data:`~.agents.ESCALATING_ACTIONS`.
     """
     workspace_id = principal.workspace_id
 
@@ -822,7 +882,7 @@ async def summary(
         )
     ).one()
 
-    violations, blocked, distinct_policies = (
+    violations, blocked, escalations, distinct_policies = (
         await session.execute(
             select(
                 func.count(PolicyViolation.id),
@@ -834,11 +894,9 @@ async def summary(
                         )
                     )
                 ),
+                func.count(case((is_human_escalation(), PolicyViolation.id))),
                 func.count(func.distinct(PolicyViolation.policy_id)),
-            ).where(
-                PolicyViolation.workspace_id == workspace_id,
-                PolicyViolation.occurred_at >= _window_start(window_days),
-            )
+            ).where(*violations_in_window(workspace_id, _window_start(window_days)))
         )
     ).one()
 
@@ -852,7 +910,31 @@ async def summary(
         blocked_actions_30d=int(blocked),
         policies_violated_30d=int(distinct_policies),
         violations_30d=int(violations),
+        human_escalations_30d=int(escalations),
+        escalating_actions=list(ESCALATING_ACTIONS),
         window_days=window_days,
+    )
+
+
+async def window_counts(
+    session: AsyncSession,
+    principal: Principal,
+    policies: Iterable[Policy],
+    *,
+    window_days: int = DEFAULT_WINDOW_DAYS,
+) -> dict[str, ViolationCounts]:
+    """Each policy's violations, blocks and human escalations in the window.
+
+    What the table's "Violations (30d)" column, the inspector's 30-day summary
+    and the CSV print, counted now with the definition the KPI cards use -- so
+    the rows of a page add up to the cards above them. One grouped statement
+    over the ids given; a policy with no violations is absent (read it as 0).
+    """
+    return await violation_counts_by_policy(
+        session,
+        principal.workspace_id,
+        [policy.id for policy in policies],
+        _window_start(window_days),
     )
 
 
@@ -869,11 +951,13 @@ async def refresh_rollups(
 ) -> int:
     """Recompute the cached counters on ``policies``; returns the rows refreshed.
 
-    These columns feed the table's "Violations (30d)" column and its sort, the
-    inspector's 30-day summary, the CSV export, Agent Detail's policy rows and
-    the ordering of approval rules. Nothing used to write them, so all of those
-    read zero while the KPI cards beside them — which count the violation table
-    directly — did not.
+    ``requests_30d`` and ``approved_pct`` feed the inspector's 30-day summary
+    and the CSV. The stored ``violations_30d`` and ``blocked_30d`` are kept for
+    anything reading the table directly, but no screen shows them any more:
+    the table, its sort, the inspector, the CSV and Agent Detail's policy rows
+    count live (:func:`window_counts`), because a copy up to five minutes old
+    disagreed with the KPI cards above it. They are counted here with the same
+    predicate, so a fresh copy equals the live figure.
 
     Meant for the scheduler, not for a request: it is one UPDATE with correlated
     counts over every policy (or one workspace's), plus a reach recount per
@@ -886,13 +970,20 @@ async def refresh_rollups(
     is nothing true to put in them.
     """
     cutoff = _window_start(window_days)
+    swept_at = dt.datetime.now(dt.UTC)
 
     def _violations(*extra: ColumnElement[bool]) -> Any:
+        # The live count's predicate (:func:`~.agents.violations_in_window`:
+        # from the cutoff up to and including now, nothing stamped in the
+        # future), correlated to the policy's own workspace because one
+        # statement here may cover every workspace.
         return (
             select(func.count(PolicyViolation.id))
             .where(
+                PolicyViolation.workspace_id == Policy.workspace_id,
                 PolicyViolation.policy_id == Policy.id,
                 PolicyViolation.occurred_at >= cutoff,
+                PolicyViolation.occurred_at <= swept_at,
                 *extra,
             )
             .scalar_subquery()

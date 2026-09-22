@@ -100,7 +100,7 @@ let encoder: { encode(input: string): Uint8Array } | undefined;
 /**
  * UTF-8 byte length of a string.
  *
- * The batch limit the control plane enforces is in bytes, not characters, so a
+ * The batch limit the server enforces is in bytes, not characters, so a
  * payload of emoji or CJK text must be measured as the server will measure it.
  */
 export function byteLength(value: string): number {

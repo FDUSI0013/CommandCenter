@@ -195,7 +195,7 @@ async def create_secret(
     """Store a credential in the vault.
 
     Supply `value` and it is encrypted before it touches a row, or supply
-    `vault_reference` alone to register a credential this control plane only
+    `vault_reference` alone to register a credential the server only
     points at. The value is never returned by this or any other list or detail
     endpoint. Requires the admin role.
     """
@@ -280,7 +280,7 @@ async def reveal_secret(
 
     Requires the admin role and a non-empty `justification`, which is stored
     against your name. Disabled and revoked credentials are refused with 412,
-    as are entries the control plane only points at. Every outcome — allowed or
+    as are entries the server only points at. Every outcome — allowed or
     refused — is written to the credential's access log and to the audit trail.
     """
     return await service.reveal_secret(
@@ -307,7 +307,7 @@ async def rotate_secret(
     this response, while a supplied one is never echoed back. `next_rotation_at`
     is recomputed from the rotation period. Requires the admin role.
 
-    A credential the control plane only points at (`has_material` false) is
+    A credential the server only points at (`has_material` false) is
     never minted into: omit `value` there and the call records a rotation you
     performed in its own vault — `recorded_upstream` is true, no value comes
     back, and the row stays a reference.

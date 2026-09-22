@@ -78,7 +78,7 @@ ENTITY_TYPE: Final[str] = "connection"
 PROBE_TIMEOUT_SECONDS: float = 5.0
 PROBE_CONNECT_TIMEOUT_SECONDS: Final[float] = 2.0
 PROBE_MAX_REDIRECTS: Final[int] = 3
-PROBE_USER_AGENT: Final[str] = "fulcrum-ops-control-plane/1.0 (connection-probe)"
+PROBE_USER_AGENT: Final[str] = "FD-AI-Command-Center/1.0 (connection-probe)"
 
 #: Exactly the diagnostics the probe used to write over the operator's note.
 #: A note that is nothing but one of these was never the operator's, so the

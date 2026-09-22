@@ -51,7 +51,7 @@ async function main() {
   const body = html.replace(/<style[\s\S]*?<\/style>/gi, "");
 
   const buffer = await HTMLtoDOCX(body, null, {
-    title: "Fulcrum Ops — Operator Manual",
+    title: "FD AI Command Center — Operator Manual",
     orientation: "portrait",
     margins: { top: 1080, right: 1080, bottom: 1080, left: 1080 },
     table: { row: { cantSplit: true } },
