@@ -1,6 +1,6 @@
 <?xml version="1.0"?>
 <!--
-  Fulcrum Ops — analytics store profile settings.
+  FD AI Command Center — analytics store profile settings.
 
   This is a users.d file, not a config.d one: the setting below belongs to a
   settings profile rather than to the server.

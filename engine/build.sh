@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fulcrum Ops — build the three private engine images.
+# FD AI Command Center — build the three private engine images.
 #
 #   fulcrum-ops/telemetry-engine   the telemetry service (Java)
 #   fulcrum-ops/metric-runner      runs user-defined metric code in a sandbox
@@ -54,7 +54,7 @@ build() {
     --file "$dir/$dockerfile" \
     --tag "$image" \
     --label "org.opencontainers.image.version=$TAG" \
-    --label "org.opencontainers.image.vendor=Fulcrum Ops" \
+    --label "org.opencontainers.image.vendor=FD AI Command Center" \
     $extra \
     "$dir"
   if [ "$PUSH" = "1" ]; then

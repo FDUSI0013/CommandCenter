@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fulcrum Ops — publish the console's static files to the edge's document root.
+# FD AI Command Center — publish the console's static files to the edge's document root.
 #
 # The obvious `cp -r apps/web/. /srv/fulcrum-ops/` is wrong, and wrong in a way
 # that hides: it overwrites what changed and *leaves behind what was deleted*.

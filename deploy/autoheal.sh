@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fulcrum Ops — restart containers that are running but no longer answering.
+# FD AI Command Center — restart containers that are running but no longer answering.
 #
 # Compose's `restart: unless-stopped` reacts to a process that EXITS. A process
 # that is still there and has stopped answering — a wedged JVM, a server whose

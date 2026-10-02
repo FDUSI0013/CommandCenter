@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fulcrum Ops — ship the committed tree to the production host, from a workstation.
+# FD AI Command Center — ship the committed tree to the production host, from a workstation.
 #
 #   deploy/ship.sh            package HEAD, upload, deploy the CODE phase, verify
 #   deploy/ship.sh --dry-run  package and upload only; print what would run

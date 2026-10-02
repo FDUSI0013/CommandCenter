@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fulcrum Ops — prepare the vendored telemetry engine source for our build.
+# FD AI Command Center — prepare the vendored telemetry engine source for our build.
 #
 # The engine is an Apache-2.0 upstream component we redistribute under our own
 # product name. Two things have to be true before it is built:
@@ -20,7 +20,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENDOR="${1:-$HERE/vendor}"
-PRODUCT="Fulcrum Ops"
+PRODUCT="FD AI Command Center"
 DISABLED_URL="http://127.0.0.1:9/disabled"
 
 if [ ! -d "$VENDOR" ]; then

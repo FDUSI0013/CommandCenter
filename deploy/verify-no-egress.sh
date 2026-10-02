@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fulcrum Ops — prove the private services do not talk to the internet.
+# FD AI Command Center — prove the private services do not talk to the internet.
 #
 # The telemetry engine is a third-party component running inside our product.
 # It is configured never to report outbound, and the configuration is baked into

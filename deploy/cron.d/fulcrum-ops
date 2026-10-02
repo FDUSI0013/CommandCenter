@@ -1,4 +1,4 @@
-# Fulcrum Ops — host jobs. This file is the source of truth; install it as root:
+# FD AI Command Center — host jobs. This file is the source of truth; install it as root:
 #
 #   install -m 0644 -o root -g root /opt/fulcrum/deploy/cron.d/fulcrum-ops /etc/cron.d/fulcrum-ops
 #   rm -f /etc/cron.d/fulcrum-backup      # the earlier, backup-only file: it would run the dump twice

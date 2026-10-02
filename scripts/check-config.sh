@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fulcrum Ops — validate deployment configuration before it reaches a host.
+# FD AI Command Center — validate deployment configuration before it reaches a host.
 #
 # A malformed XML file does not fail loudly at deploy time: the analytics store
 # starts, refuses to merge the config, exits, and restarts — forever — while

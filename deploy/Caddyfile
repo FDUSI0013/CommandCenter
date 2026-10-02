@@ -1,4 +1,4 @@
-# Fulcrum Ops — public edge.
+# FD AI Command Center — public edge.
 #
 # Terminates TLS, serves the console's static assets, and proxies everything
 # under /api to the control plane. The telemetry engine is not represented

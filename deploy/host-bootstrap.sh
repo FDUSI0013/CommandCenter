@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fulcrum Ops — prepare a fresh Ubuntu host to run the stack.
+# FD AI Command Center — prepare a fresh Ubuntu host to run the stack.
 #
 # Installs Docker, the edge proxy and the AWS CLI, sets the kernel limits the
 # analytics store needs, installs the host's cron jobs and log rotation, and

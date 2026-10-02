@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fulcrum Ops — one-time: reclaim the disk the analytics store's own diagnostic
+# FD AI Command Center — one-time: reclaim the disk the analytics store's own diagnostic
 # logs were left holding.
 #
 # deploy/clickhouse/config.d/fulcrum.xml now removes every system log except

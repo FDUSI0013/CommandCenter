@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fulcrum Ops — one-time: move the analytics keeper's transaction log onto its
+# FD AI Command Center — one-time: move the analytics keeper's transaction log onto its
 # named volume.
 #
 # The keeper image declares /datalog as a VOLUME, and the compose file used to

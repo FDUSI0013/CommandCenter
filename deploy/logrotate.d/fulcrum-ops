@@ -1,4 +1,4 @@
-# Fulcrum Ops — rotate the host jobs' logs. Install as root:
+# FD AI Command Center — rotate the host jobs' logs. Install as root:
 #
 #   install -m 0644 -o root -g root /opt/fulcrum/deploy/logrotate.d/fulcrum-ops /etc/logrotate.d/fulcrum-ops
 #   logrotate --debug /etc/logrotate.d/fulcrum-ops        # dry run: prints what it would do

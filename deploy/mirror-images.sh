@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fulcrum Ops — push the engine images to our own registry.
+# FD AI Command Center — push the engine images to our own registry.
 #
 # The three private images are built from vendored source by engine/build.sh.
 # This pushes them to an ECR registry in the account that runs the deployment,

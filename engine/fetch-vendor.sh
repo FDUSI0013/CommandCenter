@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fulcrum Ops — place the telemetry engine's upstream source where the build
+# FD AI Command Center — place the telemetry engine's upstream source where the build
 # can reach it.
 #
 # The source is not committed: it is a large third-party tree that we neither

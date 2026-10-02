@@ -1,4 +1,4 @@
-# Fulcrum Ops — single-host production stack.
+# FD AI Command Center — single-host production stack.
 #
 # Public surface is Caddy on the host (80/443) → control-plane (8080).
 # Everything below binds to the internal compose network only; the telemetry
