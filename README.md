@@ -96,6 +96,13 @@ apps/control-plane/.venv/Scripts/python.exe apps/control-plane/scripts/check_con
 deploy/verify-no-egress.sh                             # on a deployed host
 ```
 
+## Taking it over
+
+[MAINTAINER.md](MAINTAINER.md) is the page to read first: how to reach the
+server, the gates that must pass before a release, the deploy path, the
+identifiers that look like leftovers and must not be renamed, and what is
+still open. [HANDOFF.md](HANDOFF.md) is the long engineering brief behind it.
+
 ## Deploying
 
 `deploy/README.md` has the runbook: host sizing, first deployment, the edge

@@ -7,6 +7,10 @@ as a real user would, find what breaks, and fix it.
 
 Work from evidence. Do not trust this document over what you observe.
 
+If you are a maintainer taking the project over rather than finishing this
+brief, start at [`MAINTAINER.md`](MAINTAINER.md) — it is the short map to the
+server, the gates and the deploy path, and points back here for the detail.
+
 > **Corrected 2026-09-18.** This brief was written on 2026-08-24, before the
 > repository existed, and three of its statements had since become false: that
 > the code is not under version control, that a restore has never been tested,
@@ -66,7 +70,7 @@ itself instead.
 | Onboarding skill | `skills/connect-agent/SKILL.md` |
 | Agent fleet | `C:\Users\FDUSI0013\fulcrum-ops-agents\` (keys in `.keys.env`) |
 | Live console | https://controlplane.fdprod.net |
-| Host | AWS EC2 `i-02c888d6ca6f07a6b`, us-east-1, **SSM only — no SSH key exists** |
+| Host | AWS EC2 `i-02c888d6ca6f07a6b`, us-east-1, public IP `54.162.124.30`. Reachable over AWS SSM, and — since 2026-10-02 — over SSH on port 22 with the maintainer key (`ubuntu@`, key-only, no password) |
 | On-host root | `/opt/fulcrum/`, compose stack in `/opt/fulcrum/deploy/` |
 | Owner password | `/opt/fulcrum/owner-password.txt` on the host (read it via SSM) |
 | Owner account | `ops@fulcrumops.com` |
